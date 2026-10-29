@@ -48,7 +48,7 @@
     "sha256": "b5e4b060ec91221c47ed1edf389f95a5e0c26734b5aadbc1d7c4026a9bd40454",
     "bytes": 34501
   },
-  "baseline_reference_commit": "18aa3ade571b21ce7ca1478a8e1fa75ad9071bc5",
+  "baseline_reference_commit": "cde986569acee45abe668ddbe387e3b59fff5310",
   "live_goldens": ["pool-1", "pool-2"],
   "timed_prompt_pool": [
     {"r2_path": "correctness_prompts/qwen3.8-27b-tf-cuda-v1/pool-1.golden.json", "sha256": "4ddced144f92658e1751159809f46e6d319f5640f2e0a8fd6d5f7b416329ee66", "bytes": 34613},
