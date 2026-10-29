@@ -212,6 +212,18 @@ DEST_RECORDER="${DEST_DIR}/${RECORDER_NAME}"
 # See the BENCHD_DIST_BASE_URL note above for channel selection.
 BASE_URL="${BENCHD_DIST_BASE_URL:-https://raw.githubusercontent.com/Layr-Labs/benchd}"
 
+display_path() {
+  case "$1" in
+    "${DEST_DIR}") printf '<benchd-dir>' ;;
+    "${DEST_DIR}"/*) printf '<benchd-dir>/%s' "${1#"${DEST_DIR}"/}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+print_destination() {
+  printf '%s\n' "${DEST}"
+}
+
 die() {
   echo "fetch-benchd.sh: $*" >&2
   exit 1
@@ -253,19 +265,19 @@ load_manifest() {
   MF_RECORDER_SHA256="$(manifest_binary_field "${path}" "${RECORDER_NAME}" sha256)"
   MF_RECORDER_BYTES="$(manifest_binary_field "${path}" "${RECORDER_NAME}" bytes)"
   if [[ "${#MF_SHA256}" -ne 64 || -n "${MF_SHA256//[0-9a-f]/}" ]]; then
-    echo "fetch-benchd.sh:   manifest sha256 is not 64 lowercase hex characters: '${MF_SHA256}' (${path})" >&2
+    echo "fetch-benchd.sh:   manifest sha256 is not 64 lowercase hex characters: '${MF_SHA256}' ($(display_path "${path}"))" >&2
     return 1
   fi
   if [[ -z "${MF_BYTES}" || -n "${MF_BYTES//[0-9]/}" ]]; then
-    echo "fetch-benchd.sh:   manifest bytes is not a positive integer: '${MF_BYTES}' (${path})" >&2
+    echo "fetch-benchd.sh:   manifest bytes is not a positive integer: '${MF_BYTES}' ($(display_path "${path}"))" >&2
     return 1
   fi
   if [[ "${MF_BRANCH}" != "${BRANCH}" ]]; then
-    echo "fetch-benchd.sh:   manifest names branch '${MF_BRANCH}', expected '${BRANCH}' -- wrong channel (${path})" >&2
+    echo "fetch-benchd.sh:   manifest names branch '${MF_BRANCH}', expected '${BRANCH}' -- wrong channel ($(display_path "${path}"))" >&2
     return 1
   fi
   if [[ "${MF_COMMIT}" != "${SOURCE_COMMIT_PIN}" ]]; then
-    echo "fetch-benchd.sh:   manifest names source_commit '${MF_COMMIT}', the pin is '${SOURCE_COMMIT_PIN}' -- not the pinned benchd (${path})" >&2
+    echo "fetch-benchd.sh:   manifest names source_commit '${MF_COMMIT}', the pin is '${SOURCE_COMMIT_PIN}' -- not the pinned benchd ($(display_path "${path}"))" >&2
     return 1
   fi
   # A DECLARED recorder must be declared completely. Half an entry -- a digest
@@ -273,11 +285,11 @@ load_manifest() {
   # and "verifies against nothing" is the state this script exists to prevent.
   if [[ -n "${MF_RECORDER_SHA256}" || -n "${MF_RECORDER_BYTES}" ]]; then
     if [[ "${#MF_RECORDER_SHA256}" -ne 64 || -n "${MF_RECORDER_SHA256//[0-9a-f]/}" ]]; then
-      echo "fetch-benchd.sh:   manifest ${RECORDER_NAME} sha256 is not 64 lowercase hex characters: '${MF_RECORDER_SHA256}' (${path})" >&2
+      echo "fetch-benchd.sh:   manifest ${RECORDER_NAME} sha256 is not 64 lowercase hex characters: '${MF_RECORDER_SHA256}' ($(display_path "${path}"))" >&2
       return 1
     fi
     if [[ -z "${MF_RECORDER_BYTES}" || -n "${MF_RECORDER_BYTES//[0-9]/}" ]]; then
-      echo "fetch-benchd.sh:   manifest ${RECORDER_NAME} bytes is not a positive integer: '${MF_RECORDER_BYTES}' (${path})" >&2
+      echo "fetch-benchd.sh:   manifest ${RECORDER_NAME} bytes is not a positive integer: '${MF_RECORDER_BYTES}' ($(display_path "${path}"))" >&2
       return 1
     fi
   fi
@@ -297,12 +309,12 @@ matches_recorder_entry() {
   [[ -f "${path}" ]] || return 1
   actual_bytes="$(wc -c < "${path}" | tr -d '[:space:]')"
   if [[ "${actual_bytes}" != "${MF_RECORDER_BYTES}" ]]; then
-    echo "fetch-benchd.sh:   RECORDER MISMATCH: byte count manifest=${MF_RECORDER_BYTES} actual=${actual_bytes} (${path})" >&2
+    echo "fetch-benchd.sh:   RECORDER MISMATCH: byte count manifest=${MF_RECORDER_BYTES} actual=${actual_bytes} ($(display_path "${path}"))" >&2
     return 1
   fi
   actual_sha="$(shasum -a 256 "${path}" | awk '{print $1}')"
   if [[ "${actual_sha}" != "${MF_RECORDER_SHA256}" ]]; then
-    echo "fetch-benchd.sh:   RECORDER MISMATCH: sha256 manifest=${MF_RECORDER_SHA256} actual=${actual_sha} (${path})" >&2
+    echo "fetch-benchd.sh:   RECORDER MISMATCH: sha256 manifest=${MF_RECORDER_SHA256} actual=${actual_sha} ($(display_path "${path}"))" >&2
     return 1
   fi
   return 0
@@ -316,12 +328,12 @@ matches_manifest() {
   [[ -f "${path}" ]] || return 1
   actual_bytes="$(wc -c < "${path}" | tr -d '[:space:]')"
   if [[ "${actual_bytes}" != "${MF_BYTES}" ]]; then
-    echo "fetch-benchd.sh:   byte count mismatch: manifest=${MF_BYTES} actual=${actual_bytes} (${path})" >&2
+    echo "fetch-benchd.sh:   byte count mismatch: manifest=${MF_BYTES} actual=${actual_bytes} ($(display_path "${path}"))" >&2
     return 1
   fi
   actual_sha="$(shasum -a 256 "${path}" | awk '{print $1}')"
   if [[ "${actual_sha}" != "${MF_SHA256}" ]]; then
-    echo "fetch-benchd.sh:   sha256 mismatch: manifest=${MF_SHA256} actual=${actual_sha} (${path})" >&2
+    echo "fetch-benchd.sh:   sha256 mismatch: manifest=${MF_SHA256} actual=${actual_sha} ($(display_path "${path}"))" >&2
     return 1
   fi
   return 0
@@ -330,7 +342,7 @@ matches_manifest() {
 announce() {
   echo "fetch-benchd.sh: benchd identity: branch=${MF_BRANCH} source_commit=${MF_COMMIT} target_triple=${MF_TRIPLE} sha256=${MF_SHA256} bytes=${MF_BYTES}" >&2
   if manifest_declares_recorder; then
-    echo "fetch-benchd.sh: ${RECORDER_NAME} identity: sha256=${MF_RECORDER_SHA256} bytes=${MF_RECORDER_BYTES} (staged at ${DEST_RECORDER})" >&2
+    echo "fetch-benchd.sh: ${RECORDER_NAME} identity: sha256=${MF_RECORDER_SHA256} bytes=${MF_RECORDER_BYTES} (staged at <benchd-dir>/${RECORDER_NAME})" >&2
   else
     echo "fetch-benchd.sh: this manifest declares no ${RECORDER_NAME}; the channel carries benchd alone" >&2
   fi
@@ -425,7 +437,7 @@ matches_platform() {
   fi
   have_format="$(file_format "${path}")"
   if [[ "${have_format}" != "${want_format}" ]]; then
-    echo "fetch-benchd.sh:   MIS-STAMPED DIST: target_triple '${MF_TRIPLE}' says ${want_format}, the bytes are ${have_format} (${path})" >&2
+    echo "fetch-benchd.sh:   MIS-STAMPED DIST: target_triple '${MF_TRIPLE}' says ${want_format}, the bytes are ${have_format} ($(display_path "${path}"))" >&2
     return 1
   fi
   return 0
@@ -439,22 +451,22 @@ fi
 
 if [[ -f "${DEST}" ]]; then
   load_manifest "${DEST_MANIFEST}" \
-    || die "${DEST} exists but ${DEST_MANIFEST} is missing or malformed; a binary with no manifest is unattributable and will not be run. Place the channel's benchd.manifest.json beside it, or delete the binary and re-run."
+    || die "<benchd-dir>/benchd exists but <benchd-dir>/benchd.manifest.json is missing or malformed; a binary with no manifest is unattributable and will not be run. Place the channel's benchd.manifest.json beside it, or delete the binary and re-run."
   matches_manifest "${DEST}" \
-    || die "${DEST} does NOT match its manifest (see the mismatch above); refusing to run or replace it. Delete the pair deliberately, then re-run."
+    || die "<benchd-dir>/benchd does NOT match its manifest (see the mismatch above); refusing to run or replace it. Delete the pair deliberately, then re-run."
   matches_platform "${DEST}" \
-    || die "${DEST} is not for this host (see the platform mismatch above); refusing to run it. A binary for another platform fails at exec with an unreadable message, so it is refused here by name instead."
+    || die "<benchd-dir>/benchd is not for this host (see the platform mismatch above); refusing to run it. A binary for another platform fails at exec with an unreadable message, so it is refused here by name instead."
   if manifest_declares_recorder; then
     [[ -f "${DEST_RECORDER}" ]] \
-      || die "RECORDER MISSING: ${DEST_MANIFEST} declares ${RECORDER_NAME} but ${DEST_RECORDER} is not there. The channel publishes both files together; place the recorder beside benchd, or set BENCHD_REFRESH=1 to re-resolve the pair."
+      || die "RECORDER MISSING: <benchd-dir>/benchd.manifest.json declares ${RECORDER_NAME} but <benchd-dir>/${RECORDER_NAME} is not there. The channel publishes both files together; place the recorder beside benchd, or set BENCHD_REFRESH=1 to re-resolve the pair."
     matches_recorder_entry "${DEST_RECORDER}" \
-      || die "${DEST_RECORDER} does NOT match the manifest entry for ${RECORDER_NAME} (see the mismatch above); refusing to run or replace it. Delete it deliberately, or set BENCHD_REFRESH=1."
+      || die "<benchd-dir>/${RECORDER_NAME} does NOT match the manifest entry for ${RECORDER_NAME} (see the mismatch above); refusing to run or replace it. Delete it deliberately, or set BENCHD_REFRESH=1."
     # A root-owned staged pair is already executable; chmod only when needed.
     [[ -x "${DEST_RECORDER}" ]] || chmod 755 "${DEST_RECORDER}"
   fi
   [[ -x "${DEST}" ]] || chmod 755 "${DEST}"
   announce
-  printf '%s\n' "${DEST}"
+  print_destination
   exit 0
 fi
 
@@ -519,7 +531,7 @@ else
       if [[ -z "${auth_token}" ]]; then
         echo "  if the channel repo is private, set BENCHD_DIST_TOKEN/GITHUB_TOKEN."
       fi
-      echo "  offline alternative: place benchd + benchd.manifest.json at ${DEST_DIR}/,"
+      echo "  offline alternative: place benchd + benchd.manifest.json at <benchd-dir>/,"
       echo "  or point BENCHD_DIST_LOCAL at a directory holding both."
     } >&2
     exit 1
@@ -549,11 +561,11 @@ mkdir -p "${DEST_DIR}"
 chmod 755 "${STAGED}"
 mv "${STAGED}" "${DEST}"
 mv "${STAGED_MANIFEST}" "${DEST_MANIFEST}"
-echo "fetch-benchd.sh: installed benchd at ${DEST} (manifest beside it)" >&2
+echo "fetch-benchd.sh: installed benchd at <benchd-dir>/benchd (manifest beside it)" >&2
 if manifest_declares_recorder; then
   chmod 755 "${STAGED_RECORDER}"
   mv "${STAGED_RECORDER}" "${DEST_RECORDER}"
-  echo "fetch-benchd.sh: installed ${RECORDER_NAME} at ${DEST_RECORDER}" >&2
+  echo "fetch-benchd.sh: installed ${RECORDER_NAME} at <benchd-dir>/${RECORDER_NAME}" >&2
 else
   # A channel that no longer declares the recorder must not leave a stale one
   # staged: it would be a binary this manifest cannot attribute, which is the
@@ -562,4 +574,4 @@ else
 fi
 announce
 
-printf '%s\n' "${DEST}"
+print_destination

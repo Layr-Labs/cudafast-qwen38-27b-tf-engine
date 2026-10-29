@@ -103,7 +103,7 @@ sandbox_shim() {
     || { echo "stage-cuda-engine.sh: SANDBOX_ROOT '${root}' is not an absolute path" >&2; return 1; }
   if [[ -z "${log_dir}" || -L "${log_dir}" || ! -d "${log_dir}" \
         || "$(file_owner "${log_dir}")" != "$(id -un)" ]]; then
-    echo "stage-cuda-engine.sh: RUNNER_TEMP '${log_dir}' is not a directory owned by $(id -un); the worker's stderr file needs one" >&2
+    echo "stage-cuda-engine.sh: RUNNER_TEMP <runner-temp> is not a directory owned by <runner-user>; the worker's stderr file needs one" >&2
     return 1
   fi
   printf '#!/usr/bin/env bash\nset -euo pipefail\n'
@@ -120,7 +120,7 @@ if [[ "${1:-}" == "--print-shim" ]]; then
 fi
 
 if [[ ! -x "${TENSORFOLD_WORKER_BIN}" ]]; then
-  echo "stage-cuda-engine.sh: native worker missing or not executable: ${TENSORFOLD_WORKER_BIN}" >&2
+  echo "stage-cuda-engine.sh: native worker <native-worker> is missing or not executable" >&2
   echo "stage-cuda-engine.sh: build it first:" >&2
   echo "  tools/engine/build.sh" >&2
   exit 1
@@ -133,7 +133,7 @@ fi
 if [[ -n "${SANDBOX_USER:-}" ]]; then
   if [[ -L "${TENSORFOLD_WORKER_BIN}" || ! -f "${TENSORFOLD_WORKER_BIN}" \
         || "$(file_owner "${TENSORFOLD_WORKER_BIN}")" != "${SANDBOX_USER}" ]]; then
-    echo "stage-cuda-engine.sh: refusing ${TENSORFOLD_WORKER_BIN}: not a regular file owned by ${SANDBOX_USER}" >&2
+    echo "stage-cuda-engine.sh: refusing <native-worker>: not a regular file owned by ${SANDBOX_USER}" >&2
     exit 1
   fi
   SHIM="$(sandbox_shim)" || exit 1
@@ -168,7 +168,7 @@ if [[ ! "${TENSORFOLD_WORKER_BIN}" -ef "${REAL_ENGINE_BIN}" ]]; then
 fi
 if [[ -n "${SANDBOX_USER:-}" ]] && [[ -L "${REAL_ENGINE_BIN}" || ! -f "${REAL_ENGINE_BIN}" ]]; then
   rm -f "${REAL_ENGINE_BIN}"
-  echo "stage-cuda-engine.sh: refusing the staged copy ${REAL_ENGINE_BIN}: not a regular file (the source changed after it was checked)" >&2
+  echo "stage-cuda-engine.sh: refusing the staged copy <staged-engine>: not a regular file (the source changed after it was checked)" >&2
   exit 1
 fi
 
@@ -178,7 +178,7 @@ if [[ -n "${SANDBOX_USER:-}" ]]; then
   printf '%s\n' "${SHIM}" > "${STAGED_ENGINE_BIN}"
   chmod 0755 "${STAGED_ENGINE_BIN}"
   write_source_identity
-  echo "stage-cuda-engine.sh: staged ${REAL_ENGINE_BIN} (native worker) and the sandbox shim ${STAGED_ENGINE_BIN} for benchd (runs it as ${SANDBOX_USER})"
+  echo "stage-cuda-engine.sh: staged <staged-engine> (native worker) and <sandbox-shim> for benchd (runs it as ${SANDBOX_USER})"
   exit 0
 fi
 

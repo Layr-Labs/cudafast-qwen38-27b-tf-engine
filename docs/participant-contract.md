@@ -18,6 +18,11 @@ The resident clears model state at each phase boundary.
 
 It must not keep prompt or decode work from an earlier phase.
 
+The engine must not carry state from one job to a later job through any side
+channel, such as the page cache or file access times of shared host files. The
+sandbox cleanup does not clear those, so promoted entries are reviewed. An
+entry that carries state across jobs is removed.
+
 ## Correctness
 
 The timed token stream must match its pinned tape.

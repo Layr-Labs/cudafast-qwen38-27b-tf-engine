@@ -10,6 +10,7 @@ TREE="${TMP}/repo"
 mkdir -p "${TREE}/tools/engine" "${TREE}/fixtures" "${TREE}/Vendor/TensorFold" \
   "${TMP}/bin" "${TMP}/zig/lib"
 cp "${ROOT}/tools/engine/build.sh" "${TREE}/tools/engine/build.sh"
+cp "${ROOT}/tools/public-log-redact.awk" "${ROOT}/tools/public-log-redact.sh" "${TREE}/tools/"
 cp "${ROOT}/fixtures/qwen3_8_27b_tf_cuda_v1_track.json" "${TREE}/fixtures/"
 
 cat > "${TMP}/zig/zig" <<'EOF'

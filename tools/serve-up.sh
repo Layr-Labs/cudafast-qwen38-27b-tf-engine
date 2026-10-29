@@ -159,18 +159,21 @@ stage_snapshots() {
   [[ -n "$dest_root" ]] || die "--stage-snapshots requires --dest-root DIR"
   [[ -n "$env_out" ]] || die "--stage-snapshots requires --env-out FILE"
   [[ -n "$share_group" ]] || die "--stage-snapshots requires --group GROUP"
-  [[ ! -e "$dest_root" && ! -L "$dest_root" ]] || die "snapshot staging destination already exists: ${dest_root}"
+  [[ ! -e "$dest_root" && ! -L "$dest_root" ]] || die "snapshot staging destination already exists: <sandbox-root>/weights"
   target_source="${MLXFAST_TARGET_SNAPSHOT_DIR:-}"
   drafter_source="${MLXFAST_DRAFTER_SNAPSHOT_DIR:-}"
   [[ -d "$target_source" ]] || die "MLXFAST_TARGET_SNAPSHOT_DIR is missing"
   [[ -d "$drafter_source" ]] || die "MLXFAST_DRAFTER_SNAPSHOT_DIR is missing"
-  [[ -f "$FIXTURE" ]] || die "track fixture is missing: ${FIXTURE}"
+  [[ -f "$FIXTURE" ]] || die "track fixture is missing: fixtures/qwen3_8_27b_tf_cuda_v1_track.json"
 
   target_dir="${dest_root}/target"
   drafter_dir="${dest_root}/drafter"
   mkdir -p "$target_dir" "$drafter_dir"
-  cp -RL -- "${target_source}/." "${target_dir}/"
-  cp -RL -- "${drafter_source}/." "${drafter_dir}/"
+  # cp's own message would print box paths; refuse with role names instead
+  cp -RL -- "${target_source}/." "${target_dir}/" 2>/dev/null \
+    || die "cannot copy <target-snapshot> into <sandbox-root>/weights/target"
+  cp -RL -- "${drafter_source}/." "${drafter_dir}/" 2>/dev/null \
+    || die "cannot copy <drafter-snapshot> into <sandbox-root>/weights/drafter"
   refuse_snapshot_symlinks "$target_dir" "staged target"
   refuse_snapshot_symlinks "$drafter_dir" "staged drafter"
 
@@ -206,7 +209,7 @@ stage_snapshots() {
     printf 'MLXFAST_WEIGHTS_PATH=%s\n' "$(cd -- "$target_dir" && pwd -P)"
     printf 'SERVE_UP_WEIGHTS_DIR=%s\n' "$(cd -- "$target_dir" && pwd -P)"
   } >> "$env_out"
-  log "staged dereferenced snapshots in ${dest_root}"
+  log "staged dereferenced snapshots in <sandbox-root>/weights"
 }
 
 if [[ "${1:-}" == "--stage-snapshots" ]]; then

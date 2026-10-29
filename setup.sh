@@ -138,7 +138,7 @@ else
     # A staged snapshot: present, complete, and hashed on every run. The ranked
     # path never fetches, deletes or short-cuts organizer material.
     local_snapshot=0
-    [[ -d "${SNAPSHOT_DIR}" ]] || die "the target snapshot directory does not exist: ${SNAPSHOT_DIR}"
+    [[ -d "${SNAPSHOT_DIR}" ]] || die "the target snapshot directory does not exist: <target-snapshot>"
   else
     local_snapshot=1
     SNAPSHOT_DIR="${DEFAULT_SNAPSHOT_DIR}"
@@ -173,13 +173,13 @@ else
   marker="$(snapshot_marker_path)"
   if [[ "${local_snapshot}" == "1" && "${MLXFAST_SKIP_WEIGHTS_SHA256:-0}" != "1" && -f "${marker}" ]] \
       && identity="$(snapshot_identity)" && [[ "${identity}" == "$(cat "${marker}")" ]]; then
-    log "target snapshot at ${SNAPSHOT_DIR} verified by marker: $(wc -l < "${marker}" | tr -d '[:space:]') pinned files unchanged since the last full verification"
+    log "target snapshot at <target-snapshot> verified by marker: $(wc -l < "${marker}" | tr -d '[:space:]') pinned files unchanged since the last full verification"
     verified_by_marker=1
   else
     verified_by_marker=0
   fi
 
-  log "verifying the pinned target snapshot at ${SNAPSHOT_DIR} against fixtures/qwen3_8_27b_tf_cuda_v1_track.json"
+  log "verifying the pinned target snapshot at <target-snapshot> against fixtures/qwen3_8_27b_tf_cuda_v1_track.json"
   # Byte counts first (cheap, names a truncated file), then sha256 of every
   # file. The files are hashed CONCURRENTLY, one process per file, bounded by
   # MLXFAST_VERIFY_JOBS (default 8): the same digests, compared against the
@@ -241,7 +241,7 @@ else
   else
     log "target snapshot verified: ${count} files by byte count and sha256"
   fi
-  log "target snapshot ready at ${SNAPSHOT_DIR}; local runs: tools/local-baseline.sh"
+  log "target snapshot ready at <target-snapshot>; local runs: tools/local-baseline.sh"
 fi
 
 log "setup complete: engine staged for benchd and the target snapshot verified per the steps above"

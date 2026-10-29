@@ -139,7 +139,7 @@ if [[ -z "${BENCHD:-}" ]]; then
   BENCHD="$("${SCRIPT_DIR}/tools/fetch-benchd.sh")"
 fi
 if [[ ! -x "${BENCHD}" ]]; then
-  echo "qwen38-measure-and-score.sh: benchd not found at ${BENCHD}." >&2
+  echo "qwen38-measure-and-score.sh: benchd not found at <benchd-dir>/benchd." >&2
   echo "  fetch it: ./tools/fetch-benchd.sh   (resolves the dist channel, verifies the manifest)" >&2
   echo "  or set BENCHD to an existing binary." >&2
   exit 1
@@ -147,7 +147,7 @@ fi
 
 CONTRACT="${SCRIPT_DIR}/fixtures/qwen3_8_27b_tf_cuda_v1_track.json"
 if [[ ! -f "${CONTRACT}" ]]; then
-  echo "qwen38-measure-and-score.sh: track contract fixture missing: ${CONTRACT}" >&2
+  echo "qwen38-measure-and-score.sh: track contract fixture missing: fixtures/qwen3_8_27b_tf_cuda_v1_track.json" >&2
   exit 1
 fi
 
@@ -238,7 +238,7 @@ for name in "${LIVE_GOLDEN_NAMES[@]}"; do
   if [[ "${SPEC_DESC}" != "serial" ]]; then
     spec_entry="$(jq -c --arg n "${name}" --arg k "${SPEC_DESC}" '.speculative_oracles[$n][$k] // empty' "${CONTRACT}")"
     if [[ -z "${spec_entry}" || "${spec_entry}" == "null" ]]; then
-      echo "qwen38-measure-and-score.sh: declared spec '${SPEC_DESC}' has no speculative_oracles['${name}'] entry in ${CONTRACT}; no timed oracle is authored for that prompt at that draft depth. Refusing rather than scoring it against the serial oracle." >&2
+      echo "qwen38-measure-and-score.sh: declared spec '${SPEC_DESC}' has no speculative_oracles['${name}'] entry in fixtures/qwen3_8_27b_tf_cuda_v1_track.json; no timed oracle is authored for that prompt at that draft depth. Refusing rather than scoring it against the serial oracle." >&2
       exit 1
     fi
     timed_base="$(printf '%s' "${spec_entry}" | jq -r '.r2_path // empty')"
@@ -340,7 +340,7 @@ if [[ "${PREFLIGHT_ONLY}" == "1" ]]; then
       --golden-bytes "${WARMUP_GOLDEN_BYTES}" \
       --contract "${CONTRACT}"
   elif [[ -n "${WARMUP_GOLDEN_PATH}" ]]; then
-    echo "qwen38-measure-and-score.sh: preflight -- warm-up golden not staged at ${WARMUP_GOLDEN_PATH}; benchd re-verifies the pin on the real run." >&2
+    echo "qwen38-measure-and-score.sh: preflight -- warm-up golden not staged at <golden-dir>/${WARMUP_GOLDEN_BASE}; benchd re-verifies the pin on the real run." >&2
   fi
   exit 0
 fi
@@ -358,7 +358,7 @@ if [[ -z "${BASELINE_WORKSPACE}" ]]; then
   exit 1
 fi
 if [[ ! -d "${BASELINE_WORKSPACE}" ]]; then
-  echo "qwen38-measure-and-score.sh: MLXFAST_BASELINE_WORKSPACE=${BASELINE_WORKSPACE} is not a directory." >&2
+  echo "qwen38-measure-and-score.sh: MLXFAST_BASELINE_WORKSPACE=<reference-workspace> is not a directory." >&2
   exit 1
 fi
 if [[ -z "${BASELINE_CALIBRATION}" ]]; then
@@ -367,7 +367,7 @@ if [[ -z "${BASELINE_CALIBRATION}" ]]; then
   exit 1
 fi
 if [[ ! -f "${BASELINE_CALIBRATION}" ]]; then
-  echo "qwen38-measure-and-score.sh: MLXFAST_BASELINE_CALIBRATION=${BASELINE_CALIBRATION} is not a file." >&2
+  echo "qwen38-measure-and-score.sh: MLXFAST_BASELINE_CALIBRATION=<calibration-file> is not a file." >&2
   exit 1
 fi
 
@@ -379,7 +379,7 @@ CALIBRATION_FOR_BENCHD="$(mktemp "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/baseline-calib
 trap 'rm -f -- "${CALIBRATION_FOR_BENCHD}"' EXIT
 if ! jq 'del(.method)' "${BASELINE_CALIBRATION}" > "${CALIBRATION_FOR_BENCHD}"; then
   rm -f "${CALIBRATION_FOR_BENCHD}"
-  echo "qwen38-measure-and-score.sh: baseline calibration is not valid JSON: ${BASELINE_CALIBRATION}" >&2
+  echo "qwen38-measure-and-score.sh: baseline calibration is not valid JSON: <calibration-file>" >&2
   exit 1
 fi
 
@@ -402,7 +402,7 @@ fi
 for var in DS4_RESIDENT_SOCKET BENCH_WORKER_RESIDENT_SOCKET; do
   eval "value=\${${var}:-}"
   if [[ -n "${value}" ]]; then
-    echo "qwen38-measure-and-score.sh: ${var}=${value} is set in the environment; benchd boots each leg's resident and injects its socket, so an inherited one would point both legs' workers at a resident neither leg booted." >&2
+    echo "qwen38-measure-and-score.sh: ${var}=<socket-dir> is set in the environment; benchd boots each leg's resident and injects its socket, so an inherited one would point both legs' workers at a resident neither leg booted." >&2
     exit 1
   fi
 done
@@ -420,7 +420,7 @@ fi
 GOLDEN_ARGS=()
 for i in "${!GOLDEN_BASENAMES[@]}"; do
   if [[ ! -f "${GOLDEN_DIR}/${GOLDEN_BASENAMES[$i]}" ]]; then
-    echo "qwen38-measure-and-score.sh: live golden not found at ${GOLDEN_DIR}/${GOLDEN_BASENAMES[$i]}" >&2
+    echo "qwen38-measure-and-score.sh: live golden not found at <golden-dir>/${GOLDEN_BASENAMES[$i]}" >&2
     echo "  live_goldens names '${LIVE_GOLDEN_NAMES[$i]}' (fixtures/qwen3_8_27b_tf_cuda_v1_track.json); stage ${GOLDEN_BASENAMES[$i]} into MLXFAST_QWEN38_GOLDEN_DIR." >&2
     exit 1
   fi
@@ -428,7 +428,7 @@ for i in "${!GOLDEN_BASENAMES[@]}"; do
 done
 if [[ -n "${WARMUP_GOLDEN_PATH}" ]]; then
   if [[ ! -f "${WARMUP_GOLDEN_PATH}" ]]; then
-    echo "qwen38-measure-and-score.sh: warm-up golden not found at ${WARMUP_GOLDEN_PATH}" >&2
+    echo "qwen38-measure-and-score.sh: warm-up golden not found at <golden-dir>/${WARMUP_GOLDEN_BASE}" >&2
     exit 1
   fi
   WARMUP_ARGS=(
@@ -444,7 +444,7 @@ fi
 # self-sufficient; MLXFAST_ENGINE_BIN overrides it for engine development.
 ENGINE_BIN="${MLXFAST_ENGINE_BIN:-${SCRIPT_DIR}/.build/release/bench-worker}"
 if [[ ! -x "${ENGINE_BIN}" ]]; then
-  echo "qwen38-measure-and-score.sh: engine binary missing or not executable: ${ENGINE_BIN}" >&2
+  echo "qwen38-measure-and-score.sh: engine binary missing or not executable: <workspace>/.build/release/bench-worker" >&2
   echo "  build + stage it (./setup.sh, or tools/stage-cuda-engine.sh), or set MLXFAST_ENGINE_BIN." >&2
   exit 1
 fi
@@ -452,7 +452,7 @@ fi
 SANDBOX_WRAPPER="${SCRIPT_DIR}/tools/run-engine-sandboxed.sh"
 if [[ -n "${SANDBOX_USER:-}" ]]; then
   if [[ ! -x "${SANDBOX_WRAPPER}" ]]; then
-    echo "qwen38-measure-and-score.sh: SANDBOX_USER=${SANDBOX_USER} but the engine wrapper is missing or not executable: ${SANDBOX_WRAPPER}" >&2
+    echo "qwen38-measure-and-score.sh: SANDBOX_USER=${SANDBOX_USER} but the engine wrapper is missing or not executable: tools/run-engine-sandboxed.sh" >&2
     exit 1
   fi
   # The staged engine must be exactly the shim stage-cuda-engine.sh writes, and
@@ -463,11 +463,11 @@ if [[ -n "${SANDBOX_USER:-}" ]]; then
   real_engine="$(cd "$(dirname -- "${ENGINE_BIN}")" && pwd -P)/$(basename -- "${ENGINE_BIN}").sandboxed"
   expected_shim="$("${SCRIPT_DIR}/tools/stage-cuda-engine.sh" --print-shim)" || exit 1
   if [[ -L "${ENGINE_BIN}" || "$(cat -- "${ENGINE_BIN}" 2>/dev/null)" != "${expected_shim}" ]]; then
-    echo "qwen38-measure-and-score.sh: SANDBOX_USER=${SANDBOX_USER} but ${ENGINE_BIN} is not the sandbox shim; stage it with SANDBOX_USER set (tools/engine/build.sh)." >&2
+    echo "qwen38-measure-and-score.sh: SANDBOX_USER=${SANDBOX_USER} but <workspace>/.build/release/bench-worker is not the sandbox shim; stage it with SANDBOX_USER set (tools/engine/build.sh)." >&2
     exit 1
   fi
   if [[ -L "${real_engine}" || ! -f "${real_engine}" || ! -x "${real_engine}" ]]; then
-    echo "qwen38-measure-and-score.sh: SANDBOX_USER=${SANDBOX_USER} but the sandboxed adapter is missing or not a regular executable file: ${real_engine}" >&2
+    echo "qwen38-measure-and-score.sh: SANDBOX_USER=${SANDBOX_USER} but the sandboxed adapter is missing or not a regular executable file: <workspace>/.build/release/bench-worker.sandboxed" >&2
     exit 1
   fi
   if ! command -v sudo >/dev/null 2>&1; then
@@ -478,7 +478,7 @@ if [[ -n "${SANDBOX_USER:-}" ]]; then
     echo "qwen38-measure-and-score.sh: SANDBOX_USER=${SANDBOX_USER} but passwordless sudo to that user is unusable (see docs/sandbox-design.md, 'Operator setup')." >&2
     exit 1
   fi
-  echo "qwen38-measure-and-score.sh: candidate leg engine ${ENGINE_BIN} is the sandbox shim (adapter ${real_engine} as ${SANDBOX_USER})" >&2
+  echo "qwen38-measure-and-score.sh: candidate leg engine <workspace>/.build/release/bench-worker is the sandbox shim (adapter <workspace>/.build/release/bench-worker.sandboxed as ${SANDBOX_USER})" >&2
 fi
 
 # --weights. benchd resolves the target weights from `--weights`. Default to the
@@ -486,7 +486,7 @@ fi
 # (MLXFAST_TARGET_SNAPSHOT_DIR); MLXFAST_WEIGHTS_PATH overrides.
 WEIGHTS_PATH="${MLXFAST_WEIGHTS_PATH:-${MLXFAST_TARGET_SNAPSHOT_DIR:-}}"
 if [[ -z "${WEIGHTS_PATH}" || ! -d "${WEIGHTS_PATH}" ]]; then
-  echo "qwen38-measure-and-score.sh: the target weights directory is missing or unset: '${WEIGHTS_PATH}'" >&2
+  echo "qwen38-measure-and-score.sh: the target weights directory is missing or unset: '<target-snapshot>'" >&2
   echo "  Set MLXFAST_TARGET_SNAPSHOT_DIR to the on-box target snapshot (./setup.sh verifies it), or MLXFAST_WEIGHTS_PATH to override." >&2
   exit 1
 fi
@@ -518,7 +518,7 @@ if "${BENCHD}" iterate --help 2>&1 | grep -q -- '--control-golden'; then
   for i in "${!SERIAL_GOLDEN_BASENAMES[@]}"; do
     control_path="${GOLDEN_DIR}/${SERIAL_GOLDEN_BASENAMES[$i]}"
     if [[ ! -f "${control_path}" ]]; then
-      echo "qwen38-measure-and-score.sh: serial golden not found at ${control_path}; the serial-control leg has no tape to verify against." >&2
+      echo "qwen38-measure-and-score.sh: serial golden not found at <golden-dir>/${SERIAL_GOLDEN_BASENAMES[$i]}; the serial-control leg has no tape to verify against." >&2
       exit 1
     fi
     CONTROL_ARGS+=(--control-golden "${control_path}" --control-golden-sha256 "${SERIAL_GOLDEN_SHA256S[$i]}" --control-golden-bytes "${SERIAL_GOLDEN_BYTES_LIST[$i]}")
@@ -631,12 +631,23 @@ fi
 HELD="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/measure-held.XXXXXX")"
 trap 'rm -rf -- "${HELD}"; rm -f -- "${CALIBRATION_FOR_BENCHD}"' EXIT
 INTEGRITY_PATH="$(dirname -- "${SCORE_PATH}")/benchmark-integrity.json"
+PUBLIC_LOG_REDACT_AWK="${SCRIPT_DIR}/tools/public-log-redact.awk"
+if ! PUBLIC_LOG_HOST="$(hostname 2>/dev/null)" || [[ -z "${PUBLIC_LOG_HOST}" ]]; then
+  echo "qwen38-measure-and-score.sh: warning: hostname lookup failed; continuing without hostname redaction" >&2
+  PUBLIC_LOG_HOST=""
+fi
+export PUBLIC_LOG_CALIBRATION_FILE="${CALIBRATION_FOR_BENCHD}"
+export PUBLIC_LOG_HOST
+
+redact() {
+  "${SCRIPT_DIR}/tools/public-log-redact.sh"
+}
 
 run_attempt() {
   rm -f -- "${HELD}/stdout" "${HELD}/marker"
   set +e
   "${iterate_official[@]}" 2>&1 >"${HELD}/stdout" \
-    | awk -v held="${HELD}/marker" 'index($0, "benchd iterate: wrote score.json") { print > held; next } { print; fflush() }' >&2
+    | LC_ALL=C awk -f "${PUBLIC_LOG_REDACT_AWK}" -v held="${HELD}/marker" -v host="${PUBLIC_LOG_HOST}" >&2
   local rc="${PIPESTATUS[0]}"
   set -e
   return "${rc}"
@@ -751,9 +762,15 @@ if [[ "${rc}" -ne 0 ]] && measurement_retry_warranted; then
   if control_leg_diverged; then
     echo "qwen38-measure-and-score.sh: attempt 1 DISCARDED, the serial control leg diverged: $(jq -r '.metrics.error' "${SCORE_PATH}")" >&2
   elif pair1_serial_control_boot_failed; then
-    echo "qwen38-measure-and-score.sh: attempt 1 DISCARDED, the pair-1 serial-control resident did not boot (no pair timing sealed): $(jq -r '.metrics.error' "${SCORE_PATH}")" >&2
+    printf '%s%s\n' \
+      "qwen38-measure-and-score.sh: attempt 1 DISCARDED, the pair-1 serial-control resident did not boot (no pair timing sealed): " \
+      "$(jq -r '.metrics.error' "${SCORE_PATH}")" | redact >&2 \
+      || echo "qwen38-measure-and-score.sh: public log redaction failed; retry reason withheld" >&2
   else
-    echo "qwen38-measure-and-score.sh: attempt 1 DISCARDED, the pair-1 candidate resident did not boot (no candidate timing sealed): $(jq -r '.metrics.error' "${SCORE_PATH}")" >&2
+    printf '%s%s\n' \
+      "qwen38-measure-and-score.sh: attempt 1 DISCARDED, the pair-1 candidate resident did not boot (no candidate timing sealed): " \
+      "$(jq -r '.metrics.error' "${SCORE_PATH}")" | redact >&2 \
+      || echo "qwen38-measure-and-score.sh: public log redaction failed; retry reason withheld" >&2
   fi
   if ! between_attempts; then
     echo "::error title=Measurement retry teardown failed::the box could not be reset after a retriable infrastructure failure; infrastructure outcome, not a submission failure" >&2
@@ -764,7 +781,9 @@ if [[ "${rc}" -ne 0 ]] && measurement_retry_warranted; then
   rc=0
   run_attempt || rc=$?
 fi
-cat -- "${HELD}/stdout"
+if ! redact < "${HELD}/stdout"; then
+  echo "qwen38-measure-and-score.sh: public log redaction failed; score output withheld" >&2
+fi
 if [[ -f "${HELD}/marker" ]]; then cat -- "${HELD}/marker" >&2; fi
 echo "qwen38-measure-and-score.sh: control_leg_attempts=${attempts}" >&2
 if [[ "${rc}" -ne 0 && "${attempts}" -eq 2 ]] && control_leg_diverged; then

@@ -146,6 +146,9 @@ jobs:
           # are fully verified here. See docs/ci-coverage.md.
           python3 tools/lint-benchmark-manifest.py --gitlink-targets report
 
+      - name: Public ranked log redaction
+        run: tools/test-public-log-redact.sh
+
       - name: Editable archive stays below 20 MiB
         run: tools/check-editable-archive-size.sh
 
