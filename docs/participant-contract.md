@@ -148,3 +148,8 @@ Make the seed step as fast as prefill.
 
 All participant files are cleared between legs and between pairs.
 Do not expect a file or a cache to survive from one leg to the next.
+
+The serial control leg must stay inside the box's calibration band.
+A background OS job on a box can slow one measurement; this was seen in 1 of 17 prod runs.
+A pair-1 case is retried once. Two in a row end the job as an infrastructure outcome.
+A pair-2 case fails that submission, and the submitter can submit again.
