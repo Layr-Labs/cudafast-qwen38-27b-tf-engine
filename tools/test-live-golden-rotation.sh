@@ -97,7 +97,8 @@ chmod +x "${WORK}/engine"
 
 # benchd stub: `iterate --help` advertises the flags (STUB_FLAGS), a real run
 # records its argv. With STUB_PLAN (a file of outcomes, one per run: pass,
-# control, prefill, spawn, floor) it also seals score.json like benchd: the
+# control, prefill, spawn, floor, band1, band2, band1_paired, candidate_token)
+# it also seals score.json like benchd: the
 # JSON on stdout, the marker on stderr, exit 1 unless it passed. Run n appends
 # its outcome to STUB_RUNS and keeps its argv as STUB_RUNS.argv.n. With
 # STUB_JOBDIR it logs how many files the per-job sandbox dirs hold
@@ -126,6 +127,10 @@ case "${what}" in
   boot2) json="{\"passed\": false, \"score\": null, \"metrics\": {\"error\": \"LEG-SERVE-BOOT-FAILED: the candidate leg's resident did not boot (1): abcd1234\", \"paired_legs\": [{\"pair\": 1, \"prompt_sha256\": \"deadbeef\", \"control_prefill_seconds_per_token\": 1.0, \"control_decode_seconds_per_token\": 2.0, \"candidate_prefill_seconds_per_token\": 1.1, \"candidate_decode_seconds_per_token\": 2.1}]}}" ;;
   boot_ctl) json="{\"passed\": false, \"score\": null, \"metrics\": {\"error\": \"LEG-SERVE-BOOT-FAILED: the serial-control leg's resident did not boot (1): abcd1234\", \"paired_legs\": []}}" ;;
   boot_ctl2) json="{\"passed\": false, \"score\": null, \"metrics\": {\"error\": \"LEG-SERVE-BOOT-FAILED: the serial-control leg's resident did not boot (1): abcd1234\", \"paired_legs\": [{\"pair\": 1, \"prompt_sha256\": \"deadbeef\", \"control_prefill_seconds_per_token\": 1.0, \"control_decode_seconds_per_token\": 2.0, \"candidate_prefill_seconds_per_token\": 1.1, \"candidate_decode_seconds_per_token\": 2.1}]}}" ;;
+  band1) json="{\"passed\": false, \"score\": null, \"metrics\": {\"error\": \"pair # of #: SERIAL-CONTROL-LEG-OUTSIDE-BAND: decode seconds per token #.# outside [#.#, #.#]\"}}" ;;
+  band2) json="{\"passed\": false, \"score\": null, \"metrics\": {\"error\": \"pair # of #: SERIAL-CONTROL-LEG-OUTSIDE-BAND: decode seconds per token #.# outside [#.#, #.#]\", \"paired_legs\": [{\"pair\": 1}]}}" ;;
+  band1_paired) json="{\"passed\": false, \"score\": null, \"metrics\": {\"error\": \"pair # of #: SERIAL-CONTROL-LEG-OUTSIDE-BAND: decode seconds per token #.# outside [#.#, #.#]\", \"paired_legs\": [{\"pair\": 1}]}}" ;;
+  candidate_token) json="{\"passed\": false, \"score\": null, \"metrics\": {\"error\": \"pair # of #: CANDIDATE-LEG-FAILED: benchmark free-run decode token mismatch at step #\"}}" ;;
 esac
 echo "stub benchd run ${n}: ${what}" >&2
 printf '%s\n' "${json}" | tee "${score}"
@@ -302,6 +307,44 @@ plan boot_ctl2 pass
   && grep -q "control_leg_attempts=1" <<<"${out}" \
   && ok "retry: pair-2 serial-control boot failure (paired_legs non-empty) is never retried" \
   || fail "retry: boot_ctl2: rc=${rc} runs=${runs} out: $(tail -3 <<<"${out}")"
+
+plan band1 pass
+[[ "${rc}" -eq 0 && "${runs}" == "band1 pass " && "$(markers)" -eq 1 ]] \
+  && grep -q "control_leg_attempts=2" <<<"${out}" && grep -q "pair-1 serial-control leg was outside this box's band" <<<"${out}" \
+  && ! grep -q '"score": null' <<<"${out}" && jq -e '.score == 1.2' "${ROOT}/score.json" >/dev/null \
+  && ok "retry: pair-1 serial-control band failure then pass is scored from attempt 2" \
+  || fail "retry: band1+pass: rc=${rc} runs=${runs} out: $(tail -5 <<<"${out}")"
+
+plan band1 band1
+[[ "${rc}" -eq 75 && "${runs}" == "band1 band1 " && "$(markers)" -eq 1 ]] \
+  && grep -q "::error title=Serial-control leg outside band twice::" <<<"${out}" \
+  && grep -q "control_leg_attempts=2" <<<"${out}" \
+  && ok "retry: two pair-1 serial-control band failures end as infrastructure (exit 75)" \
+  || fail "retry: band1 twice: rc=${rc} runs=${runs} out: $(tail -3 <<<"${out}")"
+
+plan band2 pass
+[[ "${rc}" -eq 1 && "${runs}" == "band2 " && "$(markers)" -eq 1 ]] \
+  && grep -q "control_leg_attempts=1" <<<"${out}" \
+  && ok "retry: pair-2 serial-control band failure is never retried" \
+  || fail "retry: band2: rc=${rc} runs=${runs} out: $(tail -3 <<<"${out}")"
+
+plan band1_paired pass
+[[ "${rc}" -eq 1 && "${runs}" == "band1_paired " && "$(markers)" -eq 1 ]] \
+  && grep -q "control_leg_attempts=1" <<<"${out}" \
+  && ok "retry: malformed pair-1 band failure with paired_legs is never retried" \
+  || fail "retry: band1_paired: rc=${rc} runs=${runs} out: $(tail -3 <<<"${out}")"
+
+plan candidate_token pass
+[[ "${rc}" -eq 1 && "${runs}" == "candidate_token " && "$(markers)" -eq 1 ]] \
+  && grep -q "control_leg_attempts=1" <<<"${out}" \
+  && ok "retry: a candidate token mismatch is never retried" \
+  || fail "retry: candidate_token: rc=${rc} runs=${runs} out: $(tail -3 <<<"${out}")"
+
+plan band1 control pass
+[[ "${rc}" -eq 75 && "${runs}" == "band1 control " && "$(markers)" -eq 1 ]] \
+  && grep -q "Serial control leg diverged twice" <<<"${out}" && grep -q "control_leg_attempts=2" <<<"${out}" \
+  && ok "retry: band failure then control divergence uses the one retry budget (no third run)" \
+  || fail "retry: band1+control: rc=${rc} runs=${runs} out: $(tail -5 <<<"${out}")"
 
 plan control boot
 [[ "${rc}" -eq 1 && "${runs}" == "control boot " && "$(markers)" -eq 1 ]] \
