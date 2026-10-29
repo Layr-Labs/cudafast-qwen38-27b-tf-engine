@@ -612,16 +612,22 @@ fi
 #       (LEG-SERVE-BOOT-FAILED: the serial-control leg's ... with
 #       metrics.paired_legs empty — pair 2's control boot keeps pair 1 in
 #       paired_legs and is never retried; a candidate could provoke it after
-#       its own leg ran).
+#       its own leg ran), or
+#   (d) a pair-1 SERIAL-CONTROL calibration-band failure before any pair timing
+#       is sealed (pair 1 of N: SERIAL-CONTROL-LEG-OUTSIDE-BAND: ... with
+#       metrics.paired_legs empty). Pair 2 or later is never retried: its
+#       control leg runs after the candidate leg, so a candidate could provoke
+#       it to buy a second draw.
 # Any of these re-runs the whole measurement once from scratch after the
 # teardown below. The second attempt's seal is the result; the first attempt's
 # timings are discarded, never compared. Every other failure is final,
 # INCLUDING the other control-leg failures (spawn, session, protocol, cool
 # gate, memory): pair 2's control leg runs after the candidate's leg, so a
 # candidate could provoke those on purpose to buy a second draw. A second
-# control-leg token divergence or a second pair-1 serial-control boot failure
-# exits 75: an infrastructure outcome, not a submission failure. The attempt
-# count is logged as control_leg_attempts=N; it
+# control-leg token divergence, pair-1 serial-control boot failure, or pair-1
+# serial-control calibration-band failure exits 75: an infrastructure outcome,
+# not a submission failure. The attempt count is logged as
+# control_leg_attempts=N; it
 # is not sealed, because score.json is pinned by its .sha256 and
 # benchmark-integrity.json and only benchd writes it.
 #
@@ -686,8 +692,19 @@ pair1_serial_control_boot_failed() {
     "${SCORE_PATH}" >/dev/null 2>&1
 }
 
+# benchd seals error text with every digit run replaced by "#" (score.rs seal_engine_chosen_text), so the
+# sealed error reads "pair # of #: ..."; an empty or absent paired_legs is what proves pair 1.
+pair1_serial_control_out_of_band() {
+  [[ -f "${HELD}/marker" ]] || return 1
+  jq -e '.passed == false
+    and ((.metrics.error // "") | test("^pair (#|1) of (#|[0-9]+): SERIAL-CONTROL-LEG-OUTSIDE-BAND: "))
+    and ((.metrics.paired_legs // []) | length == 0)' \
+    "${SCORE_PATH}" >/dev/null 2>&1
+}
+
 measurement_retry_warranted() {
-  control_leg_diverged || pair1_candidate_boot_failed || pair1_serial_control_boot_failed
+  control_leg_diverged || pair1_candidate_boot_failed || pair1_serial_control_boot_failed \
+    || pair1_serial_control_out_of_band
 }
 remove_seal() { rm -f -- "${SCORE_PATH}" "${SCORE_PATH}.sha256" "${INTEGRITY_PATH}"; }
 
@@ -766,6 +783,11 @@ if [[ "${rc}" -ne 0 ]] && measurement_retry_warranted; then
       "qwen38-measure-and-score.sh: attempt 1 DISCARDED, the pair-1 serial-control resident did not boot (no pair timing sealed): " \
       "$(jq -r '.metrics.error' "${SCORE_PATH}")" | redact >&2 \
       || echo "qwen38-measure-and-score.sh: public log redaction failed; retry reason withheld" >&2
+  elif pair1_serial_control_out_of_band; then
+    printf '%s%s\n' \
+      "qwen38-measure-and-score.sh: attempt 1 DISCARDED, the pair-1 serial-control leg was outside this box's band (no pair timing sealed): " \
+      "$(jq -r '.metrics.error' "${SCORE_PATH}")" | redact >&2 \
+      || echo "qwen38-measure-and-score.sh: public log redaction failed; retry reason withheld" >&2
   else
     printf '%s%s\n' \
       "qwen38-measure-and-score.sh: attempt 1 DISCARDED, the pair-1 candidate resident did not boot (no candidate timing sealed): " \
@@ -792,6 +814,10 @@ if [[ "${rc}" -ne 0 && "${attempts}" -eq 2 ]] && control_leg_diverged; then
 fi
 if [[ "${rc}" -ne 0 && "${attempts}" -eq 2 ]] && pair1_serial_control_boot_failed; then
   echo "::error title=Serial-control leg boot failed twice::infrastructure outcome, not a submission failure; re-dispatch this job" >&2
+  exit 75
+fi
+if [[ "${rc}" -ne 0 && "${attempts}" -eq 2 ]] && pair1_serial_control_out_of_band; then
+  echo "::error title=Serial-control leg outside band twice::infrastructure outcome, not a submission failure; re-dispatch this job" >&2
   exit 75
 fi
 exit "${rc}"
