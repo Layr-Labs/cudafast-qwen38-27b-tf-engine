@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "name": "cudafast-qwen38-27b-tf",
+  "trackId": "qwen3.8-27b-tf-cuda-v1",
+  "description": "Qwen3.8-27B native TensorFold CUDA speedup track on one DGX Spark GB10 (sm_121). The target is TensorFold/Qwen3.8-27B-MLX-4bit at 22d8d538154e0e5b6f8dcb1fcc74a60a0798104c. The drafter is z-lab/Qwen3.8-27B-DFlash2 at 50307d4c4cde6860d4eee73e2547cd786fe8e8a4. Each ranked run has 2 pairs: a serial-control leg with no drafter and a candidate leg that runs DFlash depth 1 with the pinned drafter. The pair score is prefill_gain^0.25 * decode_gain^0.75 with floors 0.93 (prefill) and 0.95 (decode); the run score is the mean of the pair scores. The timed token stream must match its pinned tape exactly. Only Vendor/TensorFold is editable. fixtures/qwen3_8_27b_tf_cuda_v1_track.json is the authority.",
+  "category": "cuda",
+  "direction": "+",
+  "minScoreImprovementBips": 200,
+  "editablePaths": [
+    "Vendor/TensorFold"
+  ],
+  "optionalEditablePaths": [],
+  "editableSurfaceByteBudget": {
+    "exemptPathMaxBytes": 512000000,
+    "exemptPathMaxFileBytes": 100000000,
+    "maxTotalBytes": 58341043,
+    "maxFileBytes": 3018868,
+    "maxGrowthBytes": 8388608
+  },
+  "contractPath": "fixtures/qwen3_8_27b_tf_cuda_v1_track.json",
+  "setupCommand": [
+    "bash",
+    "-c",
+    "./tools/fetch-benchd.sh && ./setup.sh"
+  ],
+  "preSubmitCommand": [
+    "bash",
+    "-c",
+    "./tools/qwen38-measure-and-score.sh --preflight-only"
+  ],
+  "benchmarkCommand": [
+    "bash",
+    "-c",
+    "MLXFAST_SCORE_PATH=score.json ./tools/qwen38-yukon-run.sh"
+  ],
+  "runner": {
+    "provider": "github-actions",
+    "workflow": "benchmark.yml"
+  },
+  "scoreArtifact": "benchmark-results-<run_id>/score.json",
+  "scorePath": "score.json",
+  "scoring": {
+    "mode": "qwen38-native-dflash-paired",
+    "formula": "composite = prefill_gain^0.25 * decode_gain^0.75",
+    "scoredExponents": {
+      "prefillGainExponent": 0.25,
+      "decodeGainExponent": 0.75
+    },
+    "scoredBatchSize": 1,
+    "kvBackend": "tensorfold-native",
+    "pairsPerCohort": 2,
+    "minPairsPerCohort": 2,
+    "decodeSpeedupFloor": 0.95,
+    "prefillSpeedupFloor": 0.93,
+    "decodeSpeedupCeiling": 5.0
+  },
+  "leaderboard": {
+    "namespace": "qwen3.8-27b-tf-cuda-v1"
+  },
+  "staticReviewTrackId": "qwen3.8-27b-tf-cuda-v1"
+}

@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "source": "pinned",
+  "spec": {
+    "enabled": true,
+    "tokens": 1
+  }
+}
