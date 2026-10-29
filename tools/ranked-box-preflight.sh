@@ -79,8 +79,8 @@ ok() {
 # cannot finish a ranked run either.
 command -v jq >/dev/null 2>&1 || fail "jq is required to read the track contract"
 command -v shasum >/dev/null 2>&1 || fail "shasum is required to verify staged assets"
-[[ -r "${CONTRACT}" ]] || fail "cannot read the track contract at ${CONTRACT}"
-jq -e . >/dev/null 2>&1 < "${CONTRACT}" || fail "the track contract is not valid JSON: ${CONTRACT}"
+[[ -r "${CONTRACT}" ]] || fail "cannot read the track contract at fixtures/qwen3_8_27b_tf_cuda_v1_track.json"
+jq -e . >/dev/null 2>&1 < "${CONTRACT}" || fail "the track contract is not valid JSON: fixtures/qwen3_8_27b_tf_cuda_v1_track.json"
 ok "track contract readable and parses: fixtures/qwen3_8_27b_tf_cuda_v1_track.json"
 
 # --- 1. the job holds no credential -----------------------------------------
@@ -188,7 +188,7 @@ else
     nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d '[:space:]'
   }
 fi
-ok "GPU temperature reader resolved: ${GPU_TEMP_SOURCE}"
+ok "GPU temperature reader resolved: <toolchain>"
 
 # --- 2c. the reader gives a plausible reading -------------------------------
 # A sensor that reads at or below the 5C implausibility floor is broken or
@@ -202,7 +202,7 @@ first_temp="$(read_gpu_temp || true)"
 # nvidia-smi reports an INTEGER Celsius that can legitimately sit on one value
 # across a long idle stretch, so no "identical reading = stuck sensor" check is
 # run; the plausibility floor above is the check.
-ok "temperature reader is plausible (${GPU_TEMP_SOURCE}: ${first_temp}C)"
+ok "temperature reader is plausible (<toolchain>: ${first_temp}C)"
 
 # --- 3. the timed pool is armed ---------------------------------------------
 # "Armed" is a property of the CONTRACT, checked before anything on disk is
@@ -257,18 +257,29 @@ GOLDEN_DIR="${MLXFAST_QWEN38_GOLDEN_DIR:-}"
 [[ -n "${GOLDEN_DIR}" ]] \
   || fail "MLXFAST_QWEN38_GOLDEN_DIR is unset; the track goldens are staged onto the box out of band and this job holds no credential to fetch them"
 [[ -d "${GOLDEN_DIR}" ]] \
-  || fail "MLXFAST_QWEN38_GOLDEN_DIR does not exist or is not a directory: ${GOLDEN_DIR}"
+  || fail "MLXFAST_QWEN38_GOLDEN_DIR does not exist or is not a directory: <golden-dir>"
+
+public_asset_path() {
+  if [[ "$1" == "${GOLDEN_DIR}"/* ]]; then
+    printf '<golden-dir>/%s\n' "${1##*/}"
+  elif [[ -n "${BENCHD_DIR:-}" && "$1" == "${BENCHD_DIR}"/* ]]; then
+    printf '<benchd-dir>/%s\n' "${1##*/}"
+  else
+    printf '<staged-file>\n'
+  fi
+}
 
 verify_pin() {
   # verify_pin <path> <want_sha256> <want_bytes> <label>
-  local path="$1" want_sha="$2" want_bytes="$3" label="$4" got_bytes got_sha
-  [[ -f "${path}" ]] || fail "${label}: staged file is missing: ${path}"
+  local path="$1" want_sha="$2" want_bytes="$3" label="$4" got_bytes got_sha shown
+  shown="$(public_asset_path "${path}")"
+  [[ -f "${path}" ]] || fail "${label}: staged file is missing: ${shown}"
   got_bytes="$(wc -c < "${path}" | tr -d '[:space:]')"
   [[ "${got_bytes}" == "${want_bytes}" ]] \
-    || fail "${label}: byte-count mismatch (staged ${got_bytes}, pinned ${want_bytes}): ${path}"
+    || fail "${label}: byte-count mismatch (staged ${got_bytes}, pinned ${want_bytes}): ${shown}"
   got_sha="$(shasum -a 256 "${path}" | awk '{print $1}')"
   [[ "${got_sha}" == "${want_sha}" ]] \
-    || fail "${label}: sha256 mismatch (staged ${got_sha}, pinned ${want_sha}): ${path}"
+    || fail "${label}: sha256 mismatch (staged ${got_sha}, pinned ${want_sha}): ${shown}"
 }
 
 expected_list=""
@@ -411,7 +422,7 @@ for prompt in "${ROTATION_POOL[@]}"; do
   jq -e --arg f "/${base}" 'any(.timed_prompt_pool[]; .r2_path | endswith($f))' "${CONTRACT}" >/dev/null \
     || fail "rotation pool prompt '${prompt}' names no timed_prompt_pool entry (looked for ${base}); its serial golden carries no pin"
   [[ -f "${GOLDEN_DIR}/${base}" ]] \
-    || fail "rotation pool prompt '${prompt}': its serial golden ${base} is not staged in ${GOLDEN_DIR}"
+    || fail "rotation pool prompt '${prompt}': its serial golden ${base} is not staged in <golden-dir>"
   for d in "${PERMITTED_DEPTHS[@]}"; do
     oracle="$(jq -r --arg p "${prompt}" --arg k "dflash${d}" '.speculative_oracles[$p][$k].r2_path // ""' "${CONTRACT}")"
     [[ -n "${oracle}" ]] \
@@ -419,7 +430,7 @@ for prompt in "${ROTATION_POOL[@]}"; do
     [[ "${oracle##*/}" == "${prompt}.dflash${d}.golden.json" ]] \
       || fail "speculative_oracles[${prompt}][dflash${d}] points at ${oracle##*/}, not ${prompt}.dflash${d}.golden.json"
     [[ -f "${GOLDEN_DIR}/${oracle##*/}" ]] \
-      || fail "rotation pool prompt '${prompt}': its per-depth oracle ${oracle##*/} is not staged in ${GOLDEN_DIR}"
+      || fail "rotation pool prompt '${prompt}': its per-depth oracle ${oracle##*/} is not staged in <golden-dir>"
   done
 done
 ok "every rotation pool prompt (${ROTATION_POOL[*]}) has its serial golden and ${#PERMITTED_DEPTHS[@]} per-depth oracle(s) pinned and staged"
@@ -451,11 +462,11 @@ BENCHD_DIR="${BENCHD_BIN_DIR:-${REPO_ROOT}/benchd-bin}"
 BENCHD_BIN="${BENCHD_DIR}/benchd"
 BENCHD_MANIFEST="${BENCHD_DIR}/benchd.manifest.json"
 [[ -f "${BENCHD_BIN}" ]] \
-  || fail "the pinned benchd is not staged at ${BENCHD_BIN}; this job holds no dist token and does not fetch benchd over the network. Stage benchd and its manifest on the box (tools/fetch-benchd.sh)"
+  || fail "the pinned benchd is not staged at <benchd-dir>/benchd; this job holds no dist token and does not fetch benchd over the network. Stage benchd and its manifest on the box (tools/fetch-benchd.sh)"
 [[ -f "${BENCHD_MANIFEST}" ]] \
-  || fail "benchd.manifest.json is missing beside ${BENCHD_BIN}; a binary with no manifest is unattributable and will not seal a score"
+  || fail "benchd.manifest.json is missing beside <benchd-dir>/benchd; a binary with no manifest is unattributable and will not seal a score"
 jq -e . >/dev/null 2>&1 < "${BENCHD_MANIFEST}" \
-  || fail "the benchd manifest is not valid JSON: ${BENCHD_MANIFEST}"
+  || fail "the benchd manifest is not valid JSON: <benchd-dir>/benchd.manifest.json"
 benchd_sha="$(jq -r '.sha256 // ""' "${BENCHD_MANIFEST}")"
 benchd_bytes="$(jq -r '.bytes // 0' "${BENCHD_MANIFEST}")"
 benchd_commit="$(jq -r '.source_commit // ""' "${BENCHD_MANIFEST}")"
@@ -567,14 +578,14 @@ command -v git >/dev/null 2>&1 || fail "git is required to verify the reference 
 BASELINE_WORKSPACE="${MLXFAST_BASELINE_WORKSPACE}"
 BASELINE_CALIBRATION="${MLXFAST_BASELINE_CALIBRATION}"
 [[ -d "${BASELINE_WORKSPACE}" ]] \
-  || fail "MLXFAST_BASELINE_WORKSPACE=${BASELINE_WORKSPACE} is not a directory on this box; stage the reference tree with tools/stage-baseline-workspace.sh"
+  || fail "MLXFAST_BASELINE_WORKSPACE=<reference-workspace> is not a directory on this box; stage the reference tree with tools/stage-baseline-workspace.sh"
 
 # The reference tree and the candidate tree are TWO trees. One tree cannot be
 # both legs: leg 1 would then measure the submission and the score would be the
 # candidate divided by itself.
 baseline_real="$(cd "${BASELINE_WORKSPACE}" && pwd -P)"
 [[ "${baseline_real}" != "${REPO_ROOT}" ]] \
-  || fail "MLXFAST_BASELINE_WORKSPACE points at this checkout (${REPO_ROOT}); the serial control must run on the reference tree, not on the submission"
+  || fail "MLXFAST_BASELINE_WORKSPACE points at this checkout (<workspace>); the serial control must run on the reference tree, not on the submission"
 
 # THE REFERENCE COMMIT IS THE FIXTURE'S. baseline_reference_commit names the
 # promoted baseline every box's leg 1 runs, so one board compares one control.
@@ -586,14 +597,14 @@ have_ref_commit="$(git -C "${BASELINE_WORKSPACE}" rev-parse HEAD 2>/dev/null || 
   || fail "the reference workspace is at ${have_ref_commit:-no git HEAD} but the fixture pins ${WANT_REF_COMMIT}; re-stage it with tools/stage-baseline-workspace.sh"
 git -C "${BASELINE_WORKSPACE}" diff --quiet HEAD 2>/dev/null \
   || fail "the reference workspace has uncommitted changes; leg 1 must run the pinned reference tree, not an edited one"
-ok "reference workspace at ${WANT_REF_COMMIT:0:12}, clean: ${BASELINE_WORKSPACE}"
+ok "reference workspace at ${WANT_REF_COMMIT:0:12}, clean: <reference-workspace>"
 
 # THE REFERENCE TREE MUST BE BUILT. A staged-but-unbuilt reference tree fails
 # only when serve-up.sh boots it -- after the candidate has already paid for the
 # build. These are exactly the outputs tools/engine/build.sh stages.
 rel=.build/release/bench-worker
 [[ -f "${BASELINE_WORKSPACE}/${rel}" ]] \
-  || fail "the reference workspace has no ${rel}; its engine build is not staged (run tools/engine/build.sh in ${BASELINE_WORKSPACE}, or re-stage with tools/stage-baseline-workspace.sh)"
+  || fail "the reference workspace has no ${rel}; its engine build is not staged (run tools/engine/build.sh in <reference-workspace>, or re-stage with tools/stage-baseline-workspace.sh)"
 [[ -x "${BASELINE_WORKSPACE}/tools/serve-up.sh" ]] \
   || fail "the reference workspace has no executable tools/serve-up.sh; leg 1 boots the REFERENCE tree's own serve script, not this checkout's"
 # WHICH serve-up.sh IS IN THERE IS SETTLED BY THE COMMIT PIN ABOVE, not by a
@@ -606,9 +617,9 @@ ok "reference workspace carries its staged native worker"
 
 # --- 8b. this box's calibration file ----------------------------------------
 [[ -f "${BASELINE_CALIBRATION}" ]] \
-  || fail "MLXFAST_BASELINE_CALIBRATION=${BASELINE_CALIBRATION} is not a file; calibrate this box with tools/calibrate-box.sh"
+  || fail "MLXFAST_BASELINE_CALIBRATION=<calibration-file> is not a file; calibrate this box with tools/calibrate-box.sh"
 jq -e . >/dev/null 2>&1 < "${BASELINE_CALIBRATION}" \
-  || fail "the baseline calibration is not valid JSON: ${BASELINE_CALIBRATION}"
+  || fail "the baseline calibration is not valid JSON: <calibration-file>"
 
 method_payload="$(jq -ceS '
   def positive_integer: type == "number" and . > 0 and . == floor;
@@ -672,9 +683,9 @@ cal_track="$(jq -r '.track_id // empty' "${BASELINE_CALIBRATION}")"
 cal_box="$(jq -r '.box // empty' "${BASELINE_CALIBRATION}")"
 [[ -n "${cal_box}" ]] || fail "the baseline calibration names no box; a per-box band must say which box"
 [[ -n "${RUNNER_NAME:-}" ]] \
-  || fail "the baseline calibration names box '${cal_box}' but this job has no RUNNER_NAME; a per-box band cannot be attributed to a runner that does not identify itself"
+  || fail "the baseline calibration names box '<ranked-box>' but this job has no RUNNER_NAME; a per-box band cannot be attributed to a runner that does not identify itself"
 [[ "${cal_box}" == "${RUNNER_NAME}" ]] \
-  || fail "the baseline calibration was captured on box '${cal_box}' but this job runs on '${RUNNER_NAME}'; another box's band does not describe this box"
+  || fail "the baseline calibration was captured for a different <ranked-box> role; another box's band does not describe this box"
 
 cal_ref="$(jq -r '.reference_commit // empty' "${BASELINE_CALIBRATION}")"
 [[ "${cal_ref}" == "${WANT_REF_COMMIT}" ]] \
@@ -768,14 +779,14 @@ cal_epoch="$(jq -r '(.captured_at // "") | try fromdateiso8601 catch empty' "${B
   || fail "the baseline calibration's captured_at ('${cal_at}') is not an RFC 3339 UTC timestamp; the band cannot be dated"
 ref_epoch="$(git -C "${BASELINE_WORKSPACE}" show -s --format=%ct HEAD 2>/dev/null || true)"
 [[ "${ref_epoch}" =~ ^[0-9]+$ ]] \
-  || fail "cannot read the reference commit's date from ${BASELINE_WORKSPACE}; the band's age cannot be checked"
+  || fail "cannot read the reference commit's date from <reference-workspace>; the band's age cannot be checked"
 now_epoch="$(date -u +%s)"
 (( cal_epoch >= ref_epoch )) \
   || fail "the baseline calibration is dated ${cal_at}, BEFORE reference commit ${WANT_REF_COMMIT:0:12}; a band captured before the reference tree existed describes a different engine"
 (( cal_epoch <= now_epoch + 300 )) \
   || fail "the baseline calibration is dated ${cal_at}, in the future; the box clock is wrong and every age check here is meaningless"
 cal_sha="$(shasum -a 256 "${BASELINE_CALIBRATION}" | awk '{print $1}')"
-ok "box band for ${cal_box}: ${cal_passes} passes on ${CALIBRATION_PROMPTS[*]}, captured ${cal_at} against ${WANT_REF_COMMIT:0:12} (sha256 ${cal_sha:0:12})"
+ok "box band for <ranked-box>: ${cal_passes} passes on ${CALIBRATION_PROMPTS[*]}, captured ${cal_at} against ${WANT_REF_COMMIT:0:12} (sha256 ${cal_sha:0:12})"
 
 # --- 9. participant code has a sandbox to run in ----------------------------
 # docs/sandbox-design.md: every participant-built execution point runs as the

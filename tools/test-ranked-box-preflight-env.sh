@@ -462,7 +462,7 @@ EOF
   cal_case "calibration prompt duplicated" '.prompts = [.prompts[0], .prompts[0]]' \
     "more than one prompts[] entry for prompt"
   cal_case "calibration track" '.track_id = "another-track-v1"' "names track 'another-track-v1'"
-  cal_case "calibration box" '.box = "another-box"' "was captured on box 'another-box'"
+  cal_case "calibration box" '.box = "another-box"' "captured for a different <ranked-box> role"
   cal_case "calibration reference commit" \
     '.reference_commit = "0000000000000000000000000000000000000000"' \
     "was captured against reference commit"

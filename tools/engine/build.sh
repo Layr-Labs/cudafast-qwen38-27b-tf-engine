@@ -15,11 +15,11 @@ file_owner() { stat -c %U -- "$1" 2>/dev/null || stat -f %Su -- "$1"; }
 
 for tool in docker jq; do command -v "${tool}" >/dev/null 2>&1 || die "${tool} is required"; done
 ZIG_BIN="$(command -v -- "${ZIG_REQUEST}" 2>/dev/null || true)"
-[[ "${ZIG_BIN}" == /* ]] || die "Zig must resolve to an absolute executable path: ${ZIG_REQUEST}"
-[[ -x "${ZIG_BIN}" ]] || die "Zig is not executable: ${ZIG_BIN}"
+[[ "${ZIG_BIN}" == /* ]] || die "Zig must resolve to an absolute executable path: <zig-toolchain>"
+[[ -x "${ZIG_BIN}" ]] || die "Zig is not executable: <zig-toolchain>"
 [[ "$("${ZIG_BIN}" version)" == "0.17.0" ]] || die "Zig 0.17.0 is required"
 ZIG_TOOLCHAIN_DIR="$(cd -- "$(dirname -- "${ZIG_BIN}")" && pwd -P)"
-[[ -d "${ZIG_TOOLCHAIN_DIR}/lib" ]] || die "Zig library directory is missing: ${ZIG_TOOLCHAIN_DIR}/lib"
+[[ -d "${ZIG_TOOLCHAIN_DIR}/lib" ]] || die "Zig library directory is missing: <zig-toolchain>/lib"
 [[ -x "${NVCC_BIN}" ]] || die "nvcc is not executable: ${NVCC_BIN}"
 
 IMAGE="$(jq -r '.serve_configuration.container_image // empty' "${FIXTURE}")"
@@ -64,6 +64,7 @@ else
 fi
 
 log "building the native worker in ${IMAGE_REF}"
+set +e
 docker run --rm --init --gpus all --ipc host --network none \
   --user "${container_uid}" --cap-drop ALL --security-opt no-new-privileges \
   --cpus "${KERNELS_CPUS:-16}" --memory "${KERNELS_MEMORY:-64g}" \
@@ -77,7 +78,15 @@ docker run --rm --init --gpus all --ipc host --network none \
   --env HOME=/tmp --env "ZIG_GLOBAL_CACHE_DIR=${global_cache}" --env "ZIG_LOCAL_CACHE_DIR=${local_cache}" \
   --workdir "${ROOT}/Vendor/TensorFold" --entrypoint /opt/tensorfold-tools/zig/zig \
   "${IMAGE_REF}" build bench-worker -Doptimize=ReleaseFast \
-  -Dsm="${CUDA_SM}" -Dnvcc="${NVCC_BIN}" ${prefix_args[@]+"${prefix_args[@]}"}
+  -Dsm="${CUDA_SM}" -Dnvcc="${NVCC_BIN}" ${prefix_args[@]+"${prefix_args[@]}"} \
+  2>&1 | "${ROOT}/tools/public-log-redact.sh"
+build_status=("${PIPESTATUS[@]}")
+set -e
+if (( build_status[0] != 0 )); then
+  exit "${build_status[0]}"
+fi
+# a failed log filter must not turn a successful build into a refusal
+(( build_status[1] == 0 )) || echo "build.sh: public log redaction failed; build output withheld" >&2
 
 if [[ -n "${SANDBOX_USER}" ]]; then
   sandbox_quiet

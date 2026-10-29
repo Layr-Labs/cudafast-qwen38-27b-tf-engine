@@ -131,6 +131,7 @@ echo "stub benchd run ${n}: ${what}" >&2
 printf '%s\n' "${json}" | tee "${score}"
 : > "${score}.sha256"
 echo "benchd iterate: wrote ${score} (passed=$(jq -r .passed "${score}"), score=$(jq -r .score "${score}"))" >&2
+[[ -z "${STUB_EXIT:-}" ]] || exit "${STUB_EXIT}"
 [[ "${what}" == pass ]]
 EOF
 chmod +x "${WORK}/benchd"
@@ -194,7 +195,7 @@ out="$(measure "${WORK}/no-live.json")"
 rm -f "${GOLDENS}/${NAMES[1]}.golden.json"
 out="$(measure "${WORK}/full.json")"
 : > "${GOLDENS}/${NAMES[1]}.golden.json"
-[[ ! -f "${WORK}/argv" ]] && grep -q "live golden not found at ${GOLDENS}/${NAMES[1]}.golden.json" <<<"${out}" \
+[[ ! -f "${WORK}/argv" ]] && grep -q "live golden not found at <golden-dir>/${NAMES[1]}.golden.json" <<<"${out}" \
   && ok "measure: an unstaged live golden is refused by name" \
   || fail "measure: an unstaged live golden was not refused: $(tail -2 <<<"${out}")"
 
@@ -238,6 +239,19 @@ plan floor pass
   && grep -q "control_leg_attempts=1" <<<"${out}" \
   && ok "retry: a candidate failure is never retried" \
   || fail "retry: floor: rc=${rc} runs=${runs} out: $(tail -3 <<<"${out}")"
+
+REDACTOR_REAL="${REPO_ROOT}/tools/public-log-redact.sh"
+rm -f "${ROOT}/tools/public-log-redact.sh"
+printf '#!/usr/bin/env bash\nexit 99\n' > "${ROOT}/tools/public-log-redact.sh"
+chmod +x "${ROOT}/tools/public-log-redact.sh"
+PLAN_ENV=(STUB_EXIT=42)
+plan floor
+PLAN_ENV=()
+ln -sf "${REDACTOR_REAL}" "${ROOT}/tools/public-log-redact.sh"
+[[ "${rc}" -eq 42 && "${runs}" == "floor " ]] \
+  && grep -q "public log redaction failed; score output withheld" <<<"${out}" \
+  && ok "measure: a failed final redaction keeps benchd's intended exit status" \
+  || fail "measure: final redaction failure changed rc=${rc}; runs=${runs}; out: $(tail -3 <<<"${out}")"
 
 plan control floor
 [[ "${rc}" -eq 1 && "${runs}" == "control floor " ]] && jq -e '.metrics.error | startswith("performance floor")' "${ROOT}/score.json" >/dev/null \

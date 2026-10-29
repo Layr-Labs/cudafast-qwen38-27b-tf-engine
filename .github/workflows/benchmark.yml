@@ -298,11 +298,18 @@ jobs:
           # no in-repo copy to fall back on and is refused.
           for var in MLXFAST_TARGET_SNAPSHOT_DIR MLXFAST_DRAFTER_SNAPSHOT_DIR BENCHD_BIN_DIR MLXFAST_BASELINE_WORKSPACE MLXFAST_QWEN38_GOLDEN_DIR; do
             eval "value=\${${var}:-}"
+            case "${var}" in
+              MLXFAST_TARGET_SNAPSHOT_DIR) role='<target-snapshot>' ;;
+              MLXFAST_DRAFTER_SNAPSHOT_DIR) role='<drafter-snapshot>' ;;
+              BENCHD_BIN_DIR) role='<benchd-dir>' ;;
+              MLXFAST_BASELINE_WORKSPACE) role='<reference-workspace>' ;;
+              MLXFAST_QWEN38_GOLDEN_DIR) role='<golden-dir>' ;;
+            esac
             if [[ -z "${value}" ]]; then
               echo "::error::${var} is not exported by the runner service environment (the organizer stages the asset and exports its path there)" >&2
               fail=1
             elif [[ ! -d "${value}" ]]; then
-              echo "::error::${var}=${value} is not a directory on this box" >&2
+              echo "::error::${var}=${role} is not a directory on this box" >&2
               fail=1
             fi
           done
@@ -313,14 +320,14 @@ jobs:
             echo "::error::MLXFAST_BASELINE_CALIBRATION is not exported by the runner service environment; every ranked box carries its own serial-control band (tools/calibrate-box.sh)" >&2
             fail=1
           elif [[ ! -f "${MLXFAST_BASELINE_CALIBRATION}" ]]; then
-            echo "::error::MLXFAST_BASELINE_CALIBRATION=${MLXFAST_BASELINE_CALIBRATION} is not a file on this box" >&2
+            echo "::error::MLXFAST_BASELINE_CALIBRATION=<calibration-file> is not a file on this box" >&2
             fail=1
           fi
           for tool in zig nvcc git jq python3 curl sha256sum nvidia-smi flock; do
             command -v "${tool}" >/dev/null 2>&1 || { echo "::error::${tool} is not on the runner service PATH (set it in the runner service environment)" >&2; fail=1; }
           done
           [[ "${fail}" == "0" ]] || exit 1
-          echo "runner environment ok: snapshot=${MLXFAST_TARGET_SNAPSHOT_DIR} benchd=${BENCHD_BIN_DIR} reference=${MLXFAST_BASELINE_WORKSPACE} calibration=${MLXFAST_BASELINE_CALIBRATION} goldens=${MLXFAST_QWEN38_GOLDEN_DIR} zig=$(command -v zig) nvcc=$(command -v nvcc)"
+          echo "runner environment ok: snapshot=<target-snapshot> drafter=<drafter-snapshot> benchd=<benchd-dir> reference=<reference-workspace> calibration=<calibration-file> goldens=<golden-dir> zig=<toolchain> nvcc=<toolchain>"
 
       - name: Reference workspace is the pinned baseline, and it is built
         # THE SERIAL CONTROL LEG RUNS ON THIS TREE. Under the paired model the
@@ -345,11 +352,11 @@ jobs:
           fi
           have="$(git -C "${ws}" rev-parse HEAD 2>/dev/null || true)"
           if [[ "${have}" != "${want}" ]]; then
-            echo "::error title=reference workspace mismatch::${ws} is at ${have:-no git HEAD} but the fixture pins ${want}; re-stage it with tools/stage-baseline-workspace.sh" >&2
+            echo "::error title=reference workspace mismatch::<reference-workspace> is at ${have:-no git HEAD} but the fixture pins ${want}; re-stage it with tools/stage-baseline-workspace.sh" >&2
             exit 1
           fi
           if ! git -C "${ws}" diff --quiet HEAD; then
-            echo "::error title=reference workspace edited::${ws} has uncommitted changes; the control leg must run the pinned reference tree" >&2
+            echo "::error title=reference workspace edited::<reference-workspace> has uncommitted changes; the control leg must run the pinned reference tree" >&2
             exit 1
           fi
           # The outputs tools/engine/build.sh stages. An unbuilt reference tree
@@ -357,15 +364,15 @@ jobs:
           # paid for the build.
           for rel in .build/release/bench-worker; do
             if [[ ! -f "${ws}/${rel}" ]]; then
-              echo "::error title=reference workspace not built::${ws} has no ${rel}; run tools/engine/build.sh there, or re-stage with tools/stage-baseline-workspace.sh" >&2
+              echo "::error title=reference workspace not built::<reference-workspace> has no ${rel}; run tools/engine/build.sh there, or re-stage with tools/stage-baseline-workspace.sh" >&2
               exit 1
             fi
           done
           if [[ ! -x "${ws}/tools/serve-up.sh" ]]; then
-            echo "::error title=reference workspace not usable::${ws}/tools/serve-up.sh is not executable; leg 1 boots the REFERENCE tree's own serve script" >&2
+            echo "::error title=reference workspace not usable::<reference-workspace>/tools/serve-up.sh is not executable; leg 1 boots the REFERENCE tree's own serve script" >&2
             exit 1
           fi
-          echo "reference workspace ok: ${ws} at ${want}, native worker staged"
+          echo "reference workspace ok: <reference-workspace> at ${want}, native worker staged"
 
       - name: Draw the score reveal nonce (per job, runner-private)
         # Commit-reveal: the nonce is written before any participant code runs and
@@ -400,7 +407,7 @@ jobs:
           ws="$(realpath "${GITHUB_WORKSPACE}")"
           home="$(realpath "${HOME}")"
           if [[ "${ws}" != "${home}"/* ]]; then
-            echo "::error::the checkout ${ws} is not under runner's home ${home}; refusing to grant ${SANDBOX_USER} access" >&2
+            echo "::error::the checkout <workspace> is not under runner's home <home>; refusing to grant ${SANDBOX_USER} access" >&2
             exit 1
           fi
           setfacl -R -P -m "u:${SANDBOX_USER}:rX" "${ws}"
@@ -432,15 +439,15 @@ jobs:
           # GOTCHA: Strip ACLs only here, after this step created the directory.
           setfacl -b -k -- "${resident_log_dir}"
           if [[ "$(stat -c '%a %u' "${resident_log_dir}")" != "700 $(id -u)" ]]; then
-            echo "::error::resident log directory is not runner-owned mode 0700: ${resident_log_dir}" >&2
+            echo "::error::resident log directory is not runner-owned mode 0700: <runner-dir>" >&2
             exit 1
           fi
           resident_log_acl="$(getfacl -cp -- "${resident_log_dir}")" || {
-            echo "::error::cannot inspect resident log directory ACL: ${resident_log_dir}" >&2
+            echo "::error::cannot inspect resident log directory ACL: <runner-dir>" >&2
             exit 1
           }
           if grep -Eq '^(user|group):[^:]|^mask:|^default:' <<< "${resident_log_acl}"; then
-            echo "::error::resident log directory has an access or default ACL: ${resident_log_dir}" >&2
+            echo "::error::resident log directory has an access or default ACL: <runner-dir>" >&2
             exit 1
           fi
           printf 'SERVE_UP_LOG_DIR=%s\n' "${resident_log_dir}" >> "${GITHUB_ENV}"
@@ -477,10 +484,10 @@ jobs:
           set -euo pipefail
           benchd_dir="${BENCHD_BIN_DIR:-${PWD}/benchd-bin}"
           if [[ ! -f "${benchd_dir}/benchd" || ! -f "${benchd_dir}/benchd.manifest.json" ]]; then
-            echo "::error title=benchd not staged::the organizer-staged pair ${benchd_dir}/{benchd,benchd.manifest.json} is absent; this ranked job holds no token and does not fetch benchd over the network. Stage the pinned pair on the box, then re-dispatch." >&2
+            echo "::error title=benchd not staged::the organizer-staged pair <benchd-dir>/{benchd,benchd.manifest.json} is absent; this ranked job holds no token and does not fetch benchd over the network. Stage the pinned pair on the box, then re-dispatch." >&2
             exit 1
           fi
-          ./tools/fetch-benchd.sh
+          ./tools/fetch-benchd.sh >/dev/null
 
       - name: Setup (engine + pinned checkpoint)
         # Second half of benchmark.json's setupCommand, verbatim. ./setup.sh
@@ -686,7 +693,7 @@ jobs:
           foreign="$(printf '%s\n' "${apps}" | grep -vE '^\s*$' | grep -vE 'Xorg|gnome-shell' || true)"
           if [[ -n "${foreign}" ]]; then
             echo "::error::the GPU is not idle; a foreign compute process holds it:" >&2
-            printf '%s\n' "${foreign}" >&2
+            printf '%s\n' "${foreign}" | tools/public-log-redact.sh >&2
             exit 1
           fi
           echo "qwen38-cuda-ranked: quiescent after ${waited}s (load=${load} gpu_util=${util}); the per-phase thermal gate is enforced inside the pinned measure-job"
@@ -725,7 +732,7 @@ jobs:
               exit 1
             fi
           done
-          echo "paired baseline: workspace=${MLXFAST_BASELINE_WORKSPACE} calibration=${MLXFAST_BASELINE_CALIBRATION}"
+          echo "paired baseline: workspace=<reference-workspace> calibration=<calibration-file>"
 
           # -- measure and score (ranked half of benchmarkCommand) ---------
           # measure-and-score.sh forwards the two as benchd's
@@ -871,7 +878,7 @@ jobs:
               score.json 2>/dev/null || true)"
             reason="the sealed record has passed=false${gates:+ (failed: ${gates})}"
           fi
-          reason="$(printf '%s' "${reason}" | LC_ALL=C tr -c '[:print:]' ' ' | LC_ALL=C tr -d '`' | cut -c1-300)"
+          reason="$(printf '%s' "${reason}" | LC_ALL=C tr -c '[:print:]' ' ' | LC_ALL=C tr -d '`' | cut -c1-300 | tools/public-log-redact.sh)"
           {
             echo "### Run refused"
             echo

@@ -8,6 +8,7 @@ ROOT="${TMP}/repo"
 mkdir -p "${ROOT}/tools/engine" "${ROOT}/fixtures" "${ROOT}/Vendor/TensorFold"
 cp "${SOURCE_ROOT}/tools/engine/build.sh" "${ROOT}/tools/engine/build.sh"
 cp "${SOURCE_ROOT}/tools/stage-cuda-engine.sh" "${ROOT}/tools/stage-cuda-engine.sh"
+cp "${SOURCE_ROOT}/tools/public-log-redact.awk" "${SOURCE_ROOT}/tools/public-log-redact.sh" "${ROOT}/tools/"
 cp "${SOURCE_ROOT}/fixtures/qwen3_8_27b_tf_cuda_v1_track.json" "${ROOT}/fixtures/"
 OUT="${ROOT}/Vendor/TensorFold/zig-out"
 STAGED="${ROOT}/.build/release/bench-worker"
@@ -37,6 +38,7 @@ printf ' <%s>' "$@" >> "${LOG}"
 printf '\n' >> "${LOG}"
 [[ "${1:-} ${2:-}" == "image inspect" ]] && exit 0
 [[ "${1:-}" == run ]] || exit 0
+[[ "${STUB_DOCKER_RUN_EXIT:-0}" == 0 ]] || exit "${STUB_DOCKER_RUN_EXIT}"
 out=""
 for arg in "$@"; do
   case "${arg}" in
@@ -81,6 +83,13 @@ grep -Fq -- "<type=bind,src=${ROOT},dst=${ROOT},readonly>" <<<"${run}"
 grep -Fq -- "<type=bind,src=${BIN},dst=/opt/tensorfold-tools/zig,readonly>" <<<"${run}"
 grep -Fq -- '<build> <bench-worker> <-Doptimize=ReleaseFast> <-Dsm=121>' <<<"${run}"
 [[ -x "${STAGED}" ]]
+
+set +e
+PATH="${BIN}:${PATH}" TENSORFOLD_ZIG=zig TENSORFOLD_NVCC="${BIN}/nvcc" \
+  STUB_DOCKER_RUN_EXIT=42 "${ROOT}/tools/engine/build.sh" >/dev/null
+docker_status=$?
+set -e
+[[ "${docker_status}" -eq 42 ]]
 
 rm -rf "${OUT}" "${ROOT}/.zig-global-cache" "${ROOT}/.zig-cache"
 rm -f "${STAGED}"
