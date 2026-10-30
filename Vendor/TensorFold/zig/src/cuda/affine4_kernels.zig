@@ -38,6 +38,7 @@ pub const Affine4Kernels = struct {
     verify128_fn: Function, // eight
     split_fn: Function,
     seg_fn: Function, // the split form over up to four projections of one input
+    many_fn: Function, // lane_gemv over up to four projections of one input, each part's CTAs as its own launch's
     prefill_fn: Function,
     prefill22_fn: Function, // the prompt tile on 2x2 warps and two stages (`half_prompt` picks it)
     half_prompt: bool = false, // prompts on prefill22_fn: its four warps a block and two stages are quicker on an RTX 5090
@@ -61,6 +62,7 @@ pub const Affine4Kernels = struct {
         a.gemv_fn = try gemv_mod.function(symbols.gemv);
         a.split_fn = try gemv_mod.function(symbols.gemv_split);
         a.seg_fn = try gemv_mod.function(symbols.gemv_seg);
+        a.many_fn = try gemv_mod.function(symbols.gemv_many);
         a.words_fn = try pack_mod.function(symbols.pack_words);
         a.scales_fn = try pack_mod.function(symbols.pack_scales);
         try a.group_fn.allowDynamicShared(group_smem);
@@ -70,6 +72,7 @@ pub const Affine4Kernels = struct {
         try a.gemv_fn.allowDynamicShared(group_smem);
         try a.split_fn.allowDynamicShared(split_smem);
         try a.seg_fn.allowDynamicShared(split_smem);
+        try a.many_fn.allowDynamicShared(group_smem);
         try a.prefill_fn.allowDynamicShared(prefill_smem);
         try a.prefill22_fn.allowDynamicShared(linear.prefill22_smem);
         a.gemv_blocks = @max(1, try a.gemv_fn.occupancy(128, group_smem)) * sms;
@@ -112,13 +115,64 @@ pub const Affine4Kernels = struct {
     }
 
     /// decode() of each projection of one input; without GB10 one segmented launch, each keeping its split's bits.
+    /// On GB10 the K-sliced projections share one lane_gemv launch and the unsliced ones one cluster launch.
     pub fn decodeMany(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, outs: []const Out, rows: usize) !void {
         if (rows > max_rows) return error.WindowTooWide;
-        const sp = a.split orelse {
-            for (outs) |o| try a.decode(s, x, xs, o.q, o.out, rows);
-            return;
-        };
+        const sp = a.split orelse return a.decodeGrouped(s, x, xs, outs, rows);
         return a.gemvSeg(s, x, xs, outs, rows, sp);
+    }
+
+    /// decode()'s kernels a projection, grouped by kernel: each part's blocks compute exactly what its own launch's would.
+    fn decodeGrouped(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, outs: []const Out, rows: usize) !void {
+        if (outs.len == 0 or outs.len > segs_max) return error.TooManyParts;
+        const rows_t = (rows + 15) / 16;
+        var lanes: linear.Many = std.mem.zeroes(linear.Many);
+        var parts: Parts = std.mem.zeroes(Parts);
+        var lane_one: usize = 0;
+        var part_one: usize = 0;
+        var blocks: usize = 0;
+        var clusters: usize = 0;
+        for (outs, 0..) |o, i| {
+            if (o.q.k != outs[0].q.k) return error.InputMismatch;
+            const tiles = (o.q.n + 63) / 64;
+            const sk = splitK(o.q.n, o.q.k);
+            if (sk > 1) {
+                const at: usize = @intCast(lanes.count);
+                lanes.p[at] = .{ .w = o.q.w, .scales = o.q.s, .biases = o.q.b, .out = o.out, .n = int(o.q.n), .npad = int(o.q.npad), .sk = int(sk), .tiles = int(tiles) };
+                lanes.first[at] = int(blocks);
+                lanes.count += 1;
+                blocks += @min(tiles, a.gemv_blocks);
+                lane_one = i;
+            } else {
+                const at: usize = @intCast(parts.count);
+                parts.p[at] = .{ .w = o.q.w, .scales = o.q.s, .biases = o.q.b, .out = o.out, .n = int(o.q.n), .npad = int(o.q.npad), .sk = 1, .tiles = int(tiles), .first = int(clusters) };
+                parts.count += 1;
+                clusters += rows_t * tiles;
+                part_one = i;
+            }
+        }
+        if (parts.count == 1) {
+            const o = outs[part_one];
+            try a.cluster(s, x, xs, o.q, o.out, rows, 1);
+        } else if (parts.count > 1) {
+            var g: launch_.Args = .{};
+            g.add(x);
+            g.add(xs);
+            g.add(parts);
+            for ([_]usize{ rows, outs[0].q.k, outs[0].q.k, rows_t, 1 }) |v| g.add(int(v));
+            try launch_.launch(a.group_fn, .{ .grid = .{ .x = u(clusters) }, .block = .{ .x = 128 }, .shared = group_smem, .pdl = a.pdl }, s, &g);
+        }
+        if (lanes.count == 1) {
+            const o = outs[lane_one];
+            try a.gemv(s, x, xs, o.q, o.out, rows, splitK(o.q.n, o.q.k));
+        } else if (lanes.count > 1) {
+            var g: launch_.Args = .{};
+            g.add(x);
+            g.add(xs);
+            g.add(lanes);
+            for ([_]usize{ rows, outs[0].q.k, outs[0].q.k }) |v| g.add(int(v));
+            try launch_.launch(a.many_fn, .{ .grid = .{ .x = u(blocks) }, .block = .{ .x = 128 }, .shared = group_smem, .pdl = a.pdl }, s, &g);
+        }
     }
 
     /// One CTA a tile's K slice over every projection of `outs`, the split form's partials and tickets in `sp`.
