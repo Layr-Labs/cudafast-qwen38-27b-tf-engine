@@ -8,8 +8,10 @@ const Engine = engine.Engine;
 const DeviceBuffer = cuda.DeviceBuffer;
 const recurrent = @import("cuda_recurrent.zig");
 
-/// Rows a drafter's tap ring holds a stream: its window and a prompt chunk more.
-pub const tap_rows = 2048 + engine.max_rows;
+/// Rows behind a forward end that a drafter can read from its tap ring.
+pub const tap_held = 2048;
+/// Preserve the held window plus a complete verification pass. Longer forwards write their newest ring rows.
+pub const tap_rows = tap_held + engine.most_verify;
 
 /// qwen35.cuh's Seg and Path.
 pub const Seg = extern struct { rec: u64, conv: u64, kv: u64, tap: u64, log: u64, before: u64, cap: c_int, len: c_int, row0: c_int, rows: c_int, tap_rows: c_int, taps: c_int, delta: c_int, pt: u64 = 0, ps: u64 = 0, ptok: c_int = 0, pn: c_int = 0, plog: u64 = 0 };
@@ -48,6 +50,52 @@ var pool_of: ?*Engine = null;
 /// Stop recycling into `e`'s pool (its deinit).
 pub fn forget(e: *Engine) void {
     if (pool_of == e) pool_of = null;
+}
+
+/// Engine allocation starts undefined, so field defaults do not initialize the pool.
+pub fn initPool(e: *Engine) void {
+    e.blocks = .empty;
+}
+
+/// Shared by normal destruction and failed startup after warmup has recycled blocks.
+pub fn releasePool(e: *Engine) void {
+    forget(e);
+    for (e.blocks.items) |*b| b.free();
+    e.blocks.deinit(e.gpa);
+    e.blocks = .empty;
+}
+
+test "cache pool starts empty on undefined engine storage and releases retained blocks" {
+    const Fake = struct {
+        var freed: usize = 0;
+        fn allocate(out: *u64, _: usize) callconv(.c) c_int {
+            out.* = 0x1000;
+            return 0;
+        }
+        fn release(_: u64) callconv(.c) c_int {
+            freed += 1;
+            return 0;
+        }
+    };
+    var driver: cuda.Driver = .{ .lib = undefined, .api = undefined };
+    driver.api.cuMemAlloc_v2 = Fake.allocate;
+    driver.api.cuMemFree_v2 = Fake.release;
+    Fake.freed = 0;
+    const e = try std.testing.allocator.create(Engine);
+    defer std.testing.allocator.destroy(e);
+    e.* = undefined;
+    e.gpa = std.testing.allocator;
+    initPool(e);
+    try std.testing.expectEqual(@as(usize, 0), e.blocks.items.len);
+    try e.blocks.append(e.gpa, try DeviceBuffer.alloc(&driver, 8192));
+    pool_of = e;
+    releasePool(e);
+    try std.testing.expect(pool_of == null);
+    try std.testing.expectEqual(@as(usize, 0), e.blocks.items.len);
+    try std.testing.expectEqual(@as(usize, 0), e.blocks.capacity);
+    try std.testing.expectEqual(@as(usize, 1), Fake.freed);
+    releasePool(e);
+    try std.testing.expectEqual(@as(usize, 1), Fake.freed);
 }
 
 /// `b` kept for the next stream (whole driver allocations of at least 1 MiB, up to 32), otherwise freed.

@@ -157,12 +157,12 @@ template __global__ void tf_qmm_prefill::prefill_kernel<64, 128, 128, 2, 2, 2, f
     int, int, int);
 
 // Prompt GEMMs of up to four projections of one input in one launch (qmm_prompt_many.cuh): 128x128 tiles on
-// 2x2 warps of 64x64, two stages, so two CTAs share an SM; every output keeps prefill_kernel's bits.
+// 1x4 warps of 128x32, two stages, and activation prefetch; every output keeps prefill_kernel's bits.
 #include "qmm_prompt_many.cuh"
 
 extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_many(const __nv_bfloat16* __restrict__ x,
         const __grid_constant__ tf_qmm_prefill::ManyParts parts, int M, int K, int ldx, int group) {
-    tf_qmm_prefill::prompt_many_body<64, 128, 128, 2, 2, 2>(x, parts, M, K, ldx, group);
+    tf_qmm_prefill::prompt_many_body<64, 128, 128, 1, 4, 2>(x, parts, M, K, ldx, group);
 }
 
 // A dense MLP's gate and up prompt GEMMs and silu(gate) * up in one launch (prompt_mlp_body): parts 0 and 1 are
@@ -170,5 +170,11 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_many(const __nv_
 extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_mlp(const __nv_bfloat16* __restrict__ x,
         const __grid_constant__ tf_qmm_prefill::ManyParts parts, __nv_bfloat16* __restrict__ act, int M, int K, int ldx,
         int group) {
-    tf_qmm_prefill::prompt_mlp_body<64, 128, 2, 2>(x, parts, act, M, K, ldx, group);
+    tf_qmm_prefill::prompt_mlp_body<64, 128, 1, 4, 2>(x, parts, act, M, K, ldx, group);
+}
+
+// Narrow final column panels distribute the last prompt wave over more SMs, with the same ordered MMA chain.
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_split(const __nv_bfloat16* __restrict__ x,
+        const __grid_constant__ tf_qmm_prefill::ManyPart part, int M, int K, int ldx, int group, int full_cols) {
+    tf_qmm_prefill::prompt_split_body<64, 128, 128, 1, 4, 2>(x, part, M, K, ldx, group, full_cols);
 }

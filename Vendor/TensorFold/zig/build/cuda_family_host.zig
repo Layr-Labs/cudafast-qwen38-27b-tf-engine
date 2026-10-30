@@ -3,6 +3,8 @@ const std = @import("std");
 
 pub fn steps(b: *std.Build, cuda: *std.Build.Module, mods: anytype, step: *std.Build.Step) void {
     const host = b.graph.host;
+    const storage = b.addRunArtifact(b.addTest(.{ .root_module = mods.qwen35, .filters = &.{ "cache pool starts empty", "storage policy", "table storage", "scratch views", "a uniform 4-bit checkpoint" } }));
+    b.step("test-qwen35-storage-host", "Immutable weight policies, table budgets, scratch bounds and cache pool ownership").dependOn(&storage.step);
     const prefill = b.addRunArtifact(b.addTest(.{ .root_module = mods.qwen35, .filters = &.{"Qwen stepped prefill:"} }));
     b.step("test-qwen35-prefill-host", "Interrupted stepped prompt lifecycle without devices").dependOn(&prefill.step);
     step.dependOn(&prefill.step);

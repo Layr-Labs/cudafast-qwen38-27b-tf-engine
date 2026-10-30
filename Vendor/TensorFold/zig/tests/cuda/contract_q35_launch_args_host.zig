@@ -178,7 +178,7 @@ fn sitesIn(a: std.mem.Allocator, path: []const u8, text: [:0]const u8, out: *std
     while (i < list.len) : (i += 1) {
         if (list[i].tag != .identifier) continue;
         const name = text[list[i].loc.start..list[i].loc.end];
-        if (!std.mem.eql(u8, name, "run") and !std.mem.eql(u8, name, "shared") and !std.mem.eql(u8, name, "launch")) continue;
+        if (!std.mem.eql(u8, name, "run") and !std.mem.eql(u8, name, "runAfter") and !std.mem.eql(u8, name, "shared") and !std.mem.eql(u8, name, "sharedSized") and !std.mem.eql(u8, name, "launch") and !std.mem.eql(u8, name, "launchAfter")) continue;
         if (i + 1 >= list.len or list[i + 1].tag != .l_paren) continue;
         var spans: std.ArrayList(Span) = .empty;
         var depth: usize = 0;

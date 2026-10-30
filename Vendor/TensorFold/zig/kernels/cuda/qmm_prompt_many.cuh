@@ -24,25 +24,17 @@ struct ManyParts {
     int count;
 };
 
+// One BM x BN output tile at (m0, n0) of x through (w, scales, biases) into out (rows N wide): prefill_kernel's chain.
 template <int GS, int BM, int BN, int WM, int WN, int STAGES>
-__device__ __forceinline__ void prompt_many_body(
-        const __nv_bfloat16* __restrict__ x, const ManyParts& parts, int M, int K, int ldx, int group) {
+__device__ __forceinline__ void prompt_tile(
+        const __nv_bfloat16* __restrict__ x, const uint32_t* __restrict__ w, const __nv_bfloat16* __restrict__ scales,
+        const __nv_bfloat16* __restrict__ biases, void* __restrict__ out, int N, int npad, int M, int K, int ldx, int m0,
+        int n0) {
     using T = Tile<GS, BM, BN, WM, WN, STAGES>;
     extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm = warp / WN, wn = warp % WN;
-    int q = 0;
-#pragma unroll
-    for (int i = 1; i < MANY; ++i)
-        if (i < parts.count && (int)blockIdx.x >= parts.p[i].first) q = i;
-    const uint32_t* __restrict__ w = parts.p[q].w;
-    const __nv_bfloat16* __restrict__ scales = parts.p[q].scales;
-    const __nv_bfloat16* __restrict__ biases = parts.p[q].biases;
-    void* __restrict__ out = parts.p[q].out;
-    const int N = parts.p[q].n, npad = parts.p[q].npad;
     const int KG = K / GS, per = KG, g0 = 0;
-    const int2 at = tile_of((int)blockIdx.x - parts.p[q].first, M, N, BM, BN, group);
-    const int m0 = at.x, n0 = at.y;
 
     auto stage = [&](int s) { return buf + s * T::STAGE; };
     auto load = [&](int s, int g) {
@@ -99,21 +91,32 @@ __device__ __forceinline__ void prompt_many_body(
             sv[j] = ps[col] * 0x10001u;
             bv[j] = ps[BN + col] * 0x10001u;
         }
-#pragma unroll
-        for (int kt = 0; kt < GS / 16; ++kt) {
-            uint32_t a[T::MT][4];
+        // Prefetch A along K and B along N while preserving each accumulator's MMA chain.
+        uint32_t a[2][T::MT][4];
+        auto load_a = [&](int kt, int slot) {
 #pragma unroll
             for (int i = 0; i < T::MT; ++i) {
                 const int r = wm * (BM / WM) + i * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
                 const int ch = kt * 2 + (lane >> 4);
-                ldmatrix4(a[i], p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16);
+                ldmatrix4(a[slot][i], p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16);
             }
+        };
+        load_a(0, 0);
+#pragma unroll
+        for (int kt = 0; kt < GS / 16; ++kt) {
+            if (kt + 1 < GS / 16) load_a(kt + 1, (kt + 1) & 1);
+            uint32_t b[2][2];
+            auto load_b = [&](int j, int slot) {
+                b[slot][0] = fma2(pair(words[j][kt / 2], (kt & 1) * 8), sv[j], bv[j]);
+                b[slot][1] = fma2(pair(words[j][kt / 2], (kt & 1) * 8 + 4), sv[j], bv[j]);
+            };
+            load_b(0, 0);
 #pragma unroll
             for (int j = 0; j < T::NT; ++j) {
-                const uint32_t b0 = fma2(pair(words[j][kt / 2], (kt & 1) * 8), sv[j], bv[j]);
-                const uint32_t b1 = fma2(pair(words[j][kt / 2], (kt & 1) * 8 + 4), sv[j], bv[j]);
+                if (j + 1 < T::NT) load_b(j + 1, (j + 1) & 1);
 #pragma unroll
-                for (int i = 0; i < T::MT; ++i) mma(acc[i][j], a[i], b0, b1);
+                for (int i = 0; i < T::MT; ++i)
+                    mma(acc[i][j], a[kt & 1][i], b[j & 1][0], b[j & 1][1]);
             }
         }
     }
@@ -140,15 +143,46 @@ __device__ __forceinline__ void prompt_many_body(
 }
 
 
+template <int GS, int BM, int BN, int WM, int WN, int STAGES>
+__device__ __forceinline__ void prompt_many_body(
+        const __nv_bfloat16* __restrict__ x, const ManyParts& parts, int M, int K, int ldx, int group) {
+    int q = 0;
+#pragma unroll
+    for (int i = 1; i < MANY; ++i)
+        if (i < parts.count && (int)blockIdx.x >= parts.p[i].first) q = i;
+    const ManyPart& P = parts.p[q];
+    const int2 at = tile_of((int)blockIdx.x - P.first, M, P.n, BM, BN, group);
+    prompt_tile<GS, BM, BN, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x, at.y);
+}
+
+// One projection whose last column panels run as half-width tiles: the first CTAs take BN-wide panels over columns
+// [0, full_cols), the rest BN/2-wide panels over [full_cols, N). A last wave of whole tiles leaves SMs idle; half
+// tiles there even the SMs' shares. Each tile keeps prompt_tile's chain, so the bits are prefill_kernel's.
+template <int GS, int BM, int BN, int WM, int WN, int STAGES>
+__device__ __forceinline__ void prompt_split_body(
+        const __nv_bfloat16* __restrict__ x, const ManyPart& P, int M, int K, int ldx, int group, int full_cols) {
+    const int rows_t = (M + BM - 1) / BM, full = rows_t * (full_cols / BN);
+    if ((int)blockIdx.x < full) {
+        const int2 at = tile_of((int)blockIdx.x, M, full_cols, BM, BN, group);
+        prompt_tile<GS, BM, BN, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x, at.y);
+    } else {
+        const int2 at = tile_of((int)blockIdx.x - full, M, P.n - full_cols, BM, BN / 2, group);
+        prompt_tile<GS, BM, BN / 2, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x,
+                                                    full_cols + at.y);
+    }
+}
+
+
 // A dense MLP's gate and up prompt GEMMs and its activation in one launch: out = bf16(silu(gate) * up), the bits
 // of prefill_kernel's gate and up (each rounded to bf16 as it stores them) through tf_q35_mlp_act's formula.
-// A CTA's 128 GEMM columns are 64 gate columns (warps wn 0) and the same 64 up columns (warps wn 1); the gate
-// warps park their bf16 values in shared memory and the up warps write the activation.
-template <int GS, int BM, int WM, int STAGES>
+// A CTA's first half of column warps computes 64 gate columns; the other half computes the same up columns.
+// Gate warps park their bf16 values in shared memory and up warps write the activation.
+template <int GS, int BM, int WM, int WN, int STAGES>
 __device__ __forceinline__ void prompt_mlp_body(
         const __nv_bfloat16* __restrict__ x, const ManyParts& parts, __nv_bfloat16* __restrict__ act, int M, int K,
         int ldx, int group) {
-    constexpr int BN = 128, WN = 2;
+    constexpr int BN = 128;
+    static_assert(WN % 2 == 0, "gate and up use equal column-warp groups");
     using T = Tile<GS, BM, BN, WM, WN, STAGES>;
     static_assert(BM * 64 * 2 <= T::SMEM, "the gate tile fits the stages' memory");
     extern __shared__ __align__(128) unsigned char buf[];
@@ -216,48 +250,61 @@ __device__ __forceinline__ void prompt_mlp_body(
             sv[j] = ps[col] * 0x10001u;
             bv[j] = ps[BN + col] * 0x10001u;
         }
-#pragma unroll
-        for (int kt = 0; kt < GS / 16; ++kt) {
-            uint32_t a[T::MT][4];
+        // Prefetch A along K and B along N while preserving each accumulator's MMA chain.
+        uint32_t a[2][T::MT][4];
+        auto load_a = [&](int kt, int slot) {
 #pragma unroll
             for (int i = 0; i < T::MT; ++i) {
                 const int r = wm * (BM / WM) + i * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
                 const int ch = kt * 2 + (lane >> 4);
-                ldmatrix4(a[i], p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16);
+                ldmatrix4(a[slot][i], p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16);
             }
+        };
+        load_a(0, 0);
+#pragma unroll
+        for (int kt = 0; kt < GS / 16; ++kt) {
+            if (kt + 1 < GS / 16) load_a(kt + 1, (kt + 1) & 1);
+            uint32_t b[2][2];
+            auto load_b = [&](int j, int slot) {
+                b[slot][0] = fma2(pair(words[j][kt / 2], (kt & 1) * 8), sv[j], bv[j]);
+                b[slot][1] = fma2(pair(words[j][kt / 2], (kt & 1) * 8 + 4), sv[j], bv[j]);
+            };
+            load_b(0, 0);
 #pragma unroll
             for (int j = 0; j < T::NT; ++j) {
-                const uint32_t b0 = fma2(pair(words[j][kt / 2], (kt & 1) * 8), sv[j], bv[j]);
-                const uint32_t b1 = fma2(pair(words[j][kt / 2], (kt & 1) * 8 + 4), sv[j], bv[j]);
+                if (j + 1 < T::NT) load_b(j + 1, (j + 1) & 1);
 #pragma unroll
-                for (int i = 0; i < T::MT; ++i) mma(acc[i][j], a[i], b0, b1);
+                for (int i = 0; i < T::MT; ++i)
+                    mma(acc[i][j], a[kt & 1][i], b[j & 1][0], b[j & 1][1]);
             }
         }
     }
     wait<0>();
     __syncthreads();                                  // every stage read: the gate tile takes their memory
     __nv_bfloat16* gt = reinterpret_cast<__nv_bfloat16*>(buf);   // (BM, 64) bf16 gate values
-    if (wn == 0) {
+    if (wn < WN / 2) {
 #pragma unroll
         for (int i = 0; i < T::MT; ++i)
 #pragma unroll
             for (int j = 0; j < T::NT; ++j)
 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
-                    const int r = wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8, c = j * 8 + (lane & 3) * 2;
+                    const int r = wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8;
+                    const int c = (wn % (WN / 2)) * (BN / WN) + j * 8 + (lane & 3) * 2;
                     *reinterpret_cast<__nv_bfloat162*>(gt + r * 64 + c) =
                         __floats2bfloat162_rn(acc[i][j][2 * h], acc[i][j][2 * h + 1]);
                 }
     }
     __syncthreads();
-    if (wn == 1) {
+    if (wn >= WN / 2) {
 #pragma unroll
         for (int i = 0; i < T::MT; ++i)
 #pragma unroll
             for (int j = 0; j < T::NT; ++j)
 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
-                    const int r = wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8, c = j * 8 + (lane & 3) * 2;
+                    const int r = wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8;
+                    const int c = (wn % (WN / 2)) * (BN / WN) + j * 8 + (lane & 3) * 2;
                     const int row = m0 + r, col = n0 + c;
                     if (row >= M) continue;
                     const __nv_bfloat162 g2 = *reinterpret_cast<const __nv_bfloat162*>(gt + r * 64 + c);

@@ -1,8 +1,8 @@
 //! Prompt GEMMs of up to four affine-4 projections of one input in one launch (qmm_prompt_many.cuh).
 //!
 //! Each output keeps qmm_prefill's prefill_kernel bits: the same bf16 weights, the same m16n8k16 MMA chain over
-//! K into one fp32 accumulator, the same bf16 store. The tile is prefill_kernel's 128 x 128 on 2 x 2 warps with
-//! two stages (its RTX 5090 instantiation), so two CTAs share a GB10 SM, and the projections' tiles share one
+//! K into one fp32 accumulator, the same bf16 store. The 128 x 128 tile uses 1 x 4 warps, two stages, and two
+//! activation-fragment banks. Two CTAs share a GB10 SM, and the projections' tiles share one
 //! launch: a small projection (GDN's a and b, attention's k and v) runs beside a large one instead of alone.
 const std = @import("std");
 const module = @import("module.zig");
@@ -15,6 +15,7 @@ const Affine4 = qlinear.Affine4;
 
 pub const symbol = "tf_qmm_prompt_many";
 pub const mlp_symbol = "tf_qmm_prompt_mlp";
+pub const split_symbol = "tf_qmm_prompt_split";
 pub const parts_max = 4;
 pub const tile_m = 128;
 pub const tile_n = 128;
@@ -37,14 +38,29 @@ pub const Out = struct { q: Affine4, out: u64 };
 pub const Kernels = struct {
     many_fn: Function,
     mlp_fn: Function,
+    split_fn: Function,
+    /// CTAs the device runs at once: two of these tiles an SM.
+    slots: usize,
 
-    /// From a loaded qmm_prefill module.
-    pub fn resolve(prefill_mod: module.Module) !Kernels {
+    /// From a loaded qmm_prefill module, on a device of `sms` SMs.
+    pub fn resolve(prefill_mod: module.Module, sms: usize) !Kernels {
         const f = try prefill_mod.function(symbol);
         try f.allowDynamicShared(smem);
         const m = try prefill_mod.function(mlp_symbol);
         try m.allowDynamicShared(smem);
-        return .{ .many_fn = f, .mlp_fn = m };
+        const sp = try prefill_mod.function(split_symbol);
+        try sp.allowDynamicShared(smem);
+        return .{ .many_fn = f, .mlp_fn = m, .split_fn = sp, .slots = 2 * sms };
+    }
+
+    /// The columns one projection's whole 128-wide tiles cover when its last panels run 64 wide (null: none do).
+    /// Whole tiles past one wave leave a last wave part full (a 496-row prompt's 5120 columns: 160 tiles on a GB10's
+    /// 96 slots); a fifth of the panels at half width evens the SMs' shares.
+    pub fn splitCols(kk: *const Kernels, n: usize, rows: usize) ?usize {
+        const cols = n / tile_n;
+        const tiles = (rows + tile_m - 1) / tile_m * cols;
+        if (n % tile_n != 0 or cols < 10 or tiles <= kk.slots or tiles % kk.slots == 0) return null;
+        return (cols - cols / 5) * tile_n;
     }
 
     /// Whether `mlp` takes this gate and up: one shape, whole 64-column tiles.
@@ -81,6 +97,16 @@ pub const Kernels = struct {
         // prefill_kernel's row band: the row tiles of a column panel that share it from L2
         const band = (12 << 20) / (tile_m * k * 2);
         const group = @max(1, @min(rows_t, band));
+        if (outs.len == 1) if (kk.splitCols(outs[0].q.n, rows)) |full_cols| {
+            const o = outs[0];
+            const part: Part = .{ .w = o.q.w, .scales = o.q.s, .biases = o.q.b, .out = o.out, .n = @intCast(o.q.n), .npad = @intCast(o.q.npad), .first = 0 };
+            var g: launch_.Args = .{};
+            g.add(x);
+            g.add(part);
+            for ([_]usize{ rows, k, k, group, full_cols }) |v| g.add(@as(c_int, @intCast(v)));
+            const blocks = rows_t * (full_cols / tile_n) + rows_t * ((o.q.n - full_cols) / (tile_n / 2));
+            return launch_.launch(kk.split_fn, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = threads }, .shared = smem }, s, &g);
+        };
         var parts: Parts = std.mem.zeroes(Parts);
         var blocks: usize = 0;
         for (outs, 0..) |o, i| {

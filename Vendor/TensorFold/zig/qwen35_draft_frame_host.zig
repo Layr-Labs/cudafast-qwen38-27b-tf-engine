@@ -10,6 +10,8 @@ pub fn config() q.draft.Config {
 
 test "Draft frames: a grown tree's node budget past the block (TF_DRAFT_NODES) stages; a chain keeps one row a depth" {
     const F = q.draft.frame;
+    _ = setenv("TF_DRAFT_NODES", "15", 1);
+    defer _ = unsetenv("TF_DRAFT_NODES");
     var c = config();
     c.block = 16;
     var storage: [F.stagedLen(2)]u8 align(8) = undefined;
@@ -20,7 +22,6 @@ test "Draft frames: a grown tree's node budget past the block (TF_DRAFT_NODES) s
     items[0].depth = 16;
     try std.testing.expectError(error.BadDraftFrame, F.stage(c, &items, &refs, &storage));
     _ = setenv("TF_DRAFT_NODES", "24", 1);
-    defer _ = unsetenv("TF_DRAFT_NODES");
     items[0].depth = 24;
     try F.stage(c, &items, &refs, &storage);
     items[0].depth = 25;
