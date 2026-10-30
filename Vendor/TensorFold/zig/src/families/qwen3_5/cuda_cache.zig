@@ -8,8 +8,12 @@ const Engine = engine.Engine;
 const DeviceBuffer = cuda.DeviceBuffer;
 const recurrent = @import("cuda_recurrent.zig");
 
-/// Rows a drafter's tap ring holds a stream: its window and a prompt chunk more.
-pub const tap_rows = 2048 + engine.max_rows;
+/// Rows behind a forward's end a drafter reads from the tap ring: its window.
+pub const tap_held = 2048;
+/// Rows a drafter's tap ring holds a stream: its window and a verify window more. A forward of more rows writes only
+/// its newest tap_rows (tf_q35_tap), so the ring always holds the newest tap_rows rows written; a ring of a full prompt
+/// chunk more (4096 rows, 315 MB a stream) was allocated and zeroed in every phase's first request.
+pub const tap_rows = tap_held + engine.most_verify;
 
 /// qwen35.cuh's Seg and Path.
 pub const Seg = extern struct { rec: u64, conv: u64, kv: u64, tap: u64, log: u64, before: u64, cap: c_int, len: c_int, row0: c_int, rows: c_int, tap_rows: c_int, taps: c_int, delta: c_int, pt: u64 = 0, ps: u64 = 0, ptok: c_int = 0, pn: c_int = 0, plog: u64 = 0 };
