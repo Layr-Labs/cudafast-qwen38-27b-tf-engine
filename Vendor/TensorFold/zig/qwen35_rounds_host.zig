@@ -72,6 +72,7 @@ test "Verify width calibration: actual DeltaNet dispatch selects its register va
     e.kit = null;
     e.d = &d;
     e.stream = .{ .d = &d, .handle = null };
+    e.affine.pdl = false;
     e.tables = .{ .d = &d, .ptr = 0x100000, .len = q.round.bytes };
     e.g.v_heads = 4;
     e.geo = .{ .hid = 512, .nk = 2, .nv = 4, .qh = 4, .kvh = 1, .nl = 1 };
