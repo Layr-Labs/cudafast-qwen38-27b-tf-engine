@@ -96,6 +96,7 @@ pub const Engine = struct {
     g: Geometry,
     geo: Geo,
     stream: cuda.Stream,
+    blocks: std.ArrayListUnmanaged(cuda.DeviceBuffer) = .empty, // closed streams' device blocks (cuda_cache.zig take/give)
     mods: [19]cuda.Module,
     kv8: bool, // attention caches as e4m3 rows with a scale each
     fp8: Kv8,
@@ -309,6 +310,9 @@ pub const Engine = struct {
         e.arena.free();
         e.gpa.free(e.layers);
         e.gpa.free(e.dir);
+        for (e.blocks.items) |*b| b.free();
+        e.blocks.deinit(e.gpa);
+        @import("cuda_cache.zig").forget(e);
         e.affine.deinit();
         e.wide.deinit();
         e.int8.deinit();
@@ -320,7 +324,7 @@ pub const Engine = struct {
 
     /// A stream's device bytes at a `cap`-token window: recurrences, convolution tails, keys and values, taps, log.
     pub fn streamBytes(e: *const Engine, cap: usize) usize {
-        return 2 * e.g.stateBytes() + e.g.kvBytes(cap, e.kv8) + e.tapBytes() + e.g.logBytes(most_window);
+        return 2 * e.g.stateBytes() + e.g.kvBytes(cap, e.kv8) + e.tapBytes() + 2 * e.g.logBytes(most_window);
     }
 
     /// A stream's tap ring: tap_rows rows of the tapped layers' residuals.
@@ -461,11 +465,13 @@ pub const Engine = struct {
         const slot_peak = try Round.build(st, parts, record);
         for (parts) |p| {
             try p.cache.settle(e);
+            // a pending kept prefix rides in this forward's slot scan only when its log half survives `prepare`
+            if (!(record and keep != .hidden and recurrent.logStays(e, p.cache, p.rows))) try p.cache.flush(e);
             try recurrent.prepare(e, p.cache, p.rows, record);
         }
         var row0: usize = 0;
         for (parts, 0..) |p, i| {
-            segs[i] = p.cache.seg(e, p.cache.len, row0, p.rows);
+            segs[i] = p.cache.fold(p.cache.seg(e, p.cache.len, row0, p.rows));
             row0 += p.rows;
         }
         if (keep == .draws) {

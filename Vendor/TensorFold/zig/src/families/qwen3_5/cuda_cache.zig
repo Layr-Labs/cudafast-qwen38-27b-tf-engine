@@ -12,7 +12,7 @@ const recurrent = @import("cuda_recurrent.zig");
 pub const tap_rows = 2048 + engine.max_rows;
 
 /// qwen35.cuh's Seg and Path.
-pub const Seg = extern struct { rec: u64, conv: u64, kv: u64, tap: u64, log: u64, before: u64, cap: c_int, len: c_int, row0: c_int, rows: c_int, tap_rows: c_int, taps: c_int, delta: c_int, pt: u64 = 0, ps: u64 = 0, ptok: c_int = 0 };
+pub const Seg = extern struct { rec: u64, conv: u64, kv: u64, tap: u64, log: u64, before: u64, cap: c_int, len: c_int, row0: c_int, rows: c_int, tap_rows: c_int, taps: c_int, delta: c_int, pt: u64 = 0, ps: u64 = 0, ptok: c_int = 0, pn: c_int = 0, plog: u64 = 0 };
 pub const Path = extern struct { n: c_int, rows: [engine.most_window]c_int };
 
 /// A cache's keys and values as pages (qwen35.cuh kv_row): page i of the stream's positions at `base` + ids[i] pages.
@@ -34,6 +34,34 @@ pub const Paged = struct {
 };
 
 /// TF_QWEN_KV_PAGE_TEST=n: each cache's own buffer read through a table of n-position pages in reverse order (checks).
+/// A device block of `len` bytes: a pooled block of exactly that size (from a closed stream), or a new allocation.
+/// The caller zeroes or overwrites it before any read, as it does a new one.
+fn take(e: *Engine, len: usize) !DeviceBuffer {
+    pool_of = e;
+    for (e.blocks.items, 0..) |b, i| if (b.len == len) return e.blocks.swapRemove(i);
+    return DeviceBuffer.alloc(e.d, len);
+}
+
+/// The engine whose pool `give` fills: the one that allocated through `take` (one engine a process).
+var pool_of: ?*Engine = null;
+
+/// Stop recycling into `e`'s pool (its deinit).
+pub fn forget(e: *Engine) void {
+    if (pool_of == e) pool_of = null;
+}
+
+/// `b` kept for the next stream (whole driver allocations of at least 1 MiB, up to 32), otherwise freed.
+fn give(b: *DeviceBuffer) void {
+    const e = pool_of orelse return b.free();
+    if (!b.borrowed and b.owner == null and b.len >= 1 << 20 and e.blocks.items.len < 32) {
+        if (e.blocks.append(e.gpa, b.*)) |_| {
+            b.* = undefined;
+            return;
+        } else |_| {}
+    }
+    b.free();
+}
+
 pub fn pageTest() !usize {
     const v = std.c.getenv("TF_QWEN_KV_PAGE_TEST") orelse return 0;
     return parsePageTest(std.mem.span(v));
@@ -94,6 +122,12 @@ pub const Cache = struct {
     logits: []u16,
     /// The newest verify window, until its path is kept: where it started, its rows.
     last: ?struct { start: usize, rows: usize } = null,
+    /// A kept prefix of the newest window (rows 0..pend-1) whose recurrence replay the next recorded slot scan folds.
+    pend: c_int = 0,
+    /// The log half that window wrote (the next window writes the other half of `log`).
+    pend_log: u64 = 0,
+    /// Which half of `log` the next window writes.
+    flip: bool = false,
     /// An image prompt's rotary shift (get_rope_index's rope_delta): rows after its prompt rotate at position + delta.
     pub fn init(gpa: std.mem.Allocator, e: *Engine, cap: usize) !Cache {
         return initFor(gpa, e, cap, true);
@@ -103,7 +137,7 @@ pub const Cache = struct {
     pub fn initFor(gpa: std.mem.Allocator, e: *Engine, cap: usize, taps: bool) !Cache {
         const test_pages = try pageTest();
         const rows = try cacheRows(cap, test_pages);
-        var kv = try DeviceBuffer.alloc(e.d, try std.math.mul(usize, e.g.kvBytes(1, e.kv8), rows));
+        var kv = try take(e, try std.math.mul(usize, e.g.kvBytes(1, e.kv8), rows));
         var own = true;
         errdefer if (own) kv.free();
         var paged: ?Paged = null;
@@ -145,7 +179,7 @@ pub const Cache = struct {
     }
 
     fn runParts(e: *const Engine, ring: usize) [5]usize {
-        return .{ e.g.stateBytes(), e.g.stateBytes(), e.g.logBytes(engine.most_window), e.tapBytes(), ring };
+        return .{ e.g.stateBytes(), e.g.stateBytes(), 2 * e.g.logBytes(engine.most_window), e.tapBytes(), ring };
     }
 
     /// A lane's state, before, log, taps and drafter ring as views of the run at `base`; a short run is refused.
@@ -158,6 +192,7 @@ pub const Cache = struct {
             at += std.mem.alignForward(usize, n, 256);
         }
         self.state = views[0];
+        self.pend = 0;
         self.before = views[1];
         self.log = views[2];
         self.tap = if (e.n_taps > 0) views[3] else null;
@@ -169,6 +204,7 @@ pub const Cache = struct {
     pub fn unmapRun(self: *Cache, e: *const Engine) void {
         const none: DeviceBuffer = .{ .d = e.d, .ptr = 0, .len = 0, .borrowed = true };
         self.state = none;
+        self.pend = 0;
         self.before = none;
         self.log = none;
         self.tap = null;
@@ -177,19 +213,19 @@ pub const Cache = struct {
 
     /// The parts every cache holds itself beside `kv` and `paged` (the caller's to free on failure).
     fn fixed(gpa: std.mem.Allocator, e: *Engine, cap: usize, kv: DeviceBuffer, paged: ?Paged, taps: bool) !Cache {
-        var state = try DeviceBuffer.alloc(e.d, e.g.stateBytes());
+        var state = try take(e, e.g.stateBytes());
         errdefer state.free();
         const adaptive = recurrent.enabled(e);
         var before: ?DeviceBuffer = null;
         errdefer if (before) |*b| b.free();
-        if (!adaptive) before = try DeviceBuffer.alloc(e.d, e.g.stateBytes());
+        if (!adaptive) before = try take(e, e.g.stateBytes());
         var log: DeviceBuffer = .{ .d = e.d, .ptr = 0, .len = 0, .borrowed = true };
-        if (!adaptive) log = try DeviceBuffer.alloc(e.d, e.g.logBytes(engine.most_window));
+        if (!adaptive) log = try take(e, 2 * e.g.logBytes(engine.most_window));
         errdefer log.free();
         var tap: ?DeviceBuffer = null;
         errdefer if (tap) |*t| t.free();
         if (e.n_taps > 0 and taps) {
-            tap = try DeviceBuffer.alloc(e.d, e.tapBytes());
+            tap = try take(e, e.tapBytes());
         }
         const logits = try gpa.alloc(u16, e.g.vocab);
         errdefer gpa.free(logits);
@@ -214,6 +250,7 @@ pub const Cache = struct {
     pub fn reset(self: *Cache, e: *const Engine) !void {
         recurrent.release(self);
         self.len = 0;
+        self.pend = 0;
         self.written = 0;
         self.last = null;
         self.untaught = false;
@@ -224,19 +261,22 @@ pub const Cache = struct {
     pub fn deinit(self: *Cache, gpa: std.mem.Allocator) void {
         recurrent.release(self);
         if (self.owner) |p| p.cap -= self.scratch;
-        self.state.free();
-        if (self.before) |*b| b.free();
-        self.kv.free();
-        if (self.paged) |*p| freePaged(gpa, p);
-        self.log.free();
-        if (self.tap) |*t| t.free();
+        give(&self.state);
+        if (self.before) |*b| give(b);
+        if (self.paged) |*p| {
+            self.kv.free();
+            freePaged(gpa, p);
+        } else give(&self.kv);
+        give(&self.log);
+        if (self.tap) |*t| give(t);
         gpa.free(self.logits);
     }
+
 
     /// The stream's window of `rows` rows from forward row `row0`, after `len` cached positions.
     pub fn seg(self: *const Cache, e: *const Engine, len: usize, row0: usize, rows: usize) Seg {
         const g = e.g;
-        var sg: Seg = .{ .rec = self.state.ptr, .conv = self.state.ptr + g.deltas() * g.recBytes(), .kv = self.kv.ptr, .tap = if (self.tap) |t| t.ptr else 0, .log = self.log.ptr, .before = if (self.before) |b| b.ptr else 0, .cap = @intCast(self.cap), .len = @intCast(len), .row0 = @intCast(row0), .rows = @intCast(rows), .tap_rows = tap_rows, .taps = @intCast(e.n_taps), .delta = self.delta };
+        var sg: Seg = .{ .rec = self.state.ptr, .conv = self.state.ptr + g.deltas() * g.recBytes(), .kv = self.kv.ptr, .tap = if (self.tap) |t| t.ptr else 0, .log = self.log.ptr + if (self.flip) self.log.len / 2 else 0, .before = if (self.before) |b| b.ptr else 0, .cap = @intCast(self.cap), .len = @intCast(len), .row0 = @intCast(row0), .rows = @intCast(rows), .tap_rows = tap_rows, .taps = @intCast(e.n_taps), .delta = self.delta };
         if (self.paged) |p| {
             sg.kv = p.base;
             sg.pt = p.table.ptr;
@@ -249,6 +289,7 @@ pub const Cache = struct {
     /// Keeps `path` (window rows, ascending from 0): the state as that chain would leave it, a tree's keys moved down.
     pub fn keep(self: *Cache, e: *Engine, path: []const u32) !void {
         const last = self.last orelse return error.NothingToKeep;
+        try self.flush(e);
         if (path.len == 0) {
             if (last.rows == 1) {
                 try recurrent.mark(self, true);
@@ -274,11 +315,40 @@ pub const Cache = struct {
         const g = e.g;
         const sg = self.seg(e, last.start, 0, last.rows);
         try recurrent.mark(self, false);
-        try e.run(e.keeps.apply, .{ 1, geometry.dk / 4, g.v_heads * g.deltas() }, .{ 32, 4, 1 }, .{ e.geo, sg, p });
+        if (!prefix) try e.run(e.keeps.apply, .{ 1, geometry.dk / 4, g.v_heads * g.deltas() }, .{ 32, 4, 1 }, .{ e.geo, sg, p });
         try e.run(e.keeps.conv, .{ g.deltas(), (g.convBytes() / 2 + 255) / 256, 1 }, .{ 256, 1, 1 }, .{ e.geo, sg, @as(c_int, @intCast(path[path.len - 1])) });
         if (!prefix and g.attentions() > 0) try e.run(if (e.kv8) e.fp8.compact else e.keeps.compact, .{ g.attentions(), g.kv_heads, 1 }, .{ geometry.head_dim, 1, 1 }, .{ e.geo, sg, p });
+        if (prefix) {
+            // a chain's prefix: the next recorded slot scan replays it from this log half while it loads the state
+            self.pend = p.n;
+            self.pend_log = sg.log;
+            self.flip = !self.flip;
+        }
         self.last = null;
         self.len = last.start + path.len;
+    }
+
+    /// A pending kept prefix replayed into the recurrences now (before anything but a recorded slot scan reads them).
+    pub fn flush(self: *Cache, e: *Engine) !void {
+        if (self.pend == 0) return;
+        var p: Path = .{ .n = self.pend, .rows = @splat(0) };
+        const n: usize = @intCast(self.pend);
+        for (p.rows[0..n], 0..) |*r, i| r.* = @intCast(i);
+        var sg = self.seg(e, self.len, 0, 0);
+        sg.log = self.pend_log;
+        self.pend = 0;
+        const g = e.g;
+        try recurrent.mark(self, false);
+        try e.run(e.keeps.apply, .{ 1, geometry.dk / 4, g.v_heads * g.deltas() }, .{ 32, 4, 1 }, .{ e.geo, sg, p });
+    }
+
+    /// The pending prefix handed to this forward's slot scan (`segs`' entry for this cache).
+    pub fn fold(self: *Cache, seg_: Seg) Seg {
+        var sg = seg_;
+        sg.pn = self.pend;
+        sg.plog = self.pend_log;
+        self.pend = 0;
+        return sg;
     }
 
     /// The newest window kept whole (the round loop keeps nothing when every row landed), before the next forward.

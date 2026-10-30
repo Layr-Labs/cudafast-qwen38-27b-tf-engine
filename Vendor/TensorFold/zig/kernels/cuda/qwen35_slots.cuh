@@ -44,10 +44,29 @@ __device__ __forceinline__ void q35_slots(Geo geo, const __nv_bfloat16* q, const
 #pragma unroll
     for (int r = 0; r < R; ++r)
 #pragma unroll
-        for (int i = 0; i < PT; ++i) {
-            root[r][i] = st[r * DK + i];
-            if (sg.rows == 1) reinterpret_cast<float*>(sg.before)[(size_t)layer * geo.rec() + at + r * DK + i] = root[r][i];
+        for (int i = 0; i < PT; ++i) root[r][i] = st[r * DK + i];
+    if (sg.pn > 0) {
+        Seg prev = sg;
+        prev.log = sg.plog;
+        for (int j = 0; j < sg.pn; ++j) {
+            const LogRow l = log_row(geo, prev, layer, j);
+            const float pg = l.g[hv];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const float pd = l.delta[hv * DK + dv0 + r];
+#pragma unroll
+                for (int i = 0; i < PT; i++) {
+                    root[r][i] = root[r][i] * pg;
+                    root[r][i] = fmaf(bf(l.k[hk * DK + PT * dk + i]), pd, root[r][i]);
+                }
+            }
         }
+    }
+    if (sg.rows == 1)
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+#pragma unroll
+            for (int i = 0; i < PT; ++i) reinterpret_cast<float*>(sg.before)[(size_t)layer * geo.rec() + at + r * DK + i] = root[r][i];
     const bool record = recorded(P);
     // row inputs as stored, the next row's loaded while this one computes
     struct In { uint2 k, q; __nv_bfloat16 v[R], beta; float g; };
@@ -151,7 +170,14 @@ __device__ __forceinline__ void q35_slots(Geo geo, const __nv_bfloat16* q, const
         const float tot = spread_sum<R>(pend, dk);
         if ((dk & ((1 << SR) - 1)) == 0) y[((size_t)pend_row * NV + hv) * DK + dv0 + (dk >> SR)] = __float2bfloat16_rn(tot);
     }
-    if (record && sg.rows != 1) return;
+    if (record && sg.rows != 1) {
+        if (sg.pn > 0)
+#pragma unroll
+            for (int r = 0; r < R; ++r)
+#pragma unroll
+                for (int i = 0; i < PT; ++i) st[r * DK + i] = root[r][i];
+        return;
+    }
 #pragma unroll
     for (int r = 0; r < R; ++r)
 #pragma unroll
