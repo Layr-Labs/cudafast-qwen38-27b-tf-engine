@@ -8,8 +8,12 @@ const Engine = engine.Engine;
 const DeviceBuffer = cuda.DeviceBuffer;
 const recurrent = @import("cuda_recurrent.zig");
 
-/// Rows a drafter's tap ring holds a stream: its window and a prompt chunk more.
-pub const tap_rows = 2048 + engine.max_rows;
+/// Rows behind a forward's end a drafter reads from the tap ring: its window.
+pub const tap_held = 2048;
+/// Rows a drafter's tap ring holds a stream: its window and a verify window more. A forward of more rows writes only
+/// its newest tap_rows (tf_q35_tap), so the ring always holds the newest tap_rows rows written; a ring of a full prompt
+/// chunk more (4096 rows, 315 MB a stream) was allocated and zeroed in every phase's first request.
+pub const tap_rows = tap_held + engine.most_verify;
 
 /// qwen35.cuh's Seg and Path.
 pub const Seg = extern struct { rec: u64, conv: u64, kv: u64, tap: u64, log: u64, before: u64, cap: c_int, len: c_int, row0: c_int, rows: c_int, tap_rows: c_int, taps: c_int, delta: c_int, pt: u64 = 0, ps: u64 = 0, ptok: c_int = 0 };
@@ -34,6 +38,34 @@ pub const Paged = struct {
 };
 
 /// TF_QWEN_KV_PAGE_TEST=n: each cache's own buffer read through a table of n-position pages in reverse order (checks).
+/// A device block of `len` bytes: a pooled block of exactly that size (from a closed stream), or a new allocation.
+/// The caller zeroes or overwrites it before any read, as it does a new one.
+fn take(e: *Engine, len: usize) !DeviceBuffer {
+    pool_of = e;
+    for (e.blocks.items, 0..) |b, i| if (b.len == len) return e.blocks.swapRemove(i);
+    return DeviceBuffer.alloc(e.d, len);
+}
+
+/// The engine whose pool `give` fills: the one that allocated through `take` (one engine a process).
+var pool_of: ?*Engine = null;
+
+/// Stop recycling into `e`'s pool (its deinit).
+pub fn forget(e: *Engine) void {
+    if (pool_of == e) pool_of = null;
+}
+
+/// `b` kept for the next stream (whole driver allocations of at least 1 MiB, up to 32), otherwise freed.
+fn give(b: *DeviceBuffer) void {
+    const e = pool_of orelse return b.free();
+    if (!b.borrowed and b.owner == null and b.len >= 1 << 20 and e.blocks.items.len < 32) {
+        if (e.blocks.append(e.gpa, b.*)) |_| {
+            b.* = undefined;
+            return;
+        } else |_| {}
+    }
+    b.free();
+}
+
 pub fn pageTest() !usize {
     const v = std.c.getenv("TF_QWEN_KV_PAGE_TEST") orelse return 0;
     return parsePageTest(std.mem.span(v));
@@ -103,7 +135,7 @@ pub const Cache = struct {
     pub fn initFor(gpa: std.mem.Allocator, e: *Engine, cap: usize, taps: bool) !Cache {
         const test_pages = try pageTest();
         const rows = try cacheRows(cap, test_pages);
-        var kv = try DeviceBuffer.alloc(e.d, try std.math.mul(usize, e.g.kvBytes(1, e.kv8), rows));
+        var kv = try take(e, try std.math.mul(usize, e.g.kvBytes(1, e.kv8), rows));
         var own = true;
         errdefer if (own) kv.free();
         var paged: ?Paged = null;
@@ -177,19 +209,19 @@ pub const Cache = struct {
 
     /// The parts every cache holds itself beside `kv` and `paged` (the caller's to free on failure).
     fn fixed(gpa: std.mem.Allocator, e: *Engine, cap: usize, kv: DeviceBuffer, paged: ?Paged, taps: bool) !Cache {
-        var state = try DeviceBuffer.alloc(e.d, e.g.stateBytes());
+        var state = try take(e, e.g.stateBytes());
         errdefer state.free();
         const adaptive = recurrent.enabled(e);
         var before: ?DeviceBuffer = null;
         errdefer if (before) |*b| b.free();
-        if (!adaptive) before = try DeviceBuffer.alloc(e.d, e.g.stateBytes());
+        if (!adaptive) before = try take(e, e.g.stateBytes());
         var log: DeviceBuffer = .{ .d = e.d, .ptr = 0, .len = 0, .borrowed = true };
-        if (!adaptive) log = try DeviceBuffer.alloc(e.d, e.g.logBytes(engine.most_window));
+        if (!adaptive) log = try take(e, e.g.logBytes(engine.most_window));
         errdefer log.free();
         var tap: ?DeviceBuffer = null;
         errdefer if (tap) |*t| t.free();
         if (e.n_taps > 0 and taps) {
-            tap = try DeviceBuffer.alloc(e.d, e.tapBytes());
+            tap = try take(e, e.tapBytes());
         }
         const logits = try gpa.alloc(u16, e.g.vocab);
         errdefer gpa.free(logits);
@@ -224,14 +256,17 @@ pub const Cache = struct {
     pub fn deinit(self: *Cache, gpa: std.mem.Allocator) void {
         recurrent.release(self);
         if (self.owner) |p| p.cap -= self.scratch;
-        self.state.free();
-        if (self.before) |*b| b.free();
-        self.kv.free();
-        if (self.paged) |*p| freePaged(gpa, p);
-        self.log.free();
-        if (self.tap) |*t| t.free();
+        give(&self.state);
+        if (self.before) |*b| give(b);
+        if (self.paged) |*p| {
+            self.kv.free();
+            freePaged(gpa, p);
+        } else give(&self.kv);
+        give(&self.log);
+        if (self.tap) |*t| give(t);
         gpa.free(self.logits);
     }
+
 
     /// The stream's window of `rows` rows from forward row `row0`, after `len` cached positions.
     pub fn seg(self: *const Cache, e: *const Engine, len: usize, row0: usize, rows: usize) Seg {
