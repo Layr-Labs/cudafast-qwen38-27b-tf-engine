@@ -514,7 +514,28 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_attn_partial(Geo geo, c
                                                                         const int* __restrict__ P, float scale,
                                                                         float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
     extern __shared__ __align__(16) uint4 attn_tiles[];
-    tf_q35_tc::attn_one<tf_q35_tc::Bf16Tiles<128>>({attn_tiles, nullptr, nullptr, nullptr}, geo, Q, segs, rowseg, rowanc, layer, P, scale, PM, PL, PO);
+    // A block takes every gridDim.y-th chunk, each chunk's arithmetic as its own block's: a short stream's rows need few
+    // of the MAXCH chunks, and a block of these tiles holds its SM alone, so an idle chunk's block cost a dispatch.
+    // A chunk past the row's keys only marks itself empty (attn_one's k0 >= k1 case), here without its loads.
+    const size_t m = blockIdx.x;
+    if (past_rows(P, (int)m)) return;
+    const int G = geo.qh / geo.kvh;
+    const bool own = segs[rowseg[m]].len < tf_q35_tc::GROUP_LEN;
+    const int keys = segs[rowseg[m]].len + rows_seen(rowanc[m]), ck = chunk_keys(keys), nch = (keys + ck - 1) / ck;
+    bool first = true;
+    for (int c = blockIdx.y; c < MAXCH; c += gridDim.y) {
+        if (c >= nch) {
+            if (own && (int)threadIdx.x < G) {
+                const size_t at = (m * geo.qh + (size_t)blockIdx.z * G + threadIdx.x) * MAXCH + c;
+                PM[at] = -INFINITY;
+                PL[at] = 0.0f;
+            }
+            continue;
+        }
+        if (!first) __syncthreads();
+        first = false;
+        tf_q35_tc::attn_one<tf_q35_tc::Bf16Tiles1<128>>({attn_tiles, nullptr, nullptr, nullptr}, geo, Q, segs, rowseg, rowanc, layer, P, scale, PM, PL, PO, c);
+    }
 }
 
 extern "C" __global__ void __launch_bounds__(256) tf_q35_attn_rows(Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
@@ -522,5 +543,19 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_attn_rows(Geo geo, cons
                                                                      const int* __restrict__ P, float scale, int total,
                                                                      float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
     extern __shared__ __align__(16) uint4 attn_tiles[];
-    tf_q35_tc::attn_rows<4, tf_q35_tc::Bf16Tiles<256>>({attn_tiles, nullptr, nullptr, nullptr}, geo, Q, segs, rowseg, rowanc, layer, P, scale, total, PM, PL, PO);
+    // every gridDim.y-th chunk, as tf_q35_attn_partial's; a group without a long stream's row has nothing at any chunk
+    __shared__ int long_rows;
+    const int RB = 64 / (geo.qh / geo.kvh), m0 = blockIdx.x * RB;
+    if (threadIdx.x == 0) long_rows = 0;
+    __syncthreads();
+    if ((int)threadIdx.x < RB) {
+        const int m = m0 + threadIdx.x;
+        if (m < total && !past_rows(P, m) && segs[rowseg[m]].len >= tf_q35_tc::GROUP_LEN) atomicOr(&long_rows, 1);
+    }
+    __syncthreads();
+    if (!long_rows) return;
+    for (int c = blockIdx.y; c < MAXCH; c += gridDim.y) {
+        if (c != (int)blockIdx.y) __syncthreads();
+        tf_q35_tc::attn_rows<4, tf_q35_tc::Bf16Tiles<256>>({attn_tiles, nullptr, nullptr, nullptr}, geo, Q, segs, rowseg, rowanc, layer, P, scale, total, PM, PL, PO, c);
+    }
 }

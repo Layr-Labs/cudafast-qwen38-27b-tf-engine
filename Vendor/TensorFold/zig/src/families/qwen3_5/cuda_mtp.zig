@@ -348,7 +348,7 @@ pub const Mtp = struct {
         if (rows_) |rs| if (rs.len != n or n > most_window) return error.BadDraftRows;
         if (start < ctx.end) ctx.end = start;
         if (start > ctx.end) ctx.begin = start; // a gap (a prompt restored from a cache): the context starts here
-        const held = engine.tap_held; // the target's ring holds this many rows behind its newest chunk
+        const held = engine.tap_rows - engine.max_rows; // the target's ring holds this many rows behind its newest chunk
         if (n > held) {
             fi = n - held;
             start += n - held;

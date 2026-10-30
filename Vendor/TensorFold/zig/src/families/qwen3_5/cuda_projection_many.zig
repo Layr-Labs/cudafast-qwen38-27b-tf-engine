@@ -18,8 +18,8 @@ pub fn projectMany(e: *Engine, ls: []const Proj, x: u64, xs: u64, outs: []const 
     }
     const A = cuda.qlinear.Affine4Kernels;
     // GB10 has no split form: a decode or verify window of one row tile groups its projections by kernel instead
-    const grouped_decode = e.affine.split != null or (!prompt and rows <= A.max_rows);
-    const segmented = grouped_decode and !(prompt and rows > 16) and ls.len <= A.segs_max and for (ls) |l| {
+    const by_kernel = e.affine.split != null or (!prompt and rows <= A.max_rows);
+    const segmented = by_kernel and !(prompt and rows > 16) and ls.len <= A.segs_max and for (ls) |l| {
         if (l != .a4 or l.inputs() != ls[0].inputs()) break false;
     } else true;
     if (!segmented) {

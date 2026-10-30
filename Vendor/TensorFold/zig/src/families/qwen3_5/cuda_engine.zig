@@ -18,7 +18,6 @@ pub const recurrent = @import("cuda_recurrent.zig");
 pub const Geometry = geometry.Geometry;
 pub const Cache = caches.Cache;
 pub const tap_rows = caches.tap_rows;
-pub const tap_held = caches.tap_held;
 const Seg = caches.Seg;
 const DeviceBuffer = cuda.DeviceBuffer;
 const head_dim = geometry.head_dim;

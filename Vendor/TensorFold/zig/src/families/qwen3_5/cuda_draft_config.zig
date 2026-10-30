@@ -85,7 +85,7 @@ pub const Config = struct {
         if (c.hidden != target.hidden or c.vocab != target.vocab or c.hidden % 256 != 0 or c.hidden % c.group != 0 or c.heads % c.kv_heads != 0 or c.layers > 8) return error.UnsupportedDraftConfig;
         _ = std.math.mul(usize, c.heads, c.head_dim) catch return error.UnsupportedDraftConfig;
         _ = std.math.mul(usize, c.kv_heads, c.head_dim) catch return error.UnsupportedDraftConfig;
-        if (c.window < 16 or c.window > engine.tap_held) return error.UnsupportedDraftConfig;
+        if (c.window < 16 or c.window > engine.tap_rows - max_rows) return error.UnsupportedDraftConfig;
         c.block = 16;
         return c;
     }

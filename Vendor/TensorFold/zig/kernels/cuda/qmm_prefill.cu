@@ -164,3 +164,11 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_many(const __nv_
         const __grid_constant__ tf_qmm_prefill::ManyParts parts, int M, int K, int ldx, int group) {
     tf_qmm_prefill::prompt_many_body<64, 128, 128, 2, 2, 2>(x, parts, M, K, ldx, group);
 }
+
+// A dense MLP's gate and up prompt GEMMs and silu(gate) * up in one launch (prompt_mlp_body): parts 0 and 1 are
+// gate and up, `act` the activation rows; the same 128-row tiles, warps and stages as tf_qmm_prompt_many.
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_mlp(const __nv_bfloat16* __restrict__ x,
+        const __grid_constant__ tf_qmm_prefill::ManyParts parts, __nv_bfloat16* __restrict__ act, int M, int K, int ldx,
+        int group) {
+    tf_qmm_prefill::prompt_mlp_body<64, 128, 2, 2>(x, parts, act, M, K, ldx, group);
+}

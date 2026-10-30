@@ -10,6 +10,10 @@ const max_chunks = 64;
 pub const prompt_moe_cutoff: usize = 16;
 /// qwen35_attn_tc.cuh's bf16 tile buffers: two of a 32-key tile's keys and values, 512 bytes a row each.
 pub const attn_tiles = 4 * 32 * 512;
+/// tf_q35_attn_partial's one key and value tile (Bf16Tiles1), and the chunk blocks it launches a (row, key head):
+/// each takes every partial_chunks-th of the MAXCH chunks, so a short stream's rows dispatch no idle blocks.
+const attn_tile = attn_tiles / 2;
+const partial_chunks = 8;
 const ids_at = E.Engine.ids_at;
 const segs_at = E.Engine.segs_at;
 const rowseg_at = E.Engine.rowseg_at;
@@ -84,7 +88,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                         try launch(e, e.fp8.attn_partial, sig.attn_partial8, .{ total, max_chunks, g.kv_heads }, .{ 128, 1, 1 }, args);
                         try launch(e, e.fp8.attn_rows, sig.attn_rows8, .{ groups, max_chunks, g.kv_heads }, .{ 256, 1, 1 }, rows_args);
                     } else {
-                        try shared(e, e.fns.attn_partial, sig.attn_partial, .{ total, max_chunks, g.kv_heads }, 128, args);
+                        try sharedSized(e, e.fns.attn_partial, sig.attn_partial, .{ total, partial_chunks, g.kv_heads }, 128, attn_tile, args);
                         try shared(e, e.fns.attn_rows, sig.attn_rows, .{ groups, max_chunks, g.kv_heads }, 256, rows_args);
                     }
                     try launch(e, e.fns.attn_merge, sig.attn_merge, .{ g.q_heads, total, 1 }, .{ 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.y });
@@ -99,10 +103,17 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
         if (e.learning) |k| try k.post(i, e.h, e.x, total);
         switch (l.mlp) {
             .dense => |m| {
-                try e.projMany(&.{ m.gate, m.up }, e.x, &.{ e.gate, e.up }, total, prompt); // one launch: prompt GEMM, or grouped decode
-                if (e.learning) |k| try k.mlp(i, e.gate, e.up, total);
-                const n: c_longlong = @intCast(total * g.intermediate);
-                try e.run(e.fns.mlp_act, .{ (total * g.intermediate + 1023) / 1024, 1, 1 }, .{ 256, 1, 1 }, .{ e.gate, e.up, e.act, n, t_params, @as(c_int, @intCast(g.intermediate)), sums });
+                // a prompt chunk: gate, up and the activation in one launch, with the three kernels' bits
+                const fused = prompt and total > 16 and e.learning == null and !e.int8.on and m.gate == .a4 and m.up == .a4 and
+                    cuda.prompt_many.Kernels.mlpFits(m.gate.a4, m.up.a4) and m.gate.a4.n == g.intermediate;
+                if (fused) {
+                    try e.prompt_many.mlp(e.stream, e.x, m.gate.a4, m.up.a4, e.act, total);
+                } else {
+                    try e.projMany(&.{ m.gate, m.up }, e.x, &.{ e.gate, e.up }, total, prompt);
+                    if (e.learning) |k| try k.mlp(i, e.gate, e.up, total);
+                    const n: c_longlong = @intCast(total * g.intermediate);
+                    try e.run(e.fns.mlp_act, .{ (total * g.intermediate + 1023) / 1024, 1, 1 }, .{ 256, 1, 1 }, .{ e.gate, e.up, e.act, n, t_params, @as(c_int, @intCast(g.intermediate)), sums });
+                }
                 try e.projAgain(m.down, e.act, e.r, total, prompt);
                 if (e.mlp) |k| try k.f(k.ctx, i, e.x, e.r, total, e.taught) else try e.pockets.add(e.stream, i, e.x, e.r, total, e.taught);
             },
@@ -123,10 +134,14 @@ fn launch(e: *E.Engine, f: cuda.Function, comptime s: sig.Sig, grid: [3]usize, b
 
 /// A bf16 decode attention launch with its two tile buffers of dynamic shared memory.
 fn shared(e: *E.Engine, f: cuda.Function, comptime s: sig.Sig, grid: [3]usize, threads: u32, args: anytype) !void {
+    return sharedSized(e, f, s, grid, threads, attn_tiles, args);
+}
+
+fn sharedSized(e: *E.Engine, f: cuda.Function, comptime s: sig.Sig, grid: [3]usize, threads: u32, bytes: u32, args: anytype) !void {
     sig.check(s, @TypeOf(args));
     var a: cuda.Args = .{};
     inline for (args) |v| a.add(v);
-    const cfg: cuda.Config = .{ .grid = .{ .x = @intCast(grid[0]), .y = @intCast(grid[1]), .z = @intCast(grid[2]) }, .block = .{ .x = threads }, .shared = attn_tiles };
+    const cfg: cuda.Config = .{ .grid = .{ .x = @intCast(grid[0]), .y = @intCast(grid[1]), .z = @intCast(grid[2]) }, .block = .{ .x = threads }, .shared = bytes };
     try cuda.launch.launch(f, cfg, e.stream, &a);
 }
 

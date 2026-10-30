@@ -14,6 +14,7 @@ const Stream = stream_.Stream;
 const Affine4 = qlinear.Affine4;
 
 pub const symbol = "tf_qmm_prompt_many";
+pub const mlp_symbol = "tf_qmm_prompt_mlp";
 pub const parts_max = 4;
 pub const tile_m = 128;
 pub const tile_n = 128;
@@ -35,12 +36,41 @@ pub const Out = struct { q: Affine4, out: u64 };
 
 pub const Kernels = struct {
     many_fn: Function,
+    mlp_fn: Function,
 
     /// From a loaded qmm_prefill module.
     pub fn resolve(prefill_mod: module.Module) !Kernels {
         const f = try prefill_mod.function(symbol);
         try f.allowDynamicShared(smem);
-        return .{ .many_fn = f };
+        const m = try prefill_mod.function(mlp_symbol);
+        try m.allowDynamicShared(smem);
+        return .{ .many_fn = f, .mlp_fn = m };
+    }
+
+    /// Whether `mlp` takes this gate and up: one shape, whole 64-column tiles.
+    pub fn mlpFits(gate: Affine4, up: Affine4) bool {
+        return gate.n == up.n and gate.k == up.k and gate.npad == up.npad and gate.n % 64 == 0 and gate.k % 64 == 0;
+    }
+
+    /// act (rows, n) = bf16(silu(gate) * up) of x (rows, k) through gate and up: the bits of `prompt` over both,
+    /// each stored as bf16, then qwen35.cu's tf_q35_mlp_act over them; neither projection's rows are written.
+    pub fn mlp(kk: *const Kernels, s: Stream, x: u64, gate: Affine4, up: Affine4, act: u64, rows: usize) !void {
+        if (!mlpFits(gate, up) or rows == 0) return error.InputMismatch;
+        const k = gate.k;
+        const rows_t = (rows + tile_m - 1) / tile_m;
+        const band = (12 << 20) / (tile_m * k * 2);
+        const group = @max(1, @min(rows_t, band));
+        var parts: Parts = std.mem.zeroes(Parts);
+        parts.p[0] = .{ .w = gate.w, .scales = gate.s, .biases = gate.b, .out = 0, .n = @intCast(gate.n), .npad = @intCast(gate.npad), .first = 0 };
+        parts.p[1] = .{ .w = up.w, .scales = up.s, .biases = up.b, .out = 0, .n = @intCast(up.n), .npad = @intCast(up.npad), .first = 0 };
+        parts.count = 2;
+        var g: launch_.Args = .{};
+        g.add(x);
+        g.add(parts);
+        g.add(act);
+        for ([_]usize{ rows, k, k, group }) |v| g.add(@as(c_int, @intCast(v)));
+        const blocks = rows_t * (gate.n / 64);
+        try launch_.launch(kk.mlp_fn, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = threads }, .shared = smem }, s, &g);
     }
 
     /// out_i (rows, n_i) = x (rows, k) through each of `outs`, every one with prefill_kernel's bits.

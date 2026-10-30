@@ -41,6 +41,7 @@ pub const Affine4Kernels = struct {
     seg_fn: Function, // the split form over up to four projections of one input
     many_fn: Function, // lane_gemv over up to four projections of one input, each part's CTAs as its own launch's
     prefill_fn: Function,
+    sms: usize = 0,
     prefill22_fn: Function, // the prompt tile on 2x2 warps and two stages (`half_prompt` picks it)
     half_prompt: bool = false, // prompts on prefill22_fn: its four warps a block and two stages are quicker on an RTX 5090
     words_fn: Function, // affine4_pack.cu: MLX words into the tiles
@@ -61,6 +62,7 @@ pub const Affine4Kernels = struct {
         a.verify128_fn = try group_mod.function(symbols.verify128);
         a.prefill_fn = try prefill_mod.function(symbols.prefill);
         a.prefill22_fn = try prefill_mod.function(symbols.prefill22);
+        a.sms = sms;
         a.half_prompt = false;
         a.gemv_fn = try gemv_mod.function(symbols.gemv);
         a.split_fn = try gemv_mod.function(symbols.gemv_split);
@@ -309,6 +311,7 @@ pub const Affine4Kernels = struct {
         };
         try launch_.launch(a.group_fn, cfg, s, &g);
     }
+
 
     /// qmm.prefill_matmul (tile 0): weights rounded once to bf16, one fp32 chain over K; bf16 out.
     pub fn prompt(a: *const Affine4Kernels, s: Stream, x: u64, q: Affine4, out: u64, rows: usize) !void {
