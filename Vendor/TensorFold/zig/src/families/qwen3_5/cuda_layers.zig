@@ -71,6 +71,7 @@ pub const Fns = struct {
     argmax_merge: cuda.Function,
     tap: cuda.Function,
     splice: cuda.Function,
+    l2_warm: cuda.Function,
 };
 
 /// qwen35_keep.cu's kernels (Cache.keep).
