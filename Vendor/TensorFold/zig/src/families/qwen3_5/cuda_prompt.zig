@@ -17,10 +17,10 @@ pub const Fns = struct { bf16: cuda.Function, fp8: cuda.Function, chain: cuda.Fu
 pub const symbols = struct {
     pub const bf16 = "_ZN20tf_prefill_attention13hpattn_kernelILi256ELi8ELi2ELi2EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiifi";
     pub const fp8 = "_ZN20tf_prefill_attention14hpattn8_kernelILi256ELi8ELi2ELi2EEEvPK13__nv_bfloat16PKhS5_PKfS7_PS1_iiiiifi";
-    pub const chain = "_ZN14tf_gdn_prefill12chain_kernelI13__nv_bfloat16S1_Li64ELi32EEEvPKT_S4_PKS1_PKfPKT0_S8_PfPS1_iii";
+    pub const chain = "_ZN14tf_gdn_prefill12chain_kernelI13__nv_bfloat16S1_Li32ELi16EEEvPKT_S4_PKS1_PKfPKT0_S8_PfPS1_iii";
 };
 /// gdn_prefill.cu's value rows a block (two threads a row).
-const chain_rows = 64;
+const chain_rows = 32;
 
 pub fn resolve(attention: cuda.Module, gdn: cuda.Module) !Fns {
     const f: Fns = .{ .bf16 = try attention.function(symbols.bf16), .fp8 = try attention.function(symbols.fp8), .chain = try gdn.function(symbols.chain) };

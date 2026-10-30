@@ -172,3 +172,11 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_mlp(const __nv_b
         int group) {
     tf_qmm_prefill::prompt_mlp_body<64, 128, 2, 2>(x, parts, act, M, K, ldx, group);
 }
+
+// The same body on 64x128 tiles, 1x4 warps of 64x32, two stages (25.6 KB: three CTAs an SM on GB10): a launch whose
+// 128x128 grid is under two GB10 waves (an N = 5120 projection's 160 tiles) fills more of the SMs; every output's
+// m16 row block and n8 column block start at the same multiples, so its MMA chain and bits are unchanged.
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_many_narrow(const __nv_bfloat16* __restrict__ x,
+        const __grid_constant__ tf_qmm_prefill::ManyParts parts, int M, int K, int ldx, int group) {
+    tf_qmm_prefill::prompt_many_body<64, 64, 128, 1, 4, 2>(x, parts, M, K, ldx, group);
+}

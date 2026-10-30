@@ -421,7 +421,10 @@ pub const Engine = struct {
     }
 
     pub fn norm(e: *Engine, residual: bool, w: u64, rows: usize) !void {
-        try e.run(e.fns.norm, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, if (residual) e.r else @as(u64, 0), w, e.x, e.g.eps, @as(c_int, @intCast(e.g.hidden)), e.tables.ptr + params_at, e.xs });
+        // a programmatic launch: tf_q35_norm streams its weights in under the previous kernel's tail, then waits
+        var a: cuda.Args = .{};
+        inline for (.{ e.h, if (residual) e.r else @as(u64, 0), w, e.x, e.g.eps, @as(c_int, @intCast(e.g.hidden)), e.tables.ptr + params_at, e.xs }) |v| a.add(v);
+        try cuda.launch.launch(e.fns.norm, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = 256, .y = 1, .z = 1 }, .pdl = true }, e.stream, &a);
     }
 
     /// Refuse the whole frame before settling any prior window or launching work.

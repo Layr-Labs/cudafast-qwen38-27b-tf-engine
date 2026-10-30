@@ -34,9 +34,17 @@ comptime {
 /// One projection of the shared input and its output rows.
 pub const Out = struct { q: Affine4, out: u64 };
 
+/// tf_qmm_prompt_many_narrow: 64 x 128 tiles on 1 x 4 warps, two stages (three CTAs a GB10 SM).
+pub const narrow_symbol = "tf_qmm_prompt_many_narrow";
+pub const narrow_m = 64;
+pub const narrow_smem: u32 = 2 * (64 * 128 + 128 * 32 + 2 * 128 * 2);
+/// A launch of fewer 128 x 128 tiles than this takes the narrow tiles (GB10: under two waves of two CTAs on 48 SMs).
+pub const narrow_below = 192;
+
 pub const Kernels = struct {
     many_fn: Function,
     mlp_fn: Function,
+    narrow_fn: Function,
 
     /// From a loaded qmm_prefill module.
     pub fn resolve(prefill_mod: module.Module) !Kernels {
@@ -44,7 +52,9 @@ pub const Kernels = struct {
         try f.allowDynamicShared(smem);
         const m = try prefill_mod.function(mlp_symbol);
         try m.allowDynamicShared(smem);
-        return .{ .many_fn = f, .mlp_fn = m };
+        const n = try prefill_mod.function(narrow_symbol);
+        try n.allowDynamicShared(narrow_smem);
+        return .{ .many_fn = f, .mlp_fn = m, .narrow_fn = n };
     }
 
     /// Whether `mlp` takes this gate and up: one shape, whole 64-column tiles.
@@ -77,9 +87,13 @@ pub const Kernels = struct {
     pub fn prompt(kk: *const Kernels, s: Stream, x: u64, outs: []const Out, rows: usize) !void {
         if (outs.len == 0 or outs.len > parts_max or rows == 0) return error.TooManyParts;
         const k = outs[0].q.k;
-        const rows_t = (rows + tile_m - 1) / tile_m;
+        var wide: usize = 0;
+        for (outs) |o| wide += ((rows + tile_m - 1) / tile_m) * ((o.q.n + tile_n - 1) / tile_n);
+        const narrow = wide < narrow_below;
+        const tm: usize = if (narrow) narrow_m else tile_m;
+        const rows_t = (rows + tm - 1) / tm;
         // prefill_kernel's row band: the row tiles of a column panel that share it from L2
-        const band = (12 << 20) / (tile_m * k * 2);
+        const band = (12 << 20) / (tm * k * 2);
         const group = @max(1, @min(rows_t, band));
         var parts: Parts = std.mem.zeroes(Parts);
         var blocks: usize = 0;
@@ -93,6 +107,7 @@ pub const Kernels = struct {
         g.add(x);
         g.add(parts);
         for ([_]usize{ rows, k, k, group }) |v| g.add(@as(c_int, @intCast(v)));
+        if (narrow) return launch_.launch(kk.narrow_fn, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = threads }, .shared = narrow_smem }, s, &g);
         try launch_.launch(kk.many_fn, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = threads }, .shared = smem }, s, &g);
     }
 };
