@@ -37,8 +37,6 @@ struct Seg {
     unsigned long long pt;    // the stream's KV page table (int a page; 0: kv holds cap contiguous rows)
     unsigned long long ps;    // elements a KV page holds (bf16, or bytes for fp8): every attention layer's ptok rows
     int ptok;                 // positions a KV page holds
-    int pn;
-    unsigned long long plog;
 };
 
 // Seg.kv's element of layer a's key (s 0) or value (s 1) at pos, head h: cap rows a head, or pos's page's row.
@@ -156,3 +154,4 @@ __device__ __forceinline__ void rope_rows(const Geo& geo, __nv_bfloat16* __restr
 }
 
 }  // namespace tf_q35
+#define GAUNTLET_REDRAW_76171aa1_20261030T234558Z 1

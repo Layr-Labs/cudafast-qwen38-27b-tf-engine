@@ -109,7 +109,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 if (fused) {
                     try e.prompt_many.mlp(e.stream, e.x, m.gate.a4, m.up.a4, e.act, total);
                 } else {
-                    try e.projMany(&.{ m.gate, m.up }, e.x, &.{ e.gate, e.up }, total, prompt);
+                    try e.projMany(&.{ m.gate, m.up }, e.x, &.{ e.gate, e.up }, total, prompt); // one launch: prompt GEMM, or grouped decode
                     if (e.learning) |k| try k.mlp(i, e.gate, e.up, total);
                     const n: c_longlong = @intCast(total * g.intermediate);
                     try e.runAfter(e.fns.mlp_act, .{ (total * g.intermediate + 1023) / 1024, 1, 1 }, .{ 256, 1, 1 }, .{ e.gate, e.up, e.act, n, t_params, @as(c_int, @intCast(g.intermediate)), sums });

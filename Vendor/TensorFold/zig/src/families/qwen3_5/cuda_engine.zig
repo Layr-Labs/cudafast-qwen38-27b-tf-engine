@@ -212,12 +212,12 @@ pub const Engine = struct {
         e.window_rows = most_window;
         e.arena_at = 0;
         e.graphs = .empty;
+        e.blocks = .empty;
         e.rec_scratch = recurrent.Pool.init(gpa, @intFromPtr(e));
         e.n_taps = 0;
         e.features = 0;
         e.stream = try cuda.Stream.init(d, true);
         errdefer e.stream.deinit();
-        e.blocks = .empty; // the field's default does not apply: Allocation(Engine).create leaves the engine undefined
         var ck = try core.Checkpoint.openModel(gpa, io, dir);
         defer ck.close();
         // an EXL3 checkpoint's weights are sized by a dry run of its loader (trellis widths come from the tensors)
@@ -326,7 +326,7 @@ pub const Engine = struct {
 
     /// A stream's device bytes at a `cap`-token window: recurrences, convolution tails, keys and values, taps, log.
     pub fn streamBytes(e: *const Engine, cap: usize) usize {
-        return 2 * e.g.stateBytes() + e.g.kvBytes(cap, e.kv8) + e.tapBytes() + 2 * e.g.logBytes(most_window);
+        return 2 * e.g.stateBytes() + e.g.kvBytes(cap, e.kv8) + e.tapBytes() + e.g.logBytes(most_window);
     }
 
     /// A stream's tap ring: tap_rows rows of the tapped layers' residuals.
@@ -395,8 +395,7 @@ pub const Engine = struct {
         try cuda.launch.launch(f, cfg, e.stream, &a);
     }
 
-    /// `run` with programmatic dependent launch on GB10, for glue kernels that open with griddepcontrol.wait
-    /// (qwen35.cu's await_prior): the launch overlaps the preceding kernel's tail, which triggers early.
+    /// Allow the next dependent grid to begin after the kernel's early release.
     pub fn runAfter(e: *Engine, f: cuda.Function, grid: [3]usize, block: [3]usize, args: anytype) !void {
         var a: cuda.Args = .{};
         inline for (args) |v| a.add(v);
@@ -476,13 +475,11 @@ pub const Engine = struct {
         const slot_peak = try Round.build(st, parts, record);
         for (parts) |p| {
             try p.cache.settle(e);
-            // a pending kept prefix rides in this forward's slot scan only when its log half survives `prepare`
-            if (!(record and keep != .hidden and recurrent.logStays(e, p.cache, p.rows))) try p.cache.flush(e);
             try recurrent.prepare(e, p.cache, p.rows, record);
         }
         var row0: usize = 0;
         for (parts, 0..) |p, i| {
-            segs[i] = p.cache.fold(p.cache.seg(e, p.cache.len, row0, p.rows));
+            segs[i] = p.cache.seg(e, p.cache.len, row0, p.rows);
             row0 += p.rows;
         }
         if (keep == .draws) {
@@ -624,6 +621,4 @@ fn envOff(name: [*:0]const u8) bool {
     return std.mem.eql(u8, std.mem.span(v), "0");
 }
 
-/// Compile-time switch: decode glue kernels (norm, GDN pre/conv/scan/post, head norms, rope, attention, gate, mlp_act)
-/// launched with PDL on GB10, each opening with griddepcontrol.wait; false restores plain stream-ordered launches.
 pub const glue_pdl = true;
