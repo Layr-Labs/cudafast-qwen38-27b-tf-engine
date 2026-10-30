@@ -7,6 +7,8 @@ const protocol = @import("protocol.zig");
 
 const capabilities = [_][]const u8{"free_run_decode"};
 const spec_modes = [_][]const u8{ "serial", "dflash" };
+// The harness gates can hold the connection idle for well over 30 minutes of wall time; the job limit still applies.
+pub const idle_timeout_ms: u32 = 3_600_000;
 const handshake_timeout_ms: u32 = 2_000;
 
 pub const Identity = struct {
@@ -25,7 +27,7 @@ pub const Config = struct {
     identity: Identity,
     max_clients: ?usize = null,
     ready: ?*std.atomic.Value(bool) = null,
-    timeout_ms: u32 = client.default_timeout_ms,
+    timeout_ms: u32 = idle_timeout_ms,
     weights_identity: ?DirectoryIdentity = null,
     failure_writer: ?*std.Io.Writer = null,
 };
