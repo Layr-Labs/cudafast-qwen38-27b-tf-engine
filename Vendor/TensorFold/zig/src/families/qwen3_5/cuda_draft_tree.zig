@@ -5,7 +5,7 @@ const lanes = @import("lanes");
 const engine = @import("cuda_engine.zig");
 
 /// Children a node, the selector's weight, the softmax scale, and the nodes a tree takes by default.
-const branch = 8;
+const branch = 12;
 const edge_weight = 0.6;
 const scale = 1.5;
 /// A sampled stream's candidates carry the draw's own Gumbel noise at this weight (the 27B engine's draft_tree).
@@ -41,33 +41,44 @@ pub fn nodes() usize {
     return @min(n, engine.most_window - 1);
 }
 
-/// Offered tree nodes (parent row kept) and landed ones by own log-chance in half-nat bins, greedy then every round's.
+/// Offered tree nodes (parent row kept) and landed ones by own log-chance in half-nat bins, greedy then every round's;
+/// the same again by depth, each depth's rate drawn toward the depth-free one until its own counts outweigh it.
 pub const Landing = struct {
     counts: [2][16][2]f64 = @splat(@splat(.{ 0, 0 })),
+    deep: [2][depths][16][2]f64 = @splat(@splat(@splat(.{ 0, 0 }))),
+
+    const depths = 8;
+    /// A depth's own counts weigh against the depth-free rate as this many offers.
+    const pull = 4;
 
     fn bin(own: f64) usize {
         return @min(15, @as(usize, @intFromFloat(@max(0, @floor(-own / 0.5)))));
     }
 
-    pub fn observe(l: *Landing, sampled: bool, own: f64, landed: bool) void {
-        for (l.counts[@intFromBool(sampled)..]) |*table| {
-            const x = &table[bin(own)];
-            x[0] += 1;
-            if (landed) x[1] += 1;
+    pub fn observe(l: *Landing, sampled: bool, depth: usize, own: f64, landed: bool) void {
+        for (l.counts[@intFromBool(sampled)..], l.deep[@intFromBool(sampled)..]) |*table, *by| {
+            for ([_]*[2]f64{ &table[bin(own)], &by[@min(depth, depths - 1)][bin(own)] }) |x| {
+                x[0] += 1;
+                if (landed) x[1] += 1;
+            }
         }
     }
 
-    pub fn chance(l: *const Landing, sampled: bool, own: f64) f64 {
+    pub fn chance(l: *const Landing, sampled: bool, depth: usize, own: f64) f64 {
         const x = l.counts[@intFromBool(sampled)][bin(own)];
-        return (x[1] + 2 * @exp(own)) / (x[0] + 2);
+        const base = (x[1] + 2 * @exp(own)) / (x[0] + 2);
+        const y = l.deep[@intFromBool(sampled)][@min(depth, depths - 1)][bin(own)];
+        return (y[1] + pull * base) / (y[0] + pull);
     }
 
     /// A verified window's offered nodes (the first `offered`, node i at row i + 1) against the rows it kept.
     pub fn observeTree(l: *Landing, sampled: bool, parents: []const i32, own: []const f64, offered: usize, kept: []const u32) void {
-        for (parents[0..@min(offered, parents.len)], own[0..@min(offered, own.len)], 0..) |p, o, i| {
+        var depth: [engine.most_window]usize = undefined;
+        for (parents[0..@min(offered, parents.len, own.len, depth.len)], own[0..@min(offered, parents.len, own.len, depth.len)], 0..) |p, o, i| {
+            depth[i] = if (p < 0) 0 else depth[@intCast(p)] + 1;
             const parent_row: u32 = if (p < 0) 0 else @intCast(p + 1);
             if (std.mem.indexOfScalar(u32, kept, parent_row) == null) continue;
-            l.observe(sampled, o, std.mem.indexOfScalar(u32, kept, @intCast(i + 1)) != null);
+            l.observe(sampled, depth[i], o, std.mem.indexOfScalar(u32, kept, @intCast(i + 1)) != null);
         }
     }
 };
@@ -143,7 +154,9 @@ fn chancesAfter(c: Candidates, r: usize, pred: u32, out: *[lp_top]f64) void {
 }
 
 /// Up to `most` nodes best first: the open node of least path cost next (ties by parent, token, row); the count grown.
-pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32, parents: []i32, own: []f64) usize {
+/// A node's cost is its landing chance as `landing` has measured it at its depth, so the tree's prefixes are the ones
+/// the round planner (chancesFn) prices best; before any measurement that is the drafter's own chance.
+pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, landing: *const Landing, sampled: bool, tokens: []u32, parents: []i32, own: []f64) usize {
     const Open = struct { cost: f64, parent: i32, token: u32, row: usize, own: f64 };
     var open: [branch * (engine.most_window + 1)]Open = undefined;
     var n_open: usize = 0;
@@ -167,7 +180,7 @@ pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32
             const w = ids(c, row);
             for (order[0..@min(branch, c.topk)]) |j| {
                 if (!std.math.isFinite(lc[j]) or n_open == open.len) break;
-                open[n_open] = .{ .cost = path - lc[j], .parent = parent, .token = w[2 + j], .row = row, .own = lc[j] };
+                open[n_open] = .{ .cost = path - @log(landing.chance(sampled, row, lc[j])), .parent = parent, .token = w[2 + j], .row = row, .own = lc[j] };
                 n_open += 1;
             }
         }
@@ -197,13 +210,17 @@ test "landing: a node is offered when its parent's row is kept, and landed when 
     // nodes 0 and 1 under the pending row, node 2 under node 0; the window kept rows 0, 1 (node 0) and 3 (node 2)
     l.observeTree(false, &.{ -1, -1, 0 }, &.{ -0.1, -1.2, -0.3 }, 3, &.{ 0, 1, 3 });
     try std.testing.expectEqual(@as(f64, 2), l.counts[0][0][0]); // nodes 0 and 2, both landed
+    try std.testing.expectEqual(@as(f64, 1), l.deep[0][0][0][1]); // node 0 at depth 0, node 2 at depth 1
+    try std.testing.expectEqual(@as(f64, 1), l.deep[0][1][0][1]);
     try std.testing.expectEqual(@as(f64, 2), l.counts[0][0][1]);
     try std.testing.expectEqual(@as(f64, 1), l.counts[0][2][0]); // node 1 offered, not landed
     try std.testing.expectEqual(@as(f64, 0), l.counts[0][2][1]);
     try std.testing.expectEqual(l.counts[0], l.counts[1]); // greedy rounds count for sampled streams too
     l.observeTree(true, &.{-1}, &.{-0.1}, 1, &.{0});
-    try std.testing.expect(l.chance(true, -0.1) < l.chance(false, -0.1));
-    try std.testing.expectApproxEqAbs((2 + 2 * @exp(@as(f64, -0.1))) / 4, l.chance(false, -0.1), 1e-12);
+    try std.testing.expect(l.chance(true, 0, -0.1) < l.chance(false, 0, -0.1));
+    const base = (2 + 2 * @exp(@as(f64, -0.1))) / 4;
+    try std.testing.expectApproxEqAbs((1 + Landing.pull * base) / (1 + Landing.pull), l.chance(false, 0, -0.1), 1e-12);
+    try std.testing.expectApproxEqAbs(base, l.chance(false, 5, -0.1), 1e-12); // an unmeasured depth: the depth-free rate
 }
 
 test "best first: a node's children follow it, the cheapest open node first, chances that sum to one a row" {
@@ -226,7 +243,8 @@ test "best first: a node's children follow it, the cheapest open node first, cha
     var tokens: [6]u32 = undefined;
     var parents: [6]i32 = undefined;
     var own: [6]f64 = undefined;
-    const n = grow(c, 5, 2, 6, &tokens, &parents, &own);
+    const fresh: Landing = .{};
+    const n = grow(c, 5, 2, 6, &fresh, false, &tokens, &parents, &own);
     try std.testing.expectEqual(@as(usize, 6), n);
     try std.testing.expectEqual(@as(u32, 0), tokens[0]); // row 0's best first
     try std.testing.expectEqual(@as(i32, -1), parents[0]);
