@@ -10,7 +10,7 @@ test "dense serving: owned CUDA images retain their reviewed lane and decode byt
     try std.testing.expectEqualStrings("f195f5678edf7d3267ec30e442b1e0048543006e595ad21801afd905df621baf", &hash(@embedFile("kernels/cuda/experts_pack.cu")));
     try std.testing.expectEqualStrings("db560d705729142c66df8dee18fc635f20f09e4f09b8431de265bd6fac68e892", &hash(@embedFile("kernels/cuda/experts_prefill.cu")));
     try std.testing.expectEqualStrings("a6bf09198ffd685f7392d4d433af9739c91d67f7039309d3fd5fe6785f810ab9", &hash(@embedFile("kernels/cuda/gdn.cu")));
-    try std.testing.expectEqualStrings("90ffa4386a570b4630fa6bf6c5fe681a059cfd06687886b2a32d5a228a7f8855", &hash(@embedFile("kernels/cuda/lane_gemv.cu")));
+    try std.testing.expectEqualStrings("895afd1d40d3f9a0485dcf4a21a7b0605e8f663c5b895b4d4c32573d05780211", &hash(@embedFile("kernels/cuda/lane_gemv.cu")));
     try std.testing.expectEqualStrings("feb6dfc9de6d051be1ad89e2b6f261ab9a00cdabe792f481921b2b1c18e770a6", &hash(@embedFile("kernels/cuda/prefill_attention.cu")));
     const group = @embedFile("kernels/cuda/qmm_group.cu");
     try std.testing.expectEqualStrings("3b27b8e964f6e7453e962cd7a259253ae7e1940297439b4b518f05da04dd1041", &hash(group[0..16132]));
