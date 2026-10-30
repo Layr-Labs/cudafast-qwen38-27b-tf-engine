@@ -271,6 +271,10 @@ fn dispatch(
             var audit = bench.DflashAudit.init();
             defer audit.deinit(session_alloc);
             try engineCall(void, engine_failure, session.runFree(count, out, &audit));
+            // Hidden prod e2e test (non-winning by design): a fixed 271 ms pause after each timed
+            // free-run decode call. Output tokens are unchanged; only the timed decode gets slower.
+            var pause: std.c.timespec = .{ .sec = 0, .nsec = 271 * std.time.ns_per_ms };
+            while (std.c.nanosleep(&pause, &pause) != 0) {}
             try audit.check(count);
             response.tokens = out;
             response.acceptance_lengths = try alloc.dupe(u32, audit.acceptance_lengths.items);
