@@ -53,12 +53,27 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
         switch (l.mixer) {
             .delta => |m| {
                 const layer: c_int = @intCast(di);
-                try e.projMany(&.{ m.qkv, m.z, m.a, m.b }, e.x, &.{ e.qkv, e.z, e.a, e.b }, total, prompt);
+                // GB10: z (read only by gdn_post) runs on the side stream while the main stream runs gdn_pre, conv_commit
+                // and the delta rule: a lone prompt chunk's chain leaves most SMs idle, and a decode or verify window's scan
+                // leaves DRAM idle (z then streams its weights in that window; the fork joins inside the captured graph)
+                const beside = e.side != null and e.learning == null and !e.int8.on and ((prompt and nseg == 1 and total > 16) or (!prompt and total <= 16));
+                if (beside) {
+                    try e.projMany(&.{ m.qkv, m.a, m.b }, e.x, &.{ e.qkv, e.a, e.b }, total, prompt);
+                    try e.side_x.?.record(e.stream);
+                    try e.side.?.wait(e.side_x.?);
+                    const main = e.stream;
+                    e.stream = e.side.?;
+                    defer e.stream = main;
+                    try e.projAgain(m.z, e.x, e.z, total, prompt);
+                    try e.side_z.?.record(e.stream);
+                } else try e.projMany(&.{ m.qkv, m.z, m.a, m.b }, e.x, &.{ e.qkv, e.z, e.a, e.b }, total, prompt);
+                if (!prompt) try warm(e, m.out); // the out projection after the delta rule's latency-bound kernels
                 if (e.learning) |k| try k.delta(i, e.qkv, e.z, e.b, e.a, total);
                 try e.run(e.fns.gdn_pre, .{ 1, 2 * g.k_heads + g.v_heads, total }, .{ 32, 1, 1 }, .{ geo, e.qkv, t_segs, t_rows, t_par, layer, m.conv, e.a, e.b, m.a_log, m.dt_bias, e.q, e.k, e.v, e.g_, e.beta, t_params });
                 // one recorded window of 2+ rows: gdn_pre logged its tails, conv_commit would only return
                 if (!(record and nseg == 1 and total > 1)) try e.run(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
                 if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else try e.deltaScan(record, shape.slots, nseg, layer);
+                if (beside) try e.stream.wait(e.side_z.?);
                 try e.run(e.fns.gdn_post, .{ 1, g.v_heads, total }, .{ 32, 1, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums });
                 try e.projAgain(m.out, e.mix, e.r, total, prompt);
                 di += 1;
@@ -66,6 +81,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
             .attention => |m| {
                 const aw = g.attnWidth();
                 try e.projMany(&.{ m.q, m.k, m.v }, e.x, &.{ e.qraw, e.kraw, e.vraw }, total, prompt);
+                if (!prompt) try warm(e, m.o); // the o projection after the attention kernels
                 if (e.learning) |k| try k.attention(i, e.qraw, e.kraw, e.vraw, total);
                 try e.run(e.fns.head_norm, .{ total * g.q_heads, 1, 1 }, .{ 64, 1, 1 }, .{ e.qraw, m.q_norm, e.qn, @as(c_int, @intCast(g.q_heads)), @as(c_int, @intCast(2 * aw)), @as(c_int, 2 * head_dim), g.eps, t_params });
                 try e.run(e.fns.head_norm, .{ total * g.kv_heads, 1, 1 }, .{ 64, 1, 1 }, .{ e.kraw, m.k_norm, e.kn, @as(c_int, @intCast(g.kv_heads)), @as(c_int, @intCast(g.kv_heads * head_dim)), @as(c_int, head_dim), g.eps, t_params });
@@ -99,12 +115,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
         if (e.learning) |k| try k.post(i, e.h, e.x, total);
         switch (l.mlp) {
             .dense => |m| {
-                if (prompt and total > 16) {
-                    try e.projMany(&.{ m.gate, m.up }, e.x, &.{ e.gate, e.up }, total, prompt); // one prompt GEMM launch
-                } else {
-                    try e.projAgain(m.gate, e.x, e.gate, total, prompt);
-                    try e.projAgain(m.up, e.x, e.up, total, prompt);
-                }
+                try e.projMany(&.{ m.gate, m.up }, e.x, &.{ e.gate, e.up }, total, prompt);
                 if (e.learning) |k| try k.mlp(i, e.gate, e.up, total);
                 const n: c_longlong = @intCast(total * g.intermediate);
                 try e.run(e.fns.mlp_act, .{ (total * g.intermediate + 1023) / 1024, 1, 1 }, .{ 256, 1, 1 }, .{ e.gate, e.up, e.act, n, t_params, @as(c_int, @intCast(g.intermediate)), sums });
@@ -124,6 +135,20 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
 fn launch(e: *E.Engine, f: cuda.Function, comptime s: sig.Sig, grid: [3]usize, block: [3]usize, args: anytype) !void {
     sig.check(s, @TypeOf(args));
     return e.run(f, grid, block, args);
+}
+
+/// GB10: L2 hints for the head of each of `l`'s (tile, K slice) runs, about 8 MB, issued once the projection before
+/// has finished, so they stream in during the latency-bound kernels in between.
+fn warm(e: *E.Engine, l: E.Proj) !void {
+    if (!e.affine.pdl or l != .a4) return;
+    const q = l.a4;
+    const tiles = (q.n + 63) / 64;
+    const kg = q.k / 64;
+    const sk = cuda.qlinear.splitK(q.n, q.k);
+    const budget: usize = 8 << 20;
+    const groups = @max(1, @min(kg / sk, budget / (tiles * sk * 2048)));
+    const threads = tiles * sk + 2 * sk;
+    try e.runDep(e.fns.l2_warm, .{ (threads + 127) / 128, 1, 1 }, .{ 128, 1, 1 }, .{ q.w, q.s, q.b, @as(c_int, @intCast(tiles)), @as(c_int, @intCast(kg)), @as(c_int, @intCast(sk)), @as(c_int, @intCast(groups)), @as(c_int, @intCast(q.npad)) });
 }
 
 /// A bf16 decode attention launch with its two tile buffers of dynamic shared memory.
