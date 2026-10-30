@@ -217,6 +217,7 @@ pub const Engine = struct {
         e.features = 0;
         e.stream = try cuda.Stream.init(d, true);
         errdefer e.stream.deinit();
+        e.blocks = .empty; // the field's default does not apply: Allocation(Engine).create leaves the engine undefined
         var ck = try core.Checkpoint.openModel(gpa, io, dir);
         defer ck.close();
         // an EXL3 checkpoint's weights are sized by a dry run of its loader (trellis widths come from the tensors)
