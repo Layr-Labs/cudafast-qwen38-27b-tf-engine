@@ -407,7 +407,7 @@ pub const Draft = struct {
         if (limit > 0) {
             // the whole budget whenever drafts are asked: the block's forward costs the same at any depth
             const n = if (it.depth == 0) 0 else limit;
-            ctx.grown = tree.grow(d.candidates(rows), it.pending, rows, n, &ctx.held, &ctx.parents, &ctx.own);
+            ctx.grown = tree.grow(d.candidates(rows), it.pending, rows, n, &d.landing, it.sampling != null, &ctx.held, &ctx.parents, &ctx.own);
             ctx.held_n = ctx.grown;
         } else {
             d.select(ctx, it.pending, rows);
@@ -510,7 +510,11 @@ pub const Draft = struct {
         const ctx = d.streams.get(s) orelse return error.UnknownStream;
         if (ctx.grown == 0 or out.len > ctx.grown) return false;
         const sampled = s.sampling != null;
-        for (out, ctx.parents[0..out.len], ctx.own[0..out.len]) |*o, parent, own| o.* = d.landing.chance(sampled, own) * (if (parent >= 0) out[@intCast(parent)] else 1);
+        var depth: [engine.most_window]usize = undefined;
+        for (out, ctx.parents[0..out.len], ctx.own[0..out.len], 0..) |*o, parent, own, i| {
+            depth[i] = if (parent >= 0) depth[@intCast(parent)] + 1 else 0;
+            o.* = d.landing.chance(sampled, depth[i], own) * (if (parent >= 0) out[@intCast(parent)] else 1);
+        }
         return true;
     }
 
