@@ -128,7 +128,6 @@ fn residentMain(init: std.process.Init, args: ResidentArgs) !u8 {
         .drafter = request.drafter,
         .parallel = "1",
         .prompt_cache_gib = request.prompt_cache_gib,
-        .context = request.context,
     }, &problem) catch |err| {
         std.debug.print("bench-worker: engine open failed: {s}\n", .{@errorName(err)});
         return 1;

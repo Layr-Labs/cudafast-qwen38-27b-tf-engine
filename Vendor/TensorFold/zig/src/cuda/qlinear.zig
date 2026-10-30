@@ -237,6 +237,8 @@ pub const symbols = struct {
     pub const gemv = "_ZN12tf_lane_gemv11gemv_kernelILi64ELi64ELi8EEEvPK13__nv_bfloat16PKfNS_4PartEiii";
     pub const gemv_split = "tf_lane_gemv_split";
     pub const gemv_seg = "tf_lane_gemv_seg";
+    pub const gemv_many = "tf_lane_gemv_many";
+    pub const prefill_many = "tf_qmm_prefill_many";
     pub const pack_words = "tf_pack_dense";
     pub const pack_scales = "tf_transpose_pad16";
 };
@@ -252,9 +254,17 @@ pub const GemvPart = extern struct { w: u64, scales: u64, biases: u64, out: u64,
 pub const Seg = extern struct { p: GemvPart, first: c_int, work_at: c_int, tick_at: c_int, pad: c_int = 0 };
 pub const Segs = extern struct { s: [4]Seg, count: c_int };
 
+/// lane_gemv.cu's Many: up to four projections of one input, part i on blocks first[i] up to the next part's first.
+pub const Many = extern struct { p: [4]GemvPart, first: [4]c_int, count: c_int };
+
+/// qmm_prefill.cu's PromptPart and PromptParts: up to four prompt projections of one input, part i from block first.
+pub const PromptPart = extern struct { w: u64, scales: u64, biases: u64, out: u64, n: c_int, npad: c_int, first: c_int, pad: c_int = 0 };
+pub const PromptParts = extern struct { p: [4]PromptPart, count: c_int };
+
 comptime {
     std.debug.assert(@sizeOf(Part) == 56 and @sizeOf(Parts) == 232 and @sizeOf(GemvPart) == 48);
-    std.debug.assert(@sizeOf(Seg) == 64 and @sizeOf(Segs) == 264);
+    std.debug.assert(@sizeOf(Seg) == 64 and @sizeOf(Segs) == 264 and @sizeOf(Many) == 216);
+    std.debug.assert(@sizeOf(PromptPart) == 48 and @sizeOf(PromptParts) == 200);
 }
 
 pub const group_smem: u32 = 35328; // LaneTile<64, 16, 64, 1, 4, 8>::SMEM

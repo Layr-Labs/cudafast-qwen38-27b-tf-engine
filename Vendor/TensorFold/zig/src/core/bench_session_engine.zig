@@ -76,12 +76,6 @@ pub fn platformDflash(
     };
 }
 
-/// The track's serve configuration window (fixture serve_configuration.context_size): every bench phase's
-/// prompt and reply fit it, and a longer request is refused (ContextFull), never cut. A stream's caches are
-/// sized by it and allocated at each phase's first request, so the family's 32768-token default would cost
-/// a 2 GiB key and value allocation inside every timed phase.
-pub const resident_context: i64 = 8192;
-
 pub fn residentOpenRequest(dir: []const u8, model_type: []const u8, drafter: ?[]const u8) api.Open {
     return .{
         .dir = dir,
@@ -90,7 +84,6 @@ pub fn residentOpenRequest(dir: []const u8, model_type: []const u8, drafter: ?[]
         .lanes_fixed = true,
         .drafter = drafter,
         .prompt_cache_gib = 0,
-        .context = resident_context,
     };
 }
 
