@@ -58,12 +58,6 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_splice(__nv_bfloat16* _
     for (int i = threadIdx.x; i < D; i += blockDim.x) H[(size_t)blockIdx.x * D + i] = F[(size_t)s * D + i];
 }
 
-__device__ __forceinline__ void release_next() {
-#if __CUDA_ARCH__ >= 900
-    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
-#endif
-}
-
 // h = bf16(h + r) (r may be null), x = bf16(w * (h * inv)), XS (may be null) x's group sums; D 256k up to 8192.
 extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __restrict__ H, const __nv_bfloat16* __restrict__ R,
                                                                const __nv_bfloat16* __restrict__ W, __nv_bfloat16* __restrict__ X, float eps, int D,
@@ -71,7 +65,6 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __r
     constexpr int MAXE = 32;
     __shared__ float red[8];
     __shared__ __align__(16) __nv_bfloat16 xrow[8192];
-    release_next();
     if (past_rows(P, blockIdx.x)) return;
     const size_t row = blockIdx.x;
     const int t = threadIdx.x;
@@ -373,7 +366,6 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35_gdn_post(Geo geo, const 
                                                                    const int* __restrict__ P, float* __restrict__ XS) {
     __shared__ __align__(16) __nv_bfloat16 done[DK];  // the head's outputs, for XS's group sums (XS may be null)
     const int lane = threadIdx.x, hv = blockIdx.y;
-    release_next();
     if (past_rows(P, blockIdx.z)) return;
     const size_t m = blockIdx.z;
     const size_t W = (size_t)geo.nv * DK;
@@ -490,7 +482,6 @@ __device__ __forceinline__ void block_sums(__nv_bfloat16* done, size_t total, fl
 extern "C" __global__ void tf_q35_attn_gate(Geo geo, const __nv_bfloat16* __restrict__ Y, const __nv_bfloat16* __restrict__ QRAW,
                                               __nv_bfloat16* __restrict__ OUT, int rows, const int* __restrict__ P, float* __restrict__ XS) {
     __shared__ __align__(16) __nv_bfloat16 done[256];
-    release_next();
     const size_t W = (size_t)geo.qh * HD;
     if (P != nullptr) rows = P[2];
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;

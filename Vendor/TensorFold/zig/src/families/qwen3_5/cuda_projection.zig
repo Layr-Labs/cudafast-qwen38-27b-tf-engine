@@ -57,7 +57,7 @@ pub fn project(e: *Engine, l: Proj, x: u64, xs: u64, out: u64, rows: usize, prom
         .ql => unreachable,
     };
     if (prompt and rows > 16) return switch (l) {
-        .a4 => |q| e.affine.prompt(e.stream, x, q, out, rows),
+        .a4 => |q| e.prompt_many.prompt(e.stream, x, &.{.{ .q = q, .out = out }}, rows),
         .an => |q| e.wide.prompt(e.stream, x, q, out, rows),
         .ql => unreachable,
         .x3, .bf => unreachable,

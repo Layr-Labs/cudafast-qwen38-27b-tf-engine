@@ -103,6 +103,7 @@ pub const Engine = struct {
     int8: @import("cuda_prompt_int8.zig").State = .{}, // prompt projections with int8 activations, when on
     draws: cuda.sample.Draws,
     affine: cuda.qlinear.Affine4Kernels,
+    prompt_many: cuda.prompt_many.Kernels, // prompt GEMMs, several projections of one input a launch
     wide: cuda.qlinear.AffineNKernels, // the tiles of every width but 4, and their packs
     experts: cuda.experts.Affine4Experts,
     experts3: cuda.experts3.Affine3Experts,
@@ -235,9 +236,8 @@ pub const Engine = struct {
         const gb10 = major == 12 and minor == 1;
         e.affine = try cuda.qlinear.Affine4Kernels.resolve(d, e.mods[0], e.mods[1], e.mods[2], e.mods[3], sms, gb10);
         e.affine.half_prompt = !gb10; // the 27B's prompt tile (Tile<64, 128, 128, 2, 2, 2>), quicker on an RTX 5090
-        // GB10: split-K decode/verify projections on the cluster tile (bits unchanged); TF_CLUSTER_DECODE=0 restores lane_gemv
-        e.affine.cluster_decode = gb10 and !envOff("TF_CLUSTER_DECODE");
         errdefer e.affine.deinit();
+        e.prompt_many = try cuda.prompt_many.Kernels.resolve(e.mods[1]);
         // sm_120 too: a 32-row window of the 27B verifies in 17.8 ms on one weight pass, 22.3 ms on two 16-row ones
         if (major == 12 and minor == 0) e.affine.wide_verify = true;
         e.wide = try cuda.qlinear.AffineNKernels.resolve(d, e.mods[7], e.mods[8], e.mods[3], sms, gb10);
@@ -597,10 +597,4 @@ test "dense read cost: hidden and slot variants have distinct graph keys" {
             n += 1;
         }
     }
-}
-
-/// An engine A/B switch: true when `name` is set to "0".
-fn envOff(name: [*:0]const u8) bool {
-    const v = @import("sys").c.getenv(name) orelse return false;
-    return std.mem.eql(u8, std.mem.span(v), "0");
 }
