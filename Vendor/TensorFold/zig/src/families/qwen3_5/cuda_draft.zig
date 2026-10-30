@@ -101,6 +101,10 @@ pub const Draft = struct {
     /// The target's window ms by rows (cuda_native.zig times them), for the round loop's prices.
     costs: [engine.most_window]lanes.config.Cost = undefined,
     n_costs: usize = 0,
+    /// The frame bodies captured by shape (cuda_draft_frame.zig replay): one graph launch a DFlash frame.
+    frames: std.AutoHashMapUnmanaged(frame.Key, frame.Captured) = .empty,
+    /// The driver refused a frame capture: frames run their launches eagerly from then on.
+    frames_eager: bool = false,
 
     startup: profile.Times = .{},
     frame_streams: usize = 1,
@@ -175,6 +179,9 @@ pub const Draft = struct {
         d.streams.deinit(d.gpa);
         for (d.pool.items) |ctx| d.drop(ctx);
         d.pool.deinit(d.gpa);
+        var frames = d.frames.valueIterator();
+        while (frames.next()) |f| f.exec.deinit();
+        d.frames.deinit(d.gpa);
         d.staged.free();
         d.scratch.free();
         d.w.deinit(d.gpa);
