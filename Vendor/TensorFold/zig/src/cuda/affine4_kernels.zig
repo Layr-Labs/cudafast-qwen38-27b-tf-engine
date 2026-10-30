@@ -47,6 +47,7 @@ pub const Affine4Kernels = struct {
     split: ?Split, // every GPU but GB10: lane_gemv's slices on CTAs of their own (one stream's decode() at a time)
     pdl: bool, // GB10: the decode kernels launch with programmatic dependent launch
     wide_verify: bool, // off GB10: verify windows of 17 to 32 rows share one weight pass (sm_120, when its engine says)
+    cluster_decode: bool = false, // GB10: split-K projections of <= 16 rows on qmm_group's cluster tile, not lane_gemv (same slice order)
 
     /// From loaded qmm_group, qmm_prefill, lane_gemv and affine4_pack modules; GB10 decodes without the split form.
     pub fn resolve(d: *const Driver, group_mod: Module, prefill_mod: Module, gemv_mod: Module, pack_mod: Module, sms: usize, gb10: bool) !Affine4Kernels {
@@ -75,6 +76,7 @@ pub const Affine4Kernels = struct {
         a.gemv_blocks = @max(1, try a.gemv_fn.occupancy(128, group_smem)) * sms;
         a.pdl = gb10;
         a.wide_verify = false;
+        a.cluster_decode = false;
         a.split = if (gb10) null else try Split.initFor(d, segs_max);
         return a;
     }
@@ -108,6 +110,9 @@ pub const Affine4Kernels = struct {
         if (rows > max_rows) return error.WindowTooWide;
         const sk = splitK(q.n, q.k);
         if (sk > 1) if (a.split) |sp| return a.gemvSplit(s, x, xs, q, out, rows, sk, sp);
+        // lane_gemv runs min(tiles, resident) CTAs: an N = 5120 projection is 80 CTAs on GB10's 48 SMs; the cluster
+        // tile runs tiles * sk CTAs (320), each K slice summed in slice order over distributed shared memory
+        if (sk > 1 and a.cluster_decode) return a.cluster(s, x, xs, q, out, rows, sk);
         return if (sk > 1) a.gemv(s, x, xs, q, out, rows, sk) else a.cluster(s, x, xs, q, out, rows, sk);
     }
 
@@ -115,10 +120,44 @@ pub const Affine4Kernels = struct {
     pub fn decodeMany(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, outs: []const Out, rows: usize) !void {
         if (rows > max_rows) return error.WindowTooWide;
         const sp = a.split orelse {
+            if (a.cluster_decode and outs.len > 1) return a.clusterMany(s, x, xs, outs, rows);
             for (outs) |o| try a.decode(s, x, xs, o.q, o.out, rows);
             return;
         };
         return a.gemvSeg(s, x, xs, outs, rows, sp);
+    }
+
+    /// GB10: cluster() of each projection of one input in one qmm_group launch, clusters of the largest split's C
+    /// blocks; a part of split sk holds C / sk of its tiles a cluster, each tile's K slices summed in slice order.
+    fn clusterMany(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, outs: []const Out, rows: usize) !void {
+        if (outs.len == 0 or outs.len > segs_max) return error.TooManyParts;
+        const rows_t = (rows + 15) / 16;
+        var c: usize = 1;
+        for (outs) |o| c = @max(c, splitK(o.q.n, o.q.k));
+        var parts: Parts = std.mem.zeroes(Parts);
+        var clusters: usize = 0;
+        for (outs, 0..) |o, i| {
+            if (o.q.k != outs[0].q.k) return error.InputMismatch;
+            const tiles = (o.q.n + 63) / 64;
+            const sk = splitK(o.q.n, o.q.k);
+            const per = c / sk; // splits are powers of two up to 8: sk divides c
+            parts.p[i] = .{ .w = o.q.w, .scales = o.q.s, .biases = o.q.b, .out = o.out, .n = int(o.q.n), .npad = int(o.q.npad), .sk = int(sk), .tiles = int(tiles), .first = int(clusters) };
+            clusters += rows_t * ((tiles + per - 1) / per);
+        }
+        parts.count = int(outs.len);
+        var g: launch_.Args = .{};
+        g.add(x);
+        g.add(xs);
+        g.add(parts);
+        for ([_]usize{ rows, outs[0].q.k, outs[0].q.k, rows_t, c }) |v| g.add(int(v));
+        const cfg: launch_.Config = .{
+            .grid = .{ .x = u(clusters * c) },
+            .block = .{ .x = 128 },
+            .shared = group_smem,
+            .cluster = if (c > 1) .{ .x = u(c) } else null,
+            .pdl = a.pdl,
+        };
+        try launch_.launch(a.group_fn, cfg, s, &g);
     }
 
     /// One CTA a tile's K slice over every projection of `outs`, the split form's partials and tickets in `sp`.
