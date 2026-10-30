@@ -39,7 +39,6 @@ pub const nvfp4 = @import("nvfp4.zig");
 pub const segments = @import("segments.zig");
 pub const grouped = @import("grouped.zig");
 pub const qlinear = @import("qlinear.zig");
-pub const prompt_many = @import("prompt_many.zig");
 pub const w4a8 = @import("w4a8.zig");
 pub const norms = @import("norms.zig");
 pub const embed_rows = @import("embed_rows.zig");

@@ -97,7 +97,7 @@ fn opening(self: anytype, stream: *lanes.Stream) !Fill {
         return err;
     };
     errdefer if (self.seen.fetchRemove(stream)) |kv| self.gpa.free(kv.value);
-    const cache = try self.takeFor(ids.len, stream.max_new, stream.drafts);
+    const cache = try self.take(ids.len, stream.max_new);
     errdefer self.give(cache);
     // the stream's cache is found by a save at a mark (cuda_reuse.zig) while its pass runs
     try self.caches.put(self.gpa, stream, cache);

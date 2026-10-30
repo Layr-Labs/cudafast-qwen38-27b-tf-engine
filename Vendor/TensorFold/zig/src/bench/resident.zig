@@ -8,8 +8,6 @@ const protocol = @import("protocol.zig");
 const capabilities = [_][]const u8{"free_run_decode"};
 const spec_modes = [_][]const u8{ "serial", "dflash" };
 const handshake_timeout_ms: u32 = 2_000;
-/// How long a connected worker may stay quiet between requests (benchd's gates wait before timing a phase).
-const request_wait_ms: u32 = 30 * 60 * 1000;
 
 pub const Identity = struct {
     backend: []const u8,
@@ -98,9 +96,7 @@ fn serveClient(alloc: std.mem.Allocator, fd: std.posix.fd_t, session: bench.Benc
     try client.sendFrame(fd, response.bytes.items);
 
     while (true) {
-        // a phase's worker connects, then its host may hold the first request behind a quiescence or cool gate:
-        // wait that long for a request's first byte, and the usual timeout for the rest of it
-        const frame = (try client.receiveFrameWithTransferTimeout(alloc, fd, request_wait_ms, config.timeout_ms)) orelse return;
+        const frame = (try client.receiveFrameWithTimeout(alloc, fd, config.timeout_ms)) orelse return;
         defer alloc.free(frame);
         var reply = dispatch(alloc, session, frame) catch |err| {
             reportFailure(config.failure_writer, operationName(frame), @errorName(err));

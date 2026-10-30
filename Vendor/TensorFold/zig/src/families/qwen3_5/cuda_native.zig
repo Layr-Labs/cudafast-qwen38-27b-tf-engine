@@ -342,30 +342,9 @@ const Lanes = struct {
 
     /// A cache for a new stream: a pooled one reset, a pool lane with its pages, else one more window.
     pub fn take(self: *Lanes, prompt: usize, max_new: usize) !*E.Cache {
-        return self.takeFor(prompt, max_new, true);
-    }
-
-    /// `take` for a stream that drafts (`drafts`: its drafter reads the tap ring) or not. Without pages, a new
-    /// window holds the request's positions and one verify window more (the whole capacity at most): a phase's
-    /// caches are allocated inside its timing, and a one-token prompt pass needs no 8192-position keys and
-    /// values, nor a tap ring no drafter reads. A pooled window too small or without the ring is replaced.
-    pub fn takeFor(self: *Lanes, prompt: usize, max_new: usize, drafts: bool) !*E.Cache {
         if (self.pages != null)
             return takeFirstWindow(&self.first_window, !self.paged_only, self, prompt, max_new, takeWindow, takePages);
-        const need = std.math.add(usize, prompt, max_new) catch std.math.maxInt(usize);
-        const rows = if (need >= self.capacity) self.capacity else @min(self.capacity, std.mem.alignForward(usize, need + E.most_window, 256));
-        const taps = drafts and self.e.n_taps > 0;
-        if (self.pool.pop()) |cache| {
-            if (cache.cap >= rows and (cache.tap != null or !taps)) {
-                try cache.reset(self.e);
-                return cache;
-            }
-            self.drop(cache);
-        }
-        const cache = try self.gpa.create(E.Cache);
-        errdefer self.gpa.destroy(cache);
-        cache.* = try E.Cache.initFor(self.gpa, self.e, rows, taps);
-        return cache;
+        return self.takeWindow();
     }
 
     fn takeWindow(self: *Lanes) anyerror!*E.Cache {

@@ -188,13 +188,14 @@ __device__ __forceinline__ void gemv_store(const Part& P, int M, int n0, Got got
         }
 }
 
+// Column CTAs retain group_kernel chains and K-slice order.
 template <int GS, int BN, int STAGES>
-__device__ __forceinline__ void gemv_tiles(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs, const Part& P, int M,
-                                           int K, int ldx, int bid, int nb) {
+__global__ void __launch_bounds__(128) gemv_kernel(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
+                                                   const __grid_constant__ Part P, int M, int K, int ldx) {
     constexpr int NT = GemvTile<GS, BN, STAGES>::NT;
     const int KG = K / GS, per = KG / P.sk;
-    const int mine = P.tiles > bid ? (P.tiles - 1 - bid) / nb + 1 : 0;
-    auto tile_of_item = [&](int i) { return bid + (i / KG) * nb; };
+    const int mine = P.tiles > (int)blockIdx.x ? (P.tiles - 1 - (int)blockIdx.x) / (int)gridDim.x + 1 : 0;
+    auto tile_of_item = [&](int i) { return (int)blockIdx.x + (i / KG) * (int)gridDim.x; };
     float acc[NT][4], tot[NT][4];
 #pragma unroll
     for (int j = 0; j < NT; ++j)
@@ -218,20 +219,6 @@ __device__ __forceinline__ void gemv_tiles(const __nv_bfloat16* __restrict__ x, 
                                    });
                                });
 }
-
-template <int GS, int BN, int STAGES>
-__global__ void __launch_bounds__(128) gemv_kernel(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
-                                                   const __grid_constant__ Part P, int M, int K, int ldx) {
-    gemv_tiles<GS, BN, STAGES>(x, xs, P, M, K, ldx, (int)blockIdx.x, (int)gridDim.x);
-}
-
-constexpr int MANY = 4;
-
-struct Many {
-    Part p[MANY];
-    int first[MANY];
-    int count;
-};
 
 // Each CTA writes one tile/slice partial; the tile's last CTA sums slices in their original order.
 template <int GS, int BN, int STAGES, bool ONE = false>
@@ -320,18 +307,4 @@ extern "C" __global__ void __launch_bounds__(128) tf_lane_gemv_seg(const __nv_bf
     const int b = (int)blockIdx.x - sg.first;
     tf_lane_gemv::gemv_split<64, 64, 4, true>(x, xs, sg.p, M, K, ldx, work + static_cast<size_t>(sg.work_at) * 16 * 64,
                                               tickets + sg.tick_at, b / sg.p.sk, b % sg.p.sk);
-}
-
-extern "C" __global__ void __launch_bounds__(128) tf_lane_gemv_many(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
-                                                                    const __grid_constant__ tf_lane_gemv::Many S, int M, int K, int ldx) {
-    tf_lane_gemv::Part P = S.p[0];
-    int first = 0, end = S.count > 1 ? S.first[1] : (int)gridDim.x;
-#pragma unroll
-    for (int i = 1; i < tf_lane_gemv::MANY; ++i)
-        if (i < S.count && (int)blockIdx.x >= S.first[i]) {
-            P = S.p[i];
-            first = S.first[i];
-            end = i + 1 < S.count ? S.first[i + 1] : (int)gridDim.x;
-        }
-    tf_lane_gemv::gemv_tiles<64, 64, 8>(x, xs, P, M, K, ldx, (int)blockIdx.x - first, end - first);
 }

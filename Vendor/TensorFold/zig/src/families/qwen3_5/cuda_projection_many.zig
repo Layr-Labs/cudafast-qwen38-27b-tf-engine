@@ -6,20 +6,8 @@ const Proj = engine.Proj;
 
 pub fn projectMany(e: *Engine, ls: []const Proj, x: u64, xs: u64, outs: []const u64, rows: usize, prompt: bool, params: u64, sums: bool) !void {
     if (ls.len == 0 or ls.len != outs.len) return error.UnexpectedTensor;
-    // a prompt chunk's projections of one input in one launch, each with the single prompt GEMM's bits
-    const P = cuda.prompt_many;
-    const grouped = prompt and rows > 16 and !e.int8.on and ls.len <= P.parts_max and for (ls) |l| {
-        if (l != .a4 or l.inputs() != ls[0].inputs()) break false;
-    } else true;
-    if (grouped) {
-        var parts: [P.parts_max]P.Out = undefined;
-        for (ls, outs, parts[0..ls.len]) |l, out, *m| m.* = .{ .q = l.a4, .out = out };
-        return e.prompt_many.prompt(e.stream, x, parts[0..ls.len], rows);
-    }
     const A = cuda.qlinear.Affine4Kernels;
-    // GB10 has no split form: a decode or verify window of one row tile groups its projections by kernel instead
-    const by_kernel = e.affine.split != null or (!prompt and rows <= A.max_rows);
-    const segmented = by_kernel and !(prompt and rows > 16) and ls.len <= A.segs_max and for (ls) |l| {
+    const segmented = e.affine.split != null and !(prompt and rows > 16) and ls.len <= A.segs_max and for (ls) |l| {
         if (l != .a4 or l.inputs() != ls[0].inputs()) break false;
     } else true;
     if (!segmented) {

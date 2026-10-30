@@ -96,11 +96,6 @@ pub const Cache = struct {
     last: ?struct { start: usize, rows: usize } = null,
     /// An image prompt's rotary shift (get_rope_index's rope_delta): rows after its prompt rotate at position + delta.
     pub fn init(gpa: std.mem.Allocator, e: *Engine, cap: usize) !Cache {
-        return initFor(gpa, e, cap, true);
-    }
-
-    /// `init`, with the drafter's tap ring only when `taps` (a stream that drafts; the forwards skip a missing ring).
-    pub fn initFor(gpa: std.mem.Allocator, e: *Engine, cap: usize, taps: bool) !Cache {
         const test_pages = try pageTest();
         const rows = try cacheRows(cap, test_pages);
         var kv = try DeviceBuffer.alloc(e.d, try std.math.mul(usize, e.g.kvBytes(1, e.kv8), rows));
@@ -119,7 +114,7 @@ pub const Cache = struct {
             errdefer table.free();
             paged = .{ .base = kv.ptr, .table = table, .ids = ids, .tokens = test_pages };
         }
-        var out = try fixed(gpa, e, cap, kv, paged, taps);
+        var out = try fixed(gpa, e, cap, kv, paged);
         own = false;
         errdefer out.deinit(gpa);
         errdefer cuda.completion.drain(e.d, e.stream, "qwen3_5: failed cache initialization did not drain");
@@ -176,7 +171,7 @@ pub const Cache = struct {
     }
 
     /// The parts every cache holds itself beside `kv` and `paged` (the caller's to free on failure).
-    fn fixed(gpa: std.mem.Allocator, e: *Engine, cap: usize, kv: DeviceBuffer, paged: ?Paged, taps: bool) !Cache {
+    fn fixed(gpa: std.mem.Allocator, e: *Engine, cap: usize, kv: DeviceBuffer, paged: ?Paged) !Cache {
         var state = try DeviceBuffer.alloc(e.d, e.g.stateBytes());
         errdefer state.free();
         const adaptive = recurrent.enabled(e);
@@ -188,7 +183,7 @@ pub const Cache = struct {
         errdefer log.free();
         var tap: ?DeviceBuffer = null;
         errdefer if (tap) |*t| t.free();
-        if (e.n_taps > 0 and taps) {
+        if (e.n_taps > 0) {
             tap = try DeviceBuffer.alloc(e.d, e.tapBytes());
         }
         const logits = try gpa.alloc(u16, e.g.vocab);
