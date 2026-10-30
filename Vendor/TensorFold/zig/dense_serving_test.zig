@@ -10,14 +10,14 @@ test "dense serving: owned CUDA images retain their reviewed lane and decode byt
     try std.testing.expectEqualStrings("f195f5678edf7d3267ec30e442b1e0048543006e595ad21801afd905df621baf", &hash(@embedFile("kernels/cuda/experts_pack.cu")));
     try std.testing.expectEqualStrings("db560d705729142c66df8dee18fc635f20f09e4f09b8431de265bd6fac68e892", &hash(@embedFile("kernels/cuda/experts_prefill.cu")));
     try std.testing.expectEqualStrings("a6bf09198ffd685f7392d4d433af9739c91d67f7039309d3fd5fe6785f810ab9", &hash(@embedFile("kernels/cuda/gdn.cu")));
-    try std.testing.expectEqualStrings("895afd1d40d3f9a0485dcf4a21a7b0605e8f663c5b895b4d4c32573d05780211", &hash(@embedFile("kernels/cuda/lane_gemv.cu")));
-    try std.testing.expectEqualStrings("feb6dfc9de6d051be1ad89e2b6f261ab9a00cdabe792f481921b2b1c18e770a6", &hash(@embedFile("kernels/cuda/prefill_attention.cu")));
+    try std.testing.expectEqualStrings("3ef6b19741b8d915a9c5ff1442d6621e07b1d11516be71c88725051de331ece6", &hash(@embedFile("kernels/cuda/lane_gemv.cu")));
+    try std.testing.expectEqualStrings("80a0d488160c6d726f0a0fdc31260f01152ab2dafafccac27b261bfb950274de", &hash(@embedFile("kernels/cuda/prefill_attention.cu")));
     const group = @embedFile("kernels/cuda/qmm_group.cu");
     try std.testing.expectEqualStrings("3b27b8e964f6e7453e962cd7a259253ae7e1940297439b4b518f05da04dd1041", &hash(group[0..16132]));
     try std.testing.expectEqualStrings("25172d5cd98fe2768a216183336f7eb9c23a66b0a56cfff77b9825ef66a481a6", &hash(group));
-    try std.testing.expectEqualStrings("2e4f98ea301a4d87639c55b93c37577a9fd7f3cda0cbae055c7ba4958f019bfd", &hash(@embedFile("kernels/cuda/qmm_prefill.cu")));
-    try std.testing.expectEqualStrings("d819201c5d3e8b57e985b88bb8ca3666fdace02b9b5e7382b419ae80e5ca5126", &hash(@embedFile("kernels/cuda/qwen35.cu")));
-    try std.testing.expectEqualStrings("3d01151641d7cb710d8b7a8e2f7a5ac6b6a6b07c2a95b448122fb7d7a7564de8", &hash(@embedFile("kernels/cuda/qwen35.cuh")));
+    try std.testing.expectEqualStrings("c30a5fa4ad442216fe9b274f15538a41c89d8db09a958fcce2494709d31107e5", &hash(@embedFile("kernels/cuda/qmm_prefill.cu")));
+    try std.testing.expectEqualStrings("73ed06737ccc26183d706e309ef3ad19902d441aeb665be8026c1ddb558f5810", &hash(@embedFile("kernels/cuda/qwen35.cu")));
+    try std.testing.expectEqualStrings("e6a57b7545249e0bcdda36c677792456ed76d0a35aa3cd88d43601b38061fd3d", &hash(@embedFile("kernels/cuda/qwen35.cuh")));
     try std.testing.expectEqualStrings("60ffcb12aaf8155d8b82274299a0e21cb007d06e540c47cfeaeb6de2e69a6317", &hash(@embedFile("kernels/cuda/qwen35_draft.cu")));
     try std.testing.expectEqualStrings("4f14d7ce48fec892a4bb6d5724619ae6d495a6bb50f81d4a3bccc7a3d578dd9a", &hash(@embedFile("kernels/cuda/qwen35_keep.cu")));
     try std.testing.expectEqualStrings("d1a379a98cf7504a7ed3b3f2d24c8ab6a39fe5511bcded6449e598ce5c3c79e7", &hash(@embedFile("kernels/cuda/scan_rows.cu")));
@@ -39,5 +39,5 @@ test "dense serving: owned launches and projections retain their reviewed argume
             try out.append(std.testing.allocator, c);
         };
     }
-    try std.testing.expectEqualStrings("b2ed0c08dd1c3c01cbd9eabdc85a977dd26871b0ee64a0d484c40fc8d2941baf", &hash(out.items));
+    try std.testing.expectEqualStrings("886a1558a43fdf7682fe0b2ad88e685592456b0b25e29ae33a98fa886c351b2e", &hash(out.items));
 }
