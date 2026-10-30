@@ -18,6 +18,7 @@ pub const recurrent = @import("cuda_recurrent.zig");
 pub const Geometry = geometry.Geometry;
 pub const Cache = caches.Cache;
 pub const tap_rows = caches.tap_rows;
+pub const tap_held = caches.tap_held;
 const Seg = caches.Seg;
 const DeviceBuffer = cuda.DeviceBuffer;
 const head_dim = geometry.head_dim;
@@ -96,6 +97,7 @@ pub const Engine = struct {
     g: Geometry,
     geo: Geo,
     stream: cuda.Stream,
+    blocks: std.ArrayListUnmanaged(cuda.DeviceBuffer) = .empty, // closed streams' device blocks (cuda_cache.zig take/give)
     mods: [19]cuda.Module,
     kv8: bool, // attention caches as e4m3 rows with a scale each
     fp8: Kv8,
@@ -309,6 +311,9 @@ pub const Engine = struct {
         e.arena.free();
         e.gpa.free(e.layers);
         e.gpa.free(e.dir);
+        for (e.blocks.items) |*b| b.free();
+        e.blocks.deinit(e.gpa);
+        @import("cuda_cache.zig").forget(e);
         e.affine.deinit();
         e.wide.deinit();
         e.int8.deinit();
@@ -389,6 +394,15 @@ pub const Engine = struct {
         try cuda.launch.launch(f, cfg, e.stream, &a);
     }
 
+    /// `run` with programmatic dependent launch on GB10, for glue kernels that open with griddepcontrol.wait
+    /// (qwen35.cu's await_prior): the launch overlaps the preceding kernel's tail, which triggers early.
+    pub fn runAfter(e: *Engine, f: cuda.Function, grid: [3]usize, block: [3]usize, args: anytype) !void {
+        var a: cuda.Args = .{};
+        inline for (args) |v| a.add(v);
+        const cfg: cuda.Config = .{ .grid = .{ .x = @intCast(grid[0]), .y = @intCast(grid[1]), .z = @intCast(grid[2]) }, .block = .{ .x = @intCast(block[0]), .y = @intCast(block[1]), .z = @intCast(block[2]) }, .pdl = glue_pdl and e.affine.pdl };
+        try cuda.launch.launch(f, cfg, e.stream, &a);
+    }
+
     /// The projections: the row tiles, the prompt GEMM and the grouped form, in their own file.
     pub const proj = @import("cuda_projection.zig").proj;
     pub const projSums = @import("cuda_projection.zig").projSums;
@@ -417,7 +431,7 @@ pub const Engine = struct {
     }
 
     pub fn norm(e: *Engine, residual: bool, w: u64, rows: usize) !void {
-        try e.run(e.fns.norm, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, if (residual) e.r else @as(u64, 0), w, e.x, e.g.eps, @as(c_int, @intCast(e.g.hidden)), e.tables.ptr + params_at, e.xs });
+        try e.runAfter(e.fns.norm, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, if (residual) e.r else @as(u64, 0), w, e.x, e.g.eps, @as(c_int, @intCast(e.g.hidden)), e.tables.ptr + params_at, e.xs });
     }
 
     /// Refuse the whole frame before settling any prior window or launching work.
@@ -574,7 +588,7 @@ pub const Engine = struct {
         const input = e.tables.ptr + @as(usize, if (record) Round.steps_at else rowpar_at);
         // qwen35_slots.cuh: up to four slots scan two value rows a warp, so a block covers eight
         const rows_a_warp: usize = if (record and slot_count <= 4) 2 else 1;
-        try e.run(scan, .{ 1, geometry.dk / (4 * rows_a_warp), e.g.v_heads * segments }, .{ 32, 4, 1 }, .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, input, layer, e.y, e.tables.ptr + params_at });
+        try e.runAfter(scan, .{ 1, geometry.dk / (4 * rows_a_warp), e.g.v_heads * segments }, .{ 32, 4, 1 }, .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, input, layer, e.y, e.tables.ptr + params_at });
     }
 
     /// The launches of a forward of `shape`, from the embedding to the kept rows' logits (captured once a shape).
@@ -606,3 +620,7 @@ fn envOff(name: [*:0]const u8) bool {
     const v = @import("sys").c.getenv(name) orelse return false;
     return std.mem.eql(u8, std.mem.span(v), "0");
 }
+
+/// Compile-time switch: decode glue kernels (norm, GDN pre/conv/scan/post, head norms, rope, attention, gate, mlp_act)
+/// launched with PDL on GB10, each opening with griddepcontrol.wait; false restores plain stream-ordered launches.
+pub const glue_pdl = true;

@@ -10,6 +10,15 @@ constexpr int HD = 128;  // the drafter's head width (q, k, v)
 __device__ __forceinline__ float bf(__nv_bfloat16 x) { return __bfloat162float(x); }
 __device__ __forceinline__ float rbf(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
 
+// Programmatic dependent launch (GB10's frame launches, cuda_draft_frame.zig): let the next grid launch early, then
+// wait for the previous grid's completion and memory before any global access, so the bits are plain launches'.
+__device__ __forceinline__ void after_prior() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
+}
+
 __device__ __forceinline__ float warp_sum(float x) {
 #pragma unroll
     for (int m = 16; m; m >>= 1) x += __shfl_xor_sync(0xffffffffu, x, m);
