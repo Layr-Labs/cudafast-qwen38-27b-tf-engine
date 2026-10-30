@@ -58,7 +58,8 @@ pub fn probe(e: anytype, p: anytype) ?u32 {
     const most: u32 = @intCast(@min(p.count() + 1, e.cfg.batch_rows));
     var retry: ?u32 = null;
     var earliest: u64 = std.math.maxInt(u64);
-    var rows: u32 = 1;
+    if (most < e.cfg.lone_cost_min_rows) return null;
+    var rows: u32 = e.cfg.lone_cost_min_rows;
     while (true) {
         if (rows < s.cost_probes.len) {
             const cd = s.cost_probes[rows];
