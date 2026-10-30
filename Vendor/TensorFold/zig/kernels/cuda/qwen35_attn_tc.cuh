@@ -137,48 +137,12 @@ struct Bf16Tiles {
     __device__ float key_scale(int) const { return 1.0f; }
 };
 
-// bf16 rows in one buffer (half bf16's two): the next tile is copied once this one's values are read, so two
-// blocks fit an SM where the two-buffer form holds it alone. The tiles' bytes are the same either way.
-template <int THREADS>
-struct Bf16Tiles1 {
-    static constexpr bool single = true;
-    static constexpr int TILE = TK * CH;
-    TileStore s;
-    const __nv_bfloat16 *K, *V;
-    __device__ Bf16Tiles1(TileStore store, const Seg& sg, int layer, int kvh) : s(store) {
-        K = reinterpret_cast<const __nv_bfloat16*>(sg.kv) + (size_t)layer * 2 * kvh * sg.cap * HD;
-        V = K + (size_t)kvh * sg.cap * HD;
-    }
-    template <class Row>
-    __device__ void fetch(int t0, Row row) {
-#pragma unroll
-        for (int i = 0; i < TILE / THREADS; i++) {
-            const int at = threadIdx.x + THREADS * i, u = at / CH, chunk = at % CH;
-            const int r = row(t0 + u);
-            const size_t from = (size_t)(r < 0 ? 0 : r) * HD + chunk * 8;
-            qmm_frag::cp16z(s.kt + swz(u, chunk), K + from, r >= 0);
-            qmm_frag::cp16z(s.kt + TILE + swz(u, chunk), V + from, r >= 0);
-        }
-        qmm_frag::commit();
-    }
-    __device__ void put(bool) { qmm_frag::wait<0>(); }
-    __device__ const uint4* keys() const { return s.kt; }
-    __device__ const uint4* values() const { return s.kt + TILE; }
-    __device__ float kscale(int) const { return 1.0f; }
-    __device__ float vscale(int) const { return 1.0f; }
-    __device__ float key_scale(int) const { return 1.0f; }
-};
-
-// Whether a tile store has one buffer (its next tile fetched after a tile's values are read).
-template <class T, class = void> struct one_buffer { static constexpr bool value = false; };
-template <class T> struct one_buffer<T, decltype((void)T::single)> { static constexpr bool value = T::single; };
-
 // A short stream's rows, a block a (row, chunk, key head) of 128 threads; a 32-key tile a softmax step.
 template <class Tiles>
 __device__ __forceinline__ void attn_one(TileStore store, Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
                                          const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
                                          const int* __restrict__ P, float scale,
-                                         float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO, int c) {
+                                         float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
     __shared__ __align__(16) uint4 qs[16 * CH];
     __shared__ float st[16][TK + 1];                       // a tile's scores
     __shared__ __align__(16) __nv_bfloat16 pt[16][TK + 8];  // its weights times the values' scales (80-byte rows)
@@ -186,7 +150,7 @@ __device__ __forceinline__ void attn_one(TileStore store, Geo geo, const __nv_bf
     const int QH = geo.qh, KVH = geo.kvh, G = QH / KVH;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, qd = lane & 3;
     const size_t m = blockIdx.x;
-    const int h = blockIdx.z;
+    const int c = blockIdx.y, h = blockIdx.z;
     if (c >= MAXCH || past_rows(P, (int)m)) return;
     const Seg sg = segs[rowseg[m]];
     if (sg.len >= GROUP_LEN) return;  // a long stream's rows: attn_rows
@@ -226,7 +190,7 @@ __device__ __forceinline__ void attn_one(TileStore store, Geo geo, const __nv_bf
         __syncthreads();
         tiles.put(true);
         __syncthreads();
-        if (!one_buffer<Tiles>::value && t0 + TK < k1) tiles.fetch(t0 + TK, rowof);
+        if (t0 + TK < k1) tiles.fetch(t0 + TK, rowof);
         const uint4* kt = tiles.keys();
         const uint4* vt = tiles.values();
         {  // scores: warp w the tile's keys 8 w on, every line
@@ -297,10 +261,6 @@ __device__ __forceinline__ void attn_one(TileStore store, Geo geo, const __nv_bf
                 }
             }
         }
-        if (one_buffer<Tiles>::value && t0 + TK < k1) {
-            __syncthreads();
-            tiles.fetch(t0 + TK, rowof);
-        }
     }
     if (part8 == 0 && line < G) {
         PM[base + line * MAXCH] = mx;
@@ -319,7 +279,7 @@ template <int MT, class Tiles>
 __device__ __forceinline__ void attn_rows(TileStore store, Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
                                                                       const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
                                                                       const int* __restrict__ P, float scale, int total,
-                                                                      float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO, int c) {
+                                                                      float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
     constexpr int LINES = 16 * MT, WARPS = 2 * MT, NT = HD / 8 / WARPS;
     __shared__ __align__(16) __nv_bfloat16 pt[LINES][TK + 8];
     __shared__ float red[2][LINES], alpha[LINES];
@@ -327,7 +287,7 @@ __device__ __forceinline__ void attn_rows(TileStore store, Geo geo, const __nv_b
     __shared__ Ancestor r_anc[32];
     const int QH = geo.qh, KVH = geo.kvh, G = QH / KVH, RB = LINES / G;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, qd = lane & 3;
-    const int h = blockIdx.z, m0 = blockIdx.x * RB;
+    const int c = blockIdx.y, h = blockIdx.z, m0 = blockIdx.x * RB;
     if (c >= MAXCH) return;
     // the group's rows of long streams (a short stream's rows are attn_one's)
     if (tid < RB) {
