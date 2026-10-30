@@ -18,6 +18,7 @@ pub const recurrent = @import("cuda_recurrent.zig");
 pub const Geometry = geometry.Geometry;
 pub const Cache = caches.Cache;
 pub const tap_rows = caches.tap_rows;
+pub const tap_held = caches.tap_held;
 const Seg = caches.Seg;
 const DeviceBuffer = cuda.DeviceBuffer;
 const head_dim = geometry.head_dim;
@@ -240,7 +241,7 @@ pub const Engine = struct {
         // GB10: split-K decode/verify projections on the cluster tile (bits unchanged); TF_CLUSTER_DECODE=0 restores lane_gemv
         e.affine.cluster_decode = gb10 and !envOff("TF_CLUSTER_DECODE");
         errdefer e.affine.deinit();
-        e.prompt_many = try cuda.prompt_many.Kernels.resolve(e.mods[1]);
+        e.prompt_many = try cuda.prompt_many.Kernels.resolve(e.mods[1], sms);
         // sm_120 too: a 32-row window of the 27B verifies in 17.8 ms on one weight pass, 22.3 ms on two 16-row ones
         if (major == 12 and minor == 0) e.affine.wide_verify = true;
         e.wide = try cuda.qlinear.AffineNKernels.resolve(d, e.mods[7], e.mods[8], e.mods[3], sms, gb10);

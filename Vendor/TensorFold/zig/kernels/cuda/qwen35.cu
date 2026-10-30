@@ -400,14 +400,12 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35_gdn_post(Geo geo, const 
     if (lane < DK / 64) XS[m * (W / 64) + hv * (DK / 64) + lane] = group_sum(done + lane * 64);
 }
 
-// Per-head RMSNorm of attention rows, out packed (rows, heads, HD); grid (rows * heads), 64 threads of 4 values.
-extern "C" __global__ void __launch_bounds__(64) tf_q35_head_norm(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W,
-                                                                    __nv_bfloat16* __restrict__ OUT, int heads, int stride, int hstride, float eps,
-                                                                    const int* __restrict__ P) {
-    __shared__ float sums[2];
-    const int head = blockIdx.x % heads;
-    if (past_rows(P, blockIdx.x / heads)) return;
-    const size_t m = blockIdx.x / heads;
+__device__ __forceinline__ void head_norm_block(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W,
+                                                __nv_bfloat16* __restrict__ OUT, int heads, int stride, int hstride, float eps,
+                                                const int* __restrict__ P, unsigned b, float* sums) {
+    const int head = b % heads;
+    if (past_rows(P, b / heads)) return;
+    const size_t m = b / heads;
     const int t = threadIdx.x;
     const __nv_bfloat16* x = X + m * stride + head * hstride;
     float v[4], acc = 0.0f;
@@ -425,6 +423,24 @@ extern "C" __global__ void __launch_bounds__(64) tf_q35_head_norm(const __nv_bfl
         const int d = 4 * t + i;
         OUT[(m * heads + head) * HD + d] = __float2bfloat16_rn(bf(W[d]) * (v[i] * inv));
     }
+}
+
+// Per-head RMSNorm of attention rows, out packed (rows, heads, HD); grid (rows * heads), 64 threads of 4 values.
+extern "C" __global__ void __launch_bounds__(64) tf_q35_head_norm(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W,
+                                                                    __nv_bfloat16* __restrict__ OUT, int heads, int stride, int hstride, float eps,
+                                                                    const int* __restrict__ P) {
+    __shared__ float sums[2];
+    head_norm_block(X, W, OUT, heads, stride, hstride, eps, P, blockIdx.x, sums);
+}
+
+extern "C" __global__ void __launch_bounds__(64) tf_q35_head_norm_qk(const __nv_bfloat16* __restrict__ XQ, const __nv_bfloat16* __restrict__ WQ,
+                                                                       __nv_bfloat16* __restrict__ OUTQ, int qheads, int qstride, int qhstride,
+                                                                       const __nv_bfloat16* __restrict__ XK, const __nv_bfloat16* __restrict__ WK,
+                                                                       __nv_bfloat16* __restrict__ OUTK, int kheads, int kstride, int khstride,
+                                                                       float eps, const int* __restrict__ P, int qblocks) {
+    __shared__ float sums[2];
+    if ((int)blockIdx.x < qblocks) head_norm_block(XQ, WQ, OUTQ, qheads, qstride, qhstride, eps, P, blockIdx.x, sums);
+    else head_norm_block(XK, WK, OUTK, kheads, kstride, khstride, eps, P, blockIdx.x - (unsigned)qblocks, sums);
 }
 
 // A key and value as bf16 rows in their cache slot (qwen35.cu's layout: a layer's keys then values, kvh blocks of cap).
@@ -502,6 +518,50 @@ extern "C" __global__ void tf_q35_attn_gate(Geo geo, const __nv_bfloat16* __rest
         OUT[i] = done[threadIdx.x] = __float2bfloat16_rn(bf(Y[i]) * s);
     }
     block_sums(done, (size_t)rows * W, XS);
+}
+
+extern "C" __global__ void __launch_bounds__(32) tf_q35_attn_merge_gate(Geo geo, const float* __restrict__ PM, const float* __restrict__ PL,
+                                                                          const float* __restrict__ PO, const Seg* __restrict__ segs,
+                                                                          const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc,
+                                                                          const int* __restrict__ P, __nv_bfloat16* __restrict__ Y,
+                                                                          const __nv_bfloat16* __restrict__ QRAW, __nv_bfloat16* __restrict__ OUT,
+                                                                          float* __restrict__ XS) {
+    release_next();
+    __shared__ __align__(16) __nv_bfloat16 done[HD];
+    constexpr int DPL = HD / 32;
+    const int QH = geo.qh;
+    const int lane = threadIdx.x, qh = blockIdx.x;
+    if (past_rows(P, blockIdx.y)) return;
+    const size_t m = blockIdx.y;
+    const int keys = segs[rowseg[m]].len + rows_seen(rowanc[m]);
+    const int ck = chunk_keys(keys), nch = (keys + ck - 1) / ck;
+    const size_t base = (m * QH + qh) * MAXCH;
+    float mx = -INFINITY;
+    for (int c = 0; c < nch; c++)
+        if (PL[base + c] > 0.0f) mx = fmaxf(mx, PM[base + c]);
+    float lsum = 0.0f, acc[DPL];
+#pragma unroll
+    for (int i = 0; i < DPL; i++) acc[i] = 0.0f;
+    for (int c = 0; c < nch; c++) {
+        if (!(PL[base + c] > 0.0f)) continue;
+        const float e = __expf(PM[base + c] - mx);
+        lsum = fmaf(PL[base + c], e, lsum);
+#pragma unroll
+        for (int i = 0; i < DPL; i++) acc[i] = fmaf(PO[(base + c) * HD + lane * DPL + i], e, acc[i]);
+    }
+    const size_t W = (size_t)QH * HD, row = (m * QH + qh) * HD;
+#pragma unroll
+    for (int i = 0; i < DPL; i++) {
+        const int d = lane * DPL + i;
+        const __nv_bfloat16 y = __float2bfloat16_rn(acc[i] / lsum);
+        Y[row + d] = y;
+        const float gate = bf(QRAW[m * 2 * W + qh * 2 * HD + HD + d]);
+        const float s = rbf(1.0f / (1.0f + expf(-gate)));
+        OUT[row + d] = done[d] = __float2bfloat16_rn(bf(y) * s);
+    }
+    if (XS == nullptr) return;
+    __syncwarp();
+    if (lane < HD / 64) XS[row / 64 + lane] = group_sum(done + lane * 64);
 }
 
 #include "qwen35_rows.cuh"

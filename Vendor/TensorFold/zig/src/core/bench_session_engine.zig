@@ -82,6 +82,12 @@ pub fn platformDflash(
 /// a 2 GiB key and value allocation inside every timed phase.
 pub const resident_context: i64 = 8192;
 
+/// A free-run stream's reply room: its seed token and one run of at most bench/resident_client.zig's
+/// max_free_count (1536) tokens, the most a worker passes (a larger run is refused before it reaches the
+/// engine, and `round` refuses past this room with ContextFull). The stream's caches are sized by its prompt
+/// and this room (cuda_native.zig takeFor), allocated inside the timed seed, not by the whole context.
+pub const free_run_room: u32 = 1536 + 1;
+
 pub fn residentOpenRequest(dir: []const u8, model_type: []const u8, drafter: ?[]const u8) api.Open {
     return .{
         .dir = dir,
@@ -135,7 +141,7 @@ pub const EngineDflashBinding = struct {
         h.core.bench_stream = try Stream.init(binding.allocator, .{
             .id = "bench",
             .prompt = tokens,
-            .max_new = context - @as(u32, @intCast(tokens.len)),
+            .max_new = @min(context - @as(u32, @intCast(tokens.len)), free_run_room),
             .drafts = true,
         });
         binding.owned = true;
