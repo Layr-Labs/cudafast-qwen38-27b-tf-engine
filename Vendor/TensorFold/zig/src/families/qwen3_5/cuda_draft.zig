@@ -14,8 +14,8 @@ const DeviceBuffer = cuda.DeviceBuffer;
 const dr = lanes.drafter;
 const Stream = lanes.Stream;
 
-/// Rows an absorb runs at once (the target's prompt chunks are at most this).
-const max_rows = engine.most_verify; // taps absorbed at most this many rows a call (a prompt chunk's in pieces)
+/// Rows an absorb runs at once: a track prompt (496 rows) in one piece, so its fc and k/v prompt GEMMs fill the GPU.
+const max_rows = 512; // taps absorbed at most this many rows a call (a longer prompt chunk's in pieces)
 /// The logprob row's words (sample.cu's LP_WORDS) and its best-token capacity.
 const lp_words = 3 + 2 * 20;
 /// A hold's rows: the reference's 16-row blocks (dflash2.block), past the 8 the checkpoint was trained with.
@@ -92,6 +92,8 @@ pub const Draft = struct {
     ids: u64, // u32 the block's ids
     staged: cuda.HostBuffer, // pinned: the ids up, the words and projected rows down
     streams: std.AutoHashMapUnmanaged(*Stream, *Ctx) = .empty,
+    /// Captured frames (cuda_draft_frame.zig run): each key's graph, or null where capture failed, and its span output.
+    graphs: std.AutoHashMapUnmanaged(u64, struct { exec: ?cuda.graph.Exec, spanned: ?u64 }) = .empty,
     /// Contexts between streams, allocated and run once (`reserve`), as the driver stalls a buffer's first kernel.
     pool: std.ArrayList(*Ctx) = .empty,
     /// Grown trees' nodes offered and landed, by own chance: the nodes' chances the round loop prices.
@@ -170,6 +172,9 @@ pub const Draft = struct {
     }
 
     pub fn deinit(d: *Draft) void {
+        var gs = d.graphs.valueIterator();
+        while (gs.next()) |g| if (g.exec) |*x| x.deinit();
+        d.graphs.deinit(d.gpa);
         var it = d.streams.valueIterator();
         while (it.next()) |ctx| d.drop(ctx.*);
         d.streams.deinit(d.gpa);
@@ -200,8 +205,8 @@ pub const Draft = struct {
         const B = c.block * d.frame_streams;
         const R = @max(max_rows, B);
         const sizes = .{
-            .{ "taps_in", try bytes(.{ R, c.n_taps, c.hidden, 2 }) },                 .{ "th", try bytes(.{ R, c.hidden, 2 }) },              .{ "thn", try bytes(.{ R, c.hidden, 2 }) },                         .{ "kabs", try bytes(.{ R, c.kvWidth(), 2 }) },
-            .{ "kn", try bytes(.{ R, c.kvWidth(), 2 }) },                             .{ "vabs", try bytes(.{ R, c.kvWidth(), 2 }) },         .{ "xs", try bytes(.{ R, c.n_taps, (c.hidden / 64), 4 }) },         .{ "h", try bytes(.{ B, c.hidden, 2 }) },
+            .{ "taps_in", try bytes(.{ R, c.n_taps, c.hidden, 2 }) },                 .{ "th", try bytes(.{ R, c.hidden, 2 }) },              .{ "thn", try bytes(.{ R, c.hidden, 2 }) },                         .{ "kabs", try bytes(.{ R, c.layers, c.kvWidth(), 2 }) },
+            .{ "kn", try bytes(.{ R, c.kvWidth(), 2 }) },                             .{ "vabs", try bytes(.{ R, c.layers, c.kvWidth(), 2 }) },         .{ "xs", try bytes(.{ R, c.n_taps, (c.hidden / 64), 4 }) },         .{ "h", try bytes(.{ B, c.hidden, 2 }) },
             .{ "h2", try bytes(.{ B, c.hidden, 2 }) },                                .{ "x", try bytes(.{ B, c.hidden, 2 }) },               .{ "xin", try bytes(.{ B, c.hidden, 2 }) },                         .{ "dyn", try bytes(.{ B, c.dynamic(), 2 }) },
             .{ "qraw", try bytes(.{ B, c.qWidth(), 2 }) },                            .{ "q", try bytes(.{ B, c.qWidth(), 2 }) },             .{ "kraw", try bytes(.{ B, c.kvWidth(), 2 }) },                     .{ "kb", try bytes(.{ B, c.kvWidth(), 2 }) },
             .{ "vb", try bytes(.{ B, c.kvWidth(), 2 }) },                             .{ "att", try bytes(.{ B, c.qWidth(), 2 }) },           .{ "o", try bytes(.{ B, c.hidden, 2 }) },                           .{ "gate", try bytes(.{ B, c.intermediate, 2 }) },
@@ -237,6 +242,17 @@ pub const Draft = struct {
         try d.hold(ctx, 0, 1, d.c.block - 1, null);
         ctx.* = .{ .ring = ctx.ring };
         d.startup.warmups += profile.elapsed(d.io, warm_start);
+        return ctx;
+    }
+
+    /// A context for a stream opening on an empty pool (each phase's first request): its ring zeroed, as `create`'s,
+    /// without the throwaway absorb and hold; the stream's own first absorb meets the buffer's first-kernel stall.
+    fn createCold(d: *Draft) !*Ctx {
+        const ctx = try d.gpa.create(Ctx);
+        errdefer d.gpa.destroy(ctx);
+        ctx.* = .{ .ring = try DeviceBuffer.alloc(d.e.d, d.c.ringBytes()) };
+        errdefer ctx.ring.free();
+        try ctx.ring.fill8(0, null);
         return ctx;
     }
 
@@ -327,11 +343,46 @@ pub const Draft = struct {
             } else try e.run(d.fns.gather_taps, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ tap_ring, @as(c_int, engine.tap_rows), @as(c_longlong, @intCast(start)), @as(c_int, @intCast(c.n_taps * c.hidden)), d.taps_in });
             try d.proj(d.w.fc, d.taps_in, d.th, rows);
             try d.norm(d.th, d.w.hidden_norm, d.thn, rows);
+            const kv = rows * c.kvWidth() * 2; // a layer's k (v) rows in kabs (vabs)
+            // a prompt piece: every layer's k and v project the same normed taps, up to four a prompt GEMM launch
+            const grouped = precision.prompt(d.projection_role, rows, precision.dflash_projection_prompt_cutoff);
+            if (grouped) {
+                const P = cuda.prompt_many;
+                var many: [P.parts_max]P.Out = undefined;
+                var n_many: usize = 0;
+                for (d.w.layers, 0..) |l, i| for ([2]cuda.qlinear.Affine4{ l.k, l.v }, [2]u64{ d.kabs + i * kv, d.vabs + i * kv }) |q, out| {
+                    many[n_many] = .{ .q = q, .out = out };
+                    n_many += 1;
+                    if (n_many == many.len) {
+                        try e.prompt_many.prompt(e.stream, d.thn, many[0..n_many], rows);
+                        n_many = 0;
+                    }
+                };
+                if (n_many > 0) try e.prompt_many.prompt(e.stream, d.thn, many[0..n_many], rows);
+            } else if (rows <= cuda.qlinear.Affine4Kernels.max_rows) {
+                // live rows: every layer's k and v over the same normed taps (their sums from the norm), up to four a
+                // decode launch; decodeMany keeps each projection's decode() bits
+                const A = cuda.qlinear.Affine4Kernels;
+                var many: [A.segs_max]A.Out = undefined;
+                var n_many: usize = 0;
+                for (d.w.layers, 0..) |l, i| for ([2]cuda.qlinear.Affine4{ l.k, l.v }, [2]u64{ d.kabs + i * kv, d.vabs + i * kv }) |q, out| {
+                    many[n_many] = .{ .q = q, .out = out };
+                    n_many += 1;
+                    if (n_many == many.len) {
+                        try e.affine.decodeMany(e.stream, d.thn, d.xs, many[0..n_many], rows);
+                        n_many = 0;
+                    }
+                };
+                if (n_many > 0) try e.affine.decodeMany(e.stream, d.thn, d.xs, many[0..n_many], rows);
+            }
+            const listed = grouped or rows <= cuda.qlinear.Affine4Kernels.max_rows;
             for (d.w.layers, 0..) |l, i| {
-                try d.projAgain(l.k, d.thn, d.kabs, rows);
-                try d.normRope(d.kabs, l.k_norm, d.kn, rows, c.kv_heads, start);
-                try d.projAgain(l.v, d.thn, d.vabs, rows);
-                try e.run(d.fns.ring_put, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ d.kn, d.vabs, d.ringK(ctx, i), d.ringV(ctx, i), @as(c_int, @intCast(c.kvWidth())), @as(c_longlong, @intCast(start)), @as(c_int, @intCast(c.ringRows())) });
+                const kabs = d.kabs + i * kv;
+                const vabs = d.vabs + i * kv;
+                if (!listed) try d.projAgain(l.k, d.thn, kabs, rows);
+                try d.normRope(kabs, l.k_norm, d.kn, rows, c.kv_heads, start);
+                if (!listed) try d.projAgain(l.v, d.thn, vabs, rows);
+                try e.run(d.fns.ring_put, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ d.kn, vabs, d.ringK(ctx, i), d.ringV(ctx, i), @as(c_int, @intCast(c.kvWidth())), @as(c_longlong, @intCast(start)), @as(c_int, @intCast(c.ringRows())) });
             }
             start += rows;
             n -= rows;
@@ -410,7 +461,7 @@ pub const Draft = struct {
             ctx.* = .{ .ring = .{ .d = d.e.d, .ptr = ptr, .len = d.c.ringBytes(), .borrowed = true } };
             return d.streams.put(d.gpa, s, ctx);
         };
-        const ctx = d.pool.pop() orelse try d.create();
+        const ctx = d.pool.pop() orelse try d.createCold();
         errdefer d.pool.append(d.gpa, ctx) catch d.drop(ctx);
         ctx.* = .{ .ring = ctx.ring };
         try d.streams.put(d.gpa, s, ctx);
@@ -490,6 +541,12 @@ pub const Draft = struct {
 
 /// Acceptance by depth until a stream has its own (the reference's chat text: measured, see the commit).
 const prior = [_]f64{ 0.75, 0.65, 0.58, 0.52, 0.47, 0.43, 0.4, 0.37, 0.35, 0.33, 0.31, 0.29, 0.28, 0.27, 0.26 };
+
+/// TF_DRAFT_GRAPH=0: drafter frames run launch by launch instead of from their captured graphs.
+pub fn graphsOff() bool {
+    const v = platform.c.getenv("TF_DRAFT_GRAPH") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "0");
+}
 
 /// TF_TIMING=1: each call's wall time on stderr.
 pub fn timing(what: []const u8, io: std.Io, t0: std.Io.Timestamp) void {
