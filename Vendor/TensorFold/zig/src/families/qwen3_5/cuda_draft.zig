@@ -92,8 +92,6 @@ pub const Draft = struct {
     ids: u64, // u32 the block's ids
     staged: cuda.HostBuffer, // pinned: the ids up, the words and projected rows down
     streams: std.AutoHashMapUnmanaged(*Stream, *Ctx) = .empty,
-    /// Captured frames (cuda_draft_frame.zig run): each key's graph, or null where capture failed, and its span output.
-    graphs: std.AutoHashMapUnmanaged(u64, struct { exec: ?cuda.graph.Exec, spanned: ?u64 }) = .empty,
     /// Contexts between streams, allocated and run once (`reserve`), as the driver stalls a buffer's first kernel.
     pool: std.ArrayList(*Ctx) = .empty,
     /// Grown trees' nodes offered and landed, by own chance: the nodes' chances the round loop prices.
@@ -172,9 +170,6 @@ pub const Draft = struct {
     }
 
     pub fn deinit(d: *Draft) void {
-        var gs = d.graphs.valueIterator();
-        while (gs.next()) |g| if (g.exec) |*x| x.deinit();
-        d.graphs.deinit(d.gpa);
         var it = d.streams.valueIterator();
         while (it.next()) |ctx| d.drop(ctx.*);
         d.streams.deinit(d.gpa);
@@ -525,12 +520,6 @@ pub const Draft = struct {
 
 /// Acceptance by depth until a stream has its own (the reference's chat text: measured, see the commit).
 const prior = [_]f64{ 0.75, 0.65, 0.58, 0.52, 0.47, 0.43, 0.4, 0.37, 0.35, 0.33, 0.31, 0.29, 0.28, 0.27, 0.26 };
-
-/// TF_DRAFT_GRAPH=0: drafter frames run launch by launch instead of from their captured graphs.
-pub fn graphsOff() bool {
-    const v = platform.c.getenv("TF_DRAFT_GRAPH") orelse return false;
-    return std.mem.eql(u8, std.mem.span(v), "0");
-}
 
 /// TF_TIMING=1: each call's wall time on stderr.
 pub fn timing(what: []const u8, io: std.Io, t0: std.Io.Timestamp) void {
