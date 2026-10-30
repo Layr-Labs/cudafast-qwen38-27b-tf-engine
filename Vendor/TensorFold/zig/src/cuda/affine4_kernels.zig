@@ -47,6 +47,7 @@ pub const Affine4Kernels = struct {
     split: ?Split, // every GPU but GB10: lane_gemv's slices on CTAs of their own (one stream's decode() at a time)
     pdl: bool, // GB10: the decode kernels launch with programmatic dependent launch
     wide_verify: bool, // off GB10: verify windows of 17 to 32 rows share one weight pass (sm_120, when its engine says)
+    cluster_decode: bool = false, // GB10: split-K projections of <= 16 rows on qmm_group's cluster tile, not lane_gemv (same slice order)
 
     /// From loaded qmm_group, qmm_prefill, lane_gemv and affine4_pack modules; GB10 decodes without the split form.
     pub fn resolve(d: *const Driver, group_mod: Module, prefill_mod: Module, gemv_mod: Module, pack_mod: Module, sms: usize, gb10: bool) !Affine4Kernels {
@@ -75,6 +76,7 @@ pub const Affine4Kernels = struct {
         a.gemv_blocks = @max(1, try a.gemv_fn.occupancy(128, group_smem)) * sms;
         a.pdl = gb10;
         a.wide_verify = false;
+        a.cluster_decode = false;
         a.split = if (gb10) null else try Split.initFor(d, segs_max);
         return a;
     }
@@ -108,6 +110,9 @@ pub const Affine4Kernels = struct {
         if (rows > max_rows) return error.WindowTooWide;
         const sk = splitK(q.n, q.k);
         if (sk > 1) if (a.split) |sp| return a.gemvSplit(s, x, xs, q, out, rows, sk, sp);
+        // lane_gemv runs min(tiles, resident) CTAs: an N = 5120 projection is 80 CTAs on GB10's 48 SMs; the cluster
+        // tile runs tiles * sk CTAs (320), each K slice summed in slice order over distributed shared memory
+        if (sk > 1 and a.cluster_decode) return a.cluster(s, x, xs, q, out, rows, sk);
         return if (sk > 1) a.gemv(s, x, xs, q, out, rows, sk) else a.cluster(s, x, xs, q, out, rows, sk);
     }
 
