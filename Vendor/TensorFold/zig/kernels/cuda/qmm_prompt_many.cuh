@@ -37,38 +37,28 @@ __device__ __forceinline__ void prompt_tile(
     const int KG = K / GS, per = KG, g0 = 0;
 
     auto stage = [&](int s) { return buf + s * T::STAGE; };
-    // each thread's copies, addressed once: its input chunk column and rows r0 + i * (THREADS / CHUNKS), its weight
-    // tiles' chunk, and (threads below the scales' chunks) its scale or bias chunk; a stage only adds g's offsets
-    static_assert(T::THREADS % T::CHUNKS == 0 && (BM * T::CHUNKS) % T::THREADS == 0, "whole input chunks a thread");
-    constexpr int XC = BM * T::CHUNKS / T::THREADS, RSTEP = T::THREADS / T::CHUNKS;
-    constexpr int TILE_BYTES = 64 * GS / 2, WC = (T::W / 16 + T::THREADS - 1) / T::THREADS;
-    const int ch = tid % T::CHUNKS, r0 = tid / T::CHUNKS;
-    const int xdst = r0 * T::ROW + swz<T::CHUNKS>(r0, ch) * 16;  // r0 + RSTEP * i keeps r % CHUNKS (RSTEP % CHUNKS == 0)
-    static_assert(RSTEP % T::CHUNKS == 0, "the swizzle's row phase is the thread's");
-    const __nv_bfloat16* xsrc = x + static_cast<size_t>(m0 + r0) * ldx + ch * 8;
-    const unsigned char* wsrc[WC];
-    bool wok[WC];
-#pragma unroll
-    for (int k = 0; k < WC; ++k) {
-        const int c = tid + k * T::THREADS, t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
-        wok[k] = c < T::W / 16 && n0 + t * 64 < npad;
-        wsrc[k] = reinterpret_cast<const unsigned char*>(w) + static_cast<size_t>(n0 / 64 + t) * KG * TILE_BYTES + off * 16;
-    }
-    const bool sok = tid < 2 * (T::S / 16) && n0 + (tid % (T::S / 16)) * 8 < npad;
-    const __nv_bfloat16* ssrc = ((tid / (T::S / 16)) ? biases : scales) + n0 + (tid % (T::S / 16)) * 8;
-    const int sdst = (tid / (T::S / 16)) * T::S + (tid % (T::S / 16)) * 16;
     auto load = [&](int s, int g) {
         unsigned char* p = stage(s);
-#pragma unroll
-        for (int i = 0; i < XC; ++i) {
-            const bool ok = m0 + r0 + i * RSTEP < M;
-            cp16z(p + xdst + i * RSTEP * T::ROW, ok ? xsrc + static_cast<size_t>(i * RSTEP) * ldx + g * GS : x, ok);
+        for (int c = tid; c < BM * T::CHUNKS; c += T::THREADS) {
+            const int r = c / T::CHUNKS, ch = c % T::CHUNKS;
+            const int row = min(m0 + r, M - 1);
+            cp16z(p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16, x + static_cast<size_t>(row) * ldx + g * GS + ch * 8,
+                  m0 + r < M);
         }
         unsigned char* pw = p + T::X;
-#pragma unroll
-        for (int k = 0; k < WC; ++k)
-            if (wok[k]) cp16(pw + (tid + k * T::THREADS) * 16, wsrc[k] + static_cast<size_t>(g) * TILE_BYTES);
-        if (sok) cp16(pw + T::W + sdst, ssrc + static_cast<size_t>(g) * npad);
+        constexpr int TILE_BYTES = 64 * GS / 2;
+        for (int c = tid; c < T::W / 16; c += T::THREADS) {
+            const int t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
+            const size_t tile = static_cast<size_t>(n0 / 64 + t) * KG + g;
+            if (n0 + t * 64 < npad)
+                cp16(pw + c * 16, reinterpret_cast<const unsigned char*>(w) + tile * TILE_BYTES + off * 16);
+        }
+        unsigned char* ps = pw + T::W;
+        for (int c = tid; c < 2 * (T::S / 16); c += T::THREADS) {
+            const int which = c / (T::S / 16), off = c % (T::S / 16);
+            const __nv_bfloat16* src = (which ? biases : scales) + static_cast<size_t>(g) * npad + n0 + off * 8;
+            if (n0 + off * 8 < npad) cp16(ps + which * T::S + off * 16, src);
+        }
     };
 
     float acc[T::MT][T::NT][4];
@@ -176,12 +166,11 @@ __device__ __forceinline__ void prompt_split_body(
 // of prefill_kernel's gate and up (each rounded to bf16 as it stores them) through tf_q35_mlp_act's formula.
 // A CTA's 128 GEMM columns are 64 gate columns (warps wn 0) and the same 64 up columns (warps wn 1); the gate
 // warps park their bf16 values in shared memory and the up warps write the activation.
-template <int GS, int BM, int WM, int WN, int STAGES>
+template <int GS, int BM, int WM, int STAGES>
 __device__ __forceinline__ void prompt_mlp_body(
         const __nv_bfloat16* __restrict__ x, const ManyParts& parts, __nv_bfloat16* __restrict__ act, int M, int K,
         int ldx, int group) {
-    constexpr int BN = 128, GW = WN / 2;  // GW warps a row band hold gate's 64 columns, GW the same columns of up
-    static_assert(WN % 2 == 0, "gate and up warps in equal numbers");
+    constexpr int BN = 128, WN = 2;
     using T = Tile<GS, BM, BN, WM, WN, STAGES>;
     static_assert(BM * 64 * 2 <= T::SMEM, "the gate tile fits the stages' memory");
     extern __shared__ __align__(128) unsigned char buf[];
@@ -195,37 +184,28 @@ __device__ __forceinline__ void prompt_mlp_body(
     const int m0 = at.x, n0 = at.y;                 // n0: the 64 output columns, of gate and of up
 
     auto stage = [&](int s) { return buf + s * T::STAGE; };
-    // each thread's copies addressed once (prompt_tile's): a stage only adds g's offsets
-    constexpr int XC = BM * T::CHUNKS / T::THREADS, RSTEP = T::THREADS / T::CHUNKS;
-    static_assert(T::THREADS % T::CHUNKS == 0 && XC * T::THREADS == BM * T::CHUNKS && RSTEP % T::CHUNKS == 0, "whole chunks");
-    constexpr int TILE_BYTES = 64 * GS / 2, WC = (T::W / 16 + T::THREADS - 1) / T::THREADS;
-    const int ch = tid % T::CHUNKS, r0 = tid / T::CHUNKS;
-    const int xdst = r0 * T::ROW + swz<T::CHUNKS>(r0, ch) * 16;
-    const __nv_bfloat16* xsrc = x + static_cast<size_t>(m0 + r0) * ldx + ch * 8;
-    const unsigned char* wsrc[WC];
-    bool wok[WC];
-#pragma unroll
-    for (int k = 0; k < WC; ++k) {
-        const int c = tid + k * T::THREADS, t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);   // t 0: gate's tile, 1: up's
-        wok[k] = c < T::W / 16;
-        wsrc[k] = reinterpret_cast<const unsigned char*>(t ? U.w : G.w) + static_cast<size_t>(n0 / 64) * KG * TILE_BYTES + off * 16;
-    }
-    const int s_which = tid / (T::S / 16), s_off = tid % (T::S / 16), s_t = s_off / 8;
-    const bool sok = tid < 2 * (T::S / 16);
-    const __nv_bfloat16* ssrc = (s_which ? (s_t ? U.biases : G.biases) : (s_t ? U.scales : G.scales)) + n0 + (s_off % 8) * 8;
-    const int sdst = s_which * T::S + s_off * 16;
     auto load = [&](int s, int g) {
         unsigned char* p = stage(s);
-#pragma unroll
-        for (int i = 0; i < XC; ++i) {
-            const bool ok = m0 + r0 + i * RSTEP < M;
-            cp16z(p + xdst + i * RSTEP * T::ROW, ok ? xsrc + static_cast<size_t>(i * RSTEP) * ldx + g * GS : x, ok);
+        for (int c = tid; c < BM * T::CHUNKS; c += T::THREADS) {
+            const int r = c / T::CHUNKS, ch = c % T::CHUNKS;
+            const int row = min(m0 + r, M - 1);
+            cp16z(p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16, x + static_cast<size_t>(row) * ldx + g * GS + ch * 8,
+                  m0 + r < M);
         }
         unsigned char* pw = p + T::X;
-#pragma unroll
-        for (int k = 0; k < WC; ++k)
-            if (wok[k]) cp16(pw + (tid + k * T::THREADS) * 16, wsrc[k] + static_cast<size_t>(g) * TILE_BYTES);
-        if (sok) cp16(pw + T::W + sdst, ssrc + static_cast<size_t>(g) * npad);
+        constexpr int TILE_BYTES = 64 * GS / 2;
+        for (int c = tid; c < T::W / 16; c += T::THREADS) {
+            const int t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);   // t 0: gate's tile, 1: up's
+            const size_t tile = static_cast<size_t>(n0 / 64) * KG + g;
+            cp16(pw + c * 16, reinterpret_cast<const unsigned char*>(t ? U.w : G.w) + tile * TILE_BYTES + off * 16);
+        }
+        unsigned char* ps = pw + T::W;
+        for (int c = tid; c < 2 * (T::S / 16); c += T::THREADS) {
+            const int which = c / (T::S / 16), off = c % (T::S / 16), t = off / 8;
+            const ManyPart& P = t ? U : G;
+            const __nv_bfloat16* src = (which ? P.biases : P.scales) + static_cast<size_t>(g) * npad + n0 + (off % 8) * 8;
+            cp16(ps + which * T::S + off * 16, src);
+        }
     };
 
     float acc[T::MT][T::NT][4];
@@ -279,27 +259,27 @@ __device__ __forceinline__ void prompt_mlp_body(
     wait<0>();
     __syncthreads();                                  // every stage read: the gate tile takes their memory
     __nv_bfloat16* gt = reinterpret_cast<__nv_bfloat16*>(buf);   // (BM, 64) bf16 gate values
-    if (wn < GW) {
+    if (wn == 0) {
 #pragma unroll
         for (int i = 0; i < T::MT; ++i)
 #pragma unroll
             for (int j = 0; j < T::NT; ++j)
 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
-                    const int r = wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8, c = wn % GW * (64 / GW) + j * 8 + (lane & 3) * 2;
+                    const int r = wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8, c = j * 8 + (lane & 3) * 2;
                     *reinterpret_cast<__nv_bfloat162*>(gt + r * 64 + c) =
                         __floats2bfloat162_rn(acc[i][j][2 * h], acc[i][j][2 * h + 1]);
                 }
     }
     __syncthreads();
-    if (wn >= GW) {
+    if (wn == 1) {
 #pragma unroll
         for (int i = 0; i < T::MT; ++i)
 #pragma unroll
             for (int j = 0; j < T::NT; ++j)
 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
-                    const int r = wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8, c = wn % GW * (64 / GW) + j * 8 + (lane & 3) * 2;
+                    const int r = wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8, c = j * 8 + (lane & 3) * 2;
                     const int row = m0 + r, col = n0 + c;
                     if (row >= M) continue;
                     const __nv_bfloat162 g2 = *reinterpret_cast<const __nv_bfloat162*>(gt + r * 64 + c);
