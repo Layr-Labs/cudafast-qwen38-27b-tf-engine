@@ -25,24 +25,15 @@ struct ManyParts {
 };
 
 template <int GS, int BM, int BN, int WM, int WN, int STAGES>
-__device__ __forceinline__ void prompt_many_body(
-        const __nv_bfloat16* __restrict__ x, const ManyParts& parts, int M, int K, int ldx, int group) {
+__device__ __forceinline__ void prompt_tile(
+        const __nv_bfloat16* __restrict__ x, const uint32_t* __restrict__ w, const __nv_bfloat16* __restrict__ scales,
+        const __nv_bfloat16* __restrict__ biases, void* __restrict__ out, int N, int npad, int M, int K, int ldx, int m0,
+        int n0) {
     using T = Tile<GS, BM, BN, WM, WN, STAGES>;
     extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm = warp / WN, wn = warp % WN;
-    int q = 0;
-#pragma unroll
-    for (int i = 1; i < MANY; ++i)
-        if (i < parts.count && (int)blockIdx.x >= parts.p[i].first) q = i;
-    const uint32_t* __restrict__ w = parts.p[q].w;
-    const __nv_bfloat16* __restrict__ scales = parts.p[q].scales;
-    const __nv_bfloat16* __restrict__ biases = parts.p[q].biases;
-    void* __restrict__ out = parts.p[q].out;
-    const int N = parts.p[q].n, npad = parts.p[q].npad;
     const int KG = K / GS, per = KG, g0 = 0;
-    const int2 at = tile_of((int)blockIdx.x - parts.p[q].first, M, N, BM, BN, group);
-    const int m0 = at.x, n0 = at.y;
 
     auto stage = [&](int s) { return buf + s * T::STAGE; };
     auto load = [&](int s, int g) {
@@ -137,6 +128,33 @@ __device__ __forceinline__ void prompt_many_body(
                 }
             }
         }
+
+}
+
+template <int GS, int BM, int BN, int WM, int WN, int STAGES>
+__device__ __forceinline__ void prompt_many_body(
+        const __nv_bfloat16* __restrict__ x, const ManyParts& parts, int M, int K, int ldx, int group) {
+    int q = 0;
+#pragma unroll
+    for (int i = 1; i < MANY; ++i)
+        if (i < parts.count && (int)blockIdx.x >= parts.p[i].first) q = i;
+    const ManyPart& P = parts.p[q];
+    const int2 at = tile_of((int)blockIdx.x - P.first, M, P.n, BM, BN, group);
+    prompt_tile<GS, BM, BN, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x, at.y);
+}
+
+template <int GS, int BM, int BN, int WM, int WN, int STAGES>
+__device__ __forceinline__ void prompt_split_body(
+        const __nv_bfloat16* __restrict__ x, const ManyPart& P, int M, int K, int ldx, int group, int full_cols) {
+    const int rows_t = (M + BM - 1) / BM, full = rows_t * (full_cols / BN);
+    if ((int)blockIdx.x < full) {
+        const int2 at = tile_of((int)blockIdx.x, M, full_cols, BM, BN, group);
+        prompt_tile<GS, BM, BN, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x, at.y);
+    } else {
+        const int2 at = tile_of((int)blockIdx.x - full, M, P.n - full_cols, BM, BN / 2, group);
+        prompt_tile<GS, BM, BN / 2, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x,
+                                                    full_cols + at.y);
+    }
 }
 
 
