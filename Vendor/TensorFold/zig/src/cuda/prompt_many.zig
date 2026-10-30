@@ -16,6 +16,9 @@ const Affine4 = qlinear.Affine4;
 pub const symbol = "tf_qmm_prompt_many";
 pub const mlp_symbol = "tf_qmm_prompt_mlp";
 pub const split_symbol = "tf_qmm_prompt_split";
+pub const sk_symbol = "tf_qmm_prompt_sk";
+/// A stream-K CTA's parked accumulators: 128 threads' 128 fp32 each (both warp layouts).
+pub const sk_slot_bytes = threads * 128 * 4;
 pub const parts_max = 4;
 pub const tile_m = 128;
 pub const tile_n = 128;
@@ -39,8 +42,14 @@ pub const Kernels = struct {
     many_fn: Function,
     mlp_fn: Function,
     split_fn: Function,
+    sk_fn: Function,
     /// CTAs the device runs at once: two of these tiles an SM.
     slots: usize,
+    /// Stream-K for grouped prompt GEMMs: CTAs launched (0: off), parked accumulators and flags for that many.
+    sk_slots: usize = 0,
+    ws: u64 = 0,
+    flags: u64 = 0,
+    epoch: u32 = 0,
 
     /// From a loaded qmm_prefill module, on a device of `sms` SMs.
     pub fn resolve(prefill_mod: module.Module, sms: usize) !Kernels {
@@ -50,7 +59,9 @@ pub const Kernels = struct {
         try m.allowDynamicShared(smem);
         const sp = try prefill_mod.function(split_symbol);
         try sp.allowDynamicShared(smem);
-        return .{ .many_fn = f, .mlp_fn = m, .split_fn = sp, .slots = 2 * sms };
+        const k = try prefill_mod.function(sk_symbol);
+        try k.allowDynamicShared(smem);
+        return .{ .many_fn = f, .mlp_fn = m, .split_fn = sp, .sk_fn = k, .slots = 2 * sms };
     }
 
     /// The columns one projection's whole 128-wide tiles cover when its last panels run 64 wide (null: none do).
@@ -90,7 +101,7 @@ pub const Kernels = struct {
     }
 
     /// out_i (rows, n_i) = x (rows, k) through each of `outs`, every one with prefill_kernel's bits.
-    pub fn prompt(kk: *const Kernels, s: Stream, x: u64, outs: []const Out, rows: usize) !void {
+    pub fn prompt(kk: *Kernels, s: Stream, x: u64, outs: []const Out, rows: usize) !void {
         if (outs.len == 0 or outs.len > parts_max or rows == 0) return error.TooManyParts;
         const k = outs[0].q.k;
         const rows_t = (rows + tile_m - 1) / tile_m;
@@ -119,6 +130,16 @@ pub const Kernels = struct {
         g.add(x);
         g.add(parts);
         for ([_]usize{ rows, k, k, group }) |v| g.add(@as(c_int, @intCast(v)));
+        // more tiles than resident CTAs and a part-full last wave: the same chains spread evenly over them (stream-K)
+        if (kk.sk_slots > 0 and blocks > kk.sk_slots and blocks % kk.sk_slots != 0) {
+            kk.epoch +%= 1;
+            if (kk.epoch == 0) kk.epoch = 1;
+            g.add(@as(c_int, @intCast(blocks)));
+            g.add(kk.ws);
+            g.add(kk.flags);
+            g.add(kk.epoch);
+            return launch_.launch(kk.sk_fn, .{ .grid = .{ .x = @intCast(kk.sk_slots) }, .block = .{ .x = threads }, .shared = smem, .cooperative = true }, s, &g);
+        }
         try launch_.launch(kk.many_fn, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = threads }, .shared = smem }, s, &g);
     }
 };
