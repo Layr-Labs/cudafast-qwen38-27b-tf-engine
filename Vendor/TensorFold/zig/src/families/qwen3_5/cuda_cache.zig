@@ -8,11 +8,19 @@ const Engine = engine.Engine;
 const DeviceBuffer = cuda.DeviceBuffer;
 const recurrent = @import("cuda_recurrent.zig");
 
-/// Rows a drafter's tap ring holds a stream: its window and a prompt chunk more.
-pub const tap_rows = 2048 + engine.max_rows;
+/// Rows behind a forward's end a drafter reads from the tap ring: its window.
+pub const tap_held = 2048;
+/// Rows a drafter's tap ring holds a stream: its window and a verify window more. A forward of more rows writes only
+/// its newest tap_rows (tf_q35_tap), so the ring always holds the newest tap_rows rows written; a ring of a full prompt
+/// chunk more (4096 rows, 315 MB a stream) was allocated and zeroed in every phase's first request.
+pub const tap_rows = tap_held + engine.most_verify;
 
 /// qwen35.cuh's Seg and Path.
-pub const Seg = extern struct { rec: u64, conv: u64, kv: u64, tap: u64, log: u64, before: u64, cap: c_int, len: c_int, row0: c_int, rows: c_int, tap_rows: c_int, taps: c_int, delta: c_int, pt: u64 = 0, ps: u64 = 0, ptok: c_int = 0, pn: c_int = 0, plog: u64 = 0 };
+pub const Seg = extern struct { rec: u64, conv: u64, kv: u64, tap: u64, log: u64, before: u64, cap: c_int, len: c_int, row0: c_int, rows: c_int, tap_rows: c_int, taps: c_int, delta: c_int, pt: u64 = 0, ps: u64 = 0, ptok: c_int = 0, pn: [pend_most]c_int = @splat(0), wb: c_int = 0, plog: [pend_most]u64 = @splat(0) };
+/// Kept window prefixes a recorded slot scan replays before it writes the state back (qwen35.cuh's Q35_PEND).
+pub const pend_most = 4;
+/// Window logs a stream holds: the pending prefixes' and the next window's.
+pub const log_slots = pend_most + 1;
 pub const Path = extern struct { n: c_int, rows: [engine.most_window]c_int };
 
 /// A cache's keys and values as pages (qwen35.cuh kv_row): page i of the stream's positions at `base` + ids[i] pages.
@@ -122,12 +130,14 @@ pub const Cache = struct {
     logits: []u16,
     /// The newest verify window, until its path is kept: where it started, its rows.
     last: ?struct { start: usize, rows: usize } = null,
-    /// A kept prefix of the newest window (rows 0..pend-1) whose recurrence replay the next recorded slot scan folds.
-    pend: c_int = 0,
-    /// The log half that window wrote (the next window writes the other half of `log`).
-    pend_log: u64 = 0,
-    /// Which half of `log` the next window writes.
-    flip: bool = false,
+    /// Kept prefixes of the newest folded windows (rows 0..pend[i]-1, oldest first) not yet replayed into the state.
+    pend: [pend_most]c_int = @splat(0),
+    /// The log slot each of those windows wrote.
+    pend_log: [pend_most]u64 = @splat(0),
+    /// How many of `pend` are live.
+    npend: u8 = 0,
+    /// Which slot of `log` the next window writes (never one a pending window holds).
+    slot: u8 = 0,
     /// An image prompt's rotary shift (get_rope_index's rope_delta): rows after its prompt rotate at position + delta.
     pub fn init(gpa: std.mem.Allocator, e: *Engine, cap: usize) !Cache {
         return initFor(gpa, e, cap, true);
@@ -179,7 +189,7 @@ pub const Cache = struct {
     }
 
     fn runParts(e: *const Engine, ring: usize) [5]usize {
-        return .{ e.g.stateBytes(), e.g.stateBytes(), 2 * e.g.logBytes(engine.most_window), e.tapBytes(), ring };
+        return .{ e.g.stateBytes(), e.g.stateBytes(), log_slots * e.g.logBytes(engine.most_window), e.tapBytes(), ring };
     }
 
     /// A lane's state, before, log, taps and drafter ring as views of the run at `base`; a short run is refused.
@@ -192,7 +202,7 @@ pub const Cache = struct {
             at += std.mem.alignForward(usize, n, 256);
         }
         self.state = views[0];
-        self.pend = 0;
+        self.npend = 0;
         self.before = views[1];
         self.log = views[2];
         self.tap = if (e.n_taps > 0) views[3] else null;
@@ -204,7 +214,7 @@ pub const Cache = struct {
     pub fn unmapRun(self: *Cache, e: *const Engine) void {
         const none: DeviceBuffer = .{ .d = e.d, .ptr = 0, .len = 0, .borrowed = true };
         self.state = none;
-        self.pend = 0;
+        self.npend = 0;
         self.before = none;
         self.log = none;
         self.tap = null;
@@ -220,7 +230,7 @@ pub const Cache = struct {
         errdefer if (before) |*b| b.free();
         if (!adaptive) before = try take(e, e.g.stateBytes());
         var log: DeviceBuffer = .{ .d = e.d, .ptr = 0, .len = 0, .borrowed = true };
-        if (!adaptive) log = try take(e, 2 * e.g.logBytes(engine.most_window));
+        if (!adaptive) log = try take(e, log_slots * e.g.logBytes(engine.most_window));
         errdefer log.free();
         var tap: ?DeviceBuffer = null;
         errdefer if (tap) |*t| t.free();
@@ -250,7 +260,7 @@ pub const Cache = struct {
     pub fn reset(self: *Cache, e: *const Engine) !void {
         recurrent.release(self);
         self.len = 0;
-        self.pend = 0;
+        self.npend = 0;
         self.written = 0;
         self.last = null;
         self.untaught = false;
@@ -276,7 +286,7 @@ pub const Cache = struct {
     /// The stream's window of `rows` rows from forward row `row0`, after `len` cached positions.
     pub fn seg(self: *const Cache, e: *const Engine, len: usize, row0: usize, rows: usize) Seg {
         const g = e.g;
-        var sg: Seg = .{ .rec = self.state.ptr, .conv = self.state.ptr + g.deltas() * g.recBytes(), .kv = self.kv.ptr, .tap = if (self.tap) |t| t.ptr else 0, .log = self.log.ptr + if (self.flip) self.log.len / 2 else 0, .before = if (self.before) |b| b.ptr else 0, .cap = @intCast(self.cap), .len = @intCast(len), .row0 = @intCast(row0), .rows = @intCast(rows), .tap_rows = tap_rows, .taps = @intCast(e.n_taps), .delta = self.delta };
+        var sg: Seg = .{ .rec = self.state.ptr, .conv = self.state.ptr + g.deltas() * g.recBytes(), .kv = self.kv.ptr, .tap = if (self.tap) |t| t.ptr else 0, .log = self.log.ptr + @as(u64, self.slot) * (self.log.len / log_slots), .before = if (self.before) |b| b.ptr else 0, .cap = @intCast(self.cap), .len = @intCast(len), .row0 = @intCast(row0), .rows = @intCast(rows), .tap_rows = tap_rows, .taps = @intCast(e.n_taps), .delta = self.delta };
         if (self.paged) |p| {
             sg.kv = p.base;
             sg.pt = p.table.ptr;
@@ -289,7 +299,6 @@ pub const Cache = struct {
     /// Keeps `path` (window rows, ascending from 0): the state as that chain would leave it, a tree's keys moved down.
     pub fn keep(self: *Cache, e: *Engine, path: []const u32) !void {
         const last = self.last orelse return error.NothingToKeep;
-        try self.flush(e);
         if (path.len == 0) {
             if (last.rows == 1) {
                 try recurrent.mark(self, true);
@@ -314,40 +323,49 @@ pub const Cache = struct {
         }
         const g = e.g;
         const sg = self.seg(e, last.start, 0, last.rows);
+        // a tree's path is applied now, on a state with nothing pending; a full pending set is replayed first too
+        if (!prefix or self.npend == pend_most) try self.flush(e);
         try recurrent.mark(self, false);
         if (!prefix) try e.run(e.keeps.apply, .{ 1, geometry.dk / 4, g.v_heads * g.deltas() }, .{ 32, 4, 1 }, .{ e.geo, sg, p });
         try e.run(e.keeps.conv, .{ g.deltas(), (g.convBytes() / 2 + 255) / 256, 1 }, .{ 256, 1, 1 }, .{ e.geo, sg, @as(c_int, @intCast(path[path.len - 1])) });
         if (!prefix and g.attentions() > 0) try e.run(if (e.kv8) e.fp8.compact else e.keeps.compact, .{ g.attentions(), g.kv_heads, 1 }, .{ geometry.head_dim, 1, 1 }, .{ e.geo, sg, p });
         if (prefix) {
-            // a chain's prefix: the next recorded slot scan replays it from this log half while it loads the state
-            self.pend = p.n;
-            self.pend_log = sg.log;
-            self.flip = !self.flip;
+            // a chain's prefix: a later recorded slot scan replays it from this log slot while it loads the state
+            self.pend[self.npend] = p.n;
+            self.pend_log[self.npend] = sg.log;
+            self.npend += 1;
+            self.slot = (self.slot + 1) % log_slots;
         }
         self.last = null;
         self.len = last.start + path.len;
     }
 
-    /// A pending kept prefix replayed into the recurrences now (before anything but a recorded slot scan reads them).
+    /// Pending kept prefixes replayed into the recurrences now, oldest first (before anything but a recorded slot scan reads them).
     pub fn flush(self: *Cache, e: *Engine) !void {
-        if (self.pend == 0) return;
-        var p: Path = .{ .n = self.pend, .rows = @splat(0) };
-        const n: usize = @intCast(self.pend);
-        for (p.rows[0..n], 0..) |*r, i| r.* = @intCast(i);
-        var sg = self.seg(e, self.len, 0, 0);
-        sg.log = self.pend_log;
-        self.pend = 0;
+        if (self.npend == 0) return;
         const g = e.g;
         try recurrent.mark(self, false);
-        try e.run(e.keeps.apply, .{ 1, geometry.dk / 4, g.v_heads * g.deltas() }, .{ 32, 4, 1 }, .{ e.geo, sg, p });
+        for (self.pend[0..self.npend], self.pend_log[0..self.npend]) |pn, plog| {
+            var p: Path = .{ .n = pn, .rows = @splat(0) };
+            const n: usize = @intCast(pn);
+            for (p.rows[0..n], 0..) |*r, i| r.* = @intCast(i);
+            var sg = self.seg(e, self.len, 0, 0);
+            sg.log = plog;
+            try e.run(e.keeps.apply, .{ 1, geometry.dk / 4, g.v_heads * g.deltas() }, .{ 32, 4, 1 }, .{ e.geo, sg, p });
+        }
+        self.npend = 0;
     }
 
-    /// The pending prefix handed to this forward's slot scan (`segs`' entry for this cache).
-    pub fn fold(self: *Cache, seg_: Seg) Seg {
+    /// The pending prefixes handed to this forward's slot scan (`segs`' entry for this cache). A multi-row window
+    /// leaves them pending and skips its state write until `pend_most` are pending; then, or for a one-row window
+    /// (which writes its advanced state anyway), the replayed state is written back and they are cleared.
+    pub fn fold(self: *Cache, seg_: Seg, rows: usize) Seg {
         var sg = seg_;
-        sg.pn = self.pend;
-        sg.plog = self.pend_log;
-        self.pend = 0;
+        @memcpy(sg.pn[0..self.npend], self.pend[0..self.npend]);
+        @memcpy(sg.plog[0..self.npend], self.pend_log[0..self.npend]);
+        const write = self.npend == pend_most or rows == 1;
+        sg.wb = @intFromBool(write);
+        if (write) self.npend = 0;
         return sg;
     }
 

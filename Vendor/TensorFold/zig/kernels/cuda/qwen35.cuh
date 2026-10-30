@@ -13,6 +13,7 @@ constexpr int MAXQ = 32;  // attention query heads at most
 constexpr int MAXW = 64;  // a window's rows at most (the log's rows a stream)
 constexpr int MAXCH = 64; // attention chunks a row at most (cuda_engine.zig's max_chunks)
 constexpr int MROPE = 3;  // an image row's t, h and w positions (cuda_round.zig's mrope_axes)
+constexpr int Q35_PEND = 4;
 
 // The model's widths: hidden, linear key heads, linear value heads, attention query and key/value heads, linear layers.
 struct Geo {
@@ -37,8 +38,9 @@ struct Seg {
     unsigned long long pt;    // the stream's KV page table (int a page; 0: kv holds cap contiguous rows)
     unsigned long long ps;    // elements a KV page holds (bf16, or bytes for fp8): every attention layer's ptok rows
     int ptok;                 // positions a KV page holds
-    int pn;
-    unsigned long long plog;
+    int pn[Q35_PEND];
+    int wb;
+    unsigned long long plog[Q35_PEND];
 };
 
 // Seg.kv's element of layer a's key (s 0) or value (s 1) at pos, head h: cap rows a head, or pos's page's row.

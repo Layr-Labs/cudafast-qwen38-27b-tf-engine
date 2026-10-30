@@ -45,21 +45,41 @@ __device__ __forceinline__ void q35_slots(Geo geo, const __nv_bfloat16* q, const
     for (int r = 0; r < R; ++r)
 #pragma unroll
         for (int i = 0; i < PT; ++i) root[r][i] = st[r * DK + i];
-    if (sg.pn > 0) {
-        Seg prev = sg;
-        prev.log = sg.plog;
-        for (int j = 0; j < sg.pn; ++j) {
-            const LogRow l = log_row(geo, prev, layer, j);
-            const float pg = l.g[hv];
+    {
+        const Seg* sp = segs + blockIdx.z / NV;
+        constexpr int PR = 4;
+        int w = 0, j = 0;
+        for (;;) {
+            float rg[PR], rd[PR][R], rk[PR][PT];
+            int n = 0;
 #pragma unroll
-            for (int r = 0; r < R; ++r) {
-                const float pd = l.delta[hv * DK + dv0 + r];
+            for (int t = 0; t < PR; ++t) {
+                while (w < Q35_PEND && j >= sp->pn[w]) { ++w; j = 0; }
+                if (w < Q35_PEND) {
+                    const char* base = reinterpret_cast<const char*>(sp->plog[w]) + ((size_t)j * geo.nl + layer) * geo.log_bytes();
+                    const float* lg = reinterpret_cast<const float*>(base);
+                    const float* ld = lg + geo.nv;
+                    const __nv_bfloat16* lk = reinterpret_cast<const __nv_bfloat16*>(ld + (size_t)geo.nv * DK);
+                    rg[t] = lg[hv];
 #pragma unroll
-                for (int i = 0; i < PT; i++) {
-                    root[r][i] = root[r][i] * pg;
-                    root[r][i] = fmaf(bf(l.k[hk * DK + PT * dk + i]), pd, root[r][i]);
+                    for (int r = 0; r < R; ++r) rd[t][r] = ld[hv * DK + dv0 + r];
+#pragma unroll
+                    for (int i = 0; i < PT; ++i) rk[t][i] = bf(lk[hk * DK + PT * dk + i]);
+                    ++j;
+                    n = t + 1;
                 }
             }
+#pragma unroll
+            for (int t = 0; t < PR; ++t)
+                if (t < n)
+#pragma unroll
+                    for (int r = 0; r < R; ++r)
+#pragma unroll
+                        for (int i = 0; i < PT; i++) {
+                            root[r][i] = root[r][i] * rg[t];
+                            root[r][i] = fmaf(rk[t][i], rd[t][r], root[r][i]);
+                        }
+            if (n < PR) break;
         }
     }
     if (sg.rows == 1)
@@ -171,7 +191,7 @@ __device__ __forceinline__ void q35_slots(Geo geo, const __nv_bfloat16* q, const
         if ((dk & ((1 << SR) - 1)) == 0) y[((size_t)pend_row * NV + hv) * DK + dv0 + (dk >> SR)] = __float2bfloat16_rn(tot);
     }
     if (record && sg.rows != 1) {
-        if (sg.pn > 0)
+        if (sg.wb)
 #pragma unroll
             for (int r = 0; r < R; ++r)
 #pragma unroll
@@ -186,7 +206,8 @@ __device__ __forceinline__ void q35_slots(Geo geo, const __nv_bfloat16* q, const
 #define TF_Q35_SLOTS(N, R) \
 extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_slots_##N(Geo geo, const __nv_bfloat16* q, \
  const __nv_bfloat16* k, const __nv_bfloat16* v, const float* g, const __nv_bfloat16* beta, const Seg* segs, \
- const SlotStep* steps, int layer, __nv_bfloat16* y, const int* P) { q35_slots<N, R>(geo, q, k, v, g, beta, segs, steps, layer, y, P); }
+ const SlotStep* steps, int layer, __nv_bfloat16* y, const int* P) { \
+  release_next(); await_prior(); q35_slots<N, R>(geo, q, k, v, g, beta, segs, steps, layer, y, P); }
 TF_Q35_SLOTS(1, 2)
 TF_Q35_SLOTS(2, 2)
 TF_Q35_SLOTS(4, 2)

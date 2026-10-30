@@ -41,7 +41,6 @@ pub const Affine4Kernels = struct {
     seg_fn: Function, // the split form over up to four projections of one input
     many_fn: Function, // lane_gemv over up to four projections of one input, each part's CTAs as its own launch's
     prefill_fn: Function,
-    sms: usize = 0,
     prefill22_fn: Function, // the prompt tile on 2x2 warps and two stages (`half_prompt` picks it)
     half_prompt: bool = false, // prompts on prefill22_fn: its four warps a block and two stages are quicker on an RTX 5090
     words_fn: Function, // affine4_pack.cu: MLX words into the tiles
@@ -62,7 +61,6 @@ pub const Affine4Kernels = struct {
         a.verify128_fn = try group_mod.function(symbols.verify128);
         a.prefill_fn = try prefill_mod.function(symbols.prefill);
         a.prefill22_fn = try prefill_mod.function(symbols.prefill22);
-        a.sms = sms;
         a.half_prompt = false;
         a.gemv_fn = try gemv_mod.function(symbols.gemv);
         a.split_fn = try gemv_mod.function(symbols.gemv_split);
@@ -137,20 +135,35 @@ pub const Affine4Kernels = struct {
     }
 
     /// decode()'s kernels a projection, grouped by kernel: each part's blocks compute exactly what its own launch's would.
+    /// With cluster_decode the K-sliced parts share one cluster-tile launch of the widest part's slice count: a cluster
+    /// holds one part, C / sk of its tiles, each tile's slices summed by its slice 0 in slice order as cluster() does.
     fn decodeGrouped(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, outs: []const Out, rows: usize) !void {
         if (outs.len == 0 or outs.len > segs_max) return error.TooManyParts;
         const rows_t = (rows + 15) / 16;
         var lanes: linear.Many = std.mem.zeroes(linear.Many);
         var parts: Parts = std.mem.zeroes(Parts);
+        var sliced: Parts = std.mem.zeroes(Parts);
         var lane_one: usize = 0;
         var part_one: usize = 0;
+        var sliced_one: usize = 0;
         var blocks: usize = 0;
         var clusters: usize = 0;
+        var sliced_clusters: usize = 0;
+        var cs: usize = 1; // the sliced launch's cluster: every splitK is a power of two up to 8, so each divides it
+        if (a.cluster_decode) {
+            for (outs) |o| cs = @max(cs, splitK(o.q.n, o.q.k));
+        }
         for (outs, 0..) |o, i| {
             if (o.q.k != outs[0].q.k) return error.InputMismatch;
             const tiles = (o.q.n + 63) / 64;
             const sk = splitK(o.q.n, o.q.k);
-            if (sk > 1) {
+            if (sk > 1 and a.cluster_decode) {
+                const at: usize = @intCast(sliced.count);
+                sliced.p[at] = .{ .w = o.q.w, .scales = o.q.s, .biases = o.q.b, .out = o.out, .n = int(o.q.n), .npad = int(o.q.npad), .sk = int(sk), .tiles = int(tiles), .first = int(sliced_clusters) };
+                sliced.count += 1;
+                sliced_clusters += rows_t * ((tiles * sk + cs - 1) / cs);
+                sliced_one = i;
+            } else if (sk > 1) {
                 const at: usize = @intCast(lanes.count);
                 lanes.p[at] = .{ .w = o.q.w, .scales = o.q.s, .biases = o.q.b, .out = o.out, .n = int(o.q.n), .npad = int(o.q.npad), .sk = int(sk), .tiles = int(tiles) };
                 lanes.first[at] = int(blocks);
@@ -175,6 +188,17 @@ pub const Affine4Kernels = struct {
             g.add(parts);
             for ([_]usize{ rows, outs[0].q.k, outs[0].q.k, rows_t, 1 }) |v| g.add(int(v));
             try launch_.launch(a.group_fn, .{ .grid = .{ .x = u(clusters) }, .block = .{ .x = 128 }, .shared = group_smem, .pdl = a.pdl }, s, &g);
+        }
+        if (sliced.count == 1) {
+            const o = outs[sliced_one];
+            try a.cluster(s, x, xs, o.q, o.out, rows, splitK(o.q.n, o.q.k));
+        } else if (sliced.count > 1) {
+            var g: launch_.Args = .{};
+            g.add(x);
+            g.add(xs);
+            g.add(sliced);
+            for ([_]usize{ rows, outs[0].q.k, outs[0].q.k, rows_t, cs }) |v| g.add(int(v));
+            try launch_.launch(a.group_fn, .{ .grid = .{ .x = u(sliced_clusters * cs) }, .block = .{ .x = 128 }, .shared = group_smem, .cluster = .{ .x = u(cs) }, .pdl = a.pdl }, s, &g);
         }
         if (lanes.count == 1) {
             const o = outs[lane_one];
@@ -311,7 +335,6 @@ pub const Affine4Kernels = struct {
         };
         try launch_.launch(a.group_fn, cfg, s, &g);
     }
-
 
     /// qmm.prefill_matmul (tile 0): weights rounded once to bf16, one fp32 chain over K; bf16 out.
     pub fn prompt(a: *const Affine4Kernels, s: Stream, x: u64, q: Affine4, out: u64, rows: usize) !void {

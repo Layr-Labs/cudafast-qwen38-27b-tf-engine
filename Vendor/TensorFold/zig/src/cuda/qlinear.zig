@@ -238,8 +238,6 @@ pub const symbols = struct {
     pub const gemv_split = "tf_lane_gemv_split";
     pub const gemv_seg = "tf_lane_gemv_seg";
     pub const gemv_many = "tf_lane_gemv_many";
-    pub const prefill_many = "tf_qmm_prefill_many";
-    pub const prefill_n64 = "tf_qmm_prefill_n64";
     pub const pack_words = "tf_pack_dense";
     pub const pack_scales = "tf_transpose_pad16";
 };
@@ -258,14 +256,9 @@ pub const Segs = extern struct { s: [4]Seg, count: c_int };
 /// lane_gemv.cu's Many: up to four projections of one input, part i on blocks first[i] up to the next part's first.
 pub const Many = extern struct { p: [4]GemvPart, first: [4]c_int, count: c_int };
 
-/// qmm_prefill.cu's PromptPart and PromptParts: up to four prompt projections of one input, part i from block first.
-pub const PromptPart = extern struct { w: u64, scales: u64, biases: u64, out: u64, n: c_int, npad: c_int, first: c_int, pad: c_int = 0 };
-pub const PromptParts = extern struct { p: [4]PromptPart, count: c_int };
-
 comptime {
     std.debug.assert(@sizeOf(Part) == 56 and @sizeOf(Parts) == 232 and @sizeOf(GemvPart) == 48);
     std.debug.assert(@sizeOf(Seg) == 64 and @sizeOf(Segs) == 264 and @sizeOf(Many) == 216);
-    std.debug.assert(@sizeOf(PromptPart) == 48 and @sizeOf(PromptParts) == 200);
 }
 
 pub const group_smem: u32 = 35328; // LaneTile<64, 16, 64, 1, 4, 8>::SMEM
@@ -274,7 +267,6 @@ pub const verify64_smem: u32 = 43008; // LaneTile<64, 64, 64, 1, 4, 4>::SMEM
 pub const verify128_smem: u32 = 57600; // LaneTile<64, 128, 64, 1, 4, 3>::SMEM
 pub const split_smem: u32 = 17664; // LaneTile<64, 16, 64, 1, 4, 4>::SMEM: four stages, so more split CTAs fit an SM
 pub const prefill_smem: u32 = 62976; // Tile<64, 128, 128, 2, 4, 3>::SMEM
-pub const prefill_n64_smem: u32 = 56064; // Tile<64, 128, 64, 2, 4, 3>::SMEM
 pub const prefill22_smem: u32 = 41984; // Tile<64, 128, 128, 2, 2, 2>::SMEM
 
 /// Split-K lane_gemv's fp32 slice partials and per-tile tickets: splitK keeps tiles * sk under 384 and tiles under 192.
