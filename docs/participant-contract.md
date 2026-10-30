@@ -18,6 +18,8 @@ The resident clears model state at each phase boundary.
 
 It must not keep prompt or decode work from an earlier phase.
 
+Setup that holds no prompt or decode content, such as buffers, workspaces and kernel loads, may be done at engine open. It must not be built from or keyed by any prompt.
+
 The engine must not carry state from one job to a later job through any side
 channel, such as the page cache or file access times of shared host files. The
 sandbox cleanup does not clear those, so promoted entries are reviewed. An
