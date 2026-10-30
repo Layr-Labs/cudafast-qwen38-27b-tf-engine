@@ -54,13 +54,13 @@ pub fn stage(c: draft.Config, items: []const dr.Hold, contexts: []const *draft.C
 /// A launch whose arguments are checked against the kernel's .cu signature: a wrong count or kind does not build.
 fn launch(d: anytype, f: cuda.Function, comptime s: sig.Sig, grid: [3]usize, block: [3]usize, args: anytype) !void {
     sig.check(s, @TypeOf(args));
-    return d.e.run(f, grid, block, args);
+    return d.e.runAfter(f, grid, block, args);
 }
 fn conv(d: anytype, x: u64, base: u64, res: u64, out: u64, rows: usize, branch: c_int) !void {
-    try d.e.run(d.fns.dyn_conv_batch, .{ rows, (d.c.hidden + 255) / 256, 1 }, .{ 256, 1, 1 }, .{ x, d.dyn, base, res, out, @as(c_int, @intCast(d.c.hidden)), @as(c_int, @intCast(d.c.group)), branch, @as(c_int, @intCast(d.c.block)) });
+    try d.e.runAfter(d.fns.dyn_conv_batch, .{ rows, (d.c.hidden + 255) / 256, 1 }, .{ 256, 1, 1 }, .{ x, d.dyn, base, res, out, @as(c_int, @intCast(d.c.hidden)), @as(c_int, @intCast(d.c.group)), branch, @as(c_int, @intCast(d.c.block)) });
 }
 fn rope(d: anytype, x: u64, w: u64, out: u64, rows: usize, heads: usize) !void {
-    try d.e.run(d.fns.norm_rope_batch, .{ rows * heads, 1, 1 }, .{ 32, 1, 1 }, .{ x, w, out, @as(c_int, @intCast(heads)), @as(c_int, @intCast(heads * 128)), d.segments, @as(c_int, @intCast(d.c.block)), d.c.eps, d.c.theta });
+    try d.e.runAfter(d.fns.norm_rope_batch, .{ rows * heads, 1, 1 }, .{ 32, 1, 1 }, .{ x, w, out, @as(c_int, @intCast(heads)), @as(c_int, @intCast(heads * 128)), d.segments, @as(c_int, @intCast(d.c.block)), d.c.eps, d.c.theta });
 }
 pub fn attention(d: anytype, rows: usize, layer: usize) !void {
     const c = d.c;
@@ -103,9 +103,8 @@ pub fn forward(d: anytype, items: []const dr.Hold, contexts: []const *draft.Ctx)
         try d.norm(d.h2, l.post_norm, d.x, B);
         try d.projAgain(l.mlp_conv, d.x, d.dyn, B);
         try conv(d, d.x, l.mlp_base, 0, d.xin, B, 0);
-        try d.proj(l.gate, d.xin, d.gate, B);
-        try d.projAgain(l.up, d.xin, d.up, B);
-        try e.run(e.fns.mlp_act, .{ (B * c.intermediate + 1023) / 1024, 1, 1 }, .{ 256, 1, 1 }, .{ d.gate, d.up, d.act, @as(c_longlong, @intCast(B * c.intermediate)), @as(u64, 0), @as(c_int, @intCast(c.intermediate)), d.xs });
+        try d.projMany(&.{ l.gate, l.up }, d.xin, &.{ d.gate, d.up }, B);
+        try e.runAfter(e.fns.mlp_act, .{ (B * c.intermediate + 1023) / 1024, 1, 1 }, .{ 256, 1, 1 }, .{ d.gate, d.up, d.act, @as(c_longlong, @intCast(B * c.intermediate)), @as(u64, 0), @as(c_int, @intCast(c.intermediate)), d.xs });
         try d.projAgain(l.down, d.act, d.o, B);
         try conv(d, d.o, l.mlp_base, d.h2, d.h, B, 1);
     }

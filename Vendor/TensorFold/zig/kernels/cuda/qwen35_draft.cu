@@ -16,6 +16,18 @@ __device__ __forceinline__ float warp_sum(float x) {
     return x;
 }
 
+__device__ __forceinline__ void pdl_release() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+#endif
+}
+
+__device__ __forceinline__ void pdl_await() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
+}
+
 }  // namespace tf_q35d
 
 using namespace tf_q35d;
@@ -23,6 +35,8 @@ using namespace tf_q35d;
 // Tap rows (start + i) of a stream's ring of R rows, `width` bf16 each, into OUT rows 0..n. Grid (n), 256 threads.
 extern "C" __global__ void tf_q35d_gather_taps(const __nv_bfloat16* __restrict__ RING, int R, long long start, int width,
                                                  __nv_bfloat16* __restrict__ OUT) {
+    pdl_release();
+    pdl_await();
     const long long row = start + blockIdx.x;
     const __nv_bfloat16* src = RING + (size_t)(row % R) * width;
     __nv_bfloat16* dst = OUT + (size_t)blockIdx.x * width;
@@ -38,6 +52,8 @@ struct TapRows {
 // Tap rows (start + rows.rows[i]) of a stream's ring into OUT rows 0..n: a kept path's rows in order. Grid (n).
 extern "C" __global__ void tf_q35d_gather_rows(const __nv_bfloat16* __restrict__ RING, int R, long long start, TapRows rows, int width,
                                                  __nv_bfloat16* __restrict__ OUT) {
+    pdl_release();
+    pdl_await();
     const long long row = start + rows.rows[blockIdx.x];
     const __nv_bfloat16* src = RING + (size_t)(row % R) * width;
     __nv_bfloat16* dst = OUT + (size_t)blockIdx.x * width;
@@ -48,6 +64,8 @@ extern "C" __global__ void tf_q35d_gather_rows(const __nv_bfloat16* __restrict__
 extern "C" __global__ void tf_q35d_dyn_conv(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ DYN,
                                               const __nv_bfloat16* __restrict__ BASE, const __nv_bfloat16* __restrict__ RES,
                                               __nv_bfloat16* __restrict__ OUT, int D, int group, int branch) {
+    pdl_release();
+    pdl_await();
     const int t = blockIdx.x;
     const int groups = D / group;
     for (int c = threadIdx.x; c < D; c += blockDim.x) {
@@ -69,6 +87,8 @@ extern "C" __global__ void tf_q35d_dyn_conv(const __nv_bfloat16* __restrict__ X,
 extern "C" __global__ void __launch_bounds__(32) tf_q35d_norm_rope(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W,
                                                                      __nv_bfloat16* __restrict__ OUT, int heads, int stride, long long pos0,
                                                                      float eps, float theta) {
+    pdl_release();
+    pdl_await();
     const int head = blockIdx.x % heads;
     const size_t m = blockIdx.x / heads;
     const int t = threadIdx.x;
@@ -102,6 +122,8 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35d_norm_rope(const __nv_bf
 // Rows of packed (kv_heads, HD) keys and values at positions pos0 + i into a layer's rings (slot pos % W).
 extern "C" __global__ void tf_q35d_ring_put(const __nv_bfloat16* __restrict__ K, const __nv_bfloat16* __restrict__ V,
                                               __nv_bfloat16* __restrict__ RK, __nv_bfloat16* __restrict__ RV, int width, long long pos0, int W) {
+    pdl_release();
+    pdl_await();
     const int i = blockIdx.x;
     const size_t slot = (size_t)((pos0 + i) % W);
     for (int c = threadIdx.x; c < width; c += blockDim.x) {

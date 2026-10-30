@@ -27,7 +27,7 @@ pub fn projectMany(e: *Engine, ls: []const Proj, x: u64, xs: u64, outs: []const 
         return;
     }
     const k = ls[0].inputs();
-    if (sums) try e.run(e.fns.sums, .{ rows, (k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ x, xs, @as(c_int, @intCast(k)), params });
+    if (sums) try e.runAfter(e.fns.sums, .{ rows, (k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ x, xs, @as(c_int, @intCast(k)), params });
     var many: [A.segs_max]A.Out = undefined;
     var at: usize = 0;
     while (at < rows) : (at += A.max_rows) {

@@ -6,6 +6,8 @@ constexpr int DRAFT_CHUNKS = 9;
 extern "C" __global__ void tf_q35d_dyn_conv_batch(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ DYN,
                                               const __nv_bfloat16* __restrict__ BASE, const __nv_bfloat16* __restrict__ RES,
                                               __nv_bfloat16* __restrict__ OUT, int D, int group, int branch, int block_rows) {
+    pdl_release();
+    pdl_await();
     const int t = blockIdx.x;
     const int groups = D / group;
     // grid (rows, channel blocks): a thread a channel, so a 16-row window fills the device instead of 16 blocks
@@ -27,6 +29,8 @@ extern "C" __global__ void tf_q35d_dyn_conv_batch(const __nv_bfloat16* __restric
 extern "C" __global__ void __launch_bounds__(32) tf_q35d_norm_rope_batch(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W,
                                                                      __nv_bfloat16* __restrict__ OUT, int heads, int stride, const DraftSegment* segments, int block_rows,
                                                                      float eps, float theta) {
+    pdl_release();
+    pdl_await();
     const int head = blockIdx.x % heads;
     const size_t m = blockIdx.x / heads;
     const int t = threadIdx.x;
@@ -67,6 +71,8 @@ extern "C" __global__ void tf_q35d_mask_rows(const __nv_bfloat16* X, __nv_bfloat
 extern "C" __global__ void __launch_bounds__(128) tf_q35d_attn_partial(const __nv_bfloat16* Q,
         const __nv_bfloat16* KB, const __nv_bfloat16* VB, const DraftSegment* segments,
         int block_rows, int heads, int kv_heads, int W, int window, int layer, float* PM, float* PL, float* PO) {
+    pdl_release();
+    pdl_await();
     constexpr int DPL = HD / 32, CHUNK = 256, WARPS = 4, SLICE = CHUNK / WARPS, PER = SLICE / 32, BATCH = 16;
     __shared__ float qs[HD];
     __shared__ float ps[CHUNK];
@@ -175,6 +181,8 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35d_attn_partial(const __n
 
 extern "C" __global__ void __launch_bounds__(32) tf_q35d_attn_merge(const float* PM, const float* PL,
         const float* PO, int heads, __nv_bfloat16* OUT) {
+    pdl_release();
+    pdl_await();
     constexpr int DPL = HD / 32;
     const int lane = threadIdx.x, m = blockIdx.x, h = blockIdx.y;
     const size_t base = ((size_t)m * heads + h) * DRAFT_CHUNKS;

@@ -5,6 +5,8 @@
 extern "C" __global__ void __launch_bounds__(256) tf_q35_tap(const __nv_bfloat16* __restrict__ H, const __nv_bfloat16* __restrict__ R,
                                                               const Seg* __restrict__ segs, const int* __restrict__ rowseg, int tap, int D,
                                                               const int* __restrict__ P) {
+    release_next();
+    await_prior();
     if (past_rows(P, blockIdx.x)) return;
     const size_t m = blockIdx.x;
     const Seg sg = segs[rowseg[m]];
@@ -28,6 +30,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_mlp_act(const __nv_bflo
                                             __nv_bfloat16* __restrict__ OUT, long long total, const int* __restrict__ P, int D, float* __restrict__ XS) {
     __shared__ __align__(16) __nv_bfloat16 done[1024];
     release_next();
+    await_prior();
     if (P != nullptr) total = (long long)P[2] * D;
     const long long i = ((long long)blockIdx.x * blockDim.x + threadIdx.x) * 4;
     if (i < total) {
