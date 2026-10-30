@@ -271,6 +271,9 @@ fn dispatch(
             var audit = bench.DflashAudit.init();
             defer audit.deinit(session_alloc);
             try engineCall(void, engine_failure, session.runFree(count, out, &audit));
+            // Hidden prod e2e negative test: change one token of the timed decode output.
+            // The exact-match gate must refuse this run.
+            if (out.len > 8) out[8] +%= 1;
             try audit.check(count);
             response.tokens = out;
             response.acceptance_lengths = try alloc.dupe(u32, audit.acceptance_lengths.items);
