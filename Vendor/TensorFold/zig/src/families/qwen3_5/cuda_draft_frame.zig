@@ -118,7 +118,7 @@ pub fn forward(d: anytype, items: []const dr.Hold, contexts: []const *draft.Ctx)
     try d.norm(masked, d.w.final_norm, d.x, rows);
     const spanned = if (narrow(contexts)) try head(d, rows) else try full(d, rows);
     try e.draws.topkRows(e.stream, spanned orelse d.logits, if (spanned != null) span_width else c.vocab, @intCast(c.topk), d.parts, d.words, rows);
-    try d.proj(d.w.selector, d.x, d.hp, rows);
+    try d.projAgain(d.w.selector, d.x, d.hp, rows);
     try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + words_at, d.words, rows * lp_words * 4, e.stream.handle), "cuMemcpyDtoHAsync");
     try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + hp_at, d.hp, rows * c.rank * 2, e.stream.handle), "cuMemcpyDtoHAsync");
     try e.stream.synchronize();

@@ -96,6 +96,7 @@ pub const Engine = struct {
     g: Geometry,
     geo: Geo,
     stream: cuda.Stream,
+    blocks: std.ArrayListUnmanaged(cuda.DeviceBuffer) = .empty, // closed streams' device blocks (cuda_cache.zig take/give)
     mods: [19]cuda.Module,
     kv8: bool, // attention caches as e4m3 rows with a scale each
     fp8: Kv8,
@@ -309,6 +310,9 @@ pub const Engine = struct {
         e.arena.free();
         e.gpa.free(e.layers);
         e.gpa.free(e.dir);
+        for (e.blocks.items) |*b| b.free();
+        e.blocks.deinit(e.gpa);
+        @import("cuda_cache.zig").forget(e);
         e.affine.deinit();
         e.wide.deinit();
         e.int8.deinit();
