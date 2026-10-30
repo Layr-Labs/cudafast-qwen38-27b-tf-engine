@@ -236,6 +236,8 @@ pub const Engine = struct {
         const gb10 = major == 12 and minor == 1;
         e.affine = try cuda.qlinear.Affine4Kernels.resolve(d, e.mods[0], e.mods[1], e.mods[2], e.mods[3], sms, gb10);
         e.affine.half_prompt = !gb10; // the 27B's prompt tile (Tile<64, 128, 128, 2, 2, 2>), quicker on an RTX 5090
+        // GB10: split-K decode/verify projections on the cluster tile (bits unchanged); TF_CLUSTER_DECODE=0 restores lane_gemv
+        e.affine.cluster_decode = gb10 and !envOff("TF_CLUSTER_DECODE");
         errdefer e.affine.deinit();
         e.prompt_many = try cuda.prompt_many.Kernels.resolve(e.mods[1]);
         // sm_120 too: a 32-row window of the 27B verifies in 17.8 ms on one weight pass, 22.3 ms on two 16-row ones
@@ -387,6 +389,15 @@ pub const Engine = struct {
         try cuda.launch.launch(f, cfg, e.stream, &a);
     }
 
+    /// `run` with programmatic dependent launch on GB10, for glue kernels that open with griddepcontrol.wait
+    /// (qwen35.cu's await_prior): the launch overlaps the preceding projection's tail, which triggers early.
+    pub fn runAfter(e: *Engine, f: cuda.Function, grid: [3]usize, block: [3]usize, args: anytype) !void {
+        var a: cuda.Args = .{};
+        inline for (args) |v| a.add(v);
+        const cfg: cuda.Config = .{ .grid = .{ .x = @intCast(grid[0]), .y = @intCast(grid[1]), .z = @intCast(grid[2]) }, .block = .{ .x = @intCast(block[0]), .y = @intCast(block[1]), .z = @intCast(block[2]) }, .pdl = e.affine.pdl };
+        try cuda.launch.launch(f, cfg, e.stream, &a);
+    }
+
     /// The projections: the row tiles, the prompt GEMM and the grouped form, in their own file.
     pub const proj = @import("cuda_projection.zig").proj;
     pub const projSums = @import("cuda_projection.zig").projSums;
@@ -415,7 +426,7 @@ pub const Engine = struct {
     }
 
     pub fn norm(e: *Engine, residual: bool, w: u64, rows: usize) !void {
-        try e.run(e.fns.norm, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, if (residual) e.r else @as(u64, 0), w, e.x, e.g.eps, @as(c_int, @intCast(e.g.hidden)), e.tables.ptr + params_at, e.xs });
+        try e.runAfter(e.fns.norm, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, if (residual) e.r else @as(u64, 0), w, e.x, e.g.eps, @as(c_int, @intCast(e.g.hidden)), e.tables.ptr + params_at, e.xs });
     }
 
     /// Refuse the whole frame before settling any prior window or launching work.
@@ -572,7 +583,7 @@ pub const Engine = struct {
         const input = e.tables.ptr + @as(usize, if (record) Round.steps_at else rowpar_at);
         // qwen35_slots.cuh: up to four slots scan two value rows a warp, so a block covers eight
         const rows_a_warp: usize = if (record and slot_count <= 4) 2 else 1;
-        try e.run(scan, .{ 1, geometry.dk / (4 * rows_a_warp), e.g.v_heads * segments }, .{ 32, 4, 1 }, .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, input, layer, e.y, e.tables.ptr + params_at });
+        try e.runAfter(scan, .{ 1, geometry.dk / (4 * rows_a_warp), e.g.v_heads * segments }, .{ 32, 4, 1 }, .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, input, layer, e.y, e.tables.ptr + params_at });
     }
 
     /// The launches of a forward of `shape`, from the embedding to the kept rows' logits (captured once a shape).
@@ -597,4 +608,10 @@ test "dense read cost: hidden and slot variants have distinct graph keys" {
             n += 1;
         }
     }
+}
+
+/// An engine A/B switch: true when `name` is set to "0".
+fn envOff(name: [*:0]const u8) bool {
+    const v = @import("sys").c.getenv(name) orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "0");
 }
