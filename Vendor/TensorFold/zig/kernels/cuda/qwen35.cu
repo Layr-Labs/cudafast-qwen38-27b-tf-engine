@@ -72,18 +72,21 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __r
     __shared__ float red[8];
     __shared__ __align__(16) __nv_bfloat16 xrow[8192];
     release_next();
-    if (past_rows(P, blockIdx.x)) return;
-    const size_t row = blockIdx.x;
     const int t = threadIdx.x;
     const int E = D / 256;
+    uint4 wv[4];
     if ((E & 3) == 0) {
-        // h + r and w * (h * inv) move 8 entries a lane through xrow; the squares keep a thread's E entries in order
-        uint4 wv[4];
 #pragma unroll
         for (int j = 0; j < 4; j++) {
             const int d = (t + 256 * j) * 8;
             if (d < D) wv[j] = *reinterpret_cast<const uint4*>(W + d);
         }
+    }
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+    if (past_rows(P, blockIdx.x)) return;
+    const size_t row = blockIdx.x;
+    if ((E & 3) == 0) {
+        // h + r and w * (h * inv) move 8 entries a lane through xrow; the squares keep a thread's E entries in order
 #pragma unroll
         for (int j = 0; j < 4; j++) {
             const int d = (t + 256 * j) * 8;
