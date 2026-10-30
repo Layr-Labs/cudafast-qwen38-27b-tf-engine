@@ -28,21 +28,21 @@ const ResidentArgs = struct { weights: []const u8, drafter: ?[]const u8, socket:
 pub fn main(init: std.process.Init) !u8 {
     const alloc = init.arena.allocator();
     const raw = try init.minimal.args.toSlice(alloc);
-    const argv = try alloc.alloc([]const u8, raw.len);
-    for (argv, raw) |*to, from| to.* = from;
-    if (argv.len == 2 and std.mem.eql(u8, argv[1], "self-test")) return selfTest(init);
-    if (argv.len == 3 and std.mem.eql(u8, argv[1], "manifest") and std.mem.eql(u8, argv[2], "--digest")) {
+    const command_args = try alloc.alloc([]const u8, raw.len);
+    for (command_args, raw) |*to, from| to.* = from;
+    if (command_args.len == 2 and std.mem.eql(u8, command_args[1], "self-test")) return selfTest(init);
+    if (command_args.len == 3 and std.mem.eql(u8, command_args[1], "manifest") and std.mem.eql(u8, command_args[2], "--digest")) {
         const digest = manifestDigest();
         try std.Io.File.stdout().writeStreamingAll(init.io, &digest);
         try std.Io.File.stdout().writeStreamingAll(init.io, "\n");
         return 0;
     }
-    if (argv.len >= 2 and std.mem.eql(u8, argv[1], "runtime-worker")) {
-        const weights = parseRuntime(argv[2..]) orelse return usageError(init.io);
+    if (command_args.len >= 2 and std.mem.eql(u8, command_args[1], "runtime-worker")) {
+        const weights = parseRuntime(command_args[2..]) orelse return usageError(init.io);
         return runtimeWorker(init, weights);
     }
-    if (argv.len >= 2 and std.mem.eql(u8, argv[1], "resident")) {
-        const args = parseResident(argv[2..]) orelse return usageError(init.io);
+    if (command_args.len >= 2 and std.mem.eql(u8, command_args[1], "resident")) {
+        const args = parseResident(command_args[2..]) orelse return usageError(init.io);
         return residentMain(init, args);
     }
     return usageError(init.io);
