@@ -1,8 +1,8 @@
 //! Prompt GEMMs of up to four affine-4 projections of one input in one launch (qmm_prompt_many.cuh).
 //!
 //! Each output keeps qmm_prefill's prefill_kernel bits: the same bf16 weights, the same m16n8k16 MMA chain over
-//! K into one fp32 accumulator, the same bf16 store. The tile is prefill_kernel's 128 x 128 on 2 x 2 warps with
-//! two stages (its RTX 5090 instantiation), so two CTAs share a GB10 SM, and the projections' tiles share one
+//! K into one fp32 accumulator, the same bf16 store. The 128 x 128 tile uses 1 x 4 warps, two stages, and two
+//! activation-fragment banks. Two CTAs share a GB10 SM, and the projections' tiles share one
 //! launch: a small projection (GDN's a and b, attention's k and v) runs beside a large one instead of alone.
 const std = @import("std");
 const module = @import("module.zig");
