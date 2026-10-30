@@ -164,3 +164,10 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_many(const __nv_
         const __grid_constant__ tf_qmm_prefill::ManyParts parts, int M, int K, int ldx, int group) {
     tf_qmm_prefill::prompt_many_body<64, 128, 128, 2, 2, 2>(x, parts, M, K, ldx, group);
 }
+
+// The same body on 64-row tiles (prompt_many.zig's `short` picks it for tail-heavy grids): an element's m16 row
+// block and n8 column block still start at multiples of 16 and 8, so its MMA chain over K and its store are the same.
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_many64(const __nv_bfloat16* __restrict__ x,
+        const __grid_constant__ tf_qmm_prefill::ManyParts parts, int M, int K, int ldx, int group) {
+    tf_qmm_prefill::prompt_many_body<64, 64, 128, 2, 2, 2>(x, parts, M, K, ldx, group);
+}

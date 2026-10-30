@@ -58,6 +58,18 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_splice(__nv_bfloat16* _
     for (int i = threadIdx.x; i < D; i += blockDim.x) H[(size_t)blockIdx.x * D + i] = F[(size_t)s * D + i];
 }
 
+__device__ __forceinline__ void release_next() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+#endif
+}
+
+__device__ __forceinline__ void await_prior() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
+}
+
 // h = bf16(h + r) (r may be null), x = bf16(w * (h * inv)), XS (may be null) x's group sums; D 256k up to 8192.
 extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __restrict__ H, const __nv_bfloat16* __restrict__ R,
                                                                const __nv_bfloat16* __restrict__ W, __nv_bfloat16* __restrict__ X, float eps, int D,
@@ -65,6 +77,8 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __r
     constexpr int MAXE = 32;
     __shared__ float red[8];
     __shared__ __align__(16) __nv_bfloat16 xrow[8192];
+    release_next();
+    await_prior();
     if (past_rows(P, blockIdx.x)) return;
     const size_t row = blockIdx.x;
     const int t = threadIdx.x;
@@ -178,6 +192,8 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35_gdn_pre(Geo geo, const _
                                                                   __nv_bfloat16* __restrict__ Q, __nv_bfloat16* __restrict__ K,
                                                                   __nv_bfloat16* __restrict__ V, float* __restrict__ G, __nv_bfloat16* __restrict__ BETA,
                                                                   const int* __restrict__ P) {
+    release_next();
+    await_prior();  // launched with PDL: nothing below reads before the prior grid completes
     const int lane = threadIdx.x;
     const int head = blockIdx.y;
     const int w = blockIdx.z;
@@ -241,6 +257,8 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35_gdn_pre(Geo geo, const _
 // A segment's conv tail: a recorded window leaves the stream's (gdn_pre logged its rows'); others update it in place.
 extern "C" __global__ void tf_q35_conv_commit(Geo geo, const __nv_bfloat16* __restrict__ QKV, const Seg* __restrict__ segs,
                                                 const int* __restrict__ rowpar, int layer, const int* __restrict__ P) {
+    release_next();
+    await_prior();  // launched with PDL: nothing below reads before the prior grid completes
     const int C = geo.conv();
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C || past_windows(P, blockIdx.y)) return;
@@ -265,6 +283,8 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_chain(Geo geo, cons
                                                                      const __nv_bfloat16* __restrict__ beta, const Seg* __restrict__ segs,
                                                                      const int* __restrict__ rowpar, int layer, __nv_bfloat16* __restrict__ y,
                                                                      const int* __restrict__ P) {
+    release_next();
+    await_prior();  // launched with PDL: nothing below reads before the prior grid completes
     const int NK = geo.nk, NV = geo.nv;
     if (past_windows(P, blockIdx.z / NV)) return;
     const int hv = blockIdx.z % NV;
@@ -366,6 +386,8 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35_gdn_post(Geo geo, const 
                                                                    const int* __restrict__ P, float* __restrict__ XS) {
     __shared__ __align__(16) __nv_bfloat16 done[DK];  // the head's outputs, for XS's group sums (XS may be null)
     const int lane = threadIdx.x, hv = blockIdx.y;
+    release_next();
+    await_prior();  // launched with PDL: nothing below reads before the prior grid completes
     if (past_rows(P, blockIdx.z)) return;
     const size_t m = blockIdx.z;
     const size_t W = (size_t)geo.nv * DK;
@@ -396,6 +418,8 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35_gdn_post(Geo geo, const 
 extern "C" __global__ void __launch_bounds__(64) tf_q35_head_norm(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W,
                                                                     __nv_bfloat16* __restrict__ OUT, int heads, int stride, int hstride, float eps,
                                                                     const int* __restrict__ P) {
+    release_next();
+    await_prior();  // launched with PDL: nothing below reads before the prior grid completes
     __shared__ float sums[2];
     const int head = blockIdx.x % heads;
     if (past_rows(P, blockIdx.x / heads)) return;
@@ -434,6 +458,8 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_rope(Geo geo, __nv_bflo
                                                                 const __nv_bfloat16* __restrict__ Vr, const Seg* __restrict__ segs,
                                                                 const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
                                                                 const int* __restrict__ P, const int* __restrict__ M) {
+    release_next();
+    await_prior();  // launched with PDL: nothing below reads before the prior grid completes
     rope_rows(geo, Qn, Kn, Vr, segs, rowseg, rowanc, P, M, StoreBf16{layer, geo.kvh});
 }
 
@@ -445,6 +471,8 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35_attn_merge(Geo geo, cons
                                                                      const float* __restrict__ PO, const Seg* __restrict__ segs,
                                                                      const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc,
                                                                      const int* __restrict__ P, __nv_bfloat16* __restrict__ OUT) {
+    release_next();
+    await_prior();  // launched with PDL: nothing below reads before the prior grid completes
     constexpr int DPL = HD / 32;
     const int QH = geo.qh;
     const int lane = threadIdx.x, qh = blockIdx.x;
@@ -482,6 +510,8 @@ __device__ __forceinline__ void block_sums(__nv_bfloat16* done, size_t total, fl
 extern "C" __global__ void tf_q35_attn_gate(Geo geo, const __nv_bfloat16* __restrict__ Y, const __nv_bfloat16* __restrict__ QRAW,
                                               __nv_bfloat16* __restrict__ OUT, int rows, const int* __restrict__ P, float* __restrict__ XS) {
     __shared__ __align__(16) __nv_bfloat16 done[256];
+    release_next();
+    await_prior();  // launched with PDL: nothing below reads before the prior grid completes
     const size_t W = (size_t)geo.qh * HD;
     if (P != nullptr) rows = P[2];
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -504,6 +534,8 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_attn_partial(Geo geo, c
                                                                         const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
                                                                         const int* __restrict__ P, float scale,
                                                                         float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
+    release_next();
+    await_prior();  // launched with PDL: nothing below reads before the prior grid completes
     extern __shared__ __align__(16) uint4 attn_tiles[];
     tf_q35_tc::attn_one<tf_q35_tc::Bf16Tiles<128>>({attn_tiles, nullptr, nullptr, nullptr}, geo, Q, segs, rowseg, rowanc, layer, P, scale, PM, PL, PO);
 }
@@ -512,6 +544,8 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_attn_rows(Geo geo, cons
                                                                      const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
                                                                      const int* __restrict__ P, float scale, int total,
                                                                      float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
+    release_next();
+    await_prior();  // launched with PDL: nothing below reads before the prior grid completes
     extern __shared__ __align__(16) uint4 attn_tiles[];
     tf_q35_tc::attn_rows<4, tf_q35_tc::Bf16Tiles<256>>({attn_tiles, nullptr, nullptr, nullptr}, geo, Q, segs, rowseg, rowanc, layer, P, scale, total, PM, PL, PO);
 }
