@@ -13,8 +13,10 @@ pub const tap_held = 2048;
 pub const tap_rows = tap_held + engine.most_verify;
 
 /// qwen35.cuh's Seg and Path.
-pub const Seg = extern struct { rec: u64, conv: u64, kv: u64, tap: u64, log: u64, before: u64, cap: c_int, len: c_int, row0: c_int, rows: c_int, tap_rows: c_int, taps: c_int, delta: c_int, pt: u64 = 0, ps: u64 = 0, ptok: c_int = 0, pn: c_int = 0, plog: u64 = 0 };
+pub const Seg = extern struct { rec: u64, conv: u64, kv: u64, tap: u64, log: u64, before: u64, cap: c_int, len: c_int, row0: c_int, rows: c_int, tap_rows: c_int, taps: c_int, delta: c_int, pt: u64 = 0, ps: u64 = 0, ptok: c_int = 0, pn: c_int = 0, plog: u64 = 0, qn: c_int = 0, qlog: u64 = 0 };
 pub const Path = extern struct { n: c_int, rows: [engine.most_window]c_int };
+/// Window logs a cache keeps: the window being written, the newest kept prefix and the held older one.
+pub const log_parts = 3;
 
 /// A cache's keys and values as pages (qwen35.cuh kv_row): page i of the stream's positions at `base` + ids[i] pages.
 pub const Paged = struct {
@@ -125,10 +127,14 @@ pub const Cache = struct {
     last: ?struct { start: usize, rows: usize } = null,
     /// A kept prefix of the newest window (rows 0..pend-1) whose recurrence replay the next recorded slot scan folds.
     pend: c_int = 0,
-    /// The log half that window wrote (the next window writes the other half of `log`).
+    /// The log third that window wrote (the next window writes another third of `log`).
     pend_log: u64 = 0,
-    /// Which half of `log` the next window writes.
-    flip: bool = false,
+    /// An older kept prefix (rows 0..held-1 of held_log) a slot scan replayed without writing back: `state` predates
+    /// it, and the next scan, keep or flush replays it before `pend`.
+    held: c_int = 0,
+    held_log: u64 = 0,
+    /// Which third of `log` the next window writes: never one a pending or held prefix lives in.
+    turn: u8 = 0,
     /// An image prompt's rotary shift (get_rope_index's rope_delta): rows after its prompt rotate at position + delta.
     pub fn init(gpa: std.mem.Allocator, e: *Engine, cap: usize) !Cache {
         return initFor(gpa, e, cap, true);
@@ -180,7 +186,7 @@ pub const Cache = struct {
     }
 
     fn runParts(e: *const Engine, ring: usize) [5]usize {
-        return .{ e.g.stateBytes(), e.g.stateBytes(), 2 * e.g.logBytes(engine.most_window), e.tapBytes(), ring };
+        return .{ e.g.stateBytes(), e.g.stateBytes(), log_parts * e.g.logBytes(engine.most_window), e.tapBytes(), ring };
     }
 
     /// A lane's state, before, log, taps and drafter ring as views of the run at `base`; a short run is refused.
@@ -194,6 +200,7 @@ pub const Cache = struct {
         }
         self.state = views[0];
         self.pend = 0;
+        self.held = 0;
         self.before = views[1];
         self.log = views[2];
         self.tap = if (e.n_taps > 0) views[3] else null;
@@ -206,6 +213,7 @@ pub const Cache = struct {
         const none: DeviceBuffer = .{ .d = e.d, .ptr = 0, .len = 0, .borrowed = true };
         self.state = none;
         self.pend = 0;
+        self.held = 0;
         self.before = none;
         self.log = none;
         self.tap = null;
@@ -221,7 +229,7 @@ pub const Cache = struct {
         errdefer if (before) |*b| b.free();
         if (!adaptive) before = try take(e, e.g.stateBytes());
         var log: DeviceBuffer = .{ .d = e.d, .ptr = 0, .len = 0, .borrowed = true };
-        if (!adaptive) log = try take(e, 2 * e.g.logBytes(engine.most_window));
+        if (!adaptive) log = try take(e, log_parts * e.g.logBytes(engine.most_window));
         errdefer log.free();
         var tap: ?DeviceBuffer = null;
         errdefer if (tap) |*t| t.free();
@@ -252,6 +260,7 @@ pub const Cache = struct {
         recurrent.release(self);
         self.len = 0;
         self.pend = 0;
+        self.held = 0;
         self.written = 0;
         self.last = null;
         self.untaught = false;
@@ -277,7 +286,7 @@ pub const Cache = struct {
     /// The stream's window of `rows` rows from forward row `row0`, after `len` cached positions.
     pub fn seg(self: *const Cache, e: *const Engine, len: usize, row0: usize, rows: usize) Seg {
         const g = e.g;
-        var sg: Seg = .{ .rec = self.state.ptr, .conv = self.state.ptr + g.deltas() * g.recBytes(), .kv = self.kv.ptr, .tap = if (self.tap) |t| t.ptr else 0, .log = self.log.ptr + if (self.flip) self.log.len / 2 else 0, .before = if (self.before) |b| b.ptr else 0, .cap = @intCast(self.cap), .len = @intCast(len), .row0 = @intCast(row0), .rows = @intCast(rows), .tap_rows = tap_rows, .taps = @intCast(e.n_taps), .delta = self.delta };
+        var sg: Seg = .{ .rec = self.state.ptr, .conv = self.state.ptr + g.deltas() * g.recBytes(), .kv = self.kv.ptr, .tap = if (self.tap) |t| t.ptr else 0, .log = self.part(self.turn), .before = if (self.before) |b| b.ptr else 0, .cap = @intCast(self.cap), .len = @intCast(len), .row0 = @intCast(row0), .rows = @intCast(rows), .tap_rows = tap_rows, .taps = @intCast(e.n_taps), .delta = self.delta };
         if (self.paged) |p| {
             sg.kv = p.base;
             sg.pt = p.table.ptr;
@@ -287,10 +296,25 @@ pub const Cache = struct {
         return sg;
     }
 
+    /// The device address of `log`'s window part `i`.
+    fn part(self: *const Cache, i: u8) u64 {
+        return self.log.ptr + @as(u64, i) * (self.log.len / log_parts);
+    }
+
+    /// A log part neither the pending nor the held prefix lives in, for the next window to write.
+    fn freePart(self: *const Cache) u8 {
+        var i: u8 = 0;
+        while (i + 1 < log_parts) : (i += 1) {
+            const taken = (self.pend > 0 and self.part(i) == self.pend_log) or (self.held > 0 and self.part(i) == self.held_log);
+            if (!taken) return i;
+        }
+        return i;
+    }
+
     /// Keeps `path` (window rows, ascending from 0): the state as that chain would leave it, a tree's keys moved down.
     pub fn keep(self: *Cache, e: *Engine, path: []const u32) !void {
         const last = self.last orelse return error.NothingToKeep;
-        try self.flush(e);
+        if (self.pend != 0) try self.flush(e);
         if (path.len == 0) {
             if (last.rows == 1) {
                 try recurrent.mark(self, true);
@@ -314,40 +338,61 @@ pub const Cache = struct {
             return;
         }
         const g = e.g;
-        const sg = self.seg(e, last.start, 0, last.rows);
+        var sg = self.seg(e, last.start, 0, last.rows);
         try recurrent.mark(self, false);
-        if (!prefix) try e.run(e.keeps.apply, .{ 1, geometry.dk / 4, g.v_heads * g.deltas() }, .{ 32, 4, 1 }, .{ e.geo, sg, p });
+        if (!prefix) {
+            // the held older prefix goes into the recurrences ahead of the path, in the same launch
+            sg.qn = self.held;
+            sg.qlog = self.held_log;
+            self.held = 0;
+            try e.run(e.keeps.apply, .{ 1, geometry.dk / 4, g.v_heads * g.deltas() }, .{ 32, 4, 1 }, .{ e.geo, sg, p });
+        }
         try e.run(e.keeps.conv, .{ g.deltas(), (g.convBytes() / 2 + 255) / 256, 1 }, .{ 256, 1, 1 }, .{ e.geo, sg, @as(c_int, @intCast(path[path.len - 1])) });
         if (!prefix and g.attentions() > 0) try e.run(if (e.kv8) e.fp8.compact else e.keeps.compact, .{ g.attentions(), g.kv_heads, 1 }, .{ geometry.head_dim, 1, 1 }, .{ e.geo, sg, p });
         if (prefix) {
-            // a chain's prefix: the next recorded slot scan replays it from this log half while it loads the state
+            // a chain's prefix: the next recorded slot scan replays it from this log part while it loads the state
             self.pend = p.n;
             self.pend_log = sg.log;
-            self.flip = !self.flip;
+            self.turn = self.freePart();
         }
         self.last = null;
         self.len = last.start + path.len;
     }
 
-    /// A pending kept prefix replayed into the recurrences now (before anything but a recorded slot scan reads them).
+    /// The held and pending kept prefixes replayed into the recurrences now (before anything but a recorded slot scan
+    /// reads them), the older first, in one launch.
     pub fn flush(self: *Cache, e: *Engine) !void {
-        if (self.pend == 0) return;
+        if (self.pend == 0 and self.held == 0) return;
         var p: Path = .{ .n = self.pend, .rows = @splat(0) };
         const n: usize = @intCast(self.pend);
         for (p.rows[0..n], 0..) |*r, i| r.* = @intCast(i);
         var sg = self.seg(e, self.len, 0, 0);
         sg.log = self.pend_log;
+        sg.qn = self.held;
+        sg.qlog = self.held_log;
         self.pend = 0;
+        self.held = 0;
         const g = e.g;
         try recurrent.mark(self, false);
         try e.run(e.keeps.apply, .{ 1, geometry.dk / 4, g.v_heads * g.deltas() }, .{ 32, 4, 1 }, .{ e.geo, sg, p });
     }
 
-    /// The pending prefix handed to this forward's slot scan (`segs`' entry for this cache).
+    /// The held and pending prefixes handed to this forward's slot scan (`segs`' entry for this cache). The scan
+    /// writes its replayed state back only when it replays a held prefix (or updates a one-row window in place);
+    /// otherwise `state` stays as loaded and the pending prefix is held for the next scan, every other window's
+    /// recurrent-state write skipped.
     pub fn fold(self: *Cache, seg_: Seg) Seg {
         var sg = seg_;
         sg.pn = self.pend;
         sg.plog = self.pend_log;
+        sg.qn = self.held;
+        sg.qlog = self.held_log;
+        if (self.held > 0 or seg_.rows == 1) {
+            self.held = 0;
+        } else {
+            self.held = self.pend;
+            self.held_log = self.pend_log;
+        }
         self.pend = 0;
         return sg;
     }

@@ -45,10 +45,13 @@ __device__ __forceinline__ void q35_slots(Geo geo, const __nv_bfloat16* q, const
     for (int r = 0; r < R; ++r)
 #pragma unroll
         for (int i = 0; i < PT; ++i) root[r][i] = st[r * DK + i];
-    if (sg.pn > 0) {
+#pragma unroll 1
+    for (int part = 0; part < 2; ++part) {
+        const int pn = part == 0 ? sg.qn : sg.pn;
+        if (pn <= 0) continue;
         Seg prev = sg;
-        prev.log = sg.plog;
-        for (int j = 0; j < sg.pn; ++j) {
+        prev.log = part == 0 ? sg.qlog : sg.plog;
+        for (int j = 0; j < pn; ++j) {
             const LogRow l = log_row(geo, prev, layer, j);
             const float pg = l.g[hv];
 #pragma unroll
@@ -171,7 +174,7 @@ __device__ __forceinline__ void q35_slots(Geo geo, const __nv_bfloat16* q, const
         if ((dk & ((1 << SR) - 1)) == 0) y[((size_t)pend_row * NV + hv) * DK + dv0 + (dk >> SR)] = __float2bfloat16_rn(tot);
     }
     if (record && sg.rows != 1) {
-        if (sg.pn > 0)
+        if (sg.qn > 0)
 #pragma unroll
             for (int r = 0; r < R; ++r)
 #pragma unroll
