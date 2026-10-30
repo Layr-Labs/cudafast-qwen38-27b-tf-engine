@@ -27,7 +27,6 @@ fn u(v: usize) u32 {
 pub const Affine4Kernels = struct {
     pub const max_rows = 16; // rows decode() takes: its kernels tile 16 rows
     pub const segs_max = 4; // projections one segmented launch takes
-    pub const narrow_tiles = 24; // GB10: column tiles at most that decode() runs in the split form (half its 48 SMs)
 
     /// One projection of a shared input and its output.
     pub const Out = struct { q: Affine4, out: u64 };
@@ -46,7 +45,6 @@ pub const Affine4Kernels = struct {
     scales_fn: Function, // affine4_pack.cu: (n, kg) scales or biases into (kg, npad)
     gemv_blocks: usize, // resident lane_gemv CTAs: per SM times SMs
     split: ?Split, // every GPU but GB10: lane_gemv's slices on CTAs of their own (one stream's decode() at a time)
-    narrow: ?Split, // GB10: the split form for projections too narrow to fill the GPU as lane_gemv column CTAs
     pdl: bool, // GB10: the decode kernels launch with programmatic dependent launch
     wide_verify: bool, // off GB10: verify windows of 17 to 32 rows share one weight pass (sm_120, when its engine says)
 
@@ -78,13 +76,11 @@ pub const Affine4Kernels = struct {
         a.pdl = gb10;
         a.wide_verify = false;
         a.split = if (gb10) null else try Split.initFor(d, segs_max);
-        a.narrow = if (gb10) try Split.initFor(d, 1) else null;
         return a;
     }
 
     pub fn deinit(a: *Affine4Kernels) void {
         if (a.split) |*sp| sp.deinit();
-        if (a.narrow) |*sp| sp.deinit();
     }
 
     /// qmm_fast.tile: MLX words (n, k/8), scales and biases (n, k/64) on the device into q's tiles (Affine4.layout).
@@ -112,9 +108,6 @@ pub const Affine4Kernels = struct {
         if (rows > max_rows) return error.WindowTooWide;
         const sk = splitK(q.n, q.k);
         if (sk > 1) if (a.split) |sp| return a.gemvSplit(s, x, xs, q, out, rows, sk, sp);
-        // GB10: a projection of few column tiles (GDN a/b, attention k/v) leaves most SMs idle as lane_gemv's
-        // column CTAs; the split form runs each K slice on a CTA of its own and sums them in slice order (same bytes)
-        if (sk > 1) if (a.narrow) |sp| if ((q.n + 63) / 64 <= narrow_tiles) return a.gemvSplit(s, x, xs, q, out, rows, sk, sp);
         return if (sk > 1) a.gemv(s, x, xs, q, out, rows, sk) else a.cluster(s, x, xs, q, out, rows, sk);
     }
 
@@ -213,7 +206,7 @@ pub const Affine4Kernels = struct {
         for ([_]usize{ rows, q.k, q.k }) |v| g.add(int(v));
         g.add(sp.work.ptr);
         g.add(sp.tickets.ptr);
-        try launch_.launch(a.split_fn, .{ .grid = .{ .x = u(tiles * sk) }, .block = .{ .x = 128 }, .shared = split_smem, .pdl = a.pdl }, s, &g);
+        try launch_.launch(a.split_fn, .{ .grid = .{ .x = u(tiles * sk) }, .block = .{ .x = 128 }, .shared = split_smem }, s, &g);
     }
 
     /// lane_gemv: every K slice of a column tile in one CTA, summed in slice order, CTAs looping over the tiles.
