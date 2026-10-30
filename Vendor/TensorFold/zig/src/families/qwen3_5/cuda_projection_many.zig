@@ -7,7 +7,23 @@ const Proj = engine.Proj;
 pub fn projectMany(e: *Engine, ls: []const Proj, x: u64, xs: u64, outs: []const u64, rows: usize, prompt: bool, params: u64, sums: bool) !void {
     if (ls.len == 0 or ls.len != outs.len) return error.UnexpectedTensor;
     const A = cuda.qlinear.Affine4Kernels;
-    const segmented = e.affine.split != null and !(prompt and rows > 16) and ls.len <= A.segs_max and for (ls) |l| {
+    // a prompt chunk past 16 rows: its affine-4 projections of one input share one prompt-GEMM launch, each block
+    // the tile its own launch's same-index block computes (no group sums: the prompt GEMM reads none)
+    if (prompt and rows > 16 and !e.int8.on and ls.len <= A.segs_max) {
+        var many: [A.segs_max]A.Out = undefined;
+        var n: usize = 0;
+        for (ls, outs) |l, out| {
+            if (l == .a4 and l.a4.k == ls[0].inputs()) {
+                many[n] = .{ .q = l.a4, .out = out };
+                n += 1;
+            } else try e.project(l, x, xs, out, rows, prompt, params, false);
+        }
+        if (n > 0) try e.affine.promptMany(e.stream, x, many[0..n], rows);
+        return;
+    }
+    // GB10 has no split form: a decode or verify window of one row tile groups its projections by kernel instead
+    const grouped = e.affine.split != null or (!prompt and rows <= A.max_rows);
+    const segmented = grouped and !(prompt and rows > 16) and ls.len <= A.segs_max and for (ls) |l| {
         if (l != .a4 or l.inputs() != ls[0].inputs()) break false;
     } else true;
     if (!segmented) {
