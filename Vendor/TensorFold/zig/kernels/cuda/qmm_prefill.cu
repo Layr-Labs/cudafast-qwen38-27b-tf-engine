@@ -170,12 +170,12 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_many(const __nv_
 extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_mlp(const __nv_bfloat16* __restrict__ x,
         const __grid_constant__ tf_qmm_prefill::ManyParts parts, __nv_bfloat16* __restrict__ act, int M, int K, int ldx,
         int group) {
-    tf_qmm_prefill::prompt_mlp_body<64, 128, 2, 2>(x, parts, act, M, K, ldx, group);
+    tf_qmm_prefill::prompt_mlp_body<64, 128, 1, 4, 2>(x, parts, act, M, K, ldx, group);
 }
 
 // One prompt projection whose last column panels run as 64-wide tiles (prompt_split_body): a last wave of whole
 // 128 x 128 tiles leaves SMs idle; the narrow tiles even the SMs' shares, each with prefill_kernel's bits.
 extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_split(const __nv_bfloat16* __restrict__ x,
         const __grid_constant__ tf_qmm_prefill::ManyPart part, int M, int K, int ldx, int group, int full_cols) {
-    tf_qmm_prefill::prompt_split_body<64, 128, 128, 2, 2, 2>(x, part, M, K, ldx, group, full_cols);
+    tf_qmm_prefill::prompt_split_body<64, 128, 128, 1, 4, 2>(x, part, M, K, ldx, group, full_cols);
 }
