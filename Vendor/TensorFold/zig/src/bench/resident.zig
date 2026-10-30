@@ -8,8 +8,8 @@ const protocol = @import("protocol.zig");
 const capabilities = [_][]const u8{"free_run_decode"};
 const spec_modes = [_][]const u8{ "serial", "dflash" };
 const handshake_timeout_ms: u32 = 2_000;
-/// How long a connected worker may stay quiet between requests (benchd's gates wait before timing a phase).
-const request_wait_ms: u32 = 30 * 60 * 1000;
+/// How long a connected worker may stay quiet between requests. benchd can hold a request behind two 900 s gates whose wall time runs longer, so allow 1 hour.
+const request_wait_ms: u32 = 60 * 60 * 1000;
 
 pub const Identity = struct {
     backend: []const u8,
