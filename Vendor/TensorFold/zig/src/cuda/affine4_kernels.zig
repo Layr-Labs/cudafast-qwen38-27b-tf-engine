@@ -137,6 +137,8 @@ pub const Affine4Kernels = struct {
     }
 
     /// decode()'s kernels a projection, grouped by kernel: each part's blocks compute exactly what its own launch's would.
+    /// With cluster_decode the K-sliced parts share one cluster-tile launch of the widest part's slice count: a cluster
+    /// holds one part, C / sk of its tiles, each tile's slices summed by its slice 0 in slice order as cluster() does.
     fn decodeGrouped(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, outs: []const Out, rows: usize) !void {
         if (outs.len == 0 or outs.len > segs_max) return error.TooManyParts;
         const rows_t = (rows + 15) / 16;
