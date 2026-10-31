@@ -50,11 +50,11 @@ pub fn run(e: *E.Engine, layer: usize, total: usize) !void {
     const x = e.x + row * hid * 2;
     const act = e.act + row * g.intermediate * 2;
     try prompt.runFrom(e, layer, row, total);
-    try e.run(e.fns.attn_gate, .{ (aw + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ e.geo, y, e.qraw + row * 2 * aw * 2, mix, @as(c_int, 1), @as(u64, 0), @as(u64, 0) });
+    try e.runAfter(e.fns.attn_gate, .{ (aw + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ e.geo, y, e.qraw + row * 2 * aw * 2, mix, @as(c_int, 1), @as(u64, 0), @as(u64, 0) });
     try e.prompt_many.prompt(e.stream, mix, &.{.{ .q = m.o.a4, .out = r }}, 1);
-    try e.run(e.fns.norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, .{ h, r, l.post_norm, x, g.eps, @as(c_int, @intCast(hid)), params, @as(u64, 0) });
+    try e.runAfter(e.fns.norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, .{ h, r, l.post_norm, x, g.eps, @as(c_int, @intCast(hid)), params, @as(u64, 0) });
     try e.prompt_many.mlp(e.stream, x, d.gate.a4, d.up.a4, act, 1);
     try e.prompt_many.prompt(e.stream, act, &.{.{ .q = d.down.a4, .out = r }}, 1);
-    try e.run(e.fns.norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, .{ h, r, e.final_norm, x, g.eps, @as(c_int, @intCast(hid)), params, @as(u64, 0) });
+    try e.runAfter(e.fns.norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, .{ h, r, e.final_norm, x, g.eps, @as(c_int, @intCast(hid)), params, @as(u64, 0) });
     try e.proj(e.head, x, e.logits, 1, false);
 }

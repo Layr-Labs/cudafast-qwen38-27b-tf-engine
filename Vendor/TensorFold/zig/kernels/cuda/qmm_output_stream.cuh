@@ -9,6 +9,7 @@ constexpr int Stage=4416, SliceBytes=Stage*2, Bytes=SliceBytes*4;
 // A dictionary-coded part (qmm_dict.cuh): a stage's 256 bytes at 4096 hold the group's index window in place of its
 // scales and biases; each slice decodes its group into its own 256 bytes past Bytes, from the one table after them.
 // The part's npad holds the code, so the word stream's tile count is the grid's (one CTA a 64-column tile).
+// (pair codes too: qmm_dict::dict_fetch reads the column's pair entry, from the table here or through L2)
 __device__ __forceinline__ void dict_decode_at(const qmm_dict::DictLanes& D,const unsigned char* packed,unsigned char* dec,
         const unsigned char* table,int g){
     qmm_dict::dict_put(D,dec,qmm_dict::dict_fetch(D,packed,table,g));
@@ -70,6 +71,7 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
         wait<0>();__syncthreads();
         if(it+1<per){load_w(it+1);load_x(it+1);}commit();
         const auto* at=stage(it);const auto* wp=reinterpret_cast<const uint32_t*>(at+2048);
+        // the lane's scale or bias, fetched now and stored after the MMAs (a global pair table's latency)
         uint32_t dv=0;if constexpr(DICT)dv=qmm_dict::dict_fetch(D,at+4096,table,g0+it);
         const auto* sp=reinterpret_cast<const __nv_bfloat16*>(DICT?dec:at+4096);const auto* sums=reinterpret_cast<const float*>(at+4352);
         uint32_t words[2][2];

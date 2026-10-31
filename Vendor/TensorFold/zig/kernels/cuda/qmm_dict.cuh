@@ -21,13 +21,18 @@ using qmm_frag::cp16;
 // fetched whole once and the next group's indices in it come from L2.
 constexpr int DICT_DEC = 256;                    // shared bytes of one group's decoded scales and biases (bf16, 2 x 64)
 
-constexpr int DICT_PAIR_SMEM = 10240;
+// Pair mode (nb == 0 in the code: pbits | np << 5): one index a column a group-tile (64 indices of pbits bits, 8 * pbits
+// bytes, the same little-endian packing), into a table of np u32 entries, scale | bias << 16 (/root/cf/pairdict/
+// FORMAT.md). A column's scale and bias lanes read the same index and take the entry's low or high half, so dec[]
+// holds the same bf16 values. A table of at most DICT_PAIR_SMEM bytes sits in shared memory as the separate tables
+// do; a larger one is read through L2 (__ldg), its entry fetched before the group's MMAs and stored after them.
+constexpr int DICT_PAIR_SMEM = 10240;            // qlinear.zig's dict_tab_max: the twins' table room
 
 struct DictLanes {
     const unsigned char* src;                    // this thread's 16-byte chunk at the tile's first index group
-    const uint32_t* gtab;
+    const uint32_t* gtab;                        // pair mode past DICT_PAIR_SMEM: the global table (else null)
     int step, bit0, base, pos;                   // bytes a group; the lane's index's bit in its group; table half
-    int shift;
+    int shift;                                   // pair mode: the entry's half (0: scale, 16: bias)
     uint32_t mask;
     bool ok, pair;
 };
@@ -42,18 +47,23 @@ __device__ __forceinline__ int dict_ns(int code) { return code >> 5 & 0x1FFF; }
 __device__ __forceinline__ int dict_nb(int code) { return code >> 18 & 0x1FFF; }
 __device__ __forceinline__ bool dict_pair(int code) { return dict_nb(code) == 0; }
 __device__ __forceinline__ int dict_np(int code) { return dict_ns(code); }
+// a group-tile's index bytes: 64 pair indices or 128 separate ones
 __device__ __forceinline__ int dict_step(int code) { return (dict_pair(code) ? 8 : 16) * dict_bits(code); }
+// a part's table bytes in shared memory (16-byte padded): a pair table past DICT_PAIR_SMEM stays in global memory
 __device__ __forceinline__ int dict_tab_bytes(int code) {
     if (!dict_pair(code)) return (dict_ns(code) + dict_nb(code) + 7) / 8 * 16;
     const int b = (dict_np(code) * 4 + 15) / 16 * 16;
     return b <= DICT_PAIR_SMEM ? b : 0;
 }
+// dict_tab_bytes for a twin whose pair-table room is `room` bytes (a separate table's bytes regardless)
 __device__ __forceinline__ int dict_tab_bytes_upto(int code, int room) {
     if (!dict_pair(code)) return (dict_ns(code) + dict_nb(code) + 7) / 8 * 16;
     const int b = (dict_np(code) * 4 + 15) / 16 * 16;
     return b <= room ? b : 0;
 }
+// a pair entry's half: the scale (shift 0) or the bias (shift 16)
 __device__ __forceinline__ uint32_t dict_pair_half(uint32_t entry, int shift) { return entry >> shift & 0xFFFFu; }
+// pair entry idx from the shared table, or from global (L2) when the table stays there
 __device__ __forceinline__ uint32_t dict_pair_entry(const unsigned char* tab, const uint32_t* gtab, uint32_t idx) {
     return gtab != nullptr ? __ldg(gtab + idx) : reinterpret_cast<const uint32_t*>(tab)[idx];
 }
@@ -69,7 +79,7 @@ __device__ __forceinline__ DictLanes dict_lanes(const PartT& P, int n0, int KG, 
     D.src = reinterpret_cast<const unsigned char*>(P.scales) + static_cast<size_t>(n0 / 64) * KG * D.step + tid * 16;
     const int col = wn * (BN / WN) + (lane & 15);
     D.pos = (lane >> 4) * BN + col;
-    D.bit0 = (D.pair ? col : D.pos) * bits;
+    D.bit0 = (D.pair ? col : D.pos) * bits;       // pair: the column's one index; separate: the value's own
     D.base = !D.pair && (lane >> 4) ? dict_ns(code) : 0;
     D.shift = D.pair ? (lane >> 4) * 16 : 0;
     D.gtab = D.pair && dict_tab_bytes(code) == 0 ? reinterpret_cast<const uint32_t*>(P.biases) : nullptr;
@@ -77,6 +87,7 @@ __device__ __forceinline__ DictLanes dict_lanes(const PartT& P, int n0, int KG, 
     return D;
 }
 
+// dict_lanes' global-table choice for a twin whose pair-table room is `room` bytes
 template <typename PartT>
 __device__ __forceinline__ void dict_room(DictLanes& D, const PartT& P, int room) {
     D.gtab = D.pair && dict_tab_bytes_upto(P.npad, room) == 0 ? reinterpret_cast<const uint32_t*>(P.biases) : nullptr;
@@ -90,6 +101,7 @@ __device__ __forceinline__ void dict_table(const PartT& P, unsigned char* tab, i
     for (int c = tid; c < chunks; c += THREADS) cp16(tab + c * 16, src + c * 16);
 }
 
+// Group g's stage window -> the lane's bf16 value (bits), from the table at `tab` (shared) or D.gtab (global).
 __device__ __forceinline__ uint32_t dict_fetch(const DictLanes& D, const unsigned char* packed, const unsigned char* tab,
                                                int g) {
     const uint32_t* pk = reinterpret_cast<const uint32_t*>(packed);
@@ -99,10 +111,12 @@ __device__ __forceinline__ uint32_t dict_fetch(const DictLanes& D, const unsigne
     return reinterpret_cast<const unsigned short*>(tab)[D.base + idx];
 }
 
+// The lane's fetched value into dec[pos] (dec: 64 scales, 64 biases).
 __device__ __forceinline__ void dict_put(const DictLanes& D, unsigned char* dec, uint32_t v) {
     reinterpret_cast<unsigned short*>(dec)[D.pos] = static_cast<unsigned short>(v);
 }
 
+// Group g's stage window -> the lane's bf16 value at dec[pos] (the table right after dec).
 __device__ __forceinline__ void dict_decode(const DictLanes& D, const unsigned char* packed, unsigned char* dec, int g) {
     dict_put(D, dec, dict_fetch(D, packed, dec + DICT_DEC, g));
 }

@@ -35,10 +35,13 @@ __device__ __forceinline__ uint32_t pairm(uint32_t w, int s, uint32_t mask) {
 template <int GS, int BN, int STAGES>
 using GemvTile = LaneTile<GS, 16, BN, 1, 4, STAGES>;
 
+// The lane twins keep a pair table of up to LANE_PAIR_SMEM bytes in shared memory (their two-CTAs-an-SM room past the
+// stages and dec[], qlinear.zig lane_pair_tab_max), more than qmm_dict.cuh's DICT_PAIR_SMEM; a larger one is read through L2.
 constexpr int LANE_PAIR_SMEM = 14592;
 
 __device__ __forceinline__ int lane_pair_bytes(int code) { return (dict_np(code) * 4 + 15) / 16 * 16; }
 
+// dict_table, with the lane twins' pair room
 template <int THREADS, typename PartT>
 __device__ __forceinline__ void lane_table(const PartT& P, unsigned char* tab, int tid) {
     if (!dict_pair(P.npad) || lane_pair_bytes(P.npad) > LANE_PAIR_SMEM) return dict_table<THREADS>(P, tab, tid);
@@ -157,6 +160,8 @@ __device__ __forceinline__ void gemv_items(const __nv_bfloat16* __restrict__ x, 
         commit();
         const unsigned char* p = stage(it % STAGES);
         const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
+        // the lane's scale or bias fetched before the MMAs (a pair table read through L2 waits under them), stored
+        // into dec[] after them
         [[maybe_unused]] uint32_t dv = 0;
         if constexpr (DICT) dv = dict_fetch(D, p + T::X + T::W, buf + T::SMEM + DICT_DEC, map(it).x);
         const __nv_bfloat16* ps = DICT ? reinterpret_cast<const __nv_bfloat16*>(buf + T::SMEM)
@@ -183,7 +188,7 @@ __device__ __forceinline__ void gemv_items(const __nv_bfloat16* __restrict__ x, 
         }
         if constexpr (DICT) {
             dict_put(D, buf + T::SMEM, dv);
-            __syncwarp();
+            __syncwarp();                        // the warp's decoded scales and biases
         }
         const int row = lane >> 2;
         const float xv[2] = {px[row], px[row + 8]};
