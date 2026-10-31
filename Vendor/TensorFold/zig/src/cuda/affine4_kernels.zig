@@ -131,6 +131,7 @@ pub const Affine4Kernels = struct {
 
     group_fn: Function,
     stream16_fns: [2]?Function = @splat(null),
+    attention_stream16_fn: ?Function = null,
     stream16_dict_fn: ?Function = null, // tf_qmm_output_stream16 on a dictionary-coded down projection
     gdn_stream16_dict_fn: ?Function = null, // tf_qmm_gdn_stream16 with its dictionary-coded parts
     gdn_stream16_fn: ?Function = null,
@@ -190,6 +191,7 @@ pub const Affine4Kernels = struct {
         a.gemv_blocks = @max(1, try a.gemv_fn.occupancy(128, group_smem)) * sms;
         a.pdl = gb10;
         a.stream16_fns = @splat(null);
+        a.attention_stream16_fn = null;
         a.stream16_dict_fn = null;
         a.gdn_stream16_dict_fn = null;
         a.gdn_stream16_fn = null;
@@ -536,9 +538,35 @@ pub const Affine4Kernels = struct {
         return a.gemvSeg(s, x, xs, outs, rows, sp);
     }
 
+    pub fn attentionStreamable(a: *const Affine4Kernels, outs: []const Out, rows: usize) bool {
+        if (rows != 16 or outs.len != 3 or a.attention_stream16_fn == null or !a.pdl) return false;
+        for (outs) |o| if (o.q.k != 5120 or o.q.stream_w == 0 or !tileCoded(o.q)) return false;
+        return outs[0].q.n == 12288 and outs[1].q.n == 1024 and outs[2].q.n == 1024;
+    }
+
+    fn attentionStream(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, outs: []const Out) !void {
+        var parts: Parts = std.mem.zeroes(Parts);
+        parts.count = 3;
+        var first: usize = 0;
+        // The two small projections start first; all112 blocks fit one three-block residency wave.
+        for ([_]usize{ 1, 2, 0 }, 0..) |index, pi| {
+            const o = outs[index]; const q = o.q;
+            parts.p[pi] = .{ .w = q.stream_w, .scales = q.sb, .biases = q.tab, .out = o.out,
+                .n = int(q.n), .npad = @bitCast(q.code), .sk = int(splitK(q.n,q.k)),
+                .tiles = int(q.npad), .first = int(first) };
+            first += q.n / 128;
+        }
+        var args: launch_.Args = .{};
+        args.add(x); args.add(xs); args.add(parts);
+        for ([_]usize{ 16, 5120, 5120 }) |v| args.add(int(v));
+        return launch_.launch(a.attention_stream16_fn.?, .{ .grid = .{ .x = u(first) }, .block = .{ .x = 128 },
+            .shared = 28032, .pdl = a.pdl }, s, &args);
+    }
+
     /// Attention's full-K Q and ordered sliced K/V tiles in one cluster launch.
     pub fn decodeAttentionMixed(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, outs: []const Out, rows: usize) !void {
         if (rows != 16 or outs.len != 3) return error.InputMismatch;
+        if (a.attentionStreamable(outs, rows)) return a.attentionStream(s, x, xs, outs);
         var cs: usize = 1;
         for (outs) |o| {
             if (o.q.k != outs[0].q.k) return error.InputMismatch;
@@ -822,7 +850,7 @@ pub const Affine4Kernels = struct {
             var g: launch_.Args = .{};
             g.add(x); g.add(xs); g.add(parts);
             for ([_]usize{ rows, q.k, q.k }) |v| g.add(int(v));
-            const shared = if (dict) group_smem + q.tabBytesUpTo(linear.out_pair_tab_max) else group_smem;
+            const shared = if (dict) linear.out16_smem + q.tabBytesUpTo(linear.out_pair_tab_max) else linear.out16_smem;
             return launch_.launch(if (dict) a.stream16_dict_fn.? else stream_fn.?, .{ .grid = .{ .x = 80 }, .block = .{ .x = 512 }, .shared = shared, .pdl = a.pdl }, s, &g);
         }
         const tiles = (q.n + 63) / 64;
