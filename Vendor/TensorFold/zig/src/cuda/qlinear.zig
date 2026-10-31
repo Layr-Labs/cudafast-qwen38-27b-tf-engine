@@ -255,6 +255,7 @@ pub const Linear = struct {
 pub const symbols = struct {
     pub const group = "_ZN12tf_qmm_group12group_kernelILi64ELi16ELi64ELi1ELi4ELi8ELb0ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
     pub const verify32 = "_ZN12tf_qmm_group12group_kernelILi64ELi32ELi64ELi1ELi4ELi5ELb0ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
+    pub const verify32_dict = "_ZN12tf_qmm_group17group_kernel_dictILi64ELi32ELi64ELi1ELi4ELi5ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
     pub const verify64 = "_ZN12tf_qmm_group12group_kernelILi64ELi64ELi64ELi1ELi4ELi4ELb0ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
     pub const verify128 = "_ZN12tf_qmm_group12group_kernelILi64ELi128ELi64ELi1ELi4ELi3ELb0ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
     pub const prefill = "_ZN14tf_qmm_prefill14prefill_kernelILi64ELi128ELi128ELi2ELi4ELi3ELb0EEEvPK13__nv_bfloat16PKjS3_S3_Pviiiiii";
@@ -327,6 +328,10 @@ pub const dict_kmajor: u32 = 1 << 31;
 pub const dict_pair_max: u32 = 8191;
 /// The lane twins' (lane_gemv.cu) and gdn_stream16 twin's (qmm_gdn_stream.cuh) shared pair-table room at two CTAs an SM.
 pub const lane_pair_tab_max: u32 = 14592;
+pub const out32_smem: u32 = 35840; // qmm_stream32.cuh (tf_qmm_output_stream32 / prefetch32 / _dict)
+pub const lane32_smem: u32 = 32640; // qmm_stream32.cuh G32<64, 5>::SMEM (tf_qmm_lane32 / _dict)
+pub const lane32_pair_tab_max: u32 = 14592; // qmm_stream32.cuh OBytes: larger pair tables are read in place
+pub const out16_smem: u32 = 35328;
 pub const out_pair_tab_max: u32 = 14336;
 pub const gdn_pair_tab_max: u32 = 26496;
 /// group_kernel_dict's (qmm_group.cu GROUP_PAIR_SMEM, GROUP_PAIR_SMEM_ONE): two CTAs an SM in a cluster launch; any
