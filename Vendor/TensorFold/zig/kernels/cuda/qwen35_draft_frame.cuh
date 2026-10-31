@@ -63,114 +63,143 @@ extern "C" __global__ void tf_q35d_mask_rows(const __nv_bfloat16* X, __nv_bfloat
     for (int c = threadIdx.x; c < D; c += blockDim.x) OUT[(size_t)row * D + c] = X[(size_t)source * D + c];
 }
 
-// 256 keys of one row, its stream's ring and block rows only: four warps' lanes score them, warp 0 merges the slices.
-extern "C" __global__ void __launch_bounds__(128) tf_q35d_attn_partial(const __nv_bfloat16* Q,
+// 256 keys of one stream's key list (its ring's window, then its block rows) for every block row and every query
+// head of one kv head: the 4 query heads of a kv head and the block's rows read each key and value once from shared
+// memory, not once a (row, head). Grid (streams * kv_heads, DRAFT_CHUNKS), 256 threads: warp w holds 8 queries (row,
+// head) and lane j key j of each 32-key tile; each query keeps an online softmax over the chunk. A row's ring keys
+// start at its own window's first; a key outside a row's window scores -inf for that row. The partials (PM, PL, PO,
+// a (row, head, chunk) slot each) are what tf_q35d_attn_merge sums, so any partition of a row's keys over the chunks
+// gives that row's attention.
+extern "C" __global__ void __launch_bounds__(256) tf_q35d_attn_partial(const __nv_bfloat16* Q,
         const __nv_bfloat16* KB, const __nv_bfloat16* VB, const DraftSegment* segments,
         int block_rows, int heads, int kv_heads, int W, int window, int layer, float* PM, float* PL, float* PO) {
-    constexpr int DPL = HD / 32, CHUNK = 256, WARPS = 4, SLICE = CHUNK / WARPS, PER = SLICE / 32, BATCH = 16;
-    __shared__ float qs[HD];
-    __shared__ float ps[CHUNK];
-    __shared__ float wm[WARPS], wl[WARPS];
-    __shared__ float wo[WARPS][HD];
+    constexpr int DPL = HD / 32, CHUNK = 256, TILE = 32, QW = 8, KP = HD + 8;  // KP: a key row's bf16 stride
+    __shared__ __align__(16) __nv_bfloat16 qs[64][HD];
+    __shared__ __align__(16) __nv_bfloat16 ks[TILE][KP];
+    __shared__ __align__(16) __nv_bfloat16 vs[TILE][HD];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const int m = blockIdx.x, h = blockIdx.y, chunk = blockIdx.z;
-    const int stream = m / block_rows, local = m % block_rows;
+    const int G = heads / kv_heads, stream = blockIdx.x / kv_heads, kvh = blockIdx.x % kv_heads, chunk = blockIdx.y;
+    const int nq = block_rows * G;  // queries of this kv head: (row, head) pairs, row-major
     const DraftSegment sg = segments[stream];
-    const int kvh = h / (heads / kv_heads), width = kv_heads * HD;
+    const int width = kv_heads * HD;
     const __nv_bfloat16* RK = reinterpret_cast<const __nv_bfloat16*>(sg.ring) + (size_t)layer * 2 * W * width;
     const __nv_bfloat16* RV = RK + (size_t)W * width;
-    const long long first = max(sg.begin, sg.position + local - window + 1);
-    const int ring_keys = (int)(sg.position - first), keys = ring_keys + block_rows;
-    const size_t slot = ((size_t)m * heads + h) * DRAFT_CHUNKS + chunk;
-    if (chunk * CHUNK >= keys) {  // past the stream's keys: an empty partial, which the merge skips
-        if (threadIdx.x == 0) { PM[slot] = -INFINITY; PL[slot] = 0.0f; }
+    const long long first0 = max(sg.begin, sg.position - window + 1);  // row 0's window: the earliest ring key
+    const int ring_all = (int)(sg.position - first0), keys = ring_all + block_rows;
+    const int k0 = chunk * CHUNK, kn = min(CHUNK, keys - k0);
+    // this warp's queries
+    int qrow[QW], qhead[QW];
+    long long qfirst[QW];
+#pragma unroll
+    for (int i = 0; i < QW; ++i) {
+        const int qi = warp * QW + i;
+        qrow[i] = qi < nq ? qi / G : -1;
+        qhead[i] = kvh * G + (qi < nq ? qi % G : 0);
+        qfirst[i] = qrow[i] >= 0 ? max(sg.begin, sg.position + qrow[i] - window + 1) : 0;
+    }
+    if (kn <= 0) {  // past the stream's keys: empty partials, which the merge skips
+#pragma unroll
+        for (int i = 0; i < QW; ++i)
+            if (qrow[i] >= 0 && lane == 0) {
+                const size_t slot = ((size_t)(stream * block_rows + qrow[i]) * heads + qhead[i]) * DRAFT_CHUNKS + chunk;
+                PM[slot] = -INFINITY;
+                PL[slot] = 0.0f;
+            }
         return;
     }
-    const int start = chunk * CHUNK + warp * SLICE, n = max(min(keys - start, SLICE), 0);  // this warp's keys
-    const int ring0 = start < ring_keys ? (int)((first + start) % W) : 0;  // the slice's first ring row, then wrapping
-    auto row_at = [&](int e) -> size_t {  // key start + e's element offset in the ring (RK, RV) or the block (KB, VB)
-        const int index = start + e, wrapped = ring0 + e;
-        const size_t row = index < ring_keys ? (size_t)(wrapped >= W ? wrapped - W : wrapped) : (size_t)(stream * block_rows + index - ring_keys);
-        return (row * kv_heads + kvh) * HD;
-    };
-    for (int i = threadIdx.x; i < HD; i += 32 * WARPS) qs[i] = bf(Q[((size_t)m * heads + h) * HD + i]);
-    __syncthreads();
-    float mx = -INFINITY, score[PER];
+    for (int i = threadIdx.x; i < nq * (HD / 8); i += blockDim.x) {
+        const int qi = i / (HD / 8), c = i % (HD / 8);
+        const int row = qi / G, h = kvh * G + qi % G;
+        *reinterpret_cast<uint4*>(&qs[qi][8 * c]) =
+            *reinterpret_cast<const uint4*>(Q + ((size_t)(stream * block_rows + row) * heads + h) * HD + 8 * c);
+    }
+    float mx[QW], sum[QW], o[QW][DPL];
 #pragma unroll
-    for (int j = 0; j < PER; ++j) {
-        const int e = lane + 32 * j;
-        score[j] = -INFINITY;
-        if (e >= n) continue;
-        const int index = start + e;
-        const uint4* k = reinterpret_cast<const uint4*>((index < ring_keys ? RK : KB) + row_at(e));
-        float dot = 0.0f;
+    for (int i = 0; i < QW; ++i) {
+        mx[i] = -INFINITY;
+        sum[i] = 0.0f;
 #pragma unroll
-        for (int half = 0; half < 2; ++half) {
-            uint4 kw[HD / 16];
+        for (int d = 0; d < DPL; ++d) o[i][d] = 0.0f;
+    }
+    const float scale = rsqrtf((float)HD);
+    for (int t0 = 0; t0 < kn; t0 += TILE) {
+        const int tn = min(TILE, kn - t0);
+        __syncthreads();  // the last tile's readers are done (and, the first time, qs is written)
+        for (int i = threadIdx.x; i < TILE * (HD / 8); i += blockDim.x) {
+            const int e = i / (HD / 8), c = i % (HD / 8);
+            uint4 kw = make_uint4(0, 0, 0, 0), vw = make_uint4(0, 0, 0, 0);
+            if (e < tn) {
+                const int index = k0 + t0 + e;
+                const size_t row = index < ring_all ? (size_t)((first0 + index) % W) : (size_t)(stream * block_rows + index - ring_all);
+                const size_t at = (row * kv_heads + kvh) * HD + 8 * c;
+                kw = *reinterpret_cast<const uint4*>((index < ring_all ? RK : KB) + at);
+                vw = *reinterpret_cast<const uint4*>((index < ring_all ? RV : VB) + at);
+            }
+            *reinterpret_cast<uint4*>(&ks[e][8 * c]) = kw;
+            *reinterpret_cast<uint4*>(&vs[e][8 * c]) = vw;
+        }
+        __syncthreads();
+        // lane `lane` scores key t0 + lane for each of the warp's queries
+        const int index = k0 + t0 + lane;
+        const long long kpos = first0 + index;  // a ring key's position (block keys follow every row's ring keys)
+        float sc[QW];
 #pragma unroll
-            for (int c = 0; c < HD / 16; ++c) kw[c] = k[half * (HD / 16) + c];
+        for (int i = 0; i < QW; ++i) sc[i] = 0.0f;
+#pragma unroll 4
+        for (int c = 0; c < HD / 8; ++c) {
+            const uint4 kw = *reinterpret_cast<const uint4*>(&ks[lane][8 * c]);
+            const __nv_bfloat16* kb = reinterpret_cast<const __nv_bfloat16*>(&kw);
+            float kf[8];
 #pragma unroll
-            for (int c = 0; c < HD / 16; ++c) {
-                const __nv_bfloat16* kb = reinterpret_cast<const __nv_bfloat16*>(&kw[c]);
+            for (int j = 0; j < 8; ++j) kf[j] = bf(kb[j]);
 #pragma unroll
-                for (int i = 0; i < 8; ++i) dot = fmaf(qs[8 * (half * (HD / 16) + c) + i], bf(kb[i]), dot);
+            for (int i = 0; i < QW; ++i) {
+                const uint4 qw = *reinterpret_cast<const uint4*>(&qs[(warp * QW + i) < nq ? warp * QW + i : 0][8 * c]);
+                const __nv_bfloat16* qb = reinterpret_cast<const __nv_bfloat16*>(&qw);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) sc[i] = fmaf(bf(qb[j]), kf[j], sc[i]);
             }
         }
-        score[j] = dot * rsqrtf((float)HD);
-        mx = fmaxf(mx, score[j]);
-    }
 #pragma unroll
-    for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
-    float sum = 0.0f;
+        for (int i = 0; i < QW; ++i) {
+            const bool live = qrow[i] >= 0 && lane < tn && (index >= ring_all || kpos >= qfirst[i]);
+            const float s_ = live ? sc[i] * scale : -INFINITY;
+            float tmax = s_;
 #pragma unroll
-    for (int j = 0; j < PER; ++j) {
-        const float p = lane + 32 * j < n ? __expf(score[j] - mx) : 0.0f;
-        ps[warp * SLICE + lane + 32 * j] = p;
-        sum += p;
-    }
-    sum = warp_sum(sum);
-    __syncwarp();
-    float o[DPL];
+            for (int off = 16; off; off >>= 1) tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, off));
+            const float next = fmaxf(mx[i], tmax);
+            if (next == -INFINITY) { sc[i] = 0.0f; continue; }  // nothing live yet for this query
+            const float a = __expf(mx[i] - next);
+            const float p = live ? __expf(s_ - next) : 0.0f;
+            sum[i] = sum[i] * a + warp_sum(p);
 #pragma unroll
-    for (int i = 0; i < DPL; ++i) o[i] = 0.0f;
-    for (int e0 = 0; e0 < n; e0 += BATCH) {
-        uint2 vw[BATCH];
-#pragma unroll
-        for (int b = 0; b < BATCH; ++b) {
-            const int index = start + e0 + b;
-            if (e0 + b < n) vw[b] = *reinterpret_cast<const uint2*>((index < ring_keys ? RV : VB) + row_at(e0 + b) + lane * DPL);
+            for (int d = 0; d < DPL; ++d) o[i][d] *= a;
+            mx[i] = next;
+            sc[i] = p;
         }
+        // o += p . v over the tile's keys: lane `lane` owns dims lane * DPL ..
+        for (int e = 0; e < tn; ++e) {
+            const uint2 vw = *reinterpret_cast<const uint2*>(&vs[e][lane * DPL]);
+            const __nv_bfloat16* vb = reinterpret_cast<const __nv_bfloat16*>(&vw);
+            float vf[DPL];
 #pragma unroll
-        for (int b = 0; b < BATCH; ++b) {
-            if (e0 + b >= n) break;
-            const __nv_bfloat16* vb = reinterpret_cast<const __nv_bfloat16*>(&vw[b]);
-            const float p = ps[warp * SLICE + e0 + b];
+            for (int d = 0; d < DPL; ++d) vf[d] = bf(vb[d]);
 #pragma unroll
-            for (int i = 0; i < DPL; ++i) o[i] = fmaf(p, bf(vb[i]), o[i]);
+            for (int i = 0; i < QW; ++i) {
+                const float p = __shfl_sync(0xffffffffu, sc[i], e);
+#pragma unroll
+                for (int d = 0; d < DPL; ++d) o[i][d] = fmaf(p, vf[d], o[i][d]);
+            }
         }
     }
-    if (lane == 0) { wm[warp] = n > 0 ? mx : -INFINITY; wl[warp] = n > 0 ? sum : 0.0f; }
 #pragma unroll
-    for (int i = 0; i < DPL; ++i) wo[warp][lane * DPL + i] = o[i];
-    __syncthreads();
-    if (warp != 0) return;
-    float top = -INFINITY;
+    for (int i = 0; i < QW; ++i) {
+        if (qrow[i] < 0) continue;
+        const size_t slot = ((size_t)(stream * block_rows + qrow[i]) * heads + qhead[i]) * DRAFT_CHUNKS + chunk;
+        if (lane == 0) { PM[slot] = sum[i] > 0.0f ? mx[i] : -INFINITY; PL[slot] = sum[i]; }
 #pragma unroll
-    for (int w = 0; w < WARPS; ++w) if (wl[w] > 0.0f) top = fmaxf(top, wm[w]);
-    float total = 0.0f, out[DPL];
-#pragma unroll
-    for (int i = 0; i < DPL; ++i) out[i] = 0.0f;
-#pragma unroll
-    for (int w = 0; w < WARPS; ++w) {
-        if (wl[w] == 0.0f) continue;
-        const float scale = __expf(wm[w] - top);
-        total = fmaf(wl[w], scale, total);
-#pragma unroll
-        for (int i = 0; i < DPL; ++i) out[i] = fmaf(wo[w][lane * DPL + i], scale, out[i]);
+        for (int d = 0; d < DPL; ++d) PO[slot * HD + lane * DPL + d] = o[i][d];
     }
-    if (lane == 0) { PM[slot] = total > 0.0f ? top : -INFINITY; PL[slot] = total; }
-#pragma unroll
-    for (int i = 0; i < DPL; ++i) PO[slot * HD + lane * DPL + i] = out[i];
 }
 
 extern "C" __global__ void __launch_bounds__(32) tf_q35d_attn_merge(const float* PM, const float* PL,
