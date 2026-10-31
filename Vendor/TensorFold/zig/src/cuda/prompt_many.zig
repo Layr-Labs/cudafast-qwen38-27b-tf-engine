@@ -17,11 +17,12 @@ pub const symbol = "tf_qmm_prompt_many";
 pub const mlp_symbol = "tf_qmm_prompt_mlp";
 pub const split_symbol = "tf_qmm_prompt_split";
 pub const parts_max = 4;
-pub const tile_m = 128;
+/// 64-row tiles: half a warp's accumulators of a 128-row tile, so three CTAs (twelve warps) share an SM.
+pub const tile_m = 64;
 pub const tile_n = 128;
 pub const threads = 128;
-/// Tile<64, 128, 128, 2, 2, 2>::SMEM: two stages of 128 input rows, 128 columns' words, scales and biases.
-pub const smem: u32 = 2 * (128 * 128 + 128 * 32 + 2 * 128 * 2);
+/// Tile<64, 64, 128, 1, 4, 2>::SMEM: two stages of 64 input rows, 128 columns' words, scales and biases.
+pub const smem: u32 = 2 * (64 * 128 + 128 * 32 + 2 * 128 * 2);
 
 /// qmm_prompt_many.cuh's ManyPart and ManyParts, passed by value.
 pub const Part = extern struct { w: u64, scales: u64, biases: u64, out: u64, n: c_int, npad: c_int, first: c_int };
@@ -29,7 +30,7 @@ pub const Parts = extern struct { p: [parts_max]Part, count: c_int };
 
 comptime {
     std.debug.assert(@sizeOf(Part) == 48 and @sizeOf(Parts) == 200);
-    std.debug.assert(smem == 41984);
+    std.debug.assert(smem == 25600);
 }
 
 /// One projection of the shared input and its output rows.
@@ -39,7 +40,7 @@ pub const Kernels = struct {
     many_fn: Function,
     mlp_fn: Function,
     split_fn: Function,
-    /// CTAs the device runs at once: two of these tiles an SM.
+    /// CTAs the device runs at once: three of these tiles an SM on GB10 (the driver's occupancy).
     slots: usize,
 
     /// From a loaded qmm_prefill module, on a device of `sms` SMs.
@@ -50,12 +51,13 @@ pub const Kernels = struct {
         try m.allowDynamicShared(smem);
         const sp = try prefill_mod.function(split_symbol);
         try sp.allowDynamicShared(smem);
-        return .{ .many_fn = f, .mlp_fn = m, .split_fn = sp, .slots = 2 * sms };
+        const per = @max(1, @min(try f.occupancy(threads, smem), try sp.occupancy(threads, smem)));
+        return .{ .many_fn = f, .mlp_fn = m, .split_fn = sp, .slots = @as(usize, per) * sms };
     }
 
     /// The columns one projection's whole 128-wide tiles cover when its last panels run 64 wide (null: none do).
-    /// Whole tiles past one wave leave a last wave part full (a 496-row prompt's 5120 columns: 160 tiles on a GB10's
-    /// 96 slots); a fifth of the panels at half width evens the SMs' shares.
+    /// Whole tiles past one wave leave a last wave part full (a 496-row prompt's 5120 columns: 320 tiles on a GB10's
+    /// 144 slots); a fifth of the panels at half width evens the SMs' shares.
     pub fn splitCols(kk: *const Kernels, n: usize, rows: usize) ?usize {
         const cols = n / tile_n;
         const tiles = (rows + tile_m - 1) / tile_m * cols;
