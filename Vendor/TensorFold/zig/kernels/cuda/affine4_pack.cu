@@ -52,3 +52,78 @@ extern "C" __global__ void tf_pack_kmajor(const uint32_t* input, uint32_t* outpu
     const size_t panel=at/512, tile=panel/groups, group=panel%groups;
     output[(group*tiles+tile)*512+at%512]=input[at];
 }
+
+// Dictionary coding of the tiled scales and biases (qmm_dict.cuh), built at engine open from their own values.
+// tf_dict_mark: a presence bit for every 16-bit value of a (kg, npad) array (2048 words, zeroed by the caller).
+extern "C" __global__ void tf_dict_mark(const uint16_t* __restrict__ v, long long count, uint32_t* __restrict__ bitmap) {
+    for (long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const uint32_t x = v[i];
+        atomicOr(bitmap + (x >> 5), 1u << (x & 31));
+    }
+}
+
+// tf_dict_rank: block b (0: scales, 1: biases) turns its bitmap into each word's count of smaller present values
+// (rank + 2048 * b) and its total (count[b]); 1024 threads, two words a thread.
+extern "C" __global__ void __launch_bounds__(1024) tf_dict_rank(const uint32_t* __restrict__ bitmap, uint32_t* __restrict__ rank,
+                                                                int* __restrict__ count) {
+    __shared__ uint32_t sums[1024];
+    const uint32_t* bm = bitmap + 2048 * blockIdx.x;
+    const int t = threadIdx.x;
+    const uint32_t a = __popc(bm[2 * t]), b = __popc(bm[2 * t + 1]);
+    sums[t] = a + b;
+    __syncthreads();
+    for (int off = 1; off < 1024; off <<= 1) {           // inclusive scan (Hillis-Steele)
+        const uint32_t v = t >= off ? sums[t - off] : 0u;
+        __syncthreads();
+        sums[t] += v;
+        __syncthreads();
+    }
+    const uint32_t before = sums[t] - a - b;
+    rank[2048 * blockIdx.x + 2 * t] = before;
+    rank[2048 * blockIdx.x + 2 * t + 1] = before + a;
+    if (t == 1023) count[blockIdx.x] = static_cast<int>(sums[1023]);
+}
+
+// tf_dict_table: the ns present scale values in increasing bit order, then the nb bias values; one thread a word.
+extern "C" __global__ void tf_dict_table(const uint32_t* __restrict__ bitmap, const uint32_t* __restrict__ rank, int ns,
+                                         uint16_t* __restrict__ table) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= 4096) return;
+    const int which = i >> 11, w = i & 2047;
+    uint32_t m = bitmap[i];
+    uint32_t at = rank[i] + (which ? ns : 0);
+    while (m) {
+        const int bit = __ffs(m) - 1;
+        table[at++] = static_cast<uint16_t>(w * 32 + bit);
+        m &= m - 1;
+    }
+}
+
+__device__ __forceinline__ uint32_t dict_index(const uint32_t* __restrict__ bitmap, const uint32_t* __restrict__ rank, uint32_t v) {
+    return rank[v >> 5] + __popc(bitmap[v >> 5] & ((1u << (v & 31)) - 1u));
+}
+
+// tf_dict_pack: each 64-column tile's group of the (kg, npad) scales s and biases b as 128 indices of `bits` bits
+// (the tile's 64 scales, then its 64 biases), packed little-endian into 4 * bits words: out [npad / 64][kg][4 * bits],
+// or group-major [kg][npad / 64][4 * bits] (`kmajor`: tf_qmm_mlp_single16's K-major panels).
+extern "C" __global__ void tf_dict_pack(const uint16_t* __restrict__ s, const uint16_t* __restrict__ b, int kg, int npad,
+                                        const uint32_t* __restrict__ bitmap, const uint32_t* __restrict__ rank, int bits,
+                                        uint32_t* __restrict__ out, long long total, int kmajor) {
+    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int per = 4 * bits, lw = static_cast<int>(i % per);
+    const long long tg = i / per;
+    const int tiles = npad / 64;
+    const int g = static_cast<int>(kmajor ? tg / tiles : tg % kg), t = static_cast<int>(kmajor ? tg % tiles : tg / kg);
+    const int lo = 32 * lw / bits, hi = min(127, (32 * lw + 31) / bits);
+    uint32_t word = 0;
+    for (int p = lo; p <= hi; ++p) {
+        const int which = p >> 6, col = t * 64 + (p & 63);
+        const uint32_t v = (which ? b : s)[static_cast<long long>(g) * npad + col];
+        const uint32_t idx = dict_index(bitmap + 2048 * which, rank + 2048 * which, v);
+        const int start = p * bits - 32 * lw;
+        word |= start >= 0 ? idx << start : idx >> -start;
+    }
+    out[i] = word;
+}
