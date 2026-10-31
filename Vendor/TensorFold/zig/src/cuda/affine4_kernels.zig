@@ -230,6 +230,21 @@ pub const Affine4Kernels = struct {
         return a.dict != null and tileCoded(q);
     }
 
+    /// The output stream is selectable only for exactly the geometry cluster() handles.
+    fn streamed(a: *const Affine4Kernels, q: Affine4, rows: usize, sk: usize) bool {
+        if (q.stream_w == 0) return false;
+        const f = a.stream16_fns[@as(usize, if (q.k == 6144) 1 else 0)];
+        return f != null and rows == 16 and sk == 4 and q.n == 5120 and (q.k == 6144 or q.k == 17408);
+    }
+
+    /// The existing coded four-slice stream can also consume a 16-row out/o projection.
+    /// Keep the ordinary short-lane route whenever its view or kernel is unavailable.
+    fn dictOutStream(a: *const Affine4Kernels, q: Affine4, rows: usize, sk: usize) bool {
+        return a.short_lane and a.cluster_decode and rows == 16 and sk == 4 and
+            q.n == 5120 and q.npad == 5120 and q.k == 6144 and q.stream_w != 0 and
+            a.stream16_fns[1] != null and a.stream16_dict_fn != null and a.coded(q);
+    }
+
     /// q's scales and biases as dictionary indices and a table (qmm_dict.cuh) out of `store`, from the tiled arrays
     /// pack() wrote: lossless (the table holds every distinct value), so each twin's fmas read the same bf16 values.
     /// A projection of more than 2^12 distinct scales or biases, or a table past dict_tab_max, stays on its arrays.
@@ -468,7 +483,8 @@ pub const Affine4Kernels = struct {
         // clusters of four, each CTA chaining the tile's slices in order (the same bits); the down projection's long
         // slices (68 groups) stay on the cluster tile, and so does a short K (the drafter's K = 4096, 64 groups a
         // lane CTA: its 80 CTAs keep too few bytes in flight)
-        if (sk > 1 and a.cluster_decode and !(a.short_lane and q.k / 64 / sk < lane_min and q.k / 64 >= lane_groups)) return a.cluster(s, x, xs, q, out, rows, sk);
+        const short = sk > 1 and a.cluster_decode and a.short_lane and q.k / 64 / sk < lane_min and q.k / 64 >= lane_groups and !a.streamed(q, rows, sk);
+        if (sk > 1 and a.cluster_decode and !short) return a.cluster(s, x, xs, q, out, rows, sk);
         return if (sk > 1) a.gemv(s, x, xs, q, out, rows, sk) else a.cluster(s, x, xs, q, out, rows, sk);
     }
 
@@ -783,8 +799,9 @@ pub const Affine4Kernels = struct {
     pub fn cluster(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, q: Affine4, out: u64, rows: usize, sk: usize) !void {
         const stream_fn = if (q.stream_w == 0) null else a.stream16_fns[@as(usize, if (q.k == 6144) 1 else 0)];
         if (rows == 16 and sk == 4 and q.n == 5120 and (q.k == 6144 or q.k == 17408) and q.stream_w != 0 and stream_fn != null) {
-            // a coded down projection streams its index windows in place of its scales and biases (the same bits)
-            const dict = q.k == 17408 and q.npad == 5120 and a.coded(q) and a.stream16_dict_fn != null;
+            // A coded down projection, or an eligible out/o projection, streams its index windows.
+            const dict = q.npad == 5120 and a.coded(q) and a.stream16_dict_fn != null and
+                (q.k == 17408 or a.dictOutStream(q, rows, sk));
             var parts: Parts = std.mem.zeroes(Parts);
             parts.count = 1;
             parts.p[0] = .{ .w = q.stream_w, .scales = if (dict) q.sb else q.s, .biases = if (dict) q.tab else q.b, .out = out, .n = int(q.n), .npad = if (dict) @bitCast(q.code) else int(q.npad), .sk = 4, .tiles = 80, .first = 0 };

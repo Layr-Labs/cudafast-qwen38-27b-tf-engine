@@ -17,7 +17,7 @@ __device__ __forceinline__ void dict_decode_at(const qmm_dict::DictLanes& D,cons
 template<int FutureGroups,int Slices=4,int Rolling=0,bool DICT=false>
 __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const float* __restrict__ xs,
         const tf_qmm_group::Parts& parts,int M,int K,int ldx) {
-    static_assert(!DICT||(FutureGroups==0&&Rolling==0),"a coded part's L2 prefetch would target its index windows");
+    static_assert(!DICT||Rolling==0,"coded rolling prefetch is not implemented");
     extern __shared__ __align__(128) unsigned char buf[];
     const auto p=parts.p[0];
     const int slice=threadIdx.x/128,tid=threadIdx.x%128,lane=tid&31,wn=tid>>5;
@@ -47,10 +47,13 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
     if(tid==0) {
 #pragma unroll
         for(int g=1;g<=FutureGroups;++g)if(g<per){
-            const auto* w=weight(g0+g);const auto* s=p.scales+size_t(g0+g)*p.npad+n0;const auto* b=p.biases+size_t(g0+g)*p.npad+n0;
+            const auto* w=weight(g0+g);
             asm volatile("cp.async.bulk.prefetch.L2.global [%0], 2048;" :: "l"(w) : "memory");
-            asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(s) : "memory");
-            asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(b) : "memory");
+            if constexpr(!DICT){
+                const auto* s=p.scales+size_t(g0+g)*p.npad+n0;const auto* b=p.biases+size_t(g0+g)*p.npad+n0;
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(s) : "memory");
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(b) : "memory");
+            }
         }
     }
 #endif
@@ -70,7 +73,18 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
         wait<0>();__syncthreads();
         if(it+1<per){load_w(it+1);load_x(it+1);}commit();
         const auto* at=stage(it);const auto* wp=reinterpret_cast<const uint32_t*>(at+2048);
-        uint32_t dv=0;if constexpr(DICT)dv=qmm_dict::dict_fetch(D,at+4096,table,g0+it);
+        uint32_t dv=0;
+        if constexpr(DICT){
+            if(D.pair){
+                // Both bf16 values share an index: fetch one u32 per column in the first half-warp.
+                if(lane<16){
+                    const auto* pk=reinterpret_cast<const uint32_t*>(at+4096);
+                    const int off=((g0+it)*D.step&63)*8+D.bit0;
+                    const uint32_t idx=__funnelshift_r(pk[off>>5],pk[(off>>5)+1],off&31)&D.mask;
+                    dv=qmm_dict::dict_pair_entry(table,D.gtab,idx);
+                }
+            }else dv=qmm_dict::dict_fetch(D,at+4096,table,g0+it);
+        }
         const auto* sp=reinterpret_cast<const __nv_bfloat16*>(DICT?dec:at+4096);const auto* sums=reinterpret_cast<const float*>(at+4352);
         uint32_t words[2][2];
 #pragma unroll
@@ -87,11 +101,19 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
                 if(kt==0)mma0(d[j],a,b0,b1);else mma(d[j],a,b0,b1);
             }
         }
-        if constexpr(DICT){qmm_dict::dict_put(D,dec,dv);__syncwarp();}
 #pragma unroll
         for(int j=0;j<2;++j){const int col=wn*16+j*8+(lane&3)*2;
-            const auto s2=*reinterpret_cast<const __nv_bfloat162*>(sp+col),b2=*reinterpret_cast<const __nv_bfloat162*>(sp+64+col);
-            const float sv[2]={__low2float(s2),__high2float(s2)},bv[2]={__low2float(b2),__high2float(b2)};
+            float sv[2],bv[2];
+            if constexpr(DICT){
+                const float lo=__bfloat162float(__ushort_as_bfloat16(static_cast<unsigned short>(dv)));
+                const float hi=D.pair?__bfloat162float(__ushort_as_bfloat16(static_cast<unsigned short>(dv>>16))):lo;
+                const int src=j*8+(lane&3)*2, bsrc=D.pair?src:16+src;
+                sv[0]=__shfl_sync(0xffffffffu,lo,src);sv[1]=__shfl_sync(0xffffffffu,lo,src+1);
+                bv[0]=__shfl_sync(0xffffffffu,hi,bsrc);bv[1]=__shfl_sync(0xffffffffu,hi,bsrc+1);
+            }else{
+                const auto s2=*reinterpret_cast<const __nv_bfloat162*>(sp+col),b2=*reinterpret_cast<const __nv_bfloat162*>(sp+64+col);
+                sv[0]=__low2float(s2);sv[1]=__high2float(s2);bv[0]=__low2float(b2);bv[1]=__high2float(b2);
+            }
             const int r=lane>>2;const float xv[2]={sums[r],sums[r+8]};
 #pragma unroll
             for(int e=0;e<4;++e)acc[j][e]=__fmaf_rn(xv[e>>1],bv[e&1],__fmaf_rn(d[j][e],sv[e&1],acc[j][e]));
@@ -126,7 +148,9 @@ extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_stream16(const _
 }
 // tf_qmm_output_stream16 on a dictionary-coded part: the same loads, MMA chains, fmas and slice-ordered sum.
 extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_stream16_dict(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
-    tf_qmm_output_stream::body<0,4,0,true>(x,xs,parts,M,K,ldx);
+    // Out/o formerly used the four-group word prefetch stream; retain its weight prefetch, not its array metadata addresses.
+    if(K==6144)tf_qmm_output_stream::body<4,4,0,true>(x,xs,parts,M,K,ldx);
+    else tf_qmm_output_stream::body<0,4,0,true>(x,xs,parts,M,K,ldx);
 }
 extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_prefetch16(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
     tf_qmm_output_stream::body<4>(x,xs,parts,M,K,ldx);

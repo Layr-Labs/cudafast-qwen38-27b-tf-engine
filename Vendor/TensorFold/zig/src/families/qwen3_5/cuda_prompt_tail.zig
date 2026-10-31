@@ -13,6 +13,7 @@ const prompt = @import("cuda_prompt.zig");
 pub fn fits(e: *const E.Engine, total: usize, nseg: usize, hidden: bool, paged: bool) bool {
     const g = e.g;
     if (total <= 16 or nseg != 1 or hidden or paged) return false;
+    if (e.layers.len == 0 or e.n_taps > e.taps.len or g.kv_heads == 0) return false;
     if (e.learning != null or e.mlp != null or e.features != 0 or e.kv8 or e.int8.on) return false;
     if ((g.q_heads / g.kv_heads) % 2 != 0) return false;
     const last = e.layers.len - 1;
