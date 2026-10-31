@@ -574,3 +574,8 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_pair(const __nv_bfl
         float* __restrict__ as, int M, int K, int ldx, int rows_t) {
     tf_qmm_group::mlp_pair_body<8>(x, xs, parts, act, as, M, K, ldx, rows_t);
 }
+
+#include "qmm_wide_kmajor.cuh"
+#include "qmm_mlp_layout.cuh"
+
+#include "qmm_mlp_single.cuh"

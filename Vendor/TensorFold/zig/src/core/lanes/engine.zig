@@ -169,6 +169,12 @@ pub const Engine = struct {
             e.bench_stream = null;
         }
         e.bench_work = 0;
+        // A benchmark phase starts from load-time prices, never a prior prompt's observations.
+        e.rule.clearObservations();
+        for (&e.lone_kept) |*mode| for (mode) |*kept| {
+            if (kept.*) |*k| k.deinit(e.gpa);
+            kept.* = null;
+        };
     }
 
     pub fn benchActive(e: *const Engine) bool {

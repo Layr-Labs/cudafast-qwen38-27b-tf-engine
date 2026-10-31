@@ -132,6 +132,10 @@ test "Draft frames: the real hold adapter emits one frame for every stream and i
     for ([_]usize{ 8, 16 }) |block| try actualFrame(block);
 }
 fn actualFrame(block: usize) !void {
+    _ = setenv("TF_DRAFT_GRAPH", "0", 1);
+    defer _ = unsetenv("TF_DRAFT_GRAPH");
+    _ = setenv("TF_DRAFT_MLP_PAIR", "0", 1);
+    defer _ = unsetenv("TF_DRAFT_MLP_PAIR");
     Record.block = block;
     const F = q.draft.frame;
     var driver: cuda.Driver = undefined;
@@ -154,6 +158,9 @@ fn actualFrame(block: usize) !void {
     e.affine.group_fn = function(&driver, 10);
     e.affine.pdl = false;
     e.affine.wide_verify = false;
+    e.affine.split = null;
+    e.affine.narrow = null;
+    e.affine.cluster_decode = false;
     e.fns.norm = function(&driver, 13);
     e.head = .{ .a4 = weight() };
     e.draws.logprob_rows_fn = function(&driver, 9);
@@ -359,3 +366,39 @@ test "Draft frames: enlarged frame byte counts reject overflow" {
     d.c.rank = std.math.maxInt(usize);
     try std.testing.expectError(error.Overflow, d.layout(false));
 }
+
+test "Draft frames: landing observations end with the last released stream" {
+    const gpa = std.testing.allocator;
+    var d: q.draft.Draft = undefined;
+    d.gpa = gpa;
+    d.streams = .empty;
+    defer d.streams.deinit(gpa);
+    d.landing = .{};
+    d.landing.observe(false, -0.1, true);
+    d.landing.observe(true, -1.2, false);
+    const observed = d.landing;
+    var first: lanes.Stream = undefined;
+    var second: lanes.Stream = undefined;
+    const first_ctx = try gpa.create(q.draft.Ctx);
+    var first_owned = true;
+    defer if (first_owned) gpa.destroy(first_ctx);
+    first_ctx.* = undefined;
+    first_ctx.ring.borrowed = true;
+    const second_ctx = try gpa.create(q.draft.Ctx);
+    var second_owned = true;
+    defer if (second_owned) gpa.destroy(second_ctx);
+    second_ctx.* = undefined;
+    second_ctx.ring.borrowed = true;
+    try d.streams.put(gpa, &first, first_ctx);
+    try d.streams.put(gpa, &second, second_ctx);
+    d.drafter().release(&first);
+    first_owned = false;
+    try std.testing.expectEqual(@as(u32, 1), d.streams.count());
+    try std.testing.expectEqualDeep(observed, d.landing);
+    d.drafter().release(&second);
+    second_owned = false;
+    try std.testing.expectEqual(@as(u32, 0), d.streams.count());
+    try std.testing.expectEqualDeep(q.draft.tree.Landing{}, d.landing);
+}
+
+test { _ = @import("qwen35_draft_legacy_host.zig"); }

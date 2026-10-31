@@ -8,6 +8,15 @@ const Engine = engine.Engine;
 const DeviceBuffer = cuda.DeviceBuffer;
 const recurrent = @import("cuda_recurrent.zig");
 
+pub const Recycled = struct { buffer: DeviceBuffer, zeroed: bool = false };
+
+/// Clear closed allocations at the phase boundary; clean flags are published only after the stream drains.
+pub fn clearBlocks(e: anytype) !void {
+    for (e.blocks.items) |b| if (!b.zeroed) try b.buffer.fill8(0, e.stream.handle);
+    try e.stream.synchronize();
+    for (e.blocks.items) |*b| b.zeroed = true;
+}
+
 /// Rows a drafter's tap ring holds a stream: its window and a prompt chunk more.
 pub const tap_held = 2048;
 pub const tap_rows = tap_held + engine.most_verify;
@@ -37,10 +46,10 @@ pub const Paged = struct {
 /// TF_QWEN_KV_PAGE_TEST=n: each cache's own buffer read through a table of n-position pages in reverse order (checks).
 /// A device block of `len` bytes: a pooled block of exactly that size (from a closed stream), or a new allocation.
 /// The caller zeroes or overwrites it before any read, as it does a new one.
-fn take(e: *Engine, len: usize) !DeviceBuffer {
+fn take(e: *Engine, len: usize) !Recycled {
     pool_of = e;
-    for (e.blocks.items, 0..) |b, i| if (b.len == len) return e.blocks.swapRemove(i);
-    return DeviceBuffer.alloc(e.d, len);
+    for (e.blocks.items, 0..) |b, i| if (b.buffer.len == len) return e.blocks.swapRemove(i);
+    return .{ .buffer = try DeviceBuffer.alloc(e.d, len) };
 }
 
 /// The engine whose pool `give` fills: the one that allocated through `take` (one engine a process).
@@ -49,7 +58,7 @@ var pool_of: ?*Engine = null;
 /// `take` for the engine's other per-phase device buffers (recurrent scratch, drafter rings): a pooled block of exactly
 /// `len` bytes or a new one, which the caller zeroes or overwrites before any read.
 pub fn takeBlock(e: *Engine, len: usize) !DeviceBuffer {
-    return take(e, len);
+    return (try take(e, len)).buffer;
 }
 
 /// `give` for those buffers: kept for the next phase's same-size buffer, or freed.
@@ -62,11 +71,31 @@ pub fn forget(e: *Engine) void {
     if (pool_of == e) pool_of = null;
 }
 
+test "Recycled cache blocks: a completed clear survives take but returning used storage invalidates it" {
+    var d: cuda.Driver = undefined;
+    var e: Engine = undefined;
+    e.d = &d;
+    e.gpa = std.testing.allocator;
+    e.blocks = .empty;
+    defer e.blocks.deinit(e.gpa);
+    defer forget(&e);
+    const bytes = 1 << 20;
+    try e.blocks.append(e.gpa, .{ .buffer = .{ .d = &d, .ptr = 4096, .len = bytes }, .zeroed = true });
+    var clean = try take(&e, bytes);
+    try std.testing.expect(clean.zeroed);
+    try std.testing.expectEqual(@as(usize, 0), e.blocks.items.len);
+    give(&clean.buffer);
+    try std.testing.expectEqual(@as(usize, 1), e.blocks.items.len);
+    const dirty = try take(&e, bytes);
+    try std.testing.expect(!dirty.zeroed);
+    try std.testing.expectEqual(@as(u64, 4096), dirty.buffer.ptr);
+}
+
 /// `b` kept for the next stream (whole driver allocations of at least 1 MiB, up to 32), otherwise freed.
 fn give(b: *DeviceBuffer) void {
     const e = pool_of orelse return b.free();
     if (!b.borrowed and b.owner == null and b.len >= 1 << 20 and e.blocks.items.len < 32) {
-        if (e.blocks.append(e.gpa, b.*)) |_| {
+        if (e.blocks.append(e.gpa, .{ .buffer = b.* })) |_| {
             b.* = undefined;
             return;
         } else |_| {}
@@ -149,7 +178,7 @@ pub const Cache = struct {
     pub fn initFor(gpa: std.mem.Allocator, e: *Engine, cap: usize, taps: bool) !Cache {
         const test_pages = try pageTest();
         const rows = try cacheRows(cap, test_pages);
-        var kv = try take(e, try std.math.mul(usize, e.g.kvBytes(1, e.kv8), rows));
+        var kv = (try take(e, try std.math.mul(usize, e.g.kvBytes(1, e.kv8), rows))).buffer;
         var own = true;
         errdefer if (own) kv.free();
         var paged: ?Paged = null;
@@ -169,7 +198,7 @@ pub const Cache = struct {
         own = false;
         errdefer out.deinit(gpa);
         errdefer cuda.completion.drain(e.d, e.stream, "qwen3_5: failed cache initialization did not drain");
-        try kv.fill8(0, e.stream.handle);
+        // As in reset(), rope writes every readable KV row; padded attention tiles load zeros, unused rows are hidden.
         if (paged) |p| try p.table.uploadAsync(0, std.mem.sliceAsBytes(p.ids), e.stream.handle);
         try e.stream.synchronize();
         return out;
@@ -225,26 +254,30 @@ pub const Cache = struct {
 
     /// The parts every cache holds itself beside `kv` and `paged` (the caller's to free on failure).
     fn fixed(gpa: std.mem.Allocator, e: *Engine, cap: usize, kv: DeviceBuffer, paged: ?Paged, taps: bool) !Cache {
-        var state = try take(e, e.g.stateBytes());
+        const taken_state = try take(e, e.g.stateBytes());
+        var state = taken_state.buffer;
         errdefer state.free();
         const adaptive = recurrent.enabled(e);
         var before: ?DeviceBuffer = null;
         errdefer if (before) |*b| b.free();
-        if (!adaptive) before = try take(e, e.g.stateBytes());
+        if (!adaptive) before = (try take(e, e.g.stateBytes())).buffer;
         var log: DeviceBuffer = .{ .d = e.d, .ptr = 0, .len = 0, .borrowed = true };
-        if (!adaptive) log = try take(e, 2 * e.g.logBytes(engine.most_window));
+        if (!adaptive) log = (try take(e, 2 * e.g.logBytes(engine.most_window))).buffer;
         errdefer log.free();
         var tap: ?DeviceBuffer = null;
         errdefer if (tap) |*t| t.free();
+        var tap_zeroed = false;
         if (e.n_taps > 0 and taps) {
-            tap = try take(e, e.tapBytes());
+            const taken_tap = try take(e, e.tapBytes());
+            tap = taken_tap.buffer;
+            tap_zeroed = taken_tap.zeroed;
         }
         const logits = try gpa.alloc(u16, e.g.vocab);
         errdefer gpa.free(logits);
         errdefer cuda.completion.drain(e.d, e.stream, "qwen3_5: failed cache state initialization did not drain");
-        try state.fill8(0, e.stream.handle);
-        if (!adaptive) try log.fill8(0, e.stream.handle);
-        if (tap) |t| try t.fill8(0, e.stream.handle);
+        if (!taken_state.zeroed) try state.fill8(0, e.stream.handle);
+        // Forward writes conv/g/k/delta before keep/replay reads; last=null and pend=0 hide every prior record.
+        if (!tap_zeroed) if (tap) |t| try t.fill8(0, e.stream.handle);
         try e.stream.synchronize();
         const scratch = if (adaptive) recurrent.bound(e) else 0;
         e.rec_scratch.cap += scratch;

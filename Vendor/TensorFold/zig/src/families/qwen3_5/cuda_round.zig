@@ -56,6 +56,10 @@ pub fn steps(st: []u8) []slots.Step {
 pub fn variant(peak: usize) usize {
     return if (peak <= 1) 1 else if (peak <= 2) 2 else if (peak <= 4) 4 else if (peak <= 8) 8 else 16;
 }
+/// A separate graph key for the exact three-slot specialization; wider windows keep their existing dispatch.
+pub fn narrowVariant(rows: usize, peak: usize, enabled: bool) usize {
+    return if (enabled and rows > 1 and rows <= 16 and peak == 3) 35 else variant(peak);
+}
 pub fn build(st: []u8, parts: []const @import("cuda_engine.zig").Part, record: bool) !usize {
     var scratch: [max_rows * @sizeOf(usize)]u8 align(@alignOf(usize)) = undefined;
     return buildWithScratch(st, parts, record, &scratch);

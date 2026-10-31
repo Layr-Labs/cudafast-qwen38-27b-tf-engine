@@ -94,6 +94,7 @@ pub const Draft = struct {
     ids: u64, // u32 the block's ids
     staged: cuda.HostBuffer, // pinned: the ids up, the words and projected rows down
     streams: std.AutoHashMapUnmanaged(*Stream, *Ctx) = .empty,
+    graphs: std.AutoHashMapUnmanaged(u64, struct { exec: ?cuda.graph.Exec, spanned: ?u64 }) = .empty,
     /// Contexts between streams, allocated and run once (`reserve`), as the driver stalls a buffer's first kernel.
     pool: std.ArrayList(*Ctx) = .empty,
     /// Grown trees' nodes offered and landed, by own chance: the nodes' chances the round loop prices.
@@ -171,7 +172,14 @@ pub const Draft = struct {
         }
     }
 
+    pub fn clearGraphs(d: *Draft) void {
+        var it = d.graphs.valueIterator();
+        while (it.next()) |graph| if (graph.exec) |*exec| exec.deinit();
+        d.graphs.deinit(d.gpa);
+        d.graphs = .empty;
+    }
     pub fn deinit(d: *Draft) void {
+        d.clearGraphs();
         var it = d.streams.valueIterator();
         while (it.next()) |ctx| d.drop(ctx.*);
         d.streams.deinit(d.gpa);
@@ -343,6 +351,7 @@ pub const Draft = struct {
             const kv = rows * c.kvWidth() * 2; // a layer's k (v) rows in kabs (vabs)
             // a prompt piece: every layer's k and v project the same normed taps, up to four a prompt GEMM launch
             const grouped = precision.prompt(d.projection_role, rows, precision.dflash_projection_prompt_cutoff);
+            const grouped_live = liveGroups() and !grouped and rows <= 16;
             if (grouped) {
                 const P = cuda.prompt_many;
                 var many: [P.parts_max]P.Out = undefined;
@@ -357,12 +366,26 @@ pub const Draft = struct {
                 };
                 if (n_many > 0) try e.prompt_many.prompt(e.stream, d.thn, many[0..n_many], rows);
             }
+            if (grouped_live) {
+                const A = cuda.qlinear.Affine4Kernels;
+                var many: [A.segs_max]A.Out = undefined;
+                var count: usize = 0;
+                for (d.w.layers, 0..) |l, i| for ([2]cuda.qlinear.Affine4{ l.k, l.v }, [2]u64{ d.kabs + i * kv, d.vabs + i * kv }) |weight, out| {
+                    many[count] = .{ .q = weight, .out = out };
+                    count += 1;
+                    if (count == many.len) {
+                        try e.affine.decodeMany(e.stream, d.thn, d.xs, many[0..count], rows);
+                        count = 0;
+                    }
+                };
+                if (count > 0) try e.affine.decodeMany(e.stream, d.thn, d.xs, many[0..count], rows);
+            }
             for (d.w.layers, 0..) |l, i| {
                 const kabs = d.kabs + i * kv;
                 const vabs = d.vabs + i * kv;
-                if (!grouped) try d.projAgain(l.k, d.thn, kabs, rows);
+                if (!grouped and !grouped_live) try d.projAgain(l.k, d.thn, kabs, rows);
                 try d.normRope(kabs, l.k_norm, d.kn, rows, c.kv_heads, start);
-                if (!grouped) try d.projAgain(l.v, d.thn, vabs, rows);
+                if (!grouped and !grouped_live) try d.projAgain(l.v, d.thn, vabs, rows);
                 try e.run(d.fns.ring_put, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ d.kn, vabs, d.ringK(ctx, i), d.ringV(ctx, i), @as(c_int, @intCast(c.kvWidth())), @as(c_longlong, @intCast(start)), @as(c_int, @intCast(c.ringRows())) });
             }
             start += rows;
@@ -514,6 +537,7 @@ pub const Draft = struct {
     fn releaseFn(p: *anyopaque, s: *Stream) void {
         const d = cast(p);
         if (d.streams.fetchRemove(s)) |kv| {
+            if (d.streams.count() == 0) d.landing = .{};
             if (kv.value.ring.borrowed) return d.gpa.destroy(kv.value); // its lane's run goes back with the lane
             d.pool.append(d.gpa, kv.value) catch d.drop(kv.value);
         }
@@ -555,4 +579,19 @@ test "a drafter config with a zero divisor is refused, and any admitted rank's s
     defer gpa.free(wide);
     const c = try Config.parse(gpa, wide, target);
     try std.testing.expect(Draft.stagedLen(c.rank) >= Draft.hp_at + (c.block - 1) * c.rank * 2);
+}
+
+/// Independent runtime controls for qualification against the current eager frame.
+pub fn graphsOff() bool {
+    const value = platform.c.getenv("TF_DRAFT_GRAPH") orelse return false;
+    return !std.mem.eql(u8, std.mem.span(value), "1");
+}
+pub fn liveGroups() bool {
+    const value = platform.c.getenv("TF_DRAFT_GROUP_LIVE") orelse return true;
+    return std.mem.eql(u8, std.mem.span(value), "1");
+}
+
+pub fn pairedMlp() bool {
+    const value = platform.c.getenv("TF_DRAFT_MLP_PAIR") orelse return true;
+    return std.mem.eql(u8, std.mem.span(value), "1");
 }

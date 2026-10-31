@@ -221,17 +221,18 @@ test "served scratch: one drafter frame does not allocate 128 streams of logits 
     d.projection_role = .proposal;
     d.c = .{ .hidden = 5120, .intermediate = 17408, .layers = 5, .vocab = 248320, .heads = 32, .kv_heads = 8, .head_dim = 128, .block = 16, .mask = 248070, .window = 2048, .group = 16, .rank = 256, .topk = 16, .eps = 1e-6, .theta = 10000000, .taps = @splat(0), .n_taps = 5 };
     d.frame_streams = 1;
-    d.scratch_one = 23667968;
+    d.scratch_one = 62555392;
     d.target_taps = 111411200;
     d.step_ms = 1;
     d.n_costs = 0;
     try std.testing.expectEqual(d.c.ringBytes() + d.target_taps + d.scratch_one, d.drafter().facts().stream_bytes);
     const one = try d.layout(false);
-    try std.testing.expectEqual(@as(usize, 23667968), one);
+    // 512 absorption rows, with separate K/V projection space for all five drafter layers.
+    try std.testing.expectEqual(@as(usize, 62555392), one);
     for (1..129) |streams| {
         d.frame_streams = streams;
         const shared = try d.layout(false);
-        if (streams == 128) try std.testing.expectEqual(@as(usize, 1890814976), shared);
+        if (streams == 128) try std.testing.expectEqual(@as(usize, 1924369408), shared);
         try std.testing.expect(shared <= streams * one);
     }
 }
