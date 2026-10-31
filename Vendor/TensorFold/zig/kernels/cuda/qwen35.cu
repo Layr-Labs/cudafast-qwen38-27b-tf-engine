@@ -237,6 +237,9 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_pre(Geo geo, const 
                                                                   __nv_bfloat16* __restrict__ V0, float* __restrict__ G0, __nv_bfloat16* __restrict__ BETA0,
                                                                   const int* __restrict__ P) {
     release_next();
+    // The dependent-launch wait comes before any load: the staged tables (copied before this forward's first launch),
+    // the weights and a recorded window's conv tail (left by an earlier forward's keep) then issue against this
+    // forward's rows in one pass, so the row addresses are resolved once and the pipe never restarts.
     await_prior();
     const __nv_bfloat16* QKV = after_wait(QKV0);
     const __nv_bfloat16* Ain = after_wait(Ain0);
