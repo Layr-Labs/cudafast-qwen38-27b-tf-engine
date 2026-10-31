@@ -141,7 +141,7 @@ fn leastSquares(row: []align(1) const u16, start: [2]f32) [2]f32 {
     var best = start;
     var best_err = groupError(row, start);
     var cur = start;
-    for (0..3) |_| {
+    for (0..8) |_| {
         const s = cur[0];
         if (s <= 0) break;
         var sq: f64 = 0;
@@ -166,6 +166,24 @@ fn leastSquares(row: []align(1) const u16, start: [2]f32) [2]f32 {
         if (err < best_err) {
             best_err = err;
             best = cur;
+        }
+    }
+    // Search adjacent representable stored values; keep only an improvement under
+    // the same BF16-rounded error used by the base fit. Never alter the target.
+    const scale_bits = toBf16(best[0]);
+    const bias_bits = toBf16(best[1]);
+    for ([_]i32{ -1, 0, 1 }) |ds| {
+        for ([_]i32{ -1, 0, 1 }) |db| {
+            const su = @as(i32, scale_bits) + ds;
+            const bu = @as(i32, bias_bits) + db;
+            if (su < 0 or su > 65535 or bu < 0 or bu > 65535) continue;
+            const candidate = [2]f32{ bf16(@intCast(su)), bf16(@intCast(bu)) };
+            if (!(candidate[0] > 0) or !std.math.isFinite(candidate[0]) or !std.math.isFinite(candidate[1])) continue;
+            const err = groupError(row, candidate);
+            if (err < best_err) {
+                best_err = err;
+                best = candidate;
+            }
         }
     }
     return best;
