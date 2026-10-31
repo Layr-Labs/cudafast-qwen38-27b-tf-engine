@@ -43,6 +43,15 @@ pub const Ctx = struct {
     // the stream's tokens draft_frame has read, and whether one lay outside its spans (then drafts take the whole head)
     scanned: usize = 0,
     wide: bool = false,
+    // the node budget's two arms on this stream (0: a 16-row window's 15 nodes, 1: tree.nodes()): the committed tokens and
+    // milliseconds of the rounds grown with each, and the newest hold's time, position and arm
+    arm_tokens: [2]f64 = .{ 0, 0 },
+    arm_ms: [2]f64 = .{ 0, 0 },
+    arm_rounds: [2]u32 = .{ 0, 0 },
+    holds: u32 = 0,
+    last_hold: ?std.Io.Timestamp = null,
+    last_position: u64 = 0,
+    last_big: bool = false,
 };
 
 pub const Draft = struct {
@@ -396,6 +405,32 @@ pub const Draft = struct {
         ctx.held_n = shape.parents.len;
     }
 
+    /// The node budget for this hold: tree.nodes() or a 16-row window's 15, whichever has committed more tokens a
+    /// millisecond on this stream (a hold to the next is one round): each tried twice first, the other again every
+    /// eighth hold. The budget only chooses how many of the drafter's candidates the target's greedy verify sees.
+    fn budget(d: *Draft, ctx: *Ctx, position: u64) usize {
+        const big = tree.nodes();
+        const small = @min(big, 15);
+        if (big <= small) return big;
+        const now = std.Io.Clock.awake.now(d.io);
+        if (ctx.last_hold) |t0| {
+            const arm: usize = @intFromBool(ctx.last_big);
+            const ms: f64 = @as(f64, @floatFromInt(t0.durationTo(now).toNanoseconds())) / 1e6;
+            if (position > ctx.last_position and ms > 0 and ms < 1000) {
+                ctx.arm_tokens[arm] += @floatFromInt(position - ctx.last_position);
+                ctx.arm_ms[arm] += ms;
+                ctx.arm_rounds[arm] += 1;
+            }
+        }
+        ctx.holds += 1;
+        const big_wins = ctx.arm_tokens[1] * ctx.arm_ms[0] >= ctx.arm_tokens[0] * ctx.arm_ms[1];
+        const use_big = if (ctx.arm_rounds[0] < 2 or ctx.arm_rounds[1] < 2) ctx.arm_rounds[1] <= ctx.arm_rounds[0] else if (ctx.holds % 8 == 0) !big_wins else big_wins;
+        ctx.last_hold = now;
+        ctx.last_position = position;
+        ctx.last_big = use_big;
+        return if (use_big) big else small;
+    }
+
     pub fn selectHold(d: *Draft, ctx: *Ctx, it: dr.Hold) !void {
         const rows = d.c.block - 1;
         ctx.grown = 0;
@@ -403,7 +438,7 @@ pub const Draft = struct {
         d.drawn = .{ .sampling = it.sampling, .position = it.position };
         defer d.drawn = .{};
         if (it.lanes) |shape| return d.selectLanes(ctx, it.pending, rows, shape);
-        const limit = if (d.c.block == 16) tree.nodes() else 0;
+        const limit = if (d.c.block == 16) d.budget(ctx, it.position) else 0;
         if (limit > 0) {
             // the whole budget whenever drafts are asked: the block's forward costs the same at any depth
             const n = if (it.depth == 0) 0 else limit;
