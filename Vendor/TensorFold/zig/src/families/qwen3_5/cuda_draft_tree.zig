@@ -126,14 +126,14 @@ fn ids(c: Candidates, r: usize) []align(1) const u32 {
 }
 
 /// Row `r`'s candidates after `pred` as log-chances: softmax of (unary + edge x selector) / scale.
-fn chancesAfter(c: Candidates, r: usize, pred: u32, out: *[lp_top]f64) void {
+fn chancesAfter(c: Candidates, r: usize, pred: u32, out: *[lp_top]f64, use_scale: f64) void {
     const w = ids(c, r);
     const hp = std.mem.bytesAsSlice(u16, c.projected[r * c.rank * 2 ..][0 .. c.rank * 2]);
     var most: f64 = -std.math.inf(f64);
     for (0..c.topk) |j| {
         var edge: f64 = 0;
         for (0..c.rank) |k| edge += bf16(c.predecessor[pred * c.rank + k]) * bf16(hp[k]) * bf16(c.successor[w[2 + j] * c.rank + k]);
-        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edge_weight * edge) / scale;
+        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edge_weight * edge) / use_scale;
         most = @max(most, out[j]);
     }
     var total: f64 = 0;
@@ -143,7 +143,12 @@ fn chancesAfter(c: Candidates, r: usize, pred: u32, out: *[lp_top]f64) void {
 }
 
 /// Up to `most` nodes best first: the open node of least path cost next (ties by parent, token, row); the count grown.
+pub const shadow_scales = [_]f64{ 1.0, 1.5, 2.0 };
+pub const Shadow = struct { tokens: [engine.most_window]u32 = undefined, parents: [engine.most_window]i32 = undefined, own: [engine.most_window]f64 = undefined, len: usize = 0 };
 pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32, parents: []i32, own: []f64) usize {
+    return growScaled(c, pending, rows, most, tokens, parents, own, scale);
+}
+pub fn growScaled(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32, parents: []i32, own: []f64, use_scale: f64) usize {
     const Open = struct { cost: f64, parent: i32, token: u32, row: usize, own: f64 };
     var open: [branch * (engine.most_window + 1)]Open = undefined;
     var n_open: usize = 0;
@@ -156,7 +161,7 @@ pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32
         // the node just taken (or the pending token) opens its best children on the next row
         if (row < rows) {
             var lc: [lp_top]f64 = undefined;
-            chancesAfter(c, row, pred, &lc);
+            chancesAfter(c, row, pred, &lc, use_scale);
             var order: [lp_top]usize = undefined;
             for (order[0..c.topk], 0..) |*o, i| o.* = i;
             std.mem.sort(usize, order[0..c.topk], &lc, struct {
@@ -219,7 +224,7 @@ test "best first: a node's children follow it, the cheapest open node first, cha
     const zeros: [32]u16 = @splat(0);
     const c: Candidates = .{ .words = &words, .projected = std.mem.sliceAsBytes(zeros[0..2]), .topk = 4, .rank = rank, .predecessor = &zeros, .successor = &zeros };
     var lc: [lp_top]f64 = undefined;
-    chancesAfter(c, 0, 0, &lc);
+    chancesAfter(c, 0, 0, &lc, scale);
     var total: f64 = 0;
     for (lc[0..4]) |v| total += @exp(v);
     try std.testing.expectApproxEqAbs(@as(f64, 1), total, 1e-12);

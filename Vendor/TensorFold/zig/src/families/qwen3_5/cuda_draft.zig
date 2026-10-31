@@ -40,6 +40,8 @@ pub const Ctx = struct {
     parents: [engine.most_window]i32 = undefined,
     own: [engine.most_window]f64 = undefined,
     grown: usize = 0,
+    experts: [tree.shadow_scales.len]tree.Shadow = @splat(.{}),
+    expert_scores: [tree.shadow_scales.len]i32 = @splat(0), // stream-local, reset on open
     // the stream's tokens draft_frame has read, and whether more than 1 in 32 lay outside its spans (then drafts take
     // the whole head)
     scanned: usize = 0,
@@ -404,7 +406,15 @@ pub const Draft = struct {
         if (limit > 0) {
             // the whole budget whenever drafts are asked: the block's forward costs the same at any depth
             const n = if (it.depth == 0) 0 else limit;
-            ctx.grown = tree.grow(d.candidates(rows), it.pending, rows, n, &ctx.held, &ctx.parents, &ctx.own);
+            for (&ctx.experts, tree.shadow_scales) |*expert, sc| {
+                expert.len = tree.growScaled(d.candidates(rows), it.pending, rows, n, &expert.tokens, &expert.parents, &expert.own, sc);
+            }
+            const selected = @import("tree_experts.zig").choose(ctx.expert_scores, 2);
+            const picked = &ctx.experts[selected];
+            ctx.grown = picked.len;
+            @memcpy(ctx.held[0..ctx.grown], picked.tokens[0..ctx.grown]);
+            @memcpy(ctx.parents[0..ctx.grown], picked.parents[0..ctx.grown]);
+            @memcpy(ctx.own[0..ctx.grown], picked.own[0..ctx.grown]);
             ctx.held_n = ctx.grown;
         } else {
             d.select(ctx, it.pending, rows);
@@ -460,6 +470,20 @@ pub const Draft = struct {
                 for (prefix[0..@min(it.follow.len, prefix.len)], 0..) |*x, i| x.* = @intCast(i);
                 const kept = it.rows orelse prefix[0..@min(it.follow.len, prefix.len)];
                 d.landing.observeTree(it.stream.sampling != null, ctx.parents[0..ctx.grown], ctx.own[0..ctx.grown], it.offered, kept);
+                var matched: [tree.shadow_scales.len]i32 = @splat(0);
+                for (&ctx.experts, &matched) |*expert, *count| {
+                    const bound = @min(@as(usize, it.offered), expert.len);
+                    var parent: i32 = -1;
+                    for (it.follow) |target| {
+                        var found: ?usize = null;
+                        for (expert.tokens[0..bound], expert.parents[0..bound], 0..) |token, par, j| {
+                            if (par == parent and token == target) { found = j; break; }
+                        }
+                        if (found) |j| { parent = @intCast(j); count.* += 1; } else break;
+                    }
+                }
+                const baseline = matched[1];
+                for (&ctx.expert_scores, matched) |*score, count| score.* += count - baseline;
             }
             ctx.grown = 0;
             // the target's features: its ring, `offset` the first row's position (cuda_native.zig's featuresFn)
