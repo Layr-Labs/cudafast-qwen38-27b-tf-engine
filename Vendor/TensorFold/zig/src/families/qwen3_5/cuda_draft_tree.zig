@@ -5,9 +5,26 @@ const lanes = @import("lanes");
 const engine = @import("cuda_engine.zig");
 
 /// Children a node, the selector's weight, the softmax scale, and the nodes a tree takes by default.
-const branch = 12;
-const edge_weight = 0.6;
-const scale = 1.5;
+/// TF_TREE_BRANCH / TF_TREE_EDGE / TF_TREE_SCALE override the constants for measurement only;
+/// the defaults are the shipped policy.
+fn envReal(name: [:0]const u8, default: f64) f64 {
+    const v = platform.c.getenv(name) orelse return default;
+    return std.fmt.parseFloat(f64, std.mem.span(v)) catch default;
+}
+fn envInt(name: [:0]const u8, default: usize) usize {
+    const v = platform.c.getenv(name) orelse return default;
+    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch default;
+}
+const max_branch = 20;
+inline fn branchOf() usize {
+    return @min(envInt("TF_TREE_BRANCH", 12), max_branch);
+}
+inline fn edgeWeight() f64 {
+    return envReal("TF_TREE_EDGE", 0.6);
+}
+inline fn scaleOf() f64 {
+    return envReal("TF_TREE_SCALE", 1.0);
+}
 /// A sampled stream's candidates carry the draw's own Gumbel noise at this weight (the 27B engine's draft_tree).
 const noise_weight = 0.7;
 const default_nodes = 15;
@@ -140,7 +157,7 @@ fn chancesAfter(c: Candidates, r: usize, pred: u32, out: *[lp_top]f64) void {
         for (edge[0..c.topk], succ[0..c.topk]) |*e, row| e.* += ph * bf16(row[k]);
     }
     for (0..c.topk) |j| {
-        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edge_weight * edge[j]) / scale;
+        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edgeWeight() * edge[j]) / scaleOf();
         most = @max(most, out[j]);
     }
     var total: f64 = 0;
@@ -152,7 +169,7 @@ fn chancesAfter(c: Candidates, r: usize, pred: u32, out: *[lp_top]f64) void {
 /// Up to `most` nodes best first: the open node of least path cost next (ties by parent, token, row); the count grown.
 pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32, parents: []i32, own: []f64) usize {
     const Open = struct { cost: f64, parent: i32, token: u32, row: usize, own: f64 };
-    var open: [branch * (engine.most_window + 1)]Open = undefined;
+    var open: [max_branch * (engine.most_window + 1)]Open = undefined;
     var n_open: usize = 0;
     var count: usize = 0;
     var pred = pending;
@@ -172,7 +189,7 @@ pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32
                 }
             }.more);
             const w = ids(c, row);
-            for (order[0..@min(branch, c.topk)]) |j| {
+            for (order[0..@min(branchOf(), c.topk)]) |j| {
                 if (!std.math.isFinite(lc[j]) or n_open == open.len) break;
                 open[n_open] = .{ .cost = path - lc[j], .parent = parent, .token = w[2 + j], .row = row, .own = lc[j] };
                 n_open += 1;
