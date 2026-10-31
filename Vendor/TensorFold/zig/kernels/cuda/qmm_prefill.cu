@@ -186,7 +186,12 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_split(const __nv
 #include "qmm_prompt_persist.cuh"
 #include "qmm_prompt_persist_rows2.cuh"
 #include "qmm_prompt_persist_rows3.cuh"
+#include "qmm_prompt_persist_wide.cuh"
 template __global__ void tf_qmm_persistent::kernel<128,1,true,false>(const __nv_bfloat16* __restrict__, const __grid_constant__ tf_qmm_prefill::ManyParts, __nv_bfloat16* __restrict__, int,int,int,int,int,int,int);
 template __global__ void tf_qmm_persistent_rows2::kernel<128,1,false,false>(const __nv_bfloat16* __restrict__, const __grid_constant__ tf_qmm_prefill::ManyParts, __nv_bfloat16* __restrict__, int,int,int,int,int,int,int);
 template __global__ void tf_qmm_persistent_rows2::kernel<128,1,false,true>(const __nv_bfloat16* __restrict__, const __grid_constant__ tf_qmm_prefill::ManyParts, __nv_bfloat16* __restrict__, int,int,int,int,int,int,int);
 template __global__ void tf_qmm_persistent_rows3::kernel<128,1,false,false>(const __nv_bfloat16* __restrict__, const __grid_constant__ tf_qmm_prefill::ManyParts, __nv_bfloat16* __restrict__, int,int,int,int,int,int,int);
+// the 128 x 256 eight-warp schedules (qmm_prompt_persist_wide.cuh): outputs (split tail, rows2's tile), outputs, GDN in (rows3's)
+template __global__ void tf_qmm_persistent_wide::kernel<128,1,true,false>(const __nv_bfloat16* __restrict__, const __grid_constant__ tf_qmm_prefill::ManyParts, __nv_bfloat16* __restrict__, int,int,int,int,int,int,int);
+template __global__ void tf_qmm_persistent_wide::kernel<128,1,false,false>(const __nv_bfloat16* __restrict__, const __grid_constant__ tf_qmm_prefill::ManyParts, __nv_bfloat16* __restrict__, int,int,int,int,int,int,int);
+template __global__ void tf_qmm_persistent_wide::kernel<128,1,false,true>(const __nv_bfloat16* __restrict__, const __grid_constant__ tf_qmm_prefill::ManyParts, __nv_bfloat16* __restrict__, int,int,int,int,int,int,int);

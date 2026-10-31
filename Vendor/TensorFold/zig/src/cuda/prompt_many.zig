@@ -17,6 +17,10 @@ pub const symbol = "tf_qmm_prompt_many";
 pub const mlp_symbol = "tf_qmm_prompt_mlp";
 pub const split_symbol = "tf_qmm_prompt_split";
 pub const parts_max = 4;
+/// The wide twins' tile width, threads and shared memory (3 x (128 x 128 inputs + 256 x 32 words + 2 x 512 scales))
+pub const wide_n = 256;
+pub const wide_threads = 256;
+pub const wide_smem: u32 = 3 * (128 * 128 + 256 * 32 + 2 * 256 * 2);
 pub const tile_m = 128;
 pub const tile_n = 128;
 pub const threads = 128;
@@ -43,6 +47,10 @@ pub const Kernels = struct {
     slots: usize,
     /// Native MLP, two-row normal/split projection, and three-row grouped projection.
     persistent_fns: [4]?Function = @splat(null),
+    /// The 128 x 256 eight-warp, three-stage twins (qmm_prompt_persist_wide.cuh), one CTA an SM: split outputs,
+    /// outputs, GDN inputs; null with TF_PROMPT_WIDE=0
+    wide_fns: [3]?Function = @splat(null),
+    sms: usize = 0,
 
     /// From a loaded qmm_prefill module, on a device of `sms` SMs.
     pub fn resolve(prefill_mod: module.Module, sms: usize) !Kernels {
@@ -52,7 +60,7 @@ pub const Kernels = struct {
         try m.allowDynamicShared(smem);
         const sp = try prefill_mod.function(split_symbol);
         try sp.allowDynamicShared(smem);
-        var result: Kernels = .{ .many_fn = f, .mlp_fn = m, .split_fn = sp, .slots = 2 * sms };
+        var result: Kernels = .{ .many_fn = f, .mlp_fn = m, .split_fn = sp, .slots = 2 * sms, .sms = sms };
         const disabled = if (std.c.getenv("TF_PROMPT_PERSISTENT")) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
         if (sms == 48 and !disabled) {
             const names = [_][:0]const u8{
@@ -66,8 +74,34 @@ pub const Kernels = struct {
                 try kernel.allowDynamicShared(smem);
                 dest.* = kernel;
             }
+            const wide_off = if (std.c.getenv("TF_PROMPT_WIDE")) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
+            if (!wide_off) {
+                const wide_names = [_][:0]const u8{
+                    "_ZN22tf_qmm_persistent_wide6kernelILi128ELi1ELb1ELb0EEEvPK13__nv_bfloat16N14tf_qmm_prefill9ManyPartsEPS1_iiiiiii",
+                    "_ZN22tf_qmm_persistent_wide6kernelILi128ELi1ELb0ELb0EEEvPK13__nv_bfloat16N14tf_qmm_prefill9ManyPartsEPS1_iiiiiii",
+                    "_ZN22tf_qmm_persistent_wide6kernelILi128ELi1ELb0ELb1EEEvPK13__nv_bfloat16N14tf_qmm_prefill9ManyPartsEPS1_iiiiiii",
+                };
+                for (wide_names, &result.wide_fns) |name, *dest| {
+                    const kernel = try prefill_mod.function(name);
+                    try kernel.allowDynamicShared(wide_smem);
+                    dest.* = kernel;
+                }
+            }
         }
         return result;
+    }
+
+    /// `persistent` on a wide twin: 256 threads, one CTA an SM, three stages of 128 x 256.
+    fn persistentWide(kk: *const Kernels, f: Function, s: Stream, x: u64, parts: Parts, rows: usize, k: usize, group: usize, full_cols: c_int, blocks: usize) !void {
+        var g: launch_.Args = .{};
+        g.add(x);
+        g.add(parts);
+        g.add(@as(u64, 0));
+        for ([_]usize{ rows, k, k, group }) |v| g.add(@as(c_int, @intCast(v)));
+        g.add(full_cols);
+        g.add(@as(c_int, @intCast(blocks)));
+        g.add(@as(c_int, 1));
+        try launch_.launch(f, .{ .grid = .{ .x = @intCast(@min(blocks, kk.sms)) }, .block = .{ .x = wide_threads }, .shared = wide_smem }, s, &g);
     }
 
     fn persistent(kk: *const Kernels, f: Function, s: Stream, x: u64, parts: Parts, act: u64, rows: usize, k: usize, group: usize, full_cols: c_int, blocks: usize) !void {
@@ -153,6 +187,11 @@ pub const Kernels = struct {
                 var parts: Parts = std.mem.zeroes(Parts);
                 parts.count = 1;
                 parts.p[0] = part;
+                // the wide twin when the full columns split into 256-wide tiles: 128-wide tail tiles as before
+                if (kk.wide_fns[0]) |fw| if (full_cols % wide_n == 0) {
+                    const wide_blocks = rows_t * (full_cols / wide_n) + rows_t * ((o.q.n - full_cols) / (wide_n / 2));
+                    return kk.persistentWide(fw, s, x, parts, rows, k, group, @intCast(full_cols), wide_blocks);
+                };
                 return kk.persistent(f, s, x, parts, 0, rows, k, group, @intCast(full_cols), blocks);
             };
             return launch_.launch(kk.split_fn, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = threads }, .shared = smem }, s, &g);
@@ -166,8 +205,19 @@ pub const Kernels = struct {
         }
         parts.count = @intCast(outs.len);
         const selected: ?usize = if (outputRole(outs)) 1 else if (recurrentRole(outs)) 3 else null;
-        if (kk.persistentRows(rows) and blocks > kk.slots) if (selected) |index| if (kk.persistent_fns[index]) |f|
+        if (kk.persistentRows(rows) and blocks > kk.slots) if (selected) |index| if (kk.persistent_fns[index]) |f| {
+            if (kk.wide_fns[if (index == 1) 1 else 2]) |fw| {
+                // the same parts on 256-wide tiles: each part's first tile and the launch's count by the wide width
+                var wide = parts;
+                var wide_blocks: usize = 0;
+                for (outs, 0..) |o, i| {
+                    wide.p[i].first = @intCast(wide_blocks);
+                    wide_blocks += rows_t * ((o.q.n + wide_n - 1) / wide_n);
+                }
+                return kk.persistentWide(fw, s, x, wide, rows, k, group, -1, wide_blocks);
+            }
             return kk.persistent(f, s, x, parts, 0, rows, k, group, -1, blocks);
+        };
         var g: launch_.Args = .{};
         g.add(x);
         g.add(parts);
