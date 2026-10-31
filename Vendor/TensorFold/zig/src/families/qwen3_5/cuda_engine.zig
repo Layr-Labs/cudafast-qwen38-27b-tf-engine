@@ -572,7 +572,10 @@ pub const Engine = struct {
         @memcpy(std.mem.bytesAsSlice(u32, st[ids_at..][0 .. total * 4]), ids);
         @memset(st[ids_at + total * 4 .. ids_at + max_rows * 4], 0); // a bucket's padding rows read token 0
         const segs = std.mem.bytesAsSlice(Seg, st[segs_at..][0 .. parts.len * @sizeOf(Seg)]);
-        const slot_peak = try Round.build(st, parts, record);
+        // past 16 rows a branching window's scan carries each parent's state in the registers to its first child
+        // (tree_slots.carried: one slot fewer, -2 steps); TF_CARRIED=0 restores build's plans
+        const carry = record and total > 1 and !envOff("TF_CARRIED");
+        const slot_peak = try Round.buildCarried(st, parts, record, carry);
         for (parts) |p| {
             try p.cache.settle(e);
             // a pending kept prefix rides in this forward's slot scan only when its log half survives `prepare`
@@ -610,8 +613,12 @@ pub const Engine = struct {
             Round.stageImageTables(st, im, p0, total);
         }
         try e.tables.uploadAsync(0, st[0..if (images != null) tables_len else src_at], e.stream.handle); // text: as before
-        const slot_variant = if (total > 16 and total <= 32 and slot_peak == 3 and e.affine.pdl and !envOff("TF_WIDE_SLOTS")) 3 else
-            Round.narrowVariant(total, slot_peak, record and e.affine.pdl and !envOff("TF_GDN16"));
+        // carried plans of 2..32 rows (at most 3 slots) scan four value rows a warp on qwen35_slots_lean.cuh (slots_3's
+        // arithmetic, its addressing hoisted; 2 slots where they suffice); TF_SLOTS_LEAN=0 keeps tf_q35_gdn_slots_3
+        const wide = total > 1 and total <= 32 and e.affine.pdl and !envOff("TF_WIDE_SLOTS");
+        const slot_variant: usize = if (wide and carry and slot_peak <= 3)
+            (if (envOff("TF_SLOTS_LEAN")) 3 else if (slot_peak <= 2) 37 else 38)
+        else if (wide and slot_peak == 3) 3 else Round.narrowVariant(total, slot_peak, record and e.affine.pdl and !envOff("TF_GDN16"));
         var shape = Shape.init(total, parts.len, record, e.n_taps > 0, @intCast(slot_variant));
         if (record and @import("cuda_round_timing.zig").Trace.enabled())
             std.debug.print("[timing] verify_slots peak={d} variant={d}\n", .{ slot_peak, shape.slots });
@@ -713,11 +720,13 @@ pub const Engine = struct {
             8 => e.fns.gdn_slots_8,
             16 => e.fns.gdn_slots_16,
             35 => e.fns.gdn_slots16_3,
+            37 => e.fns.gdn_lean_2,
+            38 => e.fns.gdn_lean_3,
             else => return error.InvalidGdnSlots,
         };
         const input = e.tables.ptr + @as(usize, if (record) Round.steps_at else rowpar_at);
         // qwen35_slots.cuh: up to four slots scan two value rows a warp, so a block covers eight
-        const rows_a_warp: usize = if (record and (slot_count == 3 or slot_count == 35)) 4 else if (record and slot_count <= 4) 2 else 1;
+        const rows_a_warp: usize = if (record and (slot_count == 3 or slot_count == 35 or slot_count == 37 or slot_count == 38)) 4 else if (record and slot_count <= 4) 2 else 1;
         try e.runAfter(scan, .{ 1, geometry.dk / (4 * rows_a_warp), e.g.v_heads * segments }, .{ 32, 4, 1 }, .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, input, layer, e.y, e.tables.ptr + params_at });
     }
 
@@ -735,7 +744,7 @@ pub const Engine = struct {
 test "dense read cost: hidden and slot variants have distinct graph keys" {
     var seen: [32]u32 = undefined;
     var n: usize = 0;
-    for ([_]u8{ 1, 2, 3, 4, 8, 16, 35 }) |slots| {
+    for ([_]u8{ 1, 2, 3, 4, 8, 16, 35, 37, 38 }) |slots| {
         for ([_]bool{ false, true }) |hidden| {
             const shape: Engine.Shape = .{ .total = 1, .nseg = 1, .record = true, .prompt = false, .taps = true, .slots = slots, .hidden = hidden };
             for (seen[0..n]) |key| try std.testing.expect(key != shape.key());
