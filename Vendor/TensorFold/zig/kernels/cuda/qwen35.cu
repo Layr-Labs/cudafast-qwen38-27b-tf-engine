@@ -237,15 +237,6 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_pre(Geo geo, const 
                                                                   __nv_bfloat16* __restrict__ V0, float* __restrict__ G0, __nv_bfloat16* __restrict__ BETA0,
                                                                   const int* __restrict__ P) {
     release_next();
-    await_prior();
-    const __nv_bfloat16* QKV = after_wait(QKV0);
-    const __nv_bfloat16* Ain = after_wait(Ain0);
-    const __nv_bfloat16* Bin = after_wait(Bin0);
-    __nv_bfloat16* Q = after_wait(Q0);
-    __nv_bfloat16* K = after_wait(K0);
-    __nv_bfloat16* V = after_wait(V0);
-    float* G = after_wait(G0);
-    __nv_bfloat16* BETA = after_wait(BETA0);
     const int lane = threadIdx.x;
     const int head = blockIdx.y;
     const int w = blockIdx.z * blockDim.y + threadIdx.y;
@@ -259,17 +250,32 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_pre(Geo geo, const 
 #pragma unroll
     for (int tap = 0; tap < TAPS; tap++) src[tap] = back(rowpar, w, TAPS - 1 - tap);
     constexpr int PER = DK / 32;
+    const bool rec = recorded(P);
     // a recorded window's row logs the tail after it (taps 1..TAPS-1) here, so conv_commit only moves the stream's
-    __nv_bfloat16* tail = recorded(P) ? log_row(geo, sg, layer, w - sg.row0).conv : nullptr;
+    __nv_bfloat16* tail = rec ? log_row(geo, sg, layer, w - sg.row0).conv : nullptr;
     // a lane's PER channels in 8-byte loads: each tap's row, the weights (PER x TAPS in a row), the logged tail
     static_assert(PER == 4 && TAPS == 4, "a tap's channels and a channel's taps are one uint2");
     const int cl = c0 + lane * PER;
     uint2 xw[TAPS], ww[TAPS];
 #pragma unroll
     for (int tap = 0; tap < TAPS; tap++) {
-        const int at = src[tap];
-        xw[tap] = *reinterpret_cast<const uint2*>(at < 0 ? CS + (size_t)(-1 - at) * C + cl : QKV + (size_t)at * C + cl);
         ww[tap] = *reinterpret_cast<const uint2*>(CW + (size_t)cl * TAPS + tap * PER);
+        if (rec && src[tap] < 0) xw[tap] = *reinterpret_cast<const uint2*>(CS + (size_t)(-1 - src[tap]) * C + cl);
+    }
+    await_prior();
+    const __nv_bfloat16* QKV = after_wait(QKV0);
+    const __nv_bfloat16* Ain = after_wait(Ain0);
+    const __nv_bfloat16* Bin = after_wait(Bin0);
+    __nv_bfloat16* Q = after_wait(Q0);
+    __nv_bfloat16* K = after_wait(K0);
+    __nv_bfloat16* V = after_wait(V0);
+    float* G = after_wait(G0);
+    __nv_bfloat16* BETA = after_wait(BETA0);
+#pragma unroll
+    for (int tap = 0; tap < TAPS; tap++) {
+        const int at = src[tap];
+        if (at >= 0) xw[tap] = *reinterpret_cast<const uint2*>(QKV + (size_t)at * C + cl);
+        else if (!rec) xw[tap] = *reinterpret_cast<const uint2*>(CS + (size_t)(-1 - at) * C + cl);
         if (tail != nullptr && tap > 0) *reinterpret_cast<uint2*>(tail + (size_t)(tap - 1) * C + cl) = xw[tap];
     }
     const __nv_bfloat16* cw = reinterpret_cast<const __nv_bfloat16*>(ww);
@@ -459,6 +465,11 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post(Geo geo, const
     __nv_bfloat16* done = row_done[threadIdx.y];
     const int lane = threadIdx.x, hv = blockIdx.y;
     release_next();
+    // ahead of the wait: the layer's norm weights (static); after it, this forward's rows. The loads move, the
+    // arithmetic does not
+    constexpr int PER0 = DK / 32;
+    const uint2 nw = *reinterpret_cast<const uint2*>(plain(NW) + lane * PER0);
+    asm volatile("" ::"r"(nw.x), "r"(nw.y));  // the load issues before the wait (keep4's rule)
     await_prior();
     const __nv_bfloat16* Y = after_wait(Y0);
     const __nv_bfloat16* Z = after_wait(Z0);
@@ -471,7 +482,6 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post(Geo geo, const
     const size_t at = m * W + hv * DK + lane * PER;
     const uint2 yw = *reinterpret_cast<const uint2*>(Y + at);
     const uint2 zw = *reinterpret_cast<const uint2*>(Z + at);
-    const uint2 nw = *reinterpret_cast<const uint2*>(NW + lane * PER);
     const __nv_bfloat16* yp = reinterpret_cast<const __nv_bfloat16*>(&yw);
     const __nv_bfloat16* zp = reinterpret_cast<const __nv_bfloat16*>(&zw);
     const __nv_bfloat16* wp = reinterpret_cast<const __nv_bfloat16*>(&nw);
