@@ -140,9 +140,9 @@ __device__ __forceinline__ void gemv_items(const __nv_bfloat16* __restrict__ x, 
         commit();
         const unsigned char* p = stage(it % STAGES);
         const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
-        if constexpr (DICT) dict_decode(D, p + T::X + T::W, buf + T::SMEM, map(it).x);
-        const __nv_bfloat16* ps = DICT ? reinterpret_cast<const __nv_bfloat16*>(buf + T::SMEM)
-                                       : reinterpret_cast<const __nv_bfloat16*>(p + T::X + T::W);
+        float dval = 0.0f;
+        if constexpr (DICT) dval = dict_decode_reg(D, p + T::X + T::W, buf + T::SMEM + DICT_DEC, map(it).x);
+        const __nv_bfloat16* ps = reinterpret_cast<const __nv_bfloat16*>(p + T::X + T::W);
         const float* px = reinterpret_cast<const float*>(p + T::X + T::W + 2 * T::S);
         uint32_t words[NT][GS / 32];
 #pragma unroll
@@ -163,16 +163,24 @@ __device__ __forceinline__ void gemv_items(const __nv_bfloat16* __restrict__ x, 
                 else mma(d[j], a, b0, b1);
             }
         }
-        if constexpr (DICT) __syncwarp();        // the warp's decoded scales and biases
         const int row = lane >> 2;
         const float xv[2] = {px[row], px[row + 8]};
 #pragma unroll
         for (int j = 0; j < NT; ++j) {
-            const int col = wn * (BN / 4) + j * 8 + (lane & 3) * 2;
-            const __nv_bfloat162 s2 = *reinterpret_cast<const __nv_bfloat162*>(ps + col);
-            const __nv_bfloat162 b2 = *reinterpret_cast<const __nv_bfloat162*>(ps + BN + col);
-            const float sv[2] = {__low2float(s2), __high2float(s2)};
-            const float bv[2] = {__low2float(b2), __high2float(b2)};
+            float sv[2], bv[2];
+            if constexpr (DICT) {
+                const int c0 = j * 8 + (lane & 3) * 2;
+                sv[0] = __shfl_sync(0xffffffffu, dval, c0);
+                sv[1] = __shfl_sync(0xffffffffu, dval, c0 + 1);
+                bv[0] = __shfl_sync(0xffffffffu, dval, 16 + c0);
+                bv[1] = __shfl_sync(0xffffffffu, dval, 16 + c0 + 1);
+            } else {
+                const int col = wn * (BN / 4) + j * 8 + (lane & 3) * 2;
+                const __nv_bfloat162 s2 = *reinterpret_cast<const __nv_bfloat162*>(ps + col);
+                const __nv_bfloat162 b2 = *reinterpret_cast<const __nv_bfloat162*>(ps + BN + col);
+                sv[0] = __low2float(s2); sv[1] = __high2float(s2);
+                bv[0] = __low2float(b2); bv[1] = __high2float(b2);
+            }
 #pragma unroll
             for (int e = 0; e < 4; ++e)
                 acc[j][e] = __fmaf_rn(xv[e >> 1], bv[e & 1], __fmaf_rn(d[j][e], sv[e & 1], acc[j][e]));

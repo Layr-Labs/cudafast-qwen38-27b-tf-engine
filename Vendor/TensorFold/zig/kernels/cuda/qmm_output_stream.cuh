@@ -73,8 +73,9 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
         wait<0>();__syncthreads();
         if(it+1<per){load_w(it+1);load_x(it+1);}commit();
         const auto* at=stage(it);const auto* wp=reinterpret_cast<const uint32_t*>(at+2048);
-        if constexpr(DICT){dict_decode_at(D,at+4096,dec,table,g0+it);__syncwarp();}
-        const auto* sp=reinterpret_cast<const __nv_bfloat16*>(DICT?dec:at+4096);const auto* sums=reinterpret_cast<const float*>(at+4352);
+        float dval=0.0f;
+        if constexpr(DICT)dval=qmm_dict::dict_decode_reg(D,at+4096,table,g0+it);
+        const auto* sp=reinterpret_cast<const __nv_bfloat16*>(at+4096);const auto* sums=reinterpret_cast<const float*>(at+4352);
         uint32_t words[2][2];
 #pragma unroll
         for(int j=0;j<2;++j)
@@ -90,11 +91,19 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
                 if(kt==0)mma0(d[j],a,b0,b1);else mma(d[j],a,b0,b1);
             }
         }
+        const int r=lane>>2;const float xv[2]={sums[r],sums[r+8]};
 #pragma unroll
-        for(int j=0;j<2;++j){const int col=wn*16+j*8+(lane&3)*2;
-            const auto s2=*reinterpret_cast<const __nv_bfloat162*>(sp+col),b2=*reinterpret_cast<const __nv_bfloat162*>(sp+64+col);
-            const float sv[2]={__low2float(s2),__high2float(s2)},bv[2]={__low2float(b2),__high2float(b2)};
-            const int r=lane>>2;const float xv[2]={sums[r],sums[r+8]};
+        for(int j=0;j<2;++j){
+            float sv[2],bv[2];
+            if constexpr(DICT){
+                const int c0=j*8+(lane&3)*2;
+                sv[0]=__shfl_sync(0xffffffffu,dval,c0);sv[1]=__shfl_sync(0xffffffffu,dval,c0+1);
+                bv[0]=__shfl_sync(0xffffffffu,dval,16+c0);bv[1]=__shfl_sync(0xffffffffu,dval,16+c0+1);
+            }else{
+                const int col=wn*16+j*8+(lane&3)*2;
+                const auto s2=*reinterpret_cast<const __nv_bfloat162*>(sp+col),b2=*reinterpret_cast<const __nv_bfloat162*>(sp+64+col);
+                sv[0]=__low2float(s2);sv[1]=__high2float(s2);bv[0]=__low2float(b2);bv[1]=__high2float(b2);
+            }
 #pragma unroll
             for(int e=0;e<4;++e)acc[j][e]=__fmaf_rn(xv[e>>1],bv[e&1],__fmaf_rn(d[j][e],sv[e&1],acc[j][e]));
         }

@@ -43,13 +43,15 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
         woff[j] = static_cast<size_t>(t) * TILE_BYTES + off * 16;
         wdst[j] = T::X + c * 16;
     }
+    if constexpr (!DICT) {
 #pragma unroll
-    for (int j = 0; j < SC; ++j) {
-        const int c = tid + j * T::THREADS, which = c / (T::S / 16), off = c % (T::S / 16);
-        sok[j] = c < 2 * (T::S / 16);
-        sbias[j] = which;
-        soff[j] = off * 8;
-        sdst[j] = T::X + T::W + which * T::S + off * 16;
+        for (int j = 0; j < SC; ++j) {
+            const int c = tid + j * T::THREADS, which = c / (T::S / 16), off = c % (T::S / 16);
+            sok[j] = c < 2 * (T::S / 16);
+            sbias[j] = which;
+            soff[j] = off * 8;
+            sdst[j] = T::X + T::W + which * T::S + off * 16;
+        }
     }
     const bool xsok = tid < rows;
     const float* xssrc = xs + static_cast<size_t>(min(tid, rows - 1)) * KG;
@@ -129,6 +131,7 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
         commit();
         const unsigned char* p = stage(it % STAGES);
         const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
+        float dval[BN / 64 > 0 ? BN / 64 : 1];
         if constexpr (DICT) {
             // the lane's BN / 64 values of its warp's BN / 4 columns: value q is column q % (BN / 4)'s scale, then bias
             const int code = P.npad, bits = qmm_dict::dict_bits(code), step = 16 * bits, g = map(it).x;
@@ -139,12 +142,10 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
                 const uint32_t* pk = reinterpret_cast<const uint32_t*>(p + T::X + T::W + (col / 64) * 256);
                 const int off = (g * step & 63) * 8 + (half * 64 + col % 64) * bits;
                 const uint32_t idx = __funnelshift_r(pk[off >> 5], pk[(off >> 5) + 1], off & 31) & mask_bits;
-                reinterpret_cast<unsigned short*>(dec)[half * BN + col] =
-                    reinterpret_cast<const unsigned short*>(table)[(half ? qmm_dict::dict_ns(code) : 0) + idx];
+                dval[v] = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(table)[(half ? qmm_dict::dict_ns(code) : 0) + idx]);
             }
-            __syncwarp();
         }
-        const __nv_bfloat16* ps = reinterpret_cast<const __nv_bfloat16*>(DICT ? dec : p + T::X + T::W);
+        const __nv_bfloat16* ps = reinterpret_cast<const __nv_bfloat16*>(p + T::X + T::W);
         const float* px = reinterpret_cast<const float*>(p + T::X + T::W + 2 * T::S);
         uint32_t words[NT][GS / 32];
 #pragma unroll
@@ -169,11 +170,19 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
         const float xv[2] = {px[row], px[row + 8]};
 #pragma unroll
         for (int j = 0; j < NT; ++j) {
-            const int col = wn * (BN / 4) + j * 8 + (lane & 3) * 2;
-            const __nv_bfloat162 s2 = *reinterpret_cast<const __nv_bfloat162*>(ps + col);
-            const __nv_bfloat162 b2 = *reinterpret_cast<const __nv_bfloat162*>(ps + BN + col);
-            const float sv[2] = {__low2float(s2), __high2float(s2)};
-            const float bv[2] = {__low2float(b2), __high2float(b2)};
+            float sv[2], bv[2];
+            if constexpr (DICT) {
+                const int vs = j / 4, vb = (BN / 4 + j * 8) / 32;
+                const int ls = (j % 4) * 8 + (lane & 3) * 2, lb = (BN / 4 + j * 8) % 32 + (lane & 3) * 2;
+                sv[0] = __shfl_sync(0xffffffffu, dval[vs], ls); sv[1] = __shfl_sync(0xffffffffu, dval[vs], ls + 1);
+                bv[0] = __shfl_sync(0xffffffffu, dval[vb], lb); bv[1] = __shfl_sync(0xffffffffu, dval[vb], lb + 1);
+            } else {
+                const int col = wn * (BN / 4) + j * 8 + (lane & 3) * 2;
+                const __nv_bfloat162 s2 = *reinterpret_cast<const __nv_bfloat162*>(ps + col);
+                const __nv_bfloat162 b2 = *reinterpret_cast<const __nv_bfloat162*>(ps + BN + col);
+                sv[0] = __low2float(s2); sv[1] = __high2float(s2);
+                bv[0] = __low2float(b2); bv[1] = __high2float(b2);
+            }
 #pragma unroll
             for (int e = 0; e < 4; ++e)
                 acc[j][e] = __fmaf_rn(xv[e >> 1], bv[e & 1], __fmaf_rn(d[j][e], sv[e & 1], acc[j][e]));
@@ -245,4 +254,243 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_gdn_stream16(const __nv
 // tf_qmm_gdn_stream16 with its dictionary-coded parts' index windows: the same loads, MMA chains, fmas and sums.
 extern "C" __global__ void __launch_bounds__(128) tf_qmm_gdn_stream16_dict(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
     tf_qmm_gdn_stream::body_dict(x,xs,parts,M,K,ldx);
+}
+
+// 32-row twins of the grouped input stream (17 to 32-row verify windows): two m16 row tiles share each stage's
+// weight panel; every element keeps tf_qmm_gdn_stream16's MMA chain, fmas and ascending slice fold, and a row's
+// bits do not depend on the rows beside it. The wide parts take 128-column CTAs (their accumulators double).
+namespace tf_qmm_gdn_rows32 {
+using namespace tf_qmm_group;
+template<int GS,int BN,int STAGES>using GemvTile=qmm_frag::LaneTile<GS,32,BN,1,4,STAGES>;
+template <int GS, int BN, int STAGES, bool DICT, typename Map, typename After>
+__device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs, const Part& P, int M,
+                                           int K, int ldx, int items, Map map, float (&acc)[2][GemvTile<GS, BN, STAGES>::NT][4],
+                                           After after) {
+    using T = GemvTile<GS, BN, STAGES>;
+    static_assert(!DICT || (GS == 64 && BN % 64 == 0 && 2 * T::S == BN / 64 * 256), "coded stages");
+    const int npad = DICT ? P.tiles : P.npad;
+    static_assert(T::MT == 2 && T::THREADS == 128, "two m16 row tiles, four column warps");
+    constexpr int NT = T::NT;
+    extern __shared__ __align__(128) unsigned char buf[];
+    const int tid = threadIdx.x, lane = tid & 31, wn = tid >> 5;
+    const int KG = K / GS;
+    auto stage = [&](int s) { return buf + s * T::STAGE; };
+    const int rows = min(32, M);
+    constexpr int TILE_BYTES = 64 * GS / 2;
+    constexpr int XC = (32 * T::CHUNKS + T::THREADS - 1) / T::THREADS, WC = (T::W / 16 + T::THREADS - 1) / T::THREADS;
+    constexpr int SC = (2 * T::S / 16 + T::THREADS - 1) / T::THREADS;
+    const __nv_bfloat16* xsrc[XC];
+    size_t woff[WC];
+    int soff[SC], xdst[XC], wdst[WC], sdst[SC];
+    bool xok[XC], wok[WC], sok[SC], sbias[SC];
+#pragma unroll
+    for (int j = 0; j < XC; ++j) {
+        const int c = tid + j * T::THREADS, r = c / T::CHUNKS, ch = c % T::CHUNKS;
+        xok[j] = c < 32 * T::CHUNKS && r < rows;
+        xsrc[j] = x + static_cast<size_t>(min(r, rows - 1)) * ldx + ch * 8;
+        xdst[j] = r * T::ROW + swz<T::CHUNKS>(r, ch) * 16;
+    }
+#pragma unroll
+    for (int j = 0; j < WC; ++j) {
+        const int c = tid + j * T::THREADS, t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
+        wok[j] = c < T::W / 16;
+        woff[j] = static_cast<size_t>(t) * TILE_BYTES + off * 16;
+        wdst[j] = T::X + c * 16;
+    }
+#pragma unroll
+    for (int j = 0; j < SC; ++j) {
+        const int c = tid + j * T::THREADS, which = c / (T::S / 16), off = c % (T::S / 16);
+        sok[j] = c < 2 * (T::S / 16);
+        sbias[j] = which;
+        soff[j] = off * 8;
+        sdst[j] = T::X + T::W + which * T::S + off * 16;
+    }
+    const bool xsok = tid < rows;
+    const float* xssrc = xs + static_cast<size_t>(min(tid, rows - 1)) * KG;
+    auto load_x = [&](int s, int i) {
+        const int g = map(i).x;
+        unsigned char* p = stage(s);
+#pragma unroll
+        for (int j = 0; j < XC; ++j)
+            if (xok[j]) cp16(p + xdst[j], xsrc[j] + g * GS);
+        if (xsok) cp4(p + T::X + T::W + 2 * T::S + tid * 4, xssrc + g);
+    };
+    auto load_w = [&](int s, int i) {
+        const int2 at = map(i);
+        const int g = at.x, n0 = at.y;
+        unsigned char* p = stage(s);
+        const unsigned char* wb = reinterpret_cast<const unsigned char*>(P.w) +
+                                  static_cast<size_t>(n0 / 64) * TILE_BYTES + (n0 % 64) * GS / 2;
+#pragma unroll
+        for (int j = 0; j < WC; ++j)
+            if (wok[j]) cp16(p + wdst[j], wb + woff[j] + static_cast<size_t>(g) * (npad/64) * TILE_BYTES);
+        if constexpr (DICT) {
+            const int step = 16 * qmm_dict::dict_bits(P.npad);
+            const size_t window = static_cast<size_t>(g) * step & ~static_cast<size_t>(63);
+            for (int c = tid; c < BN / 4; c += T::THREADS)
+                cp16(p + T::X + T::W + c * 16, reinterpret_cast<const unsigned char*>(P.scales) +
+                     static_cast<size_t>(n0 / 64 + c / 16) * KG * step + window + (c % 16) * 16);
+        } else {
+#pragma unroll
+        for (int j = 0; j < SC; ++j)
+            if (sok[j]) cp16(p + sdst[j], (sbias[j] ? P.biases : P.scales) + n0 + soff[j] + static_cast<size_t>(g) * P.npad);
+        }
+    };
+    unsigned char* dec = buf + T::SMEM;  // DICT: BN decoded scales, BN biases, then the part's table
+    unsigned char* table = dec + 4 * BN;
+    if constexpr (DICT) qmm_dict::dict_table<T::THREADS>(P, table, tid);
+    uint32_t mask;
+    asm volatile("mov.b32 %0, 0x000F000F;\n" : "=r"(mask));
+
+    for (int c = tid; c < 32 * T::CHUNKS; c += T::THREADS)
+        if (c / T::CHUNKS >= rows)
+#pragma unroll
+            for (int s = 0; s < STAGES; ++s)
+                *reinterpret_cast<uint4*>(stage(s) + c / T::CHUNKS * T::ROW + c % T::CHUNKS * 16) = uint4{};
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s) {
+        if (s < items) load_w(s, s);
+        commit();
+    }
+    grid_wait();
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s) {
+        if (s < items) load_x(s, s);
+        commit();
+    }
+    grid_launch();
+    for (int it = 0; it < items; ++it) {
+        wait<STAGES - 2>();
+        __syncthreads();
+        const int next = it + STAGES - 1;
+        if (next < items) {
+            load_x(next % STAGES, next);
+            load_w(next % STAGES, next);
+        }
+        commit();
+        const unsigned char* p = stage(it % STAGES);
+        const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
+        float dval[BN / 64 > 0 ? BN / 64 : 1];
+        if constexpr (DICT) {
+            const int code = P.npad, bits = qmm_dict::dict_bits(code), step = 16 * bits, g = map(it).x;
+            const uint32_t mask_bits = (1u << bits) - 1u;
+#pragma unroll
+            for (int v = 0; v < BN / 64; ++v) {
+                const int q = lane + 32 * v, half = q / (BN / 4), col = wn * (BN / 4) + q % (BN / 4);
+                const uint32_t* pk = reinterpret_cast<const uint32_t*>(p + T::X + T::W + (col / 64) * 256);
+                const int off = (g * step & 63) * 8 + (half * 64 + col % 64) * bits;
+                const uint32_t idx = __funnelshift_r(pk[off >> 5], pk[(off >> 5) + 1], off & 31) & mask_bits;
+                dval[v] = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(table)[(half ? qmm_dict::dict_ns(code) : 0) + idx]);
+            }
+        }
+        const __nv_bfloat16* ps = reinterpret_cast<const __nv_bfloat16*>(p + T::X + T::W);
+        const float* px = reinterpret_cast<const float*>(p + T::X + T::W + 2 * T::S);
+        uint32_t words[NT][GS / 32];
+#pragma unroll
+        for (int j = 0; j < NT; ++j)
+#pragma unroll
+            for (int v = 0; v < GS / 32; ++v) words[j][v] = pw[((wn * NT + j) * 32 + lane) * (GS / 32) + v];
+        float d[2][NT][4];
+#pragma unroll
+        for (int kt = 0; kt < GS / 16; ++kt) {
+            uint32_t a[2][4];
+#pragma unroll
+            for (int mt = 0; mt < 2; ++mt) {
+                const int r = mt * 16 + (lane & 7) + ((lane >> 3) & 1) * 8, ch = kt * 2 + (lane >> 4);
+                ldmatrix4(a[mt], p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16);
+            }
+#pragma unroll
+            for (int j = 0; j < NT; ++j) {
+                const uint32_t b0 = pairm(words[j][kt / 2], (kt & 1) * 8, mask);
+                const uint32_t b1 = pairm(words[j][kt / 2], (kt & 1) * 8 + 4, mask);
+#pragma unroll
+                for (int mt = 0; mt < 2; ++mt) {
+                    if (kt == 0) mma0(d[mt][j], a[mt], b0, b1);
+                    else mma(d[mt][j], a[mt], b0, b1);
+                }
+            }
+        }
+#pragma unroll
+        for (int mt = 0; mt < 2; ++mt) {
+            const int row = mt * 16 + (lane >> 2);
+            const float xv[2] = {px[row], px[row + 8]};
+#pragma unroll
+            for (int j = 0; j < NT; ++j) {
+                float sv[2], bv[2];
+                if constexpr (DICT) {
+                    const int vs = j / 4, vb = (BN / 4 + j * 8) / 32;
+                    const int ls = (j % 4) * 8 + (lane & 3) * 2, lb = (BN / 4 + j * 8) % 32 + (lane & 3) * 2;
+                    sv[0] = __shfl_sync(0xffffffffu, dval[vs], ls); sv[1] = __shfl_sync(0xffffffffu, dval[vs], ls + 1);
+                    bv[0] = __shfl_sync(0xffffffffu, dval[vb], lb); bv[1] = __shfl_sync(0xffffffffu, dval[vb], lb + 1);
+                } else {
+                    const int col = wn * (BN / 4) + j * 8 + (lane & 3) * 2;
+                    const __nv_bfloat162 s2 = *reinterpret_cast<const __nv_bfloat162*>(ps + col);
+                    const __nv_bfloat162 b2 = *reinterpret_cast<const __nv_bfloat162*>(ps + BN + col);
+                    sv[0] = __low2float(s2); sv[1] = __high2float(s2);
+                    bv[0] = __low2float(b2); bv[1] = __high2float(b2);
+                }
+#pragma unroll
+                for (int e = 0; e < 4; ++e)
+                    acc[mt][j][e] = __fmaf_rn(xv[e >> 1], bv[e & 1], __fmaf_rn(d[mt][j][e], sv[e & 1], acc[mt][j][e]));
+            }
+        }
+        after(it);
+    }
+}
+
+template <int BN, int NT, typename Got>
+__device__ __forceinline__ void gemv_store(const Part& P, int M, int n0, Got got) {
+    const int lane = threadIdx.x & 31, wn = threadIdx.x >> 5, N = P.n;
+#pragma unroll
+    for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+    for (int j = 0; j < NT; ++j)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int col = n0 + wn * (BN / 4) + j * 8 + (lane & 3) * 2, r = mt * 16 + (lane >> 2) + h * 8;
+            if (r >= M) continue;
+            const float2 v = got(mt, j, h);
+            auto* dst = reinterpret_cast<__nv_bfloat16*>(P.out) + static_cast<size_t>(r) * N + col;
+            if (col + 1 < N && (N & 1) == 0) {
+                *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(v.x, v.y);
+            } else {
+                if (col < N) dst[0] = __float2bfloat16_rn(v.x);
+                if (col + 1 < N) dst[1] = __float2bfloat16_rn(v.y);
+            }
+        }
+}
+
+template<int BN,bool DICT=false>
+__device__ __forceinline__ void tile(const __nv_bfloat16* x,const float* xs,const tf_qmm_group::Part p,int t,int M,int K,int ldx){
+    constexpr int NT=GemvTile<64,BN,2>::NT;
+    const int KG=K/64,per=KG/p.sk;float acc[2][NT][4]{},tot[2][NT][4]{};
+    wide_items<64,BN,2,DICT>(x,xs,p,M,K,ldx,KG,[&](int g){return make_int2(g,t*BN);},acc,[&](int g){
+        if((g+1)%per!=0)return;bool first=g+1==per;
+#pragma unroll
+        for(int mt=0;mt<2;++mt)
+#pragma unroll
+        for(int j=0;j<NT;++j)
+#pragma unroll
+            for(int e=0;e<4;++e){tot[mt][j][e]=first?acc[mt][j][e]:tot[mt][j][e]+acc[mt][j][e];acc[mt][j][e]=0;}
+        if(g!=KG-1)return;
+        gemv_store<BN,NT>(p,M,t*BN,[&](int mt,int j,int h){return make_float2(tot[mt][j][2*h],tot[mt][j][2*h+1]);});
+    });
+}
+template<bool DICT>
+__device__ __forceinline__ void body(const __nv_bfloat16* x,const float* xs,const tf_qmm_group::Parts& parts,int M,int K,int ldx){
+    int which=0;
+#pragma unroll
+    for(int i=1;i<4;++i)if(int(blockIdx.x)>=parts.p[i].first)which=i;
+    const auto p=parts.p[which];int t=int(blockIdx.x)-p.first;const bool coded=DICT&&p.tiles>0;
+    if(which<2){if(coded)tile<128,true>(x,xs,p,t,M,K,ldx);else tile<128>(x,xs,p,t,M,K,ldx);}
+    else{if(coded)tile<64,true>(x,xs,p,t,M,K,ldx);else tile<64>(x,xs,p,t,M,K,ldx);}
+}
+}
+
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_gdn_stream32(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
+    tf_qmm_gdn_rows32::body<false>(x,xs,parts,M,K,ldx);
+}
+// tf_qmm_gdn_stream32 with its dictionary-coded parts' index windows.
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_gdn_stream32_dict(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
+    tf_qmm_gdn_rows32::body<true>(x,xs,parts,M,K,ldx);
 }

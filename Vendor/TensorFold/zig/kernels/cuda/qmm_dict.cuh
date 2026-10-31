@@ -69,4 +69,11 @@ __device__ __forceinline__ void dict_decode(const DictLanes& D, const unsigned c
     reinterpret_cast<unsigned short*>(dec)[D.pos] = tab[D.base + idx];
 }
 
+__device__ __forceinline__ float dict_decode_reg(const DictLanes& D, const unsigned char* packed, const unsigned char* tab, int g) {
+    const uint32_t* pk = reinterpret_cast<const uint32_t*>(packed);
+    const int off = (g * D.step & 63) * 8 + D.bit0;
+    const uint32_t idx = __funnelshift_r(pk[off >> 5], pk[(off >> 5) + 1], off & 31) & D.mask;
+    return __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(tab)[D.base + idx]);
+}
+
 } // namespace qmm_dict
