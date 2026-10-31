@@ -98,6 +98,9 @@ pub const Engine = struct {
     geo: Geo,
     stream: cuda.Stream,
     blocks: std.ArrayListUnmanaged(cuda.DeviceBuffer) = .empty, // closed streams' device blocks (cuda_cache.zig take/give)
+    side: ?cuda.Stream = null, // GB10 prompt chunks: a delta layer's z projection beside its delta rule (cuda_forward.zig)
+    side_x: ?cuda.Event = null, // the layer's qkv/a/b launch issued: e.x is final and the side stream may read it
+    side_z: ?cuda.Event = null, // the side stream's z written
     mods: [19]cuda.Module,
     kv8: bool, // attention caches as e4m3 rows with a scale each
     fp8: Kv8,
@@ -117,6 +120,8 @@ pub const Engine = struct {
     /// Every weight and scratch buffer in one allocation: WDDM's launch cost grows with the allocation count.
     arena: DeviceBuffer,
     arena_at: usize = 0,
+    /// The prompt GEMMs' stream-K accumulators and flags (content-free, sized by the resident CTAs).
+    sk_buf: ?DeviceBuffer = null,
     /// Rows a verify forward takes at most, and a window's rows at most.
     verify_rows: usize,
     window_rows: usize,
@@ -212,6 +217,9 @@ pub const Engine = struct {
         e.window_rows = most_window;
         e.arena_at = 0;
         e.graphs = .empty;
+        e.side = null;
+        e.side_x = null;
+        e.side_z = null;
         e.rec_scratch = recurrent.Pool.init(gpa, @intFromPtr(e));
         e.n_taps = 0;
         e.features = 0;
@@ -238,11 +246,29 @@ pub const Engine = struct {
         const minor = try ctx.attribute(.compute_capability_minor);
         const gb10 = major == 12 and minor == 1;
         e.affine = try cuda.qlinear.Affine4Kernels.resolve(d, e.mods[0], e.mods[1], e.mods[2], e.mods[3], sms, gb10);
+        if (gb10) {
+            e.side = try cuda.Stream.init(d, true);
+            e.side_x = try cuda.Event.init(d, false);
+            e.side_z = try cuda.Event.init(d, false);
+        }
         e.affine.half_prompt = !gb10; // the 27B's prompt tile (Tile<64, 128, 128, 2, 2, 2>), quicker on an RTX 5090
         // GB10: split-K decode/verify projections on the cluster tile (bits unchanged); TF_CLUSTER_DECODE=0 restores lane_gemv
         e.affine.cluster_decode = gb10 and !envOff("TF_CLUSTER_DECODE");
         errdefer e.affine.deinit();
         e.prompt_many = try cuda.prompt_many.Kernels.resolve(e.mods[1], sms);
+        // a prompt GEMM of more tiles than resident CTAs runs stream-K: its tiles' chains spread over every slot
+        e.sk_buf = null;
+        const slots = e.prompt_many.sk_cap;
+        if (slots > 0) {
+            var buf = try DeviceBuffer.alloc(d, slots * (cuda.prompt_many.sk_slot_bytes + 4));
+            errdefer buf.free();
+            try buf.fill8(0, null);
+            e.sk_buf = buf;
+            e.prompt_many.ws = buf.ptr;
+            e.prompt_many.flags = buf.ptr + slots * cuda.prompt_many.sk_slot_bytes;
+            e.prompt_many.sk_on = !envOff("TF_PROMPT_SK");
+        }
+        errdefer if (e.sk_buf) |*b| b.free();
         // sm_120 too: a 32-row window of the 27B verifies in 17.8 ms on one weight pass, 22.3 ms on two 16-row ones
         if (major == 12 and minor == 0) e.affine.wide_verify = true;
         e.wide = try cuda.qlinear.AffineNKernels.resolve(d, e.mods[7], e.mods[8], e.mods[3], sms, gb10);
@@ -310,12 +336,16 @@ pub const Engine = struct {
         e.staged.free();
         e.tables.free();
         e.arena.free();
+        if (e.sk_buf) |*b| b.free();
         e.gpa.free(e.layers);
         e.gpa.free(e.dir);
         for (e.blocks.items) |*b| b.free();
         e.blocks.deinit(e.gpa);
         @import("cuda_cache.zig").forget(e);
         e.affine.deinit();
+        if (e.side_z) |*v| v.deinit();
+        if (e.side_x) |*v| v.deinit();
+        if (e.side) |*v| v.deinit();
         e.wide.deinit();
         e.int8.deinit();
         if (e.mo) |*m| m.unload();

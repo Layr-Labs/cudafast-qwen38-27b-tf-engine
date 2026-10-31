@@ -14,5 +14,7 @@ pub fn finish(e: anytype, io: std.Io, started: i96) !void {
     e.host_logits = try cuda.HostBuffer.alloc(e.d, e.verify_rows * e.g.vocab * 2);
     errdefer e.host_logits.free();
     try e.stream.synchronize();
+    // the prompt GEMMs' variants timed on this device, before the warm passes run the chosen ones
+    try @import("cuda_prompt_tune.zig").run(e);
     try e.finishWarm(io, started);
 }
