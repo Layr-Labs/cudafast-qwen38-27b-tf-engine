@@ -57,12 +57,25 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
         switch (l.mixer) {
             .delta => |m| {
                 const layer: c_int = @intCast(di);
-                try e.projMany(&.{ m.qkv, m.z, m.a, m.b }, e.x, &.{ e.qkv, e.z, e.a, e.b }, total, prompt);
+                // a lone prompt chunk on GB10: z (read only by gdn_post) runs on the side stream while the main stream runs
+                // gdn_pre, conv_commit and the delta-rule chain, whose 96 blocks leave most SMs idle; same kernels, same bits
+                const beside = prompt and nseg == 1 and total > 16 and e.side != null and e.learning == null and !e.int8.on;
+                if (beside) {
+                    try e.projMany(&.{ m.qkv, m.a, m.b }, e.x, &.{ e.qkv, e.a, e.b }, total, prompt);
+                    try e.side_x.?.record(e.stream);
+                    try e.side.?.wait(e.side_x.?);
+                    const main = e.stream;
+                    e.stream = e.side.?;
+                    defer e.stream = main;
+                    try e.projAgain(m.z, e.x, e.z, total, prompt);
+                    try e.side_z.?.record(e.stream);
+                } else try e.projMany(&.{ m.qkv, m.z, m.a, m.b }, e.x, &.{ e.qkv, e.z, e.a, e.b }, total, prompt);
                 if (e.learning) |k| try k.delta(i, e.qkv, e.z, e.b, e.a, total);
                 try e.runAfter(e.fns.gdn_pre, .{ 1, 2 * g.k_heads + g.v_heads, total }, .{ 32, 1, 1 }, .{ geo, e.qkv, t_segs, t_rows, t_par, layer, m.conv, e.a, e.b, m.a_log, m.dt_bias, e.q, e.k, e.v, e.g_, e.beta, t_params });
                 // one recorded window of 2+ rows: gdn_pre logged its tails, conv_commit would only return
                 if (!(record and nseg == 1 and total > 1)) try e.runAfter(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
                 if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else try e.deltaScan(record, shape.slots, nseg, layer);
+                if (beside) try e.stream.wait(e.side_z.?);
                 try e.runAfter(e.fns.gdn_post, .{ 1, g.v_heads, total }, .{ 32, 1, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums });
                 try e.projAgain(m.out, e.mix, e.r, total, prompt);
                 di += 1;
@@ -109,7 +122,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 if (fused) {
                     try e.prompt_many.mlp(e.stream, e.x, m.gate.a4, m.up.a4, e.act, total);
                 } else {
-                    try e.projMany(&.{ m.gate, m.up }, e.x, &.{ e.gate, e.up }, total, prompt);
+                    try e.projMany(&.{ m.gate, m.up }, e.x, &.{ e.gate, e.up }, total, prompt); // one launch: prompt GEMM, or grouped decode
                     if (e.learning) |k| try k.mlp(i, e.gate, e.up, total);
                     const n: c_longlong = @intCast(total * g.intermediate);
                     try e.runAfter(e.fns.mlp_act, .{ (total * g.intermediate + 1023) / 1024, 1, 1 }, .{ 256, 1, 1 }, .{ e.gate, e.up, e.act, n, t_params, @as(c_int, @intCast(g.intermediate)), sums });
