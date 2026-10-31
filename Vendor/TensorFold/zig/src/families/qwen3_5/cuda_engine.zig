@@ -50,6 +50,8 @@ pub fn aligned(n: usize) usize {
 
 /// qwen35.cuh's Geo.
 pub const Geo = extern struct { hid: c_int, nk: c_int, nv: c_int, qh: c_int, kvh: c_int, nl: c_int };
+/// qwen35.cu's GdnPost: gdn_post's arguments for a slot scan that runs it on a head's last CTA (count 0: y only).
+pub const GdnPost = extern struct { z: u64 = 0, nw: u64 = 0, out: u64 = 0, xs: u64 = 0, count: u64 = 0, eps: f32 = 0 };
 
 const layers = @import("cuda_layers.zig");
 pub const Proj = layers.Proj;
@@ -160,6 +162,7 @@ pub const Engine = struct {
     beta: u64,
     y: u64,
     mix: u64,
+    gdn_count: u64 = 0, // a (window, value head)'s arrivals for the slot scans' fused gdn_post (0: gdn_post launches)
     qraw: u64,
     kraw: u64,
     vraw: u64,
@@ -174,6 +177,8 @@ pub const Engine = struct {
     logits: u64,
     routed: routed.Scratch = .{}, // qwen3_5_moe's routed rows
     amax: u64, // the argmax slices' bests: most_verify rows of argmaxSlices(vocab) (f32, i32)
+    head_amax: u64, // a greedy verify head's per-tile bests: max rows of 64-id tiles (f32, i32; Shape.amax)
+    head_argmax: bool, // TF_HEAD_ARGMAX=0: greedy verify rows keep their logits and the argmax launches
     picks: u64, // drawRows' slice scratch: most_verify rows of cuda.sample.Draws.row_scratch
     // per-forward tables (ids, segments, rows' segment, parent and ancestors, the draws' rules) staged in pinned memory
     tables: DeviceBuffer,
@@ -213,6 +218,7 @@ pub const Engine = struct {
         const g = try Geometry.read(gpa, io, dir);
         const d = ctx.d;
         const e = try @import("cuda_prompt_int8.zig").Allocation(Engine).create(gpa);
+        e.h_window = null; // Allocation.create leaves fields undefined before the first captured forward.
         errdefer gpa.destroy(e);
         e.projection_streams = null;
         errdefer if (e.projection_streams) |*b| b.free();
@@ -244,6 +250,7 @@ pub const Engine = struct {
         e.rec_scratch = recurrent.Pool.init(gpa, @intFromPtr(e));
         e.n_taps = 0;
         e.features = 0;
+        e.head_argmax = !envOff("TF_HEAD_ARGMAX");
         e.stream = try cuda.Stream.init(d, true);
         errdefer e.stream.deinit();
         e.blocks = .empty; // the field's default does not apply: Allocation(Engine).create leaves the engine undefined
@@ -454,6 +461,8 @@ pub const Engine = struct {
         e.qkv = try t.alloc(R * g.convWidth() * 2);
         inline for (.{ "gate", "up", "act" }) |name| @field(e, name) = try t.alloc(R * g.intermediate * 2);
         e.xs = try t.alloc(R * (@max(g.intermediate, wide) / 64) * 4);
+        // TF_FUSED_GDN_POST=0 restores the gdn_post launch after a recorded window's slot scan
+        e.gdn_count = if (envOff("TF_FUSED_GDN_POST")) 0 else try t.alloc(max_segs * g.v_heads * 4);
         inline for (.{ "a", "b", "beta" }) |name| @field(e, name) = try t.alloc(R * g.v_heads * 2);
         e.g_ = try t.alloc(R * g.v_heads * 4);
         e.qraw = try t.alloc(R * 2 * g.attnWidth() * 2);
@@ -466,6 +475,7 @@ pub const Engine = struct {
         e.logits = try t.alloc(most_verify * g.vocab * 2);
         if (g.moe()) e.routed = try routed.Scratch.carve(t, g, R);
         e.amax = try t.alloc(most_verify * argmaxSlices(g.vocab) * 8);
+        e.head_amax = try t.alloc(cuda.qlinear.Affine4Kernels.max_rows * ((g.vocab + 63) / 64) * 8);
         e.picks = try t.alloc(most_verify * cuda.sample.Draws.row_scratch);
         return total;
     }
@@ -510,6 +520,17 @@ pub const Engine = struct {
         if (e.embed_bits == 16) return modelopt.embed(e, ids, out, rows); // bf16 rows; padding rows' ids are zeroed
         const f = if (e.embed_bits == 8) e.fns.embed8 else e.fns.embed;
         try e.run(f, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ ids, e.embed_w, e.embed_s, e.embed_b, out, @as(c_int, @intCast(e.g.hidden)), params });
+    }
+
+    /// Whether a verify of `bucket` rows, all drawn by `draws`, takes the head's own argmax (Shape.amax): every row
+    /// greedy and the head on the dictionary tile without K slices (GB10); TF_HEAD_ARGMAX=0 keeps the logits.
+    fn headArgmax(e: *const Engine, bucket: usize, draws: []const Draw) bool {
+        if (!e.head_argmax) return false;
+        for (draws) |p| if (p.rule != null) return false;
+        return switch (e.head) {
+            .a4 => |q| e.affine.headArgmaxFits(q, bucket),
+            else => false,
+        };
     }
 
     /// Logits rows first..first + n's greedy tokens into toks: the highest logit, ties to the lower id.
@@ -629,6 +650,7 @@ pub const Engine = struct {
         };
         shape.hidden = keep == .hidden;
         shape.paged = @import("cuda_attention.zig").hasPages(segs);
+        shape.amax = keep == .draws and e.learning == null and !e.pockets.any() and e.headArgmax(shape.total, keep.draws);
         // a cache of at most GROUP_LEN positions holds fewer keys than that before any row it verifies
         shape.short = for (parts) |p| {
             if (p.cache.cap > @import("cuda_forward.zig").group_len) break false;
@@ -683,8 +705,8 @@ pub const Engine = struct {
             .hidden => try e.stream.synchronize(), // mapped layer inputs are ready before the learner reads them
             .draws => |pk| {
                 const toks = e.tables.ptr + tokens_at;
-                var i: usize = 0; // runs of greedy rows argmaxed together, runs of sampled rows drawn together
-                while (i < pk.len) {
+                var i: usize = if (shape.amax) pk.len else 0; // amax: the graph's head wrote every row's token
+                while (i < pk.len) { // runs of greedy rows argmaxed together, runs of sampled rows drawn together
                     const sampled = pk[i].rule != null;
                     var n: usize = 1;
                     while (i + n < pk.len and (pk[i + n].rule != null) == sampled) n += 1;
@@ -713,6 +735,11 @@ pub const Engine = struct {
 
     /// The same scan selected by body, exposed for host launch-contract fixtures.
     pub fn deltaScan(e: *Engine, record: bool, slot_count: u8, segments: usize, layer: c_int) !void {
+        return e.deltaScanPost(record, slot_count, segments, layer, .{});
+    }
+
+    /// deltaScan; a recorded window's slot scan with post.count set also runs gdn_post (qwen35.cu q35_post_tail).
+    pub fn deltaScanPost(e: *Engine, record: bool, slot_count: u8, segments: usize, layer: c_int, post: GdnPost) !void {
         const scan = if (!record) e.fns.gdn_chain else switch (slot_count) {
             1 => e.fns.gdn_slots_1,
             2 => e.fns.gdn_slots_2,
@@ -728,7 +755,9 @@ pub const Engine = struct {
         const input = e.tables.ptr + @as(usize, if (record) Round.steps_at else rowpar_at);
         // qwen35_slots.cuh: up to four slots scan two value rows a warp, so a block covers eight
         const rows_a_warp: usize = if (record and (slot_count == 3 or slot_count == 35 or slot_count == 37 or slot_count == 38)) 4 else if (record and slot_count <= 4) 2 else 1;
-        try e.runAfter(scan, .{ 1, geometry.dk / (4 * rows_a_warp), e.g.v_heads * segments }, .{ 32, 4, 1 }, .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, input, layer, e.y, e.tables.ptr + params_at });
+        const grid = .{ 1, geometry.dk / (4 * rows_a_warp), e.g.v_heads * segments };
+        if (!record) return e.runAfter(scan, grid, .{ 32, 4, 1 }, .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, input, layer, e.y, e.tables.ptr + params_at });
+        try e.runAfter(scan, grid, .{ 32, 4, 1 }, .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, input, layer, e.y, e.tables.ptr + params_at, post });
     }
 
     /// The launches of a forward of `shape`, from the embedding to the kept rows' logits (captured once a shape).

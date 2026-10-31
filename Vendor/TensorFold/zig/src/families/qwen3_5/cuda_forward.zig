@@ -39,10 +39,11 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     // Independent prompt rows share a block; decode keeps one warp per row. A 16..64-row window's gdn_pre rows share
     // blocks too (four row warps a block: its warps are independent, the same bits); TF_GDN_ROWS4=0 keeps one warp a
     // block there. gdn_post keeps a warp a block in windows (four a block measured slower).
-    const gdn_rows: usize = if (prompt and total > 16) 4 else 1;
-    const gdn_blocks = (total + gdn_rows - 1) / gdn_rows;
-    const pre_rows: usize = if ((prompt and total > 16) or (total >= 16 and rows4On())) 4 else 1;
+    const pre_rows: usize = if ((prompt and total > 16) or (total >= 8 and rows4On())) 4 else if (total >= 2 and rows4On()) 2 else 1;
     const pre_blocks = (total + pre_rows - 1) / pre_rows;
+    // gdn_post's decode windows: two independent row warps a block from 2 rows, as gdn_pre's (TF_POST_ROWS2=0: one)
+    const post_rows: usize = if (prompt and total > 16) 4 else if (total >= 2 and postRows2On()) 2 else 1;
+    const post_blocks = (total + post_rows - 1) / post_rows;
     const t_ids = e.tables.ptr + ids_at;
     const t_segs = e.tables.ptr + segs_at;
     const t_rows = e.tables.ptr + rowseg_at;
@@ -73,8 +74,10 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 try e.runAfter(e.fns.gdn_pre, .{ 1, 2 * g.k_heads + g.v_heads, pre_blocks }, .{ 32, pre_rows, 1 }, .{ geo, e.qkv, t_segs, t_rows, t_par, layer, m.conv, e.a, e.b, m.a_log, m.dt_bias, e.q, e.k, e.v, e.g_, e.beta, t_params });
                 // one recorded window of 2+ rows: gdn_pre logged its tails, conv_commit would only return
                 if (!(record and nseg == 1 and total > 1)) try e.runAfter(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
-                if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else try e.deltaScan(record, shape.slots, nseg, layer);
-                try e.runAfter(e.fns.gdn_post, .{ 1, g.v_heads, gdn_blocks }, .{ 32, gdn_rows, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums });
+                // a recorded decode window's slot scan runs gdn_post on each head's last CTA (one launch less a layer)
+                const fused_post = record and !prompt and e.gdn_count != 0;
+                if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else if (fused_post) try e.deltaScanPost(record, shape.slots, nseg, layer, .{ .z = e.z, .nw = m.norm, .out = e.mix, .xs = sums, .count = e.gdn_count, .eps = g.eps }) else try e.deltaScan(record, shape.slots, nseg, layer);
+                if (!fused_post) try e.runAfter(e.fns.gdn_post, .{ 1, g.v_heads, post_blocks }, .{ 32, post_rows, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums });
                 try e.projAgain(m.out, e.mix, e.r, total, prompt);
                 di += 1;
             },
@@ -116,8 +119,8 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     } else {
                         // a 2..64-row window: row pairs share each chunk's stream-key tiles (attn_pair, the same bits);
                         // TF_ATTN_PAIR=0 keeps attn_partial's block a row
-                        if (record and total >= 2 and total % 2 == 0 and 2 * group <= 16 and pairOn())
-                            try sharedSized(e, e.fns.attn_pair, sig.attn_pair, .{ total / 2, partial_chunks, g.kv_heads }, 128, attn_tile, args)
+                        if (record and total >= 2 and 2 * group <= 16 and pairOn())
+                            try sharedSized(e, e.fns.attn_pair, sig.attn_pair, .{ (total + 1) / 2, partial_chunks, g.kv_heads }, 128, attn_tile, args)
                         else
                             try sharedSized(e, e.fns.attn_partial, sig.attn_partial, .{ total, partial_chunks, g.kv_heads }, 128, attn_tile, args);
                         // streams of caches no longer than GROUP_LEN have no row for attn_rows (its blocks would only return)
@@ -168,10 +171,15 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
         // a captured forward's first layer is a graph of its own (cuda_engine.zig's cutCapture)
         if (i == 0) try e.cutCapture();
     }
-    try finish(e, total, heads, shape.hidden);
+    try finish(e, total, heads, shape.hidden, if (@hasField(@TypeOf(shape), "amax")) shape.amax else false);
 }
 
 /// TF_GDN_ROWS4=0: 16..64-row windows keep one row warp a block in tf_q35_gdn_pre.
+fn postRows2On() bool {
+    const v = @import("sys").c.getenv("TF_POST_ROWS2") orelse return true;
+    return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
+}
+
 fn rows4On() bool {
     const v = @import("sys").c.getenv("TF_GDN_ROWS4") orelse return true;
     return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
@@ -210,7 +218,7 @@ fn sharedSized(e: *E.Engine, f: cuda.Function, comptime s: sig.Sig, grid: [3]usi
 }
 
 /// Layer inputs are already kept; hidden reads need neither the final norm nor the vocabulary head.
-pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool) !void {
+pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool, amax: bool) !void {
     if (hidden) return;
     const g = e.g;
     if (e.learning == null and heads < total) {
@@ -220,6 +228,12 @@ pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool) !void {
     } else {
         try e.norm(true, e.final_norm, total);
         if (e.learning) |k| try k.final(e.h, total);
+        if (@hasField(@TypeOf(e.*), "head_amax")) if (amax) {
+            // a greedy verify: the norm wrote the rows' group sums (projAgain's input); the head's tile writes each
+            // row's best a tile and the merge each row's token (cuda_engine.zig forward then skips its argmax)
+            const x = e.x + (total - heads) * g.hidden * 2;
+            return e.affine.headArgmax(e.stream, x, e.xs, e.head.a4, e.head_amax, heads, e.tables.ptr + @import("cuda_round.zig").tokens_at);
+        };
         if (@hasDecl(@TypeOf(e.*), "projAgain"))
             try e.projAgain(e.head, e.x + (total - heads) * g.hidden * 2, e.logits, heads, false)
         else

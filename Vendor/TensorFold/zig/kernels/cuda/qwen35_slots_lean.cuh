@@ -220,8 +220,9 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q, 
 #define TF_Q35_LEAN(N) \
 extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_lean_##N(Geo geo, const __nv_bfloat16* q, \
  const __nv_bfloat16* k, const __nv_bfloat16* v, const float* g, const __nv_bfloat16* beta, const Seg* segs, \
- const SlotStep* steps, int layer, __nv_bfloat16* y, const int* P) { \
+ const SlotStep* steps, int layer, __nv_bfloat16* y, const int* P, GdnPost post) { \
   release_next(); await_prior(); \
-  q35_slots_lean<N>(geo, after_wait(q), after_wait(k), after_wait(v), after_wait(g), after_wait(beta), segs, steps, layer, after_wait(y), P); }
+  q35_slots_lean<N>(geo, after_wait(q), after_wait(k), after_wait(v), after_wait(g), after_wait(beta), segs, steps, layer, after_wait(y), P); \
+  q35_post_tail(geo, post, segs, y, P); }
 TF_Q35_LEAN(2)
 TF_Q35_LEAN(3)
