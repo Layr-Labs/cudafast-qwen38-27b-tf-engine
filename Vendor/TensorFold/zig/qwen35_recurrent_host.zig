@@ -77,8 +77,6 @@ fn engine(e: *q.engine.Engine, d: *cuda.Driver) void {
     d.api.cuMemcpyDtoDAsync_v2 = Driver.copy;
     d.api.cuLaunchKernel = Driver.launch;
     e.d = d;
-    e.blocks = .empty;
-    e.gpa = a;
     e.stream = .{ .d = d, .handle = @ptrFromInt(17) };
     e.g = .{ .hidden = 5120, .intermediate = 17408, .layers = 64, .vocab = 248320, .k_heads = 16, .v_heads = 48, .q_heads = 24, .kv_heads = 4, .eps = 1e-6, .tied = false, .context = 262144, .linear = @splat(false) };
     for (&e.g.linear, 0..) |*linear, i| linear.* = i < 64 and (i + 1) % 4 != 0;
@@ -94,10 +92,8 @@ fn finish(e: *q.engine.Engine, c: *q.engine.Cache) void {
     rec.completed(e);
     c.deinit(a);
     rec.shutdown(e);
-    freeBlocks(e);
 }
 fn forwardDone(e: *q.engine.Engine, c: *q.engine.Cache, rows: usize) !void {
-    _ = c.fold(c.seg(e, c.len, 0, rows));
     try rec.mark(c, false);
     if (rows == 1) try rec.mark(c, true);
     c.advanced(rows, true);
@@ -119,7 +115,7 @@ test "Shared verification: recurrent scratch is absent from an idle real 27B cac
     try std.testing.expectEqual(@as(usize, 0), c.log.ptr);
 }
 
-test "Shared verification: completed window transitions keep log capacity within the scratch byte bound" {
+test "Shared verification: all window transitions keep log capacity within the original byte bound" {
     Driver.reset();
     var d: cuda.Driver = undefined;
     var e: q.engine.Engine = undefined;
@@ -127,7 +123,7 @@ test "Shared verification: completed window transitions keep log capacity within
     engine(&e, &d);
     var c = try q.engine.Cache.init(a, &e, 128);
     defer finish(&e, &c);
-    const bound = e.g.stateBytes() + 2 * e.g.logBytes(64);
+    const bound = e.g.stateBytes() + e.g.logBytes(64);
     try std.testing.expectEqual(@as(usize, 153944064), e.g.stateBytes());
     for (1..65) |old| for (1..65) |rows| {
         try c.reset(&e);
@@ -135,21 +131,18 @@ test "Shared verification: completed window transitions keep log capacity within
         try rec.prepare(&e, &c, old, true);
         try forwardDone(&e, &c, old);
         if (old == 1) try c.keep(&e, &.{}) else try c.keep(&e, &.{0});
-        try c.flush(&e);
-        _ = Driver.sync(e.stream.handle);
-        rec.completed(&e);
         try rec.prepare(&e, &c, rows, true);
         try std.testing.expect(c.log.len >= e.g.logBytes(rows));
         try std.testing.expect((c.before != null) == (rows == 1));
         try std.testing.expect(e.rec_scratch.residentBytes() <= bound);
         const sg = c.seg(&e, c.len, 0, rows);
-        try std.testing.expectEqual(c.log.ptr + (if (c.flip) c.log.len / 2 else @as(usize, 0)), sg.log);
+        try std.testing.expectEqual(c.log.ptr, sg.log);
         try std.testing.expectEqual(if (c.before) |b| b.ptr else 0, sg.before);
         try forwardDone(&e, &c, rows);
         if (rows == 1) {
             try c.settle(&e);
             try rec.prepare(&e, &c, 1, true);
-            try std.testing.expectEqual(2 * e.g.logBytes(1), c.log.len);
+            try std.testing.expectEqual(e.g.logBytes(1), c.log.len);
         }
     };
     try std.testing.expectEqual(@as(usize, 0), Driver.unsafe_frees);
@@ -204,11 +197,11 @@ test "Shared verification: allocation refusal retains a queued keep's old log ow
     const prior = try cuda.setAllocationLimit(usage.device + usage.host);
     defer _ = cuda.setAllocationLimit(prior) catch unreachable;
     try std.testing.expectError(error.OutOfDeviceMemory, rec.prepare(&e, &c, 32, true));
-    try std.testing.expectEqual(2 * e.g.logBytes(64), e.rec_scratch.residentBytes());
+    try std.testing.expectEqual(e.g.logBytes(64), e.rec_scratch.residentBytes());
     try std.testing.expectEqual(@as(usize, 0), Driver.unsafe_frees);
     _ = Driver.sync(e.stream.handle);
     rec.completed(&e);
-    try std.testing.expectEqual(2 * e.g.logBytes(64), e.rec_scratch.residentBytes()); // completed: kept for another window
+    try std.testing.expectEqual(e.g.logBytes(64), e.rec_scratch.residentBytes()); // completed: kept for another window
     rec.idle(&e);
     try std.testing.expectEqual(@as(usize, 0), e.rec_scratch.residentBytes());
 }
@@ -227,7 +220,6 @@ test "Shared verification: streams cycling window widths reuse their scratch ins
         o.deinit(a);
         c.deinit(a);
         rec.shutdown(&e);
-        freeBlocks(&e);
     }
     try std.testing.expectEqual(2 * rec.bound(&e), e.rec_scratch.cap);
     const widths = [_]usize{ 1, 8, 3, 16, 1, 5 };
@@ -247,9 +239,4 @@ test "Shared verification: streams cycling window widths reuse their scratch ins
     }
     try std.testing.expectEqual(settled, Driver.allocs); // after one cycle no round allocates
     try std.testing.expectEqual(@as(usize, 0), Driver.unsafe_frees);
-}
-
-fn freeBlocks(e: *q.engine.Engine) void {
-    for (e.blocks.items) |*b| b.buffer.free();
-    e.blocks.deinit(a);
 }

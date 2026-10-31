@@ -1,7 +1,6 @@
 // The MLX affine-4 repack into the lane matmul's tiles (cuda/qlinear.zig), moved verbatim from nemotron_ops.cu.
 
 #include <stdint.h>
-#include <stddef.h>
 
 // MLX (n, k/8) words -> the tiled lane-matmul layout [npad/64][kg][8][32][2] (qmm.py's pack, groups of 64).
 extern "C" __global__ void tf_pack_dense(const uint32_t* __restrict__ w, int n, int k8, int kg, uint32_t* __restrict__ out,
@@ -34,21 +33,4 @@ extern "C" __global__ void tf_transpose_pad16(const uint16_t* __restrict__ x, in
     if (idx >= static_cast<long long>(kg) * npad) return;
     const int g = static_cast<int>(idx / npad), col = static_cast<int>(idx % npad);
     out[idx] = col < n ? x[static_cast<long long>(col) * kg + g] : 0;
-}
-
-
-// A second, value-exact view of the packed words, with group before column panel.
-extern "C" __global__ void tf_pack_wide_kmajor(const uint32_t* words, uint32_t* out, int groups, int tiles) {
- const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
- if (i >= static_cast<size_t>(groups) * tiles * 512) return;
- const size_t tile = i / (groups * 512), group = (i / 512) % groups;
- out[(group * tiles + tile) * 512 + i % 512] = words[i];
-}
-
-extern "C" __global__ void tf_pack_kmajor(const uint32_t* input, uint32_t* output, int groups, int tiles) {
-    const size_t at=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
-    const size_t words=size_t(groups)*tiles*512;
-    if(at>=words)return;
-    const size_t panel=at/512, tile=panel/groups, group=panel%groups;
-    output[(group*tiles+tile)*512+at%512]=input[at];
 }

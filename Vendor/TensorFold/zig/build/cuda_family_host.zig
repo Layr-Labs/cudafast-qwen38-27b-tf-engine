@@ -45,7 +45,6 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, mods: anytype, step: *std.B
     const timing_run = b.addRunArtifact(b.addTest(.{ .root_module = timing_host }));
     b.step("test-qwen35-round-timing-host", "Enabled-only CUDA round receipts through real host acceptance, without devices").dependOn(&timing_run.step);
     step.dependOn(&timing_run.step);
-    b.step("test-qwen35-output-tail-host", "Output-only row normalization and hidden-tap cost contracts without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mods.qwen35, .filters = &.{"dense read cost:"} })).step);
     const prompt_moe = b.addRunArtifact(b.addTest(.{ .root_module = mods.qwen35, .filters = &.{"prompt MoE precision:"} }));
     b.step("test-qwen35-prompt-moe-host", "Prompt expert arithmetic stays separate from verify capacity without devices").dependOn(&prompt_moe.step);
     step.dependOn(&prompt_moe.step);

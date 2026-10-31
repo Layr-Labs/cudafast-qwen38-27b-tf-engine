@@ -15,14 +15,10 @@ const Affine4 = qlinear.Affine4;
 pub const symbol = "tf_qmm_mlp_pair";
 /// The stages' memory and, past it, the (16, 64) bf16 gate tile rank 0 stores into rank 1's.
 pub const smem: u32 = qlinear.group_smem + 16 * 64 * 2;
-pub const kmajor_smem: u32 = 13440 + 16 * 128 * 2;
-pub const single_smem: u32 = 41088;
 
 pub const Kernels = struct {
     pair_fn: Function,
     pdl: bool,
-    kmajor_fn: ?Function = null,
-    kmajor_single: bool = false,
 
     /// From the loaded qmm_group module; `pdl` as the decode tiles' launches (GB10).
     pub fn resolve(group_mod: module.Module, pdl: bool) !Kernels {
@@ -41,18 +37,11 @@ pub const Kernels = struct {
     pub fn pair(kk: *const Kernels, s: Stream, x: u64, xs: u64, gate: Affine4, up: Affine4, act: u64, as: u64, rows: usize) !void {
         if (!fits(gate, up) or rows == 0) return error.InputMismatch;
         const rows_t = (rows + 15) / 16;
-        const major = rows == 16 and gate.n == 17408 and gate.k == 5120 and
-            gate.verify_w != 0 and up.verify_w != 0 and kk.kmajor_fn != null;
-        const single = major and kk.kmajor_single;
-        const tiles = gate.n / @as(usize, if (single) 256 else if (major) 128 else 64);
+        const tiles = gate.n / 64;
         var parts: qlinear.Parts = std.mem.zeroes(qlinear.Parts);
         parts.p[0] = .{ .w = gate.w, .scales = gate.s, .biases = gate.b, .out = 0, .n = @intCast(gate.n), .npad = @intCast(gate.npad), .sk = 1, .tiles = @intCast(tiles), .first = 0 };
         parts.p[1] = .{ .w = up.w, .scales = up.s, .biases = up.b, .out = 0, .n = @intCast(up.n), .npad = @intCast(up.npad), .sk = 1, .tiles = @intCast(tiles), .first = 0 };
         parts.count = 2;
-        if (major) {
-            parts.p[0].w = gate.verify_w;
-            parts.p[1].w = up.verify_w;
-        }
         var g: launch_.Args = .{};
         g.add(x);
         g.add(xs);
@@ -60,6 +49,6 @@ pub const Kernels = struct {
         g.add(act);
         g.add(as);
         for ([_]usize{ rows, gate.k, gate.k, rows_t }) |v| g.add(@as(c_int, @intCast(v)));
-        try launch_.launch(if (major) kk.kmajor_fn.? else kk.pair_fn, .{ .grid = .{ .x = @intCast(@as(usize, if (single) 1 else 2) * rows_t * tiles) }, .block = .{ .x = 128 }, .shared = if (single) single_smem else if (major) kmajor_smem else smem, .cluster = if (single) null else .{ .x = 2 }, .pdl = kk.pdl }, s, &g);
+        try launch_.launch(kk.pair_fn, .{ .grid = .{ .x = @intCast(2 * rows_t * tiles) }, .block = .{ .x = 128 }, .shared = smem, .cluster = .{ .x = 2 }, .pdl = kk.pdl }, s, &g);
     }
 };

@@ -51,8 +51,6 @@ pub const Affine4Kernels = struct {
     narrow: ?Split, // GB10: the split form for projections too narrow to fill the GPU as lane_gemv column CTAs
     pdl: bool, // GB10: the decode kernels launch with programmatic dependent launch
     wide_verify: bool, // off GB10: verify windows of 17 to 32 rows share one weight pass (sm_120, when its engine says)
-    wide_fns: [3]?Function = @splat(null),
-    group_wide: bool = false, // group 17 to 32-row projections without changing their tiles or K slices
     cluster_decode: bool = false, // GB10: split-K projections of <= 16 rows on qmm_group's cluster tile, not lane_gemv (same slice order)
 
     /// From loaded qmm_group, qmm_prefill, lane_gemv and affine4_pack modules; GB10 decodes without the split form.
@@ -84,8 +82,6 @@ pub const Affine4Kernels = struct {
         try a.prefill22_fn.allowDynamicShared(linear.prefill22_smem);
         a.gemv_blocks = @max(1, try a.gemv_fn.occupancy(128, group_smem)) * sms;
         a.pdl = gb10;
-        a.wide_fns = @splat(null);
-        a.group_wide = false;
         a.wide_verify = false;
         a.cluster_decode = false;
         a.split = if (gb10) null else try Split.initFor(d, segs_max);
@@ -138,32 +134,6 @@ pub const Affine4Kernels = struct {
         if (rows > max_rows) return error.WindowTooWide;
         const sp = a.split orelse return a.decodeGrouped(s, x, xs, outs, rows);
         return a.gemvSeg(s, x, xs, outs, rows, sp);
-    }
-
-    /// Attention's full-K Q and ordered sliced K/V tiles in one cluster launch.
-    pub fn decodeAttentionMixed(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, outs: []const Out, rows: usize) !void {
-        if (rows != 16 or outs.len != 3) return error.InputMismatch;
-        var cs: usize = 1;
-        for (outs) |o| {
-            if (o.q.k != outs[0].q.k) return error.InputMismatch;
-            cs = @max(cs, splitK(o.q.n, o.q.k));
-        }
-        if (cs == 1) return error.InputMismatch;
-        var parts: Parts = std.mem.zeroes(Parts);
-        var clusters: usize = 0;
-        for (outs) |o| {
-            const tiles = (o.q.n + 63) / 64;
-            const sk = splitK(o.q.n, o.q.k);
-            parts.p[@intCast(parts.count)] = .{ .w = o.q.w, .scales = o.q.s, .biases = o.q.b, .out = o.out,
-                .n = int(o.q.n), .npad = int(o.q.npad), .sk = int(sk), .tiles = int(tiles), .first = int(clusters) };
-            parts.count += 1;
-            clusters += (tiles * sk + cs - 1) / cs;
-        }
-        var args: launch_.Args = .{};
-        args.add(x); args.add(xs); args.add(parts);
-        for ([_]usize{ rows, outs[0].q.k, outs[0].q.k, 1, cs }) |v| args.add(int(v));
-        try launch_.launch(a.group_fn, .{ .grid = .{ .x = u(clusters * cs) }, .block = .{ .x = 128 },
-            .shared = group_smem, .cluster = .{ .x = u(cs) }, .pdl = a.pdl }, s, &args);
     }
 
     /// decode()'s kernels a projection, grouped by kernel: each part's blocks compute exactly what its own launch's would.
@@ -260,10 +230,7 @@ pub const Affine4Kernels = struct {
     pub fn verify(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, weight: Affine4, out: u64, rows: usize) !void {
         if (rows == 0 or rows > a.verifyRows()) return error.WindowTooWide;
         if (rows <= max_rows) return a.decode(s, x, xs, weight, out, rows);
-        if (rows <= 32) {
-            if (weight.wide_w != 0) return a.packed32(s, x, xs, weight, out, rows);
-            return a.cluster32(s, x, xs, weight, out, rows);
-        }
+        if (rows <= 32) return a.cluster32(s, x, xs, weight, out, rows);
         if (rows <= 64) return a.wide(a.verify64_fn, linear.verify64_smem, 64, s, x, xs, weight, out, rows);
         return a.wide(a.verify128_fn, linear.verify128_smem, 128, s, x, xs, weight, out, rows);
     }
@@ -271,64 +238,6 @@ pub const Affine4Kernels = struct {
     /// The same ordered group and K-slice chains as decode(), with both row tiles reusing the loaded weights.
     pub fn cluster32(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, weight: Affine4, out: u64, rows: usize) !void {
         return a.wide(a.verify_fn, linear.verify_smem, 32, s, x, xs, weight, out, rows);
-    }
-
-    /// Projections of one 17 to 32-row input, grouped only with projections of the same K-slice count.
-    pub fn verifyMany32(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, outs: []const Out, rows: usize) !void {
-        if (rows <= max_rows or rows > 32 or rows > a.verifyRows()) return error.WindowTooWide;
-        if (outs.len == 0 or outs.len > segs_max) return error.TooManyParts;
-        const k = outs[0].q.k;
-        for (outs) |o| if (o.q.k != k) return error.InputMismatch;
-        const alternate = for (outs) |o| {
-            if (o.q.wide_w == 0 or o.q.wide_kind != 1) break false;
-        } else true;
-        const bn: usize = if (alternate) 128 else 64;
-        const function = if (alternate) a.wide_fns[0] orelse return error.FormatNotLoaded else a.verify_fn;
-        const shared: u32 = if (alternate) 26496 else linear.verify_smem;
-        for ([_]usize{ 1, 2, 4, 8 }) |sk| {
-            var parts: Parts = std.mem.zeroes(Parts);
-            var clusters: usize = 0;
-            for (outs) |o| {
-                if (splitK(o.q.n, k) != sk) continue;
-                const tiles = (o.q.n + bn - 1) / bn;
-                const at: usize = @intCast(parts.count);
-                parts.p[at] = .{ .w = if (alternate) o.q.wide_w else o.q.w, .scales = o.q.s, .biases = o.q.b, .out = o.out, .n = int(o.q.n), .npad = int(o.q.npad), .sk = int(sk), .tiles = int(tiles), .first = int(clusters) };
-                parts.count += 1;
-                clusters += tiles;
-            }
-            if (parts.count == 0) continue;
-            var args: launch_.Args = .{};
-            args.add(x);
-            args.add(xs);
-            args.add(parts);
-            for ([_]usize{ rows, k, k, 1, sk }) |v| args.add(int(v));
-            try launch_.launch(function, .{ .grid = .{ .x = u(clusters * sk) }, .block = .{ .x = 128 }, .shared = shared, .cluster = if (sk > 1) .{ .x = u(sk) } else null, .pdl = a.pdl }, s, &args);
-        }
-    }
-
-    /// The same K slices through an input-independent alternate word-panel view.
-    fn packed32(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, q: Affine4, out: u64, rows: usize) !void {
-        if (q.wide_kind == 0 or q.wide_kind > 3) return error.FormatNotLoaded;
-        const index = q.wide_kind - 1;
-        const f = a.wide_fns[index] orelse return error.FormatNotLoaded;
-        const bn: usize = if (q.wide_kind == 2) 256 else 128;
-        const shared: u32 = switch (q.wide_kind) {
-            1 => 26496,
-            2 => 32768,
-            3 => 17664,
-            else => unreachable,
-        };
-        const sk = splitK(q.n, q.k);
-        const tiles = (q.n + bn - 1) / bn;
-        var parts: Parts = std.mem.zeroes(Parts);
-        parts.count = 1;
-        parts.p[0] = .{ .w = q.wide_w, .scales = q.s, .biases = q.b, .out = out, .n = int(q.n), .npad = int(q.npad), .sk = int(sk), .tiles = int(tiles), .first = 0 };
-        var args: launch_.Args = .{};
-        args.add(x);
-        args.add(xs);
-        args.add(parts);
-        for ([_]usize{ rows, q.k, q.k, 1, sk }) |v| args.add(int(v));
-        try launch_.launch(f, .{ .grid = .{ .x = u(tiles * sk) }, .block = .{ .x = 128 }, .shared = shared, .cluster = if (sk > 1) .{ .x = u(sk) } else null, .pdl = a.pdl }, s, &args);
     }
 
     /// cluster32 with four (64) or eight (128) m16 row tiles a weight panel.
@@ -404,6 +313,7 @@ pub const Affine4Kernels = struct {
         };
         try launch_.launch(a.group_fn, cfg, s, &g);
     }
+
 
     /// qmm.prefill_matmul (tile 0): weights rounded once to bf16, one fp32 chain over K; bf16 out.
     pub fn prompt(a: *const Affine4Kernels, s: Stream, x: u64, q: Affine4, out: u64, rows: usize) !void {

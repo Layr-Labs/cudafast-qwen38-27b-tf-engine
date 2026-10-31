@@ -144,7 +144,8 @@ __global__ void __launch_bounds__(2 * ROWS) chain_kernel(
 
 } // namespace tf_gdn_prefill
 
-// Prompt chunks: 64 value rows and 16 staged steps; two threads retain each value row's exact recurrence order.
-template __global__ void tf_gdn_prefill::chain_kernel<__nv_bfloat16, __nv_bfloat16, 64, 16>(const __nv_bfloat16* __restrict__,
+// Qwen3.5's prompt chunks: bf16 keys and strengths, 32 value rows a block (48 heads take 192 blocks), 16 steps a
+// stage so four blocks share an SM's shared memory; each value row keeps its two threads and its step order.
+template __global__ void tf_gdn_prefill::chain_kernel<__nv_bfloat16, __nv_bfloat16, 32, 16>(const __nv_bfloat16* __restrict__,
     const __nv_bfloat16* __restrict__, const __nv_bfloat16* __restrict__, const float* __restrict__,
     const __nv_bfloat16* __restrict__, const float*, float*, __nv_bfloat16* __restrict__, int, int, int);

@@ -44,8 +44,6 @@ fn engine(d: *cuda.Driver) q.engine.Engine {
     d.api.cuLaunchKernel = Driver.launch;
     var e: q.engine.Engine = undefined;
     e.kit = null;
-    e.blocks = .empty;
-    e.gpa = a;
     e.d = d;
     e.stream = .{ .d = d, .handle = null };
     e.g = .{ .hidden = 256, .intermediate = 256, .layers = 1, .vocab = 32, .k_heads = 1, .v_heads = 1, .q_heads = 1, .kv_heads = 1, .eps = 1e-6, .tied = true, .context = 256, .linear = @splat(true) };
@@ -117,13 +115,12 @@ test "Shared verification: empty multi-row keep preserves the root and completed
     cache.advanced(128, false);
     try std.testing.expect(cache.last == null);
     try std.testing.expectEqual(@as(usize, 136), cache.len);
-    try std.testing.expectEqual(@as(usize, 2) * e.g.stateBytes() + e.g.kvBytes(256, false) + 2 * e.g.logBytes(64), e.streamBytes(256));
+    try std.testing.expectEqual(@as(usize, 2) * e.g.stateBytes() + e.g.kvBytes(256, false) + e.g.logBytes(64), e.streamBytes(256));
 }
 
 const Owners = struct {
     var allocations: usize = 0;
     var clears: usize = 0;
-    var cleared: [8]u64 = @splat(0);
     var fail_alloc: usize = 0;
     var fail_clear: usize = 0;
     var live: [8]bool = @splat(false);
@@ -142,9 +139,7 @@ const Owners = struct {
         live[slot] = false;
         return cuda.abi.success;
     }
-    fn clear(ptr: u64, value: u8, _: usize) callconv(.c) cuda.abi.Result {
-        std.debug.assert(value == 0);
-        cleared[clears] = ptr;
+    fn clear(_: u64, _: u8, _: usize) callconv(.c) cuda.abi.Result {
         clears += 1;
         return if (clears == fail_clear) cuda.abi.error_not_ready else cuda.abi.success;
     }
@@ -166,7 +161,6 @@ const Owners = struct {
         std.debug.assert(!pending);
         allocations = 0;
         clears = 0;
-        cleared = @splat(0);
         fail_alloc = fail_alloc_;
         fail_clear = fail_clear_;
         live = @splat(false);
@@ -187,7 +181,6 @@ test "Shared verification: the actual cache constructor unwinds the before bank 
     var d: cuda.Driver = undefined;
     var e = engine(&d);
     e.stream.handle = @ptrFromInt(17);
-    defer e.blocks.deinit(a);
     e.rec_scratch = q.engine.recurrent.Pool.init(a, @intFromPtr(&e));
     defer q.engine.recurrent.shutdown(&e);
     e.n_taps = 1;
@@ -196,33 +189,21 @@ test "Shared verification: the actual cache constructor unwinds the before bank 
     for (1..6) |fail| {
         Owners.setup(&d, fail, 0);
         try std.testing.expectError(error.NotReady, q.engine.Cache.init(a, &e, 256));
-        freeBlocks(&e);
         try Owners.balanced();
     }
-    for (1..3) |fail| {
+    for (1..5) |fail| {
         Owners.setup(&d, 0, fail);
         try std.testing.expectError(error.NotReady, q.engine.Cache.init(a, &e, 256));
-        freeBlocks(&e);
         try Owners.balanced();
     }
     Owners.setup(&d, 0, 0);
     var failing: std.testing.FailingAllocator = .init(a, .{ .fail_index = 0 });
     try std.testing.expectError(error.OutOfMemory, q.engine.Cache.init(failing.allocator(), &e, 256));
-    freeBlocks(&e);
     try Owners.balanced();
     Owners.setup(&d, 0, 0);
     var cache = try q.engine.Cache.init(a, &e, 256);
     try std.testing.expect(cache.before != null);
     try std.testing.expectEqual(@as(usize, 5), Owners.allocations);
-    try std.testing.expectEqual(@as(usize, 2), Owners.clears);
-    try std.testing.expectEqual(cache.state.ptr, Owners.cleared[0]);
-    try std.testing.expectEqual(cache.tap.?.ptr, Owners.cleared[1]);
     cache.deinit(a);
-    freeBlocks(&e);
     try Owners.balanced();
-}
-
-fn freeBlocks(e: *q.engine.Engine) void {
-    for (e.blocks.items) |*b| b.buffer.free();
-    e.blocks.clearRetainingCapacity();
 }

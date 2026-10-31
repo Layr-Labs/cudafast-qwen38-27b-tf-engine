@@ -4,20 +4,14 @@ const cuda = @import("cuda");
 const q = @import("qwen35");
 const t = std.testing;
 pub const Trace = struct {
-    const Call = struct { id: usize, x: u64, xs: u64, out: u64, rows: c_int, sk: c_int, row_tiles: c_int, grid: u32, shared: u32, parts: c_int = 1, weight: u64 = 0 };
+    const Call = struct { id: usize, x: u64, xs: u64, out: u64, rows: c_int, sk: c_int, row_tiles: c_int, grid: u32, shared: u32 };
     pub var calls: [128]Call = undefined;
     pub var count: usize = 0;
     pub var prompts: usize = 0;
-    pub var last_parts: cuda.qlinear.Parts = undefined;
     fn record(f: cuda.abi.Function, gx: u32, shared: u32, args: ?[*]?*anyopaque) cuda.abi.Result {
         const id = @intFromPtr(f);
-        if (id == 4 or id == 15) {
+        if (id == 4) {
             prompts += 1;
-            return 0;
-        }
-        if (id == 14) {
-            const parts = @as(*const cuda.prompt_many.Parts, @ptrCast(@alignCast(args.?[1].?))).*;
-            prompts += @intCast(parts.count);
             return 0;
         }
         if (id == 1) return 0; // the input-sum producer
@@ -28,8 +22,6 @@ pub const Trace = struct {
         var out: u64 = 0;
         var sk: c_int = 0;
         var tiles: c_int = 1;
-        var part_count: c_int = 1;
-        var weight: u64 = 0;
         if (id == 8) {
             const segs = @as(*const cuda.qlinear.Segs, @ptrCast(@alignCast(a[2].?))).*;
             for (segs.s[0..@intCast(segs.count)]) |seg| {
@@ -42,17 +34,13 @@ pub const Trace = struct {
             const p = @as(*const cuda.qlinear.GemvPart, @ptrCast(@alignCast(a[2].?))).*;
             out = p.out;
             sk = p.sk;
-            weight = p.w;
-        } else if (id == 3 or id == 5 or id == 6 or id == 7 or id == 10 or id == 11 or id == 12) {
+        } else if (id == 3 or id == 5 or id == 6 or id == 7) {
             const p = @as(*const cuda.qlinear.Parts, @ptrCast(@alignCast(a[2].?))).*;
-            last_parts = p;
             out = p.p[0].out;
-            part_count = p.count;
-            weight = p.p[0].w;
             sk = p.p[0].sk;
             tiles = @as(*const c_int, @ptrCast(@alignCast(a[6].?))).*;
         } else return 0;
-        calls[count] = .{ .id = id, .x = x, .xs = xs, .out = out, .rows = rows, .sk = sk, .row_tiles = tiles, .grid = gx, .shared = shared, .parts = part_count, .weight = weight };
+        calls[count] = .{ .id = id, .x = x, .xs = xs, .out = out, .rows = rows, .sk = sk, .row_tiles = tiles, .grid = gx, .shared = shared };
         count += 1;
         return 0;
     }
@@ -82,7 +70,6 @@ fn device(d: *cuda.Driver, gb10: bool, wide: bool) q.engine.Engine {
     e.affine.group_fn = function(d, 3);
     e.affine.prefill_fn = function(d, 4);
     e.affine.prefill22_fn = function(d, 4);
-    e.prompt_many = .{ .many_fn = function(d, 14), .mlp_fn = function(d, 4), .split_fn = function(d, 15), .slots = 96 };
     e.affine.half_prompt = false;
     if (@hasField(cuda.qlinear.Affine4Kernels, "verify_fn")) e.affine.verify_fn = function(d, 5);
     if (@hasField(cuda.qlinear.Affine4Kernels, "verify64_fn")) e.affine.verify64_fn = function(d, 6);
@@ -90,10 +77,6 @@ fn device(d: *cuda.Driver, gb10: bool, wide: bool) q.engine.Engine {
     e.affine.gemv_blocks = 1;
     e.affine.split = null;
     e.affine.pdl = gb10;
-    e.affine.group_wide = false;
-    e.affine.wide_fns = @splat(null);
-    e.affine.cluster_decode = false;
-    e.affine.narrow = null;
     e.affine.wide_verify = wide;
     return e;
 }
@@ -184,16 +167,6 @@ test "verify matmuls: other devices retain the original sixteen-row dispatch" {
 }
 
 const Resolve = struct {
-    fn alloc(out: *cuda.abi.DevicePtr, _: usize) callconv(.c) cuda.abi.Result {
-        out.* = 0x100000;
-        return 0;
-    }
-    fn free(_: cuda.abi.DevicePtr) callconv(.c) cuda.abi.Result {
-        return 0;
-    }
-    fn memset(_: cuda.abi.DevicePtr, _: c_uint, _: usize) callconv(.c) cuda.abi.Result {
-        return 0;
-    }
     var requested = false;
     var shared: [3]c_int = @splat(0); // verify32, verify64, verify128
     fn get(out: *cuda.abi.Function, _: cuda.abi.Module, name: [*:0]const u8) callconv(.c) cuda.abi.Result {
@@ -217,9 +190,6 @@ const Resolve = struct {
 
 test "verify matmuls: real module resolution sets the new function's shared-memory allowance" {
     var d: cuda.Driver = undefined;
-    d.api.cuMemAlloc_v2 = Resolve.alloc;
-    d.api.cuMemFree_v2 = Resolve.free;
-    d.api.cuMemsetD32_v2 = Resolve.memset;
     d.api.cuModuleGetFunction = Resolve.get;
     d.api.cuFuncSetAttribute = Resolve.attribute;
     d.api.cuOccupancyMaxActiveBlocksPerMultiprocessor = Resolve.occupancy;
@@ -232,270 +202,4 @@ test "verify matmuls: real module resolution sets the new function's shared-memo
     try t.expectEqual([3]c_int{ 32640, 43008, 57600 }, Resolve.shared);
     try t.expectEqual(@as(usize, 96), a.gemv_blocks);
     try t.expectEqual(@as(usize, 128), a.verifyRows());
-}
-
-const WidePack = struct {
-    var count: usize = 0;
-    var size: usize = 0;
-    var synced = false;
-    var original: [8]u64 = undefined;
-    var dest: [8]u64 = undefined;
-    fn alloc(out: *cuda.abi.DevicePtr, n: usize) callconv(.c) cuda.abi.Result {
-        size = n;
-        out.* = 0x100000;
-        return 0;
-    }
-    fn sync(_: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
-        synced = true;
-        return 0;
-    }
-    fn launch(_: cuda.abi.Function, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, args: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
-        const a = args.?;
-        original[count] = @as(*const u64, @ptrCast(@alignCast(a[0].?))).*;
-        dest[count] = @as(*const u64, @ptrCast(@alignCast(a[1].?))).*;
-        count += 1;
-        return 0;
-    }
-};
-
-test "wide weights: one owned view keeps narrow and prompt consumers intact" {
-    var d: cuda.Driver = undefined;
-    var e = engine(&d, true);
-    d.api.cuMemAlloc_v2 = WidePack.alloc;
-    d.api.cuMemFree_v2 = Resolve.free;
-    d.api.cuModuleGetFunction = Resolve.get;
-    d.api.cuFuncSetAttribute = Resolve.attribute;
-    d.api.cuStreamSynchronize = WidePack.sync;
-    d.api.cuLaunchKernel = WidePack.launch;
-    e.mods[0] = .{ .d = &d, .handle = null };
-    e.mods[3] = .{ .d = &d, .handle = null };
-    e.head = .{ .a4 = .{ .w = 1, .s = 2, .b = 3, .n = 256, .npad = 256, .k = 5120 } };
-    const down: q.engine.Proj = .{ .a4 = .{ .w = 2, .s = 3, .b = 4, .n = 5120, .npad = 5120, .k = 17408 } };
-    const input: q.engine.Proj = .{ .a4 = .{ .w = 3, .s = 4, .b = 5, .n = 128, .npad = 128, .k = 5120 } };
-    var key = input;
-    key.a4.w = 4;
-    var value = input;
-    value.a4.w = 5;
-    var layers: [1]q.engine.Layer = undefined;
-    layers[0].mlp = .{ .dense = .{ .gate = input, .up = input, .down = down } };
-    layers[0].mixer = .{ .attention = .{ .q = input, .k = key, .v = value, .o = input, .q_norm = 0, .k_norm = 0 } };
-    e.layers = &layers;
-    WidePack.count = 0;
-    WidePack.synced = false;
-    var buffer = (try q.engine.wide_weight_layout.prepare(&e)).?;
-    defer buffer.free();
-    try t.expectEqual(@as(usize, 5), WidePack.count);
-    try t.expectEqual(@as(usize, (256 * 5120 + 5120 * 17408 + 3 * 128 * 5120) / 2), WidePack.size);
-    try t.expectEqualSlices(u64, &.{ 1, 2, 3, 4, 5 }, WidePack.original[0..5]);
-    try t.expect(WidePack.synced);
-    try t.expectEqual(@as(u64, 1), e.head.a4.w);
-    try t.expectEqual(@as(u64, 2), layers[0].mlp.dense.down.a4.w);
-    try t.expectEqual(@as(u64, 0), layers[0].mlp.dense.gate.a4.wide_w);
-    try t.expectEqual(@as(u64, 0), layers[0].mixer.attention.o.a4.wide_w);
-    try t.expectEqual(@as(u8, 3), e.head.a4.wide_kind);
-    try t.expectEqual(@as(u8, 2), layers[0].mlp.dense.down.a4.wide_kind);
-    try t.expectEqual(@as(u8, 1), layers[0].mixer.attention.q.a4.wide_kind);
-}
-
-test "wide dispatch: original grouped projections preserve each split count" {
-    var d: cuda.Driver = undefined;
-    var e = engine(&d, true);
-    e.affine.group_wide = true;
-    const large: q.engine.Proj = .{ .a4 = .{ .w = 10, .s = 20, .b = 30, .n = 10240, .npad = 10240, .k = 5120 } };
-    var mid = large;
-    mid.a4.n = 6144;
-    mid.a4.npad = 6144;
-    var small = large;
-    small.a4.n = 48;
-    small.a4.npad = 128;
-    Trace.count = 0;
-    try e.projMany(&.{ large, mid, small, small }, 0x1000, &.{ 0x2000, 0x3000, 0x4000, 0x5000 }, 32, false);
-    try t.expectEqual(@as(usize, 2), Trace.count);
-    try t.expectEqual(@as(c_int, 2), Trace.calls[0].parts);
-    try t.expectEqual(@as(c_int, 2), Trace.calls[0].sk);
-    try t.expectEqual(@as(u32, 512), Trace.calls[0].grid);
-    try t.expectEqual(@as(c_int, 2), Trace.calls[1].parts);
-    try t.expectEqual(@as(c_int, 8), Trace.calls[1].sk);
-    try t.expectEqual(@as(u32, 16), Trace.calls[1].grid);
-}
-
-test "wide dispatch: alternate words are used only at 17 to 32 rows" {
-    var d: cuda.Driver = undefined;
-    var e = engine(&d, true);
-    e.affine.wide_fns = .{ function(&d, 10), function(&d, 11), function(&d, 12) };
-    const ns = [_]usize{ 12288, 5120, 248320 };
-    const ks = [_]usize{ 5120, 17408, 5120 };
-    const grids = [_]u32{ 96, 80, 1940 };
-    const shared = [_]u32{ 26496, 32768, 17664 };
-    for (ns, ks, grids, shared, 0..) |n, k, grid, smem, i| {
-        const p: q.engine.Proj = .{ .a4 = .{ .w = 10, .wide_w = 0x9000, .wide_kind = @intCast(i + 1), .s = 20, .b = 30, .n = n, .npad = n, .k = k } };
-        for ([_]usize{ 17, 24, 31, 32 }) |rows| {
-            Trace.count = 0;
-            try e.projSums(p, 0x1000, 0x2000, 0x3000, rows, false, 0);
-            try t.expectEqual(@as(usize, 1), Trace.count);
-            try t.expectEqual(@as(usize, 10) + i, Trace.calls[0].id);
-            try t.expectEqual(@as(u64, 0x9000), Trace.calls[0].weight);
-            try t.expectEqual(grid, Trace.calls[0].grid);
-            try t.expectEqual(smem, Trace.calls[0].shared);
-        }
-        Trace.count = 0;
-        try e.projSums(p, 0x1000, 0x2000, 0x3000, 16, false, 0);
-        try t.expectEqual(@as(u64, 10), Trace.calls[0].weight);
-        try t.expect(Trace.calls[0].id < 10);
-    }
-}
-
-test "attention mixed launch: Q and K/V keep the original ordered slices and weights" {
-    var d: cuda.Driver = undefined;
-    var e = engine(&d, true);
-    e.affine.cluster_decode = true;
-    e.xs = 0x8000;
-    const query: q.engine.Proj = .{ .a4 = .{ .w = 10, .s = 20, .b = 30, .n = 12288, .npad = 12288, .k = 5120 } };
-    var key = query; key.a4.n = 1024; key.a4.npad = 1024; key.a4.w = 11;
-    var value = key; value.a4.w = 12;
-    Trace.count = 0;
-    try e.projMany(&.{query, key, value}, 0x1000, &.{0x2000, 0x3000, 0x4000}, 16, false);
-    try t.expectEqual(@as(usize, 1), Trace.count);
-    try t.expectEqual(@as(usize, 3), Trace.calls[0].id);
-    try t.expectEqual(@as(u32, 448), Trace.calls[0].grid);
-    try t.expectEqual(@as(c_int, 3), Trace.last_parts.count);
-    for (Trace.last_parts.p[0..3], [_]c_int{1, 8, 8}, [_]u64{10, 11, 12}, [_]c_int{0, 24, 40}) |part, sk, words, first| {
-        try t.expectEqual(sk, part.sk);
-        try t.expectEqual(words, part.w);
-        try t.expectEqual(first, part.first);
-    }
-}
-
-const PackTrace = struct {
-    var count: usize = 0;
-    var bytes: usize = 0;
-    var synced = false;
-    var original: [2]u64 = undefined;
-    var alternate: [2]u64 = undefined;
-    fn free(_: cuda.abi.DevicePtr) callconv(.c) cuda.abi.Result { return 0; }
-    fn alloc(out: *cuda.abi.DevicePtr, n: usize) callconv(.c) cuda.abi.Result {
-        bytes = n; out.* = 0x100000; return 0;
-    }
-    fn sync(_: cuda.abi.Stream) callconv(.c) cuda.abi.Result { synced = true; return 0; }
-    fn launch(_: cuda.abi.Function, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, args: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
-        const a = args.?;
-        original[count] = @as(*const u64, @ptrCast(@alignCast(a[0].?))).*;
-        alternate[count] = @as(*const u64, @ptrCast(@alignCast(a[1].?))).*;
-        count += 1; return 0;
-    }
-};
-
-const PairTrace = struct {
-    var id: usize = 0;
-    var grid: u32 = 0;
-    var shared: u32 = 0;
-    var parts: cuda.qlinear.Parts = undefined;
-    var rows: c_int = 0;
-    var sums: u64 = 0;
-    var cluster: u32 = 1;
-    fn launch(c: *const cuda.abi.LaunchConfig, f: cuda.abi.Function, args: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
-        id = @intFromPtr(f);
-        grid = c.grid_x;
-        shared = c.shared_bytes;
-        cluster = 1;
-        for (c.attrs.?[0..c.num_attrs]) |attr| {
-            if (attr.id == .cluster_dimension) cluster = attr.value.cluster_dim.x;
-        }
-        const a = args.?;
-        parts = @as(*const cuda.qlinear.Parts, @ptrCast(@alignCast(a[2].?))).*;
-        sums = @as(*const u64, @ptrCast(@alignCast(a[4].?))).*;
-        rows = @as(*const c_int, @ptrCast(@alignCast(a[5].?))).*;
-        return 0;
-    }
-};
-
-test "fused MLP: alternate words require both views and exactly sixteen rows" {
-    var d: cuda.Driver = undefined;
-    d.api.cuLaunchKernelEx = PairTrace.launch;
-    var pair: cuda.mlp_pair.Kernels = .{ .pair_fn = function(&d, 20), .kmajor_fn = function(&d, 21), .pdl = true };
-    const stream: cuda.Stream = .{ .d = &d, .handle = null };
-    const gate: cuda.qlinear.Affine4 = .{ .w = 10, .verify_w = 100, .s = 20, .b = 30, .n = 17408, .k = 5120, .npad = 17408 };
-    var up = gate;
-    up.w = 40; up.verify_w = 400;
-    for ([_]usize{ 1, 15, 16, 17, 32 }) |rows| {
-        try pair.pair(stream, 1000, 2000, gate, up, 3000, 4000, rows);
-        const major = rows == 16;
-        try t.expectEqual(@as(usize, if (major) 21 else 20), PairTrace.id);
-        try t.expectEqual(@as(u32, @intCast(2 * ((rows + 15) / 16) * (17408 / @as(usize, if (major) 128 else 64)))), PairTrace.grid);
-        try t.expectEqual(@as(u32, if (major) 17536 else 37376), PairTrace.shared);
-        try t.expectEqual(@as(u64, if (major) 100 else 10), PairTrace.parts.p[0].w);
-        try t.expectEqual(@as(u64, if (major) 400 else 40), PairTrace.parts.p[1].w);
-        try t.expectEqual(@as(u64, 20), PairTrace.parts.p[0].scales);
-        try t.expectEqual(@as(u64, 30), PairTrace.parts.p[0].biases);
-        try t.expectEqual(@as(u64, 4000), PairTrace.sums);
-        try t.expectEqual(@as(c_int, @intCast(rows)), PairTrace.rows);
-    }
-    up.verify_w = 0;
-    try pair.pair(stream, 1000, 2000, gate, up, 3000, 4000, 16);
-    try t.expectEqual(@as(usize, 20), PairTrace.id);
-    try t.expectEqual(@as(u64, 10), PairTrace.parts.p[0].w);
-    up.verify_w = 400; pair.kmajor_fn = null;
-    try pair.pair(stream, 1000, 2000, gate, up, 3000, 4000, 16);
-    try t.expectEqual(@as(usize, 20), PairTrace.id);
-}
-
-test "verify weights: preparation owns one weight-only view and retains original consumers" {
-    for ([_]bool{ false, true }) |single| {
-    var d: cuda.Driver = undefined;
-    var e = engine(&d, true);
-    d.api.cuMemAlloc_v2 = PackTrace.alloc;
-    d.api.cuMemFree_v2 = PackTrace.free;
-    d.api.cuModuleGetFunction = Resolve.get;
-    d.api.cuFuncSetAttribute = Resolve.attribute;
-    d.api.cuStreamSynchronize = PackTrace.sync;
-    d.api.cuLaunchKernel = PackTrace.launch;
-    e.mods[0] = .{ .d = &d, .handle = null };
-    e.mods[3] = .{ .d = &d, .handle = null };
-    const gate: q.engine.Proj = .{ .a4 = .{ .w = 10, .s = 20, .b = 30, .n = 17408, .k = 5120, .npad = 17408 } };
-    var up = gate; up.a4.w = 40;
-    var layers: [1]q.engine.Layer = undefined;
-    layers[0].mlp = .{ .dense = .{ .gate = gate, .up = up, .down = gate } };
-    e.layers = &layers;
-    PackTrace.count = 0; PackTrace.synced = false;
-    var buffer = (try q.engine.verify_weight_layout.prepare(&e, single)).?;
-    defer buffer.free();
-    try t.expectEqual(@as(usize, 2), PackTrace.count);
-    try t.expectEqual(@as(usize, 17408 * 5120), PackTrace.bytes);
-    try t.expectEqual([2]u64{10, 40}, PackTrace.original);
-    try t.expectEqual([2]u64{buffer.ptr, buffer.ptr + 17408 * 5120 / 2}, PackTrace.alternate);
-    try t.expect(PackTrace.synced);
-    try t.expect(e.mlp_pair.kmajor_fn != null);
-    try t.expectEqual(single, e.mlp_pair.kmajor_single);
-    try t.expectEqual(gate.a4.w, layers[0].mlp.dense.gate.a4.w);
-    try t.expectEqual(up.a4.w, layers[0].mlp.dense.up.a4.w);
-    try t.expectEqual(PackTrace.alternate[1], layers[0].mlp.dense.up.a4.verify_w);
-    try t.expectEqual(@as(u64, 0), layers[0].mlp.dense.down.a4.verify_w);
-    }
-}
-
-test "fused MLP: single-CTA variant has no cluster and preserves narrow fallback" {
-    var d: cuda.Driver = undefined;
-    d.api.cuLaunchKernelEx = PairTrace.launch;
-    var pair: cuda.mlp_pair.Kernels = .{ .pair_fn = function(&d, 20), .kmajor_fn = function(&d, 22), .kmajor_single = true, .pdl = true };
-    const stream: cuda.Stream = .{ .d = &d, .handle = null };
-    const gate: cuda.qlinear.Affine4 = .{ .w = 10, .verify_w = 100, .s = 20, .b = 30, .n = 17408, .k = 5120, .npad = 17408 };
-    var up = gate;
-    up.w = 40; up.verify_w = 400;
-    for ([_]usize{ 1, 15, 16, 17, 32 }) |rows| {
-        try pair.pair(stream, 1000, 2000, gate, up, 3000, 4000, rows);
-        const single = rows == 16;
-        try t.expectEqual(@as(usize, if (single) 22 else 20), PairTrace.id);
-        try t.expectEqual(@as(u32, if (single) 68 else @intCast(2 * ((rows + 15) / 16) * 272)), PairTrace.grid);
-        try t.expectEqual(@as(u32, if (single) 1 else 2), PairTrace.cluster);
-        try t.expectEqual(@as(u32, if (single) 41088 else 37376), PairTrace.shared);
-        try t.expectEqual(@as(u64, if (single) 100 else 10), PairTrace.parts.p[0].w);
-        try t.expectEqual(@as(u64, if (single) 400 else 40), PairTrace.parts.p[1].w);
-    }
-    up.verify_w = 0;
-    try pair.pair(stream, 1000, 2000, gate, up, 3000, 4000, 16);
-    try t.expectEqual(@as(usize, 20), PairTrace.id);
-    try t.expectEqual(@as(u32, 2), PairTrace.cluster);
-    up.verify_w = 400; pair.kmajor_fn = null;
-    try pair.pair(stream, 1000, 2000, gate, up, 3000, 4000, 16);
-    try t.expectEqual(@as(usize, 20), PairTrace.id);
 }

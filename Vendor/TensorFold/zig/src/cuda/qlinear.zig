@@ -18,9 +18,6 @@ const Stream = stream_.Stream;
 /// MLX affine 4-bit tiled for qmm: packed words, (kg, npad) scales and biases, n outputs from k inputs.
 pub const proposal = @import("proposal_head.zig");
 pub const Affine4 = struct {
-    wide_w: u64 = 0, // weight-only group-major view for 17 to 32-row verification
-    wide_kind: u8 = 0, // 1 attention inputs, 2 down, 3 head
-    verify_w: u64 = 0, // optional immutable K-major words; original w serves all other paths
     w: u64,
     s: u64,
     b: u64,

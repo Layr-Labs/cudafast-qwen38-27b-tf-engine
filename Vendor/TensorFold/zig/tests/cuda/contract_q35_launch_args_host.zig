@@ -178,10 +178,7 @@ fn sitesIn(a: std.mem.Allocator, path: []const u8, text: [:0]const u8, out: *std
     while (i < list.len) : (i += 1) {
         if (list[i].tag != .identifier) continue;
         const name = text[list[i].loc.start..list[i].loc.end];
-        const known = for ([_][]const u8{ "run", "runAfter", "shared", "sharedSized", "launch", "launchAfter" }) |kind| {
-            if (std.mem.eql(u8, name, kind)) break true;
-        } else false;
-        if (!known) continue;
+        if (!std.mem.eql(u8, name, "run") and !std.mem.eql(u8, name, "shared") and !std.mem.eql(u8, name, "launch")) continue;
         if (i + 1 >= list.len or list[i + 1].tag != .l_paren) continue;
         var spans: std.ArrayList(Span) = .empty;
         var depth: usize = 0;
@@ -349,18 +346,13 @@ test "the launch scanner counts a tuple's elements and finds a local one" {
         \\const args = .{ geo, e.qn, t_segs, t_params, ai, e.pm };
         \\const rows = .{ geo, e.qn, t_segs, t_params, ai, @as(c_int, @intCast(total)), e.pm, e.pl };
         \\try e.run(e.fns.attn_merge, .{ 1, 2, 1 }, .{ 32, 1, 1 }, args);
-        \\try e.runAfter(e.fns.attn_merge, .{ 1, 2, 1 }, .{ 32, 1, 1 }, args);
-        \\try launchAfter(e, e.fns.attn_merge, sig.attn_merge, .{ 1, 2, 1 }, .{ 32, 1, 1 }, args);
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     var sites: std.ArrayList(Site) = .empty;
     try sitesIn(a, "inline", try a.dupeSentinel(u8, source, 0), &sites);
-    try std.testing.expectEqual(@as(usize, 3), sites.items.len);
-    for (sites.items) |site| {
-        try std.testing.expectEqual(@as(usize, 6), site.elements.len);
-        try std.testing.expectEqualStrings("e.fns.attn_merge", site.handles[0]);
-    }
-    try std.testing.expectEqualStrings("attn_merge", sites.items[2].named.?);
+    try std.testing.expectEqual(@as(usize, 1), sites.items.len);
+    try std.testing.expectEqual(@as(usize, 6), sites.items[0].elements.len);
+    try std.testing.expectEqualStrings("e.fns.attn_merge", sites.items[0].handles[0]);
 }
