@@ -94,6 +94,8 @@ fn toBf16(x: f32) u16 {
     return @intCast((u +% rounding) >> 16);
 }
 
+const multi_start_spans = [_]f64{ 1.8, 2.5 };
+
 /// MLX affine-4, group 64: minimize weight error with a bf16 scale and bias; pack low nibbles first.
 fn quantize(gpa: std.mem.Allocator, w: []align(1) const u16, n: usize, k: usize) !struct { words: []u32, scales: []u16, biases: []u16 } {
     const groups = k / 64;
@@ -115,6 +117,27 @@ fn quantize(gpa: std.mem.Allocator, w: []align(1) const u16, n: usize, k: usize)
             }
             var fit = [2]f32{ (hi - lo) / 15.0, lo };
             fit = leastSquares(row, fit);
+            // Multi-start: the min-max line is stretched by outliers and the alternating fit keeps that local optimum.
+            // Spans of mean +- z sigma clip them; the lowest stored error wins.
+            var sum: f64 = 0;
+            var sq: f64 = 0;
+            for (row) |h| {
+                const x: f64 = bf16(h);
+                sum += x;
+                sq += x * x;
+            }
+            const mean = sum / 64.0;
+            const sigma = @sqrt(@max(sq / 64.0 - mean * mean, 0.0));
+            var fit_err = groupError(row, fit);
+            for (multi_start_spans) |z| {
+                const start = [2]f32{ @floatCast(2.0 * z * sigma / 15.0), @floatCast(mean - z * sigma) };
+                const candidate = leastSquares(row, start);
+                const e = groupError(row, candidate);
+                if (e < fit_err) {
+                    fit_err = e;
+                    fit = candidate;
+                }
+            }
             const scale = toBf16(fit[0]);
             const bias = toBf16(fit[1]);
             scales[r * groups + g] = scale;
@@ -141,7 +164,7 @@ fn leastSquares(row: []align(1) const u16, start: [2]f32) [2]f32 {
     var best = start;
     var best_err = groupError(row, start);
     var cur = start;
-    for (0..3) |_| {
+    for (0..8) |_| {
         const s = cur[0];
         if (s <= 0) break;
         var sq: f64 = 0;
