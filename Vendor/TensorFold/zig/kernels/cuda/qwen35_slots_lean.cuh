@@ -3,7 +3,7 @@
 // output and log bases fixed before the loop, a row a stride further), a lane's four value-row entries one 8-byte
 // load, the record's lane predicates and log strides computed once.
 #pragma once
-template <int SLOTS>
+template <int SLOTS, bool EAGER = false>
 __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q, const __nv_bfloat16* k,
         const __nv_bfloat16* v, const float* g, const __nv_bfloat16* beta, const Seg* segs,
         const SlotStep* steps, int layer, __nv_bfloat16* y, const int* P) {
@@ -23,7 +23,7 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q, 
 #pragma unroll
     for (int r = 0; r < R; ++r)
 #pragma unroll
-        for (int i = 0; i < PT; ++i) root[r][i] = st[r * DK + i];
+        for (int i = 0; i < PT; ++i) state[r][i] = st[r * DK + i];
     if (sg.pn > 0) {
         Seg prev = sg;
         prev.log = sg.plog;
@@ -50,8 +50,8 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q, 
                 for (int r = 0; r < R; ++r) {
 #pragma unroll
                     for (int i = 0; i < PT; i++) {
-                        root[r][i] = root[r][i] * pg[u];
-                        root[r][i] = fmaf(bf(kb[i]), pdr[r], root[r][i]);
+                        state[r][i] = state[r][i] * pg[u];
+                        state[r][i] = fmaf(bf(kb[i]), pdr[r], state[r][i]);
                     }
                 }
             }
@@ -61,7 +61,7 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q, 
 #pragma unroll
         for (int r = 0; r < R; ++r)
 #pragma unroll
-            for (int i = 0; i < PT; ++i) reinterpret_cast<float*>(sg.before)[(size_t)layer * geo.rec() + at + r * DK + i] = root[r][i];
+            for (int i = 0; i < PT; ++i) reinterpret_cast<float*>(sg.before)[(size_t)layer * geo.rec() + at + r * DK + i] = state[r][i];
     const bool record = recorded(P);
     // each lane's row-0 inputs: a row's are `row` strides further
     const unsigned kstride = (unsigned)NK * DK, vstride = (unsigned)NV * DK;
@@ -93,10 +93,21 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q, 
     int pend_row = -1;
 #pragma unroll
     for (int r = 0; r < R; ++r) pend[r] = 0.0f;
+    // Each thread owns disjoint state cells. Commit the already accepted prefix before speculative work,
+    // allowing later root selections to reload this stable base instead of keeping sixteen floats live.
+    // EAGER=false retains the prior register-root implementation for the input-independent differential check.
+    if constexpr (EAGER) {
+        if (sg.pn > 0)
 #pragma unroll
-    for (int r = 0; r < R; ++r)
+            for (int r = 0; r < R; ++r)
 #pragma unroll
-        for (int i = 0; i < PT; ++i) state[r][i] = root[r][i];
+                for (int i = 0; i < PT; ++i) st[r * DK + i] = state[r][i];
+    } else {
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+#pragma unroll
+            for (int i = 0; i < PT; ++i) root[r][i] = state[r][i];
+    }
     // the window's steps staged once (a block's threads, up to 64 rows), so a step's inputs load without its step's
     __shared__ SlotStep sp[64];
     {
@@ -105,7 +116,7 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q, 
         __syncthreads();
     }
     int live_slot = -2;
-    auto run = [&](const SlotStep& step, const In& in) {
+    auto run = [&](const SlotStep& step, const In& in, bool first) {
         const int row = step.row, rr = row - sg.row0;
 #pragma unroll
         for (int r = 0; r < R; ++r) {
@@ -116,8 +127,16 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q, 
                 state[r][2] = t.z;
                 state[r][3] = t.w;
             } else if (step.read_slot == -1) {
+                if constexpr (EAGER) {
+                    // Volatile keeps the stable base in memory rather than extending its register lifetime.
+                    // The first step already has this base, including the accepted prefix, in state.
+                    if (!first)
 #pragma unroll
-                for (int i = 0; i < PT; ++i) state[r][i] = root[r][i];
+                        for (int i = 0; i < PT; ++i) state[r][i] = reinterpret_cast<volatile float*>(st)[r * DK + i];
+                } else {
+#pragma unroll
+                    for (int i = 0; i < PT; ++i) state[r][i] = root[r][i];
+                }
             }  // -2: the step before was the parent's, its state is in the registers
         }
         const __nv_bfloat16* kb = reinterpret_cast<const __nv_bfloat16*>(&in.k);
@@ -185,7 +204,7 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q, 
                 sa = sp[item + 2];
                 load(sa.row, ia);
             }
-            run(step, in);
+            run(step, in, item == 0);
         }
         if (item + 1 >= sg.rows) break;
         {
@@ -195,7 +214,7 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q, 
                 sb = sp[item + 3];
                 load(sb.row, ib);
             }
-            run(step, in);
+            run(step, in, false);
         }
     }
     if (pend_row >= 0) {
@@ -204,11 +223,13 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q, 
         if ((dk & ((1 << SR) - 1)) == 0) y[((size_t)pend_row * NV + hv) * DK + dv0 + (dk >> SR)] = __float2bfloat16_rn(tot);
     }
     if (record && sg.rows != 1) {
-        if (sg.pn > 0)
+        if constexpr (!EAGER) {
+            if (sg.pn > 0)
 #pragma unroll
-            for (int r = 0; r < R; ++r)
+                for (int r = 0; r < R; ++r)
 #pragma unroll
-                for (int i = 0; i < PT; ++i) st[r * DK + i] = root[r][i];
+                    for (int i = 0; i < PT; ++i) st[r * DK + i] = root[r][i];
+        }
         return;
     }
 #pragma unroll
@@ -222,6 +243,6 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_lean_##N(Geo geo, c
  const __nv_bfloat16* k, const __nv_bfloat16* v, const float* g, const __nv_bfloat16* beta, const Seg* segs, \
  const SlotStep* steps, int layer, __nv_bfloat16* y, const int* P) { \
   release_next(); await_prior(); \
-  q35_slots_lean<N>(geo, after_wait(q), after_wait(k), after_wait(v), after_wait(g), after_wait(beta), segs, steps, layer, after_wait(y), P); }
+  q35_slots_lean<N, true>(geo, after_wait(q), after_wait(k), after_wait(v), after_wait(g), after_wait(beta), segs, steps, layer, after_wait(y), P); }
 TF_Q35_LEAN(2)
 TF_Q35_LEAN(3)
