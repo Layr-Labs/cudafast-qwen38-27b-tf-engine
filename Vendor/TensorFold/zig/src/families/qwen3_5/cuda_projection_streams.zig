@@ -45,10 +45,10 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     const down = try e.mods[0].function("tf_qmm_output_stream16");
     const out = try e.mods[0].function("tf_qmm_output_prefetch16");
     try down.allowDynamicShared(35328);
-    // its twin for a dictionary-coded down projection: four slices' decoded groups and the table past the stages
+    // its twin for a dictionary-coded down/out/o projection: the table past the stages
     const down_dict: ?cuda.Function = if (e.affine.dict == null) null else blk: {
         const f = try e.mods[0].function("tf_qmm_output_stream16_dict");
-        try f.allowDynamicShared(35328 + 4 * cuda.qlinear.dict_dec + cuda.qlinear.dict_tab_max);
+        try f.allowDynamicShared(35328 + @as(u32, @max(cuda.qlinear.dict_tab_max, cuda.qlinear.out_pair_tab_max)));
         break :blk f;
     };
     try out.allowDynamicShared(35328);
@@ -80,7 +80,20 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     };
     if (output) e.affine.stream16_fns = .{ down, out };
     if (output) e.affine.stream16_dict_fn = down_dict;
-    if (input) e.affine.gdn_stream16_fn = grouped;
-    if (input) e.affine.gdn_stream16_dict_fn = grouped_dict;
+    if (input) {
+        e.affine.gdn_stream16_fn = grouped;
+        e.affine.gdn_stream16_dict_fn = grouped_dict;
+        const off32 = if (@import("sys").c.getenv("TF_GDN_STREAM32")) |v| @import("std").mem.eql(u8, @import("std").mem.span(v), "0") else false;
+        if (!off32) {
+            const g32 = try e.mods[0].function("tf_qmm_gdn_stream32");
+            try g32.allowDynamicShared(cuda.qlinear.Affine4Kernels.gdn_stream32_smem);
+            e.affine.gdn_stream32_fn = g32;
+            if (e.affine.dict != null) {
+                const gd32 = try e.mods[0].function("tf_qmm_gdn_stream32_dict");
+                try gd32.allowDynamicShared(cuda.qlinear.Affine4Kernels.gdn_stream32_smem + 4 * 128 + @as(u32, @max(cuda.qlinear.dict_tab_max, cuda.qlinear.gdn_pair_tab_max)));
+                e.affine.gdn_stream32_dict_fn = gd32;
+            }
+        }
+    }
     return buffer;
 }
