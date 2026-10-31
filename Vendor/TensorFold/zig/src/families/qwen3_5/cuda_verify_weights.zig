@@ -53,5 +53,24 @@ pub fn prepare(e: anytype, single: bool) !?cuda.DeviceBuffer {
             e.mlp_pair.single32_dict_fn = f32d;
         }
     }
+    // ercumentyildirim's 32-row twins (366d8a17), taken ahead of the kernels above; TF_MLP32W=0 keeps those
+    const off32w = if (@import("sys").c.getenv("TF_MLP32W")) |v| @import("std").mem.eql(u8, @import("std").mem.span(v), "0") else false;
+    if (single and !off32 and !off32w) {
+        const mp = cuda.mlp_pair;
+        const f = try e.mods[0].function("tf_qmm_mlp_single32w");
+        try f.allowDynamicShared(mp.single32w_smem);
+        e.mlp_pair.single32w_fn = f;
+        if (e.mlp_pair.single_dict_fn != null) {
+            const fd = try e.mods[0].function("tf_qmm_mlp_single32w_dict");
+            try fd.allowDynamicShared(mp.single32w_smem + 2 * cuda.qlinear.dict_tab_max);
+            e.mlp_pair.single32w_dict_fn = fd;
+            const fp = try e.mods[0].function("tf_qmm_mlp_single32w_pair");
+            try fp.allowDynamicShared(mp.single32w_pair_smem);
+            e.mlp_pair.single32w_pair_fn = fp;
+            const fm = try e.mods[0].function("tf_qmm_mlp_single32w_mixed");
+            try fm.allowDynamicShared(mp.single32w_smem + 2 * cuda.qlinear.dict_tab_max);
+            e.mlp_pair.single32w_mixed_fn = fm;
+        }
+    }
     return buffer;
 }

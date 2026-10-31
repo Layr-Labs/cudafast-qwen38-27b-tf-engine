@@ -941,3 +941,6 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_pair_dict(const __n
 
 #include "qmm_mlp_single_dict.cuh"
 #include "qmm_mlp_single32.cuh"
+
+// ercumentyildirim's 32-row output-stream, lane and verify32 twins (366d8a17), past f3445bf7's GDN-in and MLP twins
+#include "qmm_stream32.cuh"

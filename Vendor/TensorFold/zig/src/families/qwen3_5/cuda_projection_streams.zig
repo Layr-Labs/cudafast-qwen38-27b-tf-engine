@@ -80,6 +80,46 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     };
     if (output) e.affine.stream16_fns = .{ down, out };
     if (output) e.affine.stream16_dict_fn = down_dict;
+    // ercumentyildirim's 32-row twins (qmm_stream32.cuh) of the output streams; TF_STREAM32=0 keeps 17 to 32-row
+    // windows on cluster32 / packed32
+    const off_w32 = if (@import("sys").c.getenv("TF_STREAM32")) |v| @import("std").mem.eql(u8, @import("std").mem.span(v), "0") else false;
+    if (output and !off_w32) {
+        const q = cuda.qlinear;
+        const wide_fns = [2]?cuda.Function{ try e.mods[0].function("tf_qmm_output_stream32"), try e.mods[0].function("tf_qmm_output_prefetch32") };
+        for (wide_fns) |f| try f.?.allowDynamicShared(q.out32_smem);
+        e.affine.stream32_fns = wide_fns;
+        if (e.affine.dict != null) {
+            const wd = try e.mods[0].function("tf_qmm_output_stream32_dict");
+            try wd.allowDynamicShared(q.out32_smem + 4 * q.dict_dec + q.dict_tab_max);
+            e.affine.stream32_dict_fn = wd;
+        }
+        // GDN out / attention o in the lane form (TF_W32_OUT_STREAM=1: the four-slice stream twin instead)
+        const stream_out = if (@import("sys").c.getenv("TF_W32_OUT_STREAM")) |v| @import("std").mem.eql(u8, @import("std").mem.span(v), "1") else false;
+        if (!stream_out) {
+            const l0 = try e.mods[0].function("tf_qmm_lane32");
+            try l0.allowDynamicShared(q.lane32_smem);
+            var l1: ?cuda.Function = null;
+            if (e.affine.dict != null) {
+                l1 = try e.mods[0].function("tf_qmm_lane32_dict");
+                try l1.?.allowDynamicShared(q.lane32_smem + 4 * 64 + @max(q.dict_tab_max, q.lane32_pair_tab_max));
+            }
+            e.affine.lane32_fns = .{ l0, l1 };
+            e.affine.down_lane32 = if (@import("sys").c.getenv("TF_W32_DOWN_LANE")) |v| @import("std").mem.eql(u8, @import("std").mem.span(v), "1") else false;
+        }
+    }
+    // ercumentyildirim's GDN-input twin (366d8a17) for 17 to 32 rows, ahead of f3445bf7's; TF_GDN32W=0 keeps that one
+    const off_g32w = if (@import("sys").c.getenv("TF_GDN32W")) |v| @import("std").mem.eql(u8, @import("std").mem.span(v), "0") else false;
+    if (input and !off_w32 and !off_g32w) {
+        const q = cuda.qlinear;
+        const g = try e.mods[0].function("tf_qmm_gdn_stream32w");
+        try g.allowDynamicShared(q.gdn32_smem);
+        e.affine.gdn32w_fn = g;
+        if (e.affine.dict != null) {
+            const gd = try e.mods[0].function("tf_qmm_gdn_stream32w_dict");
+            try gd.allowDynamicShared(q.gdn32_smem + 4 * 256 + @max(q.dict_tab_max, q.gdn32_pair_tab_max));
+            e.affine.gdn32w_dict_fn = gd;
+        }
+    }
     if (input) {
         e.affine.gdn_stream16_fn = grouped;
         e.affine.gdn_stream16_dict_fn = grouped_dict;
