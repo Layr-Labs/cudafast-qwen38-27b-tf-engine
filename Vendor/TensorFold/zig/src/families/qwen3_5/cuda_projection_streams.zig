@@ -14,16 +14,34 @@ fn candidates(layer: *layers.Layer, input: bool, output: bool) [6]?*layers.Proj 
                 list[2] = &m.qkv; list[3] = &m.z; list[4] = &m.a; list[5] = &m.b;
             }
         },
-        .attention => |*m| { if (output) list[1] = &m.o; },
+        .attention => |*m| {
+            if (output) list[1] = &m.o;
+            // the 16-row q, k and v of one input stream as the GDN input's parts do (TF_ATTN_STREAM=0 keeps the cluster)
+            if (input and attnStream() and m.q == .a4 and m.k == .a4 and m.v == .a4 and
+                m.q.outputs() == 12288 and m.k.outputs() == 1024 and m.v.outputs() == 1024 and
+                m.q.inputs() == 5120 and m.k.inputs() == 5120 and m.v.inputs() == 5120) {
+                list[2] = &m.q; list[3] = &m.k; list[4] = &m.v;
+            }
+        },
     }
     return list;
+}
+
+fn stream32() bool {
+    const v = @import("sys").c.getenv("TF_STREAM32") orelse return true;
+    return !(v[0] == '0' and v[1] == 0);
+}
+
+fn attnStream() bool {
+    const v = @import("sys").c.getenv("TF_ATTN_STREAM") orelse return true;
+    return !(v[0] == '0' and v[1] == 0);
 }
 
 fn size(p: layers.Proj) usize {
     if (p != .a4) return 0;
     const q = p.a4;
     const out = q.n == 5120 and (q.k == 6144 or q.k == 17408) and cuda.qlinear.splitK(q.n, q.k) == 4;
-    const in = q.k == 5120 and (q.n == 10240 or q.n == 6144 or q.n == 48);
+    const in = q.k == 5120 and (q.n == 10240 or q.n == 6144 or q.n == 48 or q.n == 12288 or q.n == 1024);
     if (!out and !in) return 0;
     return q.npad * q.k / 2;
 }
@@ -40,6 +58,18 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     const grouped_dict: ?cuda.Function = if (e.affine.dict == null) null else blk: {
         const f = try e.mods[0].function("tf_qmm_gdn_stream16_dict");
         try f.allowDynamicShared(22656 + 4 * 256 + cuda.qlinear.dict_tab_max);
+        break :blk f;
+    };
+    // the 17 to 32-row twins (TF_STREAM32=0 keeps those windows on the cluster/lane kernels)
+    const A = cuda.qlinear.Affine4Kernels;
+    const wide: ?cuda.Function = if (!stream32()) null else blk: {
+        const f = try e.mods[0].function("tf_qmm_gdn_stream32");
+        try f.allowDynamicShared(A.gdn_stream32_smem);
+        break :blk f;
+    };
+    const wide_dict: ?cuda.Function = if (wide == null or e.affine.dict == null) null else blk: {
+        const f = try e.mods[0].function("tf_qmm_gdn_stream32_dict");
+        try f.allowDynamicShared(A.gdn_stream32_smem + 4 * 128 + cuda.qlinear.dict_tab_max);
         break :blk f;
     };
     const down = try e.mods[0].function("tf_qmm_output_stream16");
@@ -82,5 +112,7 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     if (output) e.affine.stream16_dict_fn = down_dict;
     if (input) e.affine.gdn_stream16_fn = grouped;
     if (input) e.affine.gdn_stream16_dict_fn = grouped_dict;
+    if (input) e.affine.gdn_stream32_fn = wide;
+    if (input) e.affine.gdn_stream32_dict_fn = wide_dict;
     return buffer;
 }

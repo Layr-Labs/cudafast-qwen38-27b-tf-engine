@@ -114,6 +114,8 @@ pub const Engine = struct {
     mlp_pair: cuda.mlp_pair.Kernels, // decode gate, up and activation in one launch (qmm_group.cu tf_qmm_mlp_pair)
     wide_words: ?DeviceBuffer = null,
     projection_streams: ?DeviceBuffer = null,
+    /// The drafter's span head at fewer bits (cuda_draft_head.zig), when wanted.
+    draft_head: ?@import("cuda_draft_head.zig").Head = null,
     wide: cuda.qlinear.AffineNKernels, // the tiles of every width but 4, and their packs
     experts: cuda.experts.Affine4Experts,
     experts3: cuda.experts3.Affine3Experts,
@@ -207,6 +209,8 @@ pub const Engine = struct {
         errdefer if (e.projection_streams) |*b| b.free();
         e.wide_words = null;
         errdefer if (e.wide_words) |*b| b.free();
+        e.draft_head = null;
+        errdefer if (e.draft_head) |*h| h.deinit();
         errdefer e.int8.deinit();
         e.gpa = gpa;
         e.dir = try gpa.dupe(u8, dir);
@@ -305,6 +309,7 @@ pub const Engine = struct {
             var stage = try DeviceBuffer.alloc(d, weights.stageBytes(g));
             defer stage.free();
             try weights.load(e, &ck, &stage);
+            if (!g.kinds.modelopt and g.bits.head == 4) e.draft_head = try @import("cuda_draft_head.zig").prepare(e, &ck, if (g.tied) "language_model.model." else "language_model.", if (g.tied) "embed_tokens" else "lm_head", g.vocab, g.hidden);
         }
         if (gb10 and g.hidden == 5120 and g.layers == 64 and g.experts == 0 and
             @import("sys").c.getenv("TF_WIDE_KMAJOR") != null and !envOff("TF_WIDE_KMAJOR"))
@@ -359,6 +364,7 @@ pub const Engine = struct {
         e.tables.free();
         if (e.wide_words) |*b| b.free();
         if (e.projection_streams) |*b| b.free();
+        if (e.draft_head) |*h| h.deinit();
         if (e.verify_weights) |*b| b.free();
         e.arena.free();
         e.gpa.free(e.layers);

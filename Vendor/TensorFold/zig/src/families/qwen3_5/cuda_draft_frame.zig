@@ -181,6 +181,8 @@ pub fn forward(d: anytype, items: []const dr.Hold, contexts: []const *draft.Ctx)
     const spanned = try run(d, items.len, narrow(contexts));
     try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + words_at, d.words, rows * lp_words * 4, e.stream.handle), "cuMemcpyDtoHAsync");
     try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + hp_at, d.hp, rows * c.rank * 2, e.stream.handle), "cuMemcpyDtoHAsync");
+    // the host replays the streams' landed rounds while the frame runs (the per-stream 15 or 31-node choice)
+    for (items, contexts) |it, ctx| if (it.sampling == null) d.replayLanded(ctx, it.tokens);
     try e.stream.synchronize();
     if (spanned != null) for (0..rows) |r| {
         const w = std.mem.bytesAsSlice(u32, st[words_at + r * lp_words * 4 ..][0 .. lp_words * 4]);
@@ -225,8 +227,11 @@ fn head(d: anytype, rows: usize) !?u64 {
     const a = d.logits; // rows x 98,304, then rows x 320, then the packed rows x 98,592
     const b = a + rows * first.n * 2;
     const out = b + rows * tail.n * 2;
-    try draft.precision.project(e, layers.Proj{ .a4 = first }, d.x, d.xs, a, rows, .proposal, draft.precision.dflash_projection_prompt_cutoff);
-    try draft.precision.project(e, layers.Proj{ .a4 = tail }, d.x, d.xs, b, rows, .proposal, draft.precision.dflash_projection_prompt_cutoff);
+    // the span rows at fewer bits when the engine holds that copy (cuda_draft_head.zig): the same rows, fewer bytes
+    const first_p: layers.Proj = if (e.draft_head) |h| .{ .an = h.first } else .{ .a4 = first };
+    const tail_p: layers.Proj = if (e.draft_head) |h| .{ .an = h.tail } else .{ .a4 = tail };
+    try draft.precision.project(e, first_p, d.x, d.xs, a, rows, .proposal, draft.precision.dflash_projection_prompt_cutoff);
+    try draft.precision.project(e, tail_p, d.x, d.xs, b, rows, .proposal, draft.precision.dflash_projection_prompt_cutoff);
     const skip = spans[1][0] - tail_tile;
     const copies = [2]cuda.abi.Memcpy2D{
         .{ .src = a, .src_pitch = first.n * 2, .dst = out, .dst_pitch = span_width * 2, .width = first.n * 2, .height = rows },
