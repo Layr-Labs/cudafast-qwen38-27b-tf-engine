@@ -42,8 +42,9 @@ fn timed(io: std.Io, e: anytype, d: anytype, cache: anytype, warmed: *Seen, phas
     var picks: [E.most_window]E.Draw = undefined;
     for (&picks) |*pk| pk.* = .{ .rule = null, .position = 1 };
     var measured: [E.most_window]struct { rows: u32, ms: f64 } = undefined;
+    const pdl = @hasField(@TypeOf(e.*), "affine") and e.affine.pdl;
     for (1..e.window_rows + 1) |rows| {
-        const shape = E.Engine.Shape.init(rows, 1, true, e.n_taps > 0, if (rows > 1 and e.affine.pdl) 37 else 1);
+        const shape = E.Engine.Shape.init(rows, 1, true, e.n_taps > 0, if (rows > 1 and rows <= 32 and pdl) 37 else 1);
         while (warmed.passes(shape) < 2) {
             const warm_start = profile.now(io);
             try cache.reset(e);
@@ -53,15 +54,18 @@ fn timed(io: std.Io, e: anytype, d: anytype, cache: anytype, warmed: *Seen, phas
         }
         measured[rows - 1] = .{ .rows = @intCast(rows), .ms = try timeWidth(io, e, cache, rows, &ids, &picks) };
     }
-    if (e.window_rows >= 16 and e.affine.pdl) {
-        const par_c3 = [16]i32{ -1, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7 };
-        const shape = E.Engine.Shape.init(16, 1, true, e.n_taps > 0, 38);
-        while (warmed.passes(shape) < 2) {
-            const warm_start = profile.now(io);
-            try cache.reset(e);
-            try e.forward(&.{.{ .cache = cache, .rows = 16, .parents = &par_c3 }}, ids[0..16], .{ .draws = picks[0..16] });
-            warmed.mark(shape);
-            warm_ns += profile.elapsed(io, warm_start);
+    if (e.window_rows >= 16 and pdl) {
+        const par_c3 = [32]i32{ -1, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30 };
+        for ([_]usize{ 16, 32 }) |w_rows| {
+            if (e.window_rows < w_rows) continue;
+            const shape = E.Engine.Shape.init(w_rows, 1, true, e.n_taps > 0, 38);
+            while (warmed.passes(shape) < 2) {
+                const warm_start = profile.now(io);
+                try cache.reset(e);
+                try e.forward(&.{.{ .cache = cache, .rows = w_rows, .parents = par_c3[0..w_rows] }}, ids[0..w_rows], .{ .draws = picks[0..w_rows] });
+                warmed.mark(shape);
+                warm_ns += profile.elapsed(io, warm_start);
+            }
         }
     }
     try cache.reset(e);
@@ -123,21 +127,25 @@ fn run(io: std.Io, e: anytype, d: anytype, cache: anytype, warmed: *Seen, phases
     const ids: [E.most_window]u32 = @splat(0);
     var picks: [E.most_window]E.Draw = undefined;
     for (&picks) |*pk| pk.* = .{ .rule = null, .position = 1 };
+    const pdl = @hasField(@TypeOf(e.*), "affine") and e.affine.pdl;
     for (1..e.window_rows + 1) |rows| {
-        const shape = E.Engine.Shape.init(rows, 1, true, e.n_taps > 0, if (rows > 1 and e.affine.pdl) 37 else 1);
+        const shape = E.Engine.Shape.init(rows, 1, true, e.n_taps > 0, if (rows > 1 and rows <= 32 and pdl) 37 else 1);
         while (warmed.passes(shape) < 2) {
             try cache.reset(e);
             try e.forward(&.{.{ .cache = cache, .rows = rows }}, ids[0..rows], .{ .draws = picks[0..rows] });
             warmed.mark(shape);
         }
     }
-    if (e.window_rows >= 16 and e.affine.pdl) {
-        const par_c3 = [16]i32{ -1, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7 };
-        const shape = E.Engine.Shape.init(16, 1, true, e.n_taps > 0, 38);
-        while (warmed.passes(shape) < 2) {
-            try cache.reset(e);
-            try e.forward(&.{.{ .cache = cache, .rows = 16, .parents = &par_c3 }}, ids[0..16], .{ .draws = picks[0..16] });
-            warmed.mark(shape);
+    if (e.window_rows >= 16 and pdl) {
+        const par_c3 = [32]i32{ -1, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30 };
+        for ([_]usize{ 16, 32 }) |w_rows| {
+            if (e.window_rows < w_rows) continue;
+            const shape = E.Engine.Shape.init(w_rows, 1, true, e.n_taps > 0, 38);
+            while (warmed.passes(shape) < 2) {
+                try cache.reset(e);
+                try e.forward(&.{.{ .cache = cache, .rows = w_rows, .parents = par_c3[0..w_rows] }}, ids[0..w_rows], .{ .draws = picks[0..w_rows] });
+                warmed.mark(shape);
+            }
         }
     }
     try cache.reset(e);
