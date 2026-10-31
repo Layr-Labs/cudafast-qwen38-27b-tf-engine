@@ -150,7 +150,7 @@ fn chancesAfter(c: Candidates, r: usize, pred: u32, out: *[lp_top]f64) void {
 }
 
 /// Up to `most` nodes best first: the open node of least path cost next (ties by parent, token, row); the count grown.
-pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32, parents: []i32, own: []f64) usize {
+pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32, parents: []i32, own: []f64, landing: ?*const Landing, sampled: bool) usize {
     const Open = struct { cost: f64, parent: i32, token: u32, row: usize, own: f64 };
     var open: [branch * (engine.most_window + 1)]Open = undefined;
     var n_open: usize = 0;
@@ -174,7 +174,8 @@ pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32
             const w = ids(c, row);
             for (order[0..@min(branch, c.topk)]) |j| {
                 if (!std.math.isFinite(lc[j]) or n_open == open.len) break;
-                open[n_open] = .{ .cost = path - lc[j], .parent = parent, .token = w[2 + j], .row = row, .own = lc[j] };
+                const chance = if (landing) |l| l.chance(sampled, lc[j]) else @exp(lc[j]);
+                open[n_open] = .{ .cost = path - @log(@max(chance, 1e-30)), .parent = parent, .token = w[2 + j], .row = row, .own = lc[j] };
                 n_open += 1;
             }
         }
@@ -233,7 +234,7 @@ test "best first: a node's children follow it, the cheapest open node first, cha
     var tokens: [6]u32 = undefined;
     var parents: [6]i32 = undefined;
     var own: [6]f64 = undefined;
-    const n = grow(c, 5, 2, 6, &tokens, &parents, &own);
+    const n = grow(c, 5, 2, 6, &tokens, &parents, &own, null, false);
     try std.testing.expectEqual(@as(usize, 6), n);
     try std.testing.expectEqual(@as(u32, 0), tokens[0]); // row 0's best first
     try std.testing.expectEqual(@as(i32, -1), parents[0]);
