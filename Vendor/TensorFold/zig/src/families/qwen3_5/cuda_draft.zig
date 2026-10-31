@@ -45,6 +45,13 @@ pub const Ctx = struct {
     scanned: usize = 0,
     wide: bool = false,
     outside: usize = 0, // the stream's tokens so far outside the draft spans (frame.scan)
+    // the stream's verified trees (wideGuard): its rounds and kept rows, the rounds that offered more than 15 nodes and
+    // their kept rows past row 15; `narrow` once those rows no longer pay for the wider window
+    rounds: u32 = 0,
+    kept_rows: u32 = 0,
+    wide_rounds: u32 = 0,
+    wide_extra: u32 = 0,
+    narrow: bool = false,
 };
 
 pub const Draft = struct {
@@ -423,7 +430,8 @@ pub const Draft = struct {
         d.drawn = .{ .sampling = it.sampling, .position = it.position };
         defer d.drawn = .{};
         if (it.lanes) |shape| return d.selectLanes(ctx, it.pending, rows, shape);
-        const limit = if (d.c.block == 16) tree.nodes() else 0;
+        const limit = if (d.c.block == 16) d.wideGuard(ctx, tree.nodes()) else 0;
+        tree.narrowed = limit > 0 and limit <= 15;
         if (limit > 0) {
             // the whole budget whenever drafts are asked: the block's forward costs the same at any depth
             const n = if (it.depth == 0) 0 else limit;
@@ -467,6 +475,27 @@ pub const Draft = struct {
         }
     }
 
+    /// A stream's node budget: `nodes`, or 15 once its wide rounds' kept rows past row 15 (an upper bound of what the
+    /// wider tree adds) fall clearly below the wider window's extra cost in the stream's own tokens, after `wide_probe` wide
+    /// rounds (window costs from the engine's table; TF_WIDE_GUARD=0: always `nodes`).
+    fn wideGuard(d: *const Draft, ctx: *Ctx, nodes: usize) usize {
+        if (nodes <= narrow_nodes or !guardOn()) return nodes;
+        if (ctx.narrow) return narrow_nodes;
+        if (ctx.wide_rounds < wide_probe or ctx.rounds == 0) return nodes;
+        var c16: f64 = 0;
+        var cw: f64 = 0;
+        for (d.costs[0..d.n_costs]) |c| {
+            if (c.width == narrow_nodes + 1) c16 = c.ms;
+            if (c.width == nodes + 1) cw = c.ms;
+        }
+        if (c16 <= 0 or cw <= c16) return nodes;
+        const per_round = @as(f64, @floatFromInt(ctx.kept_rows)) / @as(f64, @floatFromInt(ctx.rounds));
+        const extra = @as(f64, @floatFromInt(ctx.wide_extra)) / @as(f64, @floatFromInt(ctx.wide_rounds));
+        // a round's extra cost, in the stream's tokens: (cw - c16) / (c16 / per_round)
+        if (extra * c16 < guard_margin * (cw - c16) * per_round) ctx.narrow = true;
+        return if (ctx.narrow) narrow_nodes else nodes;
+    }
+
     // the Drafter contract
 
     pub fn drafter(d: *Draft) dr.Drafter {
@@ -490,6 +519,7 @@ pub const Draft = struct {
 
     fn openFn(p: *anyopaque, s: *Stream) anyerror!void {
         const d = cast(p);
+        tree.narrowed = false;
         if (d.streams.contains(s)) return error.StreamOpen;
         if (d.ring_of) |r| if (r.ring(r.ctx, s)) |ptr| { // the lane's run holds it: a context borrowing it
             const ctx = try d.gpa.create(Ctx);
@@ -515,6 +545,12 @@ pub const Draft = struct {
                 for (prefix[0..@min(it.follow.len, prefix.len)], 0..) |*x, i| x.* = @intCast(i);
                 const kept = it.rows orelse prefix[0..@min(it.follow.len, prefix.len)];
                 d.landing.observeTree(it.stream.sampling != null, ctx.parents[0..ctx.grown], ctx.own[0..ctx.grown], it.offered, kept);
+                ctx.rounds += 1;
+                ctx.kept_rows += @intCast(kept.len);
+                if (it.offered > narrow_nodes) {
+                    ctx.wide_rounds += 1;
+                    for (kept) |r| ctx.wide_extra += @intFromBool(r > narrow_nodes);
+                }
             }
             ctx.grown = 0;
             // the target's features: its ring, `offset` the first row's position (cuda_native.zig's featuresFn)
@@ -571,6 +607,7 @@ pub const Draft = struct {
 
     fn releaseFn(p: *anyopaque, s: *Stream) void {
         const d = cast(p);
+        tree.narrowed = false;
         if (d.streams.fetchRemove(s)) |kv| {
             if (d.streams.count() == 0) d.landing = .{};
             if (kv.value.ring.borrowed) return d.gpa.destroy(kv.value); // its lane's run goes back with the lane
@@ -578,6 +615,16 @@ pub const Draft = struct {
         }
     }
 };
+
+/// The wide-tree guard (Draft.wideGuard): a stream's narrow budget, and the wide rounds it verifies before judging them.
+const narrow_nodes = 15;
+/// A stream narrows only when its extra rows fall clearly below the window's extra cost (the table prices empty context).
+const guard_margin = 1.0;
+const wide_probe = 12;
+fn guardOn() bool {
+    const v = platform.c.getenv("TF_WIDE_GUARD") orelse return false;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
 
 /// Acceptance by depth until a stream has its own (the reference's chat text: measured, see the commit).
 const prior = [_]f64{ 0.75, 0.65, 0.58, 0.52, 0.47, 0.43, 0.4, 0.37, 0.35, 0.33, 0.31, 0.29, 0.28, 0.27, 0.26 };

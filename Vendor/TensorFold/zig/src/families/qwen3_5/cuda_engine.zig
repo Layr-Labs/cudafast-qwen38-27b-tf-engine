@@ -52,6 +52,7 @@ pub fn aligned(n: usize) usize {
 pub const Geo = extern struct { hid: c_int, nk: c_int, nv: c_int, qh: c_int, kvh: c_int, nl: c_int };
 
 const layers = @import("cuda_layers.zig");
+const draft_tree = @import("cuda_draft_tree.zig");
 pub const Proj = layers.Proj;
 pub const Delta = layers.Delta;
 pub const Attention = layers.Attention;
@@ -213,6 +214,7 @@ pub const Engine = struct {
         const g = try Geometry.read(gpa, io, dir);
         const d = ctx.d;
         const e = try @import("cuda_prompt_int8.zig").Allocation(Engine).create(gpa);
+        e.h_window = null; // Allocation.create leaves fields undefined before the first captured forward.
         errdefer gpa.destroy(e);
         e.projection_streams = null;
         errdefer if (e.projection_streams) |*b| b.free();
@@ -573,8 +575,10 @@ pub const Engine = struct {
         @memset(st[ids_at + total * 4 .. ids_at + max_rows * 4], 0); // a bucket's padding rows read token 0
         const segs = std.mem.bytesAsSlice(Seg, st[segs_at..][0 .. parts.len * @sizeOf(Seg)]);
         // past 1 row a window's scan carries each parent's state in the registers to its first child
-        // (tree_slots.carried: one slot fewer, -2 steps); TF_CARRIED=0 restores build's plans
-        const carry = record and total > 1 and !envOff("TF_CARRIED");
+        // (tree_slots.carried: one slot fewer, -2 steps); TF_CARRIED=0 restores build's plans. 2..16-row windows take
+        // the carried and lean scans only while the stream grows at most 15 nodes (cuda_draft_tree.lean16).
+        const lean_floor: usize = if (draft_tree.lean16()) 1 else 16;
+        const carry = record and total > lean_floor and !envOff("TF_CARRIED");
         const slot_peak = try Round.buildCarried(st, parts, record, carry);
         for (parts) |p| {
             try p.cache.settle(e);
@@ -615,7 +619,7 @@ pub const Engine = struct {
         try e.tables.uploadAsync(0, st[0..if (images != null) tables_len else src_at], e.stream.handle); // text: as before
         // carried plans of 2..32 rows (at most 3 slots) scan four value rows a warp on qwen35_slots_lean.cuh (slots_3's
         // arithmetic, its addressing hoisted; 2 slots where they suffice); TF_SLOTS_LEAN=0 keeps prior dispatch
-        const lean = record and total > 1 and total <= 32 and e.affine.pdl and !envOff("TF_SLOTS_LEAN");
+        const lean = record and total > lean_floor and total <= 32 and e.affine.pdl and !envOff("TF_SLOTS_LEAN");
         const wide = total > 16 and total <= 32 and e.affine.pdl and !envOff("TF_WIDE_SLOTS");
         const slot_variant: usize = if (lean and carry and slot_peak <= 3)
             (if (slot_peak <= 2) 37 else 38)

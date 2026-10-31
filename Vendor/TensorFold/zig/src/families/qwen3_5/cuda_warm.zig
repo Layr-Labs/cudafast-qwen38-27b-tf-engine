@@ -2,6 +2,7 @@
 const std = @import("std");
 const lanes = @import("lanes");
 const E = @import("cuda_engine.zig");
+const draft_tree = @import("cuda_draft_tree.zig");
 pub const profile = @import("cuda_startup_profile.zig");
 
 pub const Seen = struct {
@@ -64,10 +65,32 @@ fn timed(io: std.Io, e: anytype, d: anytype, cache: anytype, warmed: *Seen, phas
             warm_ns += profile.elapsed(io, warm_start);
         }
     }
+    const narrow_start = profile.now(io);
+    try warmNarrow(e, cache);
+    warm_ns += profile.elapsed(io, narrow_start);
     try cache.reset(e);
     for (measured[0..e.window_rows]) |m| d.setCost(m.rows, m.ms);
     phases.warmups += warm_ns;
     phases.calibration += profile.elapsed(io, started) - warm_ns;
+}
+
+/// The 2..16-row variants a stream takes once it grows at most 15 nodes (cuda_draft_tree.lean16), warmed untimed after
+/// the widths: their graphs (a 2-row chain's carried scan, the 16-row binary tree's three slots) are captured here, not
+/// inside a narrowed stream's decode. The window table keeps the costs of the 31-node budget's dispatch.
+fn warmNarrow(e: anytype, cache: anytype) !void {
+    if (draft_tree.lean16() or !e.affine.pdl or e.window_rows < 16) return;
+    draft_tree.narrowed = true;
+    defer draft_tree.narrowed = false;
+    const ids: [E.most_window]u32 = @splat(0);
+    var picks: [E.most_window]E.Draw = undefined;
+    for (&picks) |*pk| pk.* = .{ .rule = null, .position = 1 };
+    const par_c3 = [16]i32{ -1, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7 };
+    for (0..2) |_| {
+        try cache.reset(e);
+        try e.forward(&.{.{ .cache = cache, .rows = 2 }}, ids[0..2], .{ .draws = picks[0..2] });
+        try cache.reset(e);
+        try e.forward(&.{.{ .cache = cache, .rows = 16, .parents = &par_c3 }}, ids[0..16], .{ .draws = picks[0..16] });
+    }
 }
 
 /// One width's cost: the fastest of its timed runs, so one slow run cannot set the table.
@@ -140,6 +163,7 @@ fn run(io: std.Io, e: anytype, d: anytype, cache: anytype, warmed: *Seen, phases
             warmed.mark(shape);
         }
     }
+    try warmNarrow(e, cache);
     try cache.reset(e);
     phases.warmups += profile.elapsed(io, started);
 }
