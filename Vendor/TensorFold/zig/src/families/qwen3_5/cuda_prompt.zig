@@ -37,6 +37,7 @@ pub fn run(e: *E.Engine, layer: usize, rows: usize) !void {
 /// (a tile past a row's position is wholly masked and leaves its maximum, sum and output as they were).
 pub fn runFrom(e: *E.Engine, layer: usize, first: usize, end: usize) !void {
     const g = e.g;
+    if (first >= end) return error.InvalidQwenSegments;
     const rows = end - first;
     const at: u64 = first * g.q_heads * head_dim * 2;
     var sg = std.mem.bytesToValue(Seg, e.staged.bytes[E.Engine.segs_at..][0..@sizeOf(Seg)]);
