@@ -99,6 +99,32 @@ __device__ __forceinline__ uint32_t dict_fetch(const DictLanes& D, const unsigne
     return reinterpret_cast<const unsigned short*>(tab)[D.base + idx];
 }
 
+__device__ __forceinline__ uint32_t dict_fetch_raw(const DictLanes& D, const unsigned char* packed, const unsigned char* tab,
+                                                   int g) {
+    if (D.pair && D.shift != 0) return 0u;
+    const uint32_t* pk = reinterpret_cast<const uint32_t*>(packed);
+    const int off = (g * D.step & 63) * 8 + D.bit0;
+    const uint32_t idx = __funnelshift_r(pk[off >> 5], pk[(off >> 5) + 1], off & 31) & D.mask;
+    if (D.pair) return dict_pair_entry(tab, D.gtab, idx);
+    return reinterpret_cast<const unsigned short*>(tab)[D.base + idx];
+}
+
+__device__ __forceinline__ void dict_raw_vals(const DictLanes& D, uint32_t dv, float& sf, float& bf) {
+    const __nv_bfloat162 sb = *reinterpret_cast<const __nv_bfloat162*>(&dv);
+    sf = __low2float(sb);
+    bf = D.pair ? __high2float(sb) : sf;
+}
+
+__device__ __forceinline__ void x_keep_l2(const __nv_bfloat16* x, int rows, int K, int ldx) {
+#if __CUDA_ARCH__ >= 900
+    const int lines = K / 64, total = rows * lines;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total; i += gridDim.x * blockDim.x) {
+        const unsigned char* p = reinterpret_cast<const unsigned char*>(x + static_cast<size_t>(i / lines) * ldx) + (i % lines) * 128;
+        asm volatile("prefetch.global.L2::evict_last [%0];" :: "l"(p));
+    }
+#endif
+}
+
 __device__ __forceinline__ void dict_put(const DictLanes& D, unsigned char* dec, uint32_t v) {
     reinterpret_cast<unsigned short*>(dec)[D.pos] = static_cast<unsigned short>(v);
 }
