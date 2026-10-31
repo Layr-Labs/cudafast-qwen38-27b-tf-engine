@@ -24,6 +24,7 @@ const lp_top = 20;
 pub const Config = @import("cuda_draft_config.zig").Config;
 pub const frame = @import("cuda_draft_frame.zig");
 pub const memory = @import("cuda_draft_memory.zig");
+pub const width_rule = @import("cuda_draft_width.zig");
 const Fns = struct { gather_taps: cuda.Function, gather_rows: cuda.Function, dyn_conv: cuda.Function, norm_rope: cuda.Function, ring_put: cuda.Function, attn: cuda.Function, dyn_conv_batch: cuda.Function, norm_rope_batch: cuda.Function, mask_rows: cuda.Function, attn_partial: cuda.Function, attn_partial_rows4: cuda.Function, attn_merge: cuda.Function };
 
 /// qwen35_draft.cu's TapRows.
@@ -40,6 +41,7 @@ pub const Ctx = struct {
     parents: [engine.most_window]i32 = undefined,
     own: [engine.most_window]f64 = undefined,
     grown: usize = 0,
+    width: width_rule.State = .{},
     // the stream's tokens draft_frame has read, and whether more than 1 in 32 lay outside its spans (then drafts take
     // the whole head)
     scanned: usize = 0,
@@ -94,6 +96,7 @@ pub const Draft = struct {
     ids: u64, // u32 the block's ids
     staged: cuda.HostBuffer, // pinned: the ids up, the words and projected rows down
     streams: std.AutoHashMapUnmanaged(*Stream, *Ctx) = .empty,
+    graphs: std.AutoHashMapUnmanaged(u64, struct { exec: ?cuda.graph.Exec, spanned: ?u64 }) = .empty,
     /// Contexts between streams, allocated and run once (`reserve`), as the driver stalls a buffer's first kernel.
     pool: std.ArrayList(*Ctx) = .empty,
     /// Grown trees' nodes offered and landed, by own chance: the nodes' chances the round loop prices.
@@ -119,7 +122,11 @@ pub const Draft = struct {
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, e: *E, dir: []const u8) !*Draft {
         const started = profile.now(io);
-        const c = try Config.read(gpa, io, dir, e.g);
+        var c = try Config.read(gpa, io, dir, e.g);
+        if (e.affine.pdl and e.g.hidden == 5120 and e.g.layers == 64 and e.g.experts == 0) {
+            c.default_tree_nodes = 31;
+            if (platform.c.getenv("TF_DFLASH_COST_PROBE_MIN_ROWS") == null) c.cost_probe_min_rows = 32;
+        }
         const d = try gpa.create(Draft);
         errdefer gpa.destroy(d);
         d.* = .{ .gpa = gpa, .io = io, .e = e, .c = c, .w = undefined, .mod = undefined, .fns = undefined, .scratch = undefined, .taps_in = 0, .th = 0, .thn = 0, .kabs = 0, .kn = 0, .vabs = 0, .xs = 0, .h = 0, .h2 = 0, .x = 0, .xin = 0, .dyn = 0, .qraw = 0, .q = 0, .kraw = 0, .kb = 0, .vb = 0, .att = 0, .o = 0, .gate = 0, .up = 0, .act = 0, .logits = 0, .words = 0, .parts = 0, .hp = 0, .ids = 0, .staged = undefined };
@@ -171,7 +178,14 @@ pub const Draft = struct {
         }
     }
 
+    pub fn clearGraphs(d: *Draft) void {
+        var it = d.graphs.valueIterator();
+        while (it.next()) |graph| if (graph.exec) |*exec| exec.deinit();
+        d.graphs.deinit(d.gpa);
+        d.graphs = .empty;
+    }
     pub fn deinit(d: *Draft) void {
+        d.clearGraphs();
         var it = d.streams.valueIterator();
         while (it.next()) |ctx| d.drop(ctx.*);
         d.streams.deinit(d.gpa);
@@ -202,14 +216,14 @@ pub const Draft = struct {
         const B = c.block * d.frame_streams;
         const R = @max(max_rows, B);
         const sizes = .{
-            .{ "taps_in", try bytes(.{ R, c.n_taps, c.hidden, 2 }) },                 .{ "th", try bytes(.{ R, c.hidden, 2 }) },              .{ "thn", try bytes(.{ R, c.hidden, 2 }) },                         .{ "kabs", try bytes(.{ R, c.layers, c.kvWidth(), 2 }) },
-            .{ "kn", try bytes(.{ R, c.kvWidth(), 2 }) },                             .{ "vabs", try bytes(.{ R, c.layers, c.kvWidth(), 2 }) },         .{ "xs", try bytes(.{ R, c.n_taps, (c.hidden / 64), 4 }) },         .{ "h", try bytes(.{ B, c.hidden, 2 }) },
-            .{ "h2", try bytes(.{ B, c.hidden, 2 }) },                                .{ "x", try bytes(.{ B, c.hidden, 2 }) },               .{ "xin", try bytes(.{ B, c.hidden, 2 }) },                         .{ "dyn", try bytes(.{ B, c.dynamic(), 2 }) },
-            .{ "qraw", try bytes(.{ B, c.qWidth(), 2 }) },                            .{ "q", try bytes(.{ B, c.qWidth(), 2 }) },             .{ "kraw", try bytes(.{ B, c.kvWidth(), 2 }) },                     .{ "kb", try bytes(.{ B, c.kvWidth(), 2 }) },
-            .{ "vb", try bytes(.{ B, c.kvWidth(), 2 }) },                             .{ "att", try bytes(.{ B, c.qWidth(), 2 }) },           .{ "o", try bytes(.{ B, c.hidden, 2 }) },                           .{ "gate", try bytes(.{ B, c.intermediate, 2 }) },
-            .{ "up", try bytes(.{ B, c.intermediate, 2 }) },                          .{ "act", try bytes(.{ B, c.intermediate, 2 }) },       .{ "logits", try bytes(.{ B, c.vocab, 2 }) },                       .{ "words", try bytes(.{ B, lp_words, 4 }) },
-            .{ "segments", try bytes(.{ d.frame_streams, @sizeOf(frame.Segment) }) }, .{ "pm", try bytes(.{ B, c.heads, frame.chunks, 4 }) }, .{ "pl", try bytes(.{ B, c.heads, frame.chunks, 4 }) },             .{ "po", try bytes(.{ B, c.heads, frame.chunks, c.head_dim, 4 }) },
-            .{ "hp", try bytes(.{ B, c.rank, 2 }) },                                  .{ "ids", try bytes(.{ B, 4 }) },                       .{ "parts", cuda.sample.Draws.topkPartsBytes(c.vocab, c.topk, B) },
+            .{ "taps_in", try bytes(.{ R, c.n_taps, c.hidden, 2 }) },                 .{ "th", try bytes(.{ R, c.hidden, 2 }) },                .{ "thn", try bytes(.{ R, c.hidden, 2 }) },                         .{ "kabs", try bytes(.{ R, c.layers, c.kvWidth(), 2 }) },
+            .{ "kn", try bytes(.{ R, c.kvWidth(), 2 }) },                             .{ "vabs", try bytes(.{ R, c.layers, c.kvWidth(), 2 }) }, .{ "xs", try bytes(.{ R, c.n_taps, (c.hidden / 64), 4 }) },         .{ "h", try bytes(.{ B, c.hidden, 2 }) },
+            .{ "h2", try bytes(.{ B, c.hidden, 2 }) },                                .{ "x", try bytes(.{ B, c.hidden, 2 }) },                 .{ "xin", try bytes(.{ B, c.hidden, 2 }) },                         .{ "dyn", try bytes(.{ B, c.dynamic(), 2 }) },
+            .{ "qraw", try bytes(.{ B, c.qWidth(), 2 }) },                            .{ "q", try bytes(.{ B, c.qWidth(), 2 }) },               .{ "kraw", try bytes(.{ B, c.kvWidth(), 2 }) },                     .{ "kb", try bytes(.{ B, c.kvWidth(), 2 }) },
+            .{ "vb", try bytes(.{ B, c.kvWidth(), 2 }) },                             .{ "att", try bytes(.{ B, c.qWidth(), 2 }) },             .{ "o", try bytes(.{ B, c.hidden, 2 }) },                           .{ "gate", try bytes(.{ B, c.intermediate, 2 }) },
+            .{ "up", try bytes(.{ B, c.intermediate, 2 }) },                          .{ "act", try bytes(.{ B, c.intermediate, 2 }) },         .{ "logits", try bytes(.{ B, c.vocab, 2 }) },                       .{ "words", try bytes(.{ B, lp_words, 4 }) },
+            .{ "segments", try bytes(.{ d.frame_streams, @sizeOf(frame.Segment) }) }, .{ "pm", try bytes(.{ B, c.heads, frame.chunks, 4 }) },   .{ "pl", try bytes(.{ B, c.heads, frame.chunks, 4 }) },             .{ "po", try bytes(.{ B, c.heads, frame.chunks, c.head_dim, 4 }) },
+            .{ "hp", try bytes(.{ B, c.rank, 2 }) },                                  .{ "ids", try bytes(.{ B, 4 }) },                         .{ "parts", cuda.sample.Draws.topkPartsBytes(c.vocab, c.topk, B) },
         };
         var total: usize = 0;
         inline for (sizes) |s| {
@@ -343,6 +357,7 @@ pub const Draft = struct {
             const kv = rows * c.kvWidth() * 2; // a layer's k (v) rows in kabs (vabs)
             // a prompt piece: every layer's k and v project the same normed taps, up to four a prompt GEMM launch
             const grouped = precision.prompt(d.projection_role, rows, precision.dflash_projection_prompt_cutoff);
+            const grouped_live = liveGroups() and !grouped and rows <= 16;
             if (grouped) {
                 const P = cuda.prompt_many;
                 var many: [P.parts_max]P.Out = undefined;
@@ -357,12 +372,26 @@ pub const Draft = struct {
                 };
                 if (n_many > 0) try e.prompt_many.prompt(e.stream, d.thn, many[0..n_many], rows);
             }
+            if (grouped_live) {
+                const A = cuda.qlinear.Affine4Kernels;
+                var many: [A.segs_max]A.Out = undefined;
+                var count: usize = 0;
+                for (d.w.layers, 0..) |l, i| for ([2]cuda.qlinear.Affine4{ l.k, l.v }, [2]u64{ d.kabs + i * kv, d.vabs + i * kv }) |weight, out| {
+                    many[count] = .{ .q = weight, .out = out };
+                    count += 1;
+                    if (count == many.len) {
+                        try e.affine.decodeMany(e.stream, d.thn, d.xs, many[0..count], rows);
+                        count = 0;
+                    }
+                };
+                if (count > 0) try e.affine.decodeMany(e.stream, d.thn, d.xs, many[0..count], rows);
+            }
             for (d.w.layers, 0..) |l, i| {
                 const kabs = d.kabs + i * kv;
                 const vabs = d.vabs + i * kv;
-                if (!grouped) try d.projAgain(l.k, d.thn, kabs, rows);
+                if (!grouped and !grouped_live) try d.projAgain(l.k, d.thn, kabs, rows);
                 try d.normRope(kabs, l.k_norm, d.kn, rows, c.kv_heads, start);
-                if (!grouped) try d.projAgain(l.v, d.thn, vabs, rows);
+                if (!grouped and !grouped_live) try d.projAgain(l.v, d.thn, vabs, rows);
                 try e.run(d.fns.ring_put, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ d.kn, vabs, d.ringK(ctx, i), d.ringV(ctx, i), @as(c_int, @intCast(c.kvWidth())), @as(c_longlong, @intCast(start)), @as(c_int, @intCast(c.ringRows())) });
             }
             start += rows;
@@ -400,7 +429,8 @@ pub const Draft = struct {
         d.drawn = .{ .sampling = it.sampling, .position = it.position };
         defer d.drawn = .{};
         if (it.lanes) |shape| return d.selectLanes(ctx, it.pending, rows, shape);
-        const limit = if (d.c.block == 16) tree.nodes() else 0;
+        const cap = if (d.c.block == 16) tree.nodesDefault(d.c.default_tree_nodes) else 0;
+        const limit = if (cap == 31 and widthRule() and it.sampling == null) ctx.width.nodes() else cap;
         if (limit > 0) {
             // the whole budget whenever drafts are asked: the block's forward costs the same at any depth
             const n = if (it.depth == 0) 0 else limit;
@@ -430,7 +460,7 @@ pub const Draft = struct {
     fn factsFn(p: *anyopaque) dr.Facts {
         const d = cast(p);
         // TF_NO_TREES=1: chains only (for comparing)
-        return .{ .depth = @intCast(d.c.block - 1), .step_ms = d.step_ms, .prior = &prior, .plain_guard = true, .batched = true, .stream_bytes = d.c.ringBytes() + d.target_taps + d.scratch_one, .trees = platform.c.getenv("TF_NO_TREES") == null, .window_costs = d.costs[0..d.n_costs], .lane_costs = d.costs[0..d.n_costs], .tree_nodes = @intCast(if (d.c.block == 16) tree.nodes() else 0), .cost_probe_min_rows = 16 };
+        return .{ .depth = @intCast(d.c.block - 1), .step_ms = d.step_ms, .prior = &prior, .plain_guard = true, .batched = true, .stream_bytes = d.c.ringBytes() + d.target_taps + d.scratch_one, .trees = platform.c.getenv("TF_NO_TREES") == null, .window_costs = d.costs[0..d.n_costs], .lane_costs = d.costs[0..d.n_costs], .tree_nodes = @intCast(if (d.c.block == 16) tree.nodesDefault(d.c.default_tree_nodes) else 0), .cost_probe_min_rows = d.c.cost_probe_min_rows, .fixed_tree_budget = d.c.block == 16 and tree.nodesDefault(d.c.default_tree_nodes) == 31 and widthRule(), .fixed_tree = d.c.fixed_tree };
     }
 
     fn openFn(p: *anyopaque, s: *Stream) anyerror!void {
@@ -460,6 +490,9 @@ pub const Draft = struct {
                 for (prefix[0..@min(it.follow.len, prefix.len)], 0..) |*x, i| x.* = @intCast(i);
                 const kept = it.rows orelse prefix[0..@min(it.follow.len, prefix.len)];
                 d.landing.observeTree(it.stream.sampling != null, ctx.parents[0..ctx.grown], ctx.own[0..ctx.grown], it.offered, kept);
+                if (widthRule() and d.c.block == 16 and tree.nodesDefault(d.c.default_tree_nodes) == 31 and it.stream.sampling == null and !it.prompt and it.offered == ctx.grown) {
+                    ctx.width.observe(width_rule.extraNodes(kept, it.offered));
+                }
             }
             ctx.grown = 0;
             // the target's features: its ring, `offset` the first row's position (cuda_native.zig's featuresFn)
@@ -514,6 +547,7 @@ pub const Draft = struct {
     fn releaseFn(p: *anyopaque, s: *Stream) void {
         const d = cast(p);
         if (d.streams.fetchRemove(s)) |kv| {
+            if (d.streams.count() == 0) d.landing = .{};
             if (kv.value.ring.borrowed) return d.gpa.destroy(kv.value); // its lane's run goes back with the lane
             d.pool.append(d.gpa, kv.value) catch d.drop(kv.value);
         }
@@ -555,4 +589,25 @@ test "a drafter config with a zero divisor is refused, and any admitted rank's s
     defer gpa.free(wide);
     const c = try Config.parse(gpa, wide, target);
     try std.testing.expect(Draft.stagedLen(c.rank) >= Draft.hp_at + (c.block - 1) * c.rank * 2);
+}
+
+/// Independent runtime controls for qualification against the current eager frame.
+pub fn graphsOff() bool {
+    const value = platform.c.getenv("TF_DRAFT_GRAPH") orelse return false;
+    return !std.mem.eql(u8, std.mem.span(value), "1");
+}
+pub fn liveGroups() bool {
+    const value = platform.c.getenv("TF_DRAFT_GROUP_LIVE") orelse return true;
+    return std.mem.eql(u8, std.mem.span(value), "1");
+}
+
+pub fn pairedMlp() bool {
+    const value = platform.c.getenv("TF_DRAFT_MLP_PAIR") orelse return true;
+    return std.mem.eql(u8, std.mem.span(value), "1");
+}
+
+/// Opt-out control; every context starts with a fresh width history.
+pub fn widthRule() bool {
+    const value = platform.c.getenv("TF_DRAFT_WIDTH_RULE") orelse return true;
+    return std.mem.eql(u8, std.mem.span(value), "1");
 }

@@ -68,10 +68,20 @@ pub const Rule = struct {
     greedy_overhead: std.ArrayList(Overhead) = .empty, // overhead from rounds without a sampled stream
 
     pub fn deinit(r: *Rule) void {
+        r.clearObservations();
+    }
+
+    /// Drop measured costs while preserving load-time policy and immutable tables.
+    pub fn clearObservations(r: *Rule) void {
         r.round_ms.deinit(r.gpa);
         r.overhead.deinit(r.gpa);
         r.greedy_ms.deinit(r.gpa);
         r.greedy_overhead.deinit(r.gpa);
+        r.round_ms = .{};
+        r.overhead = .empty;
+        r.greedy_ms = .{};
+        r.greedy_overhead = .empty;
+        r.shared_rounds = 0;
     }
 
     pub fn rates(r: *Rule, who: Who) ![]f64 {

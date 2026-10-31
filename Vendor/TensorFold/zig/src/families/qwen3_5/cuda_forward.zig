@@ -36,6 +36,9 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     const record = shape.record;
     const prompt = shape.prompt;
     const heads: usize = if (record) total else 1;
+    // Independent prompt rows share a block; decode keeps one warp per row.
+    const gdn_rows: usize = if (prompt and total > 16) 4 else 1;
+    const gdn_blocks = (total + gdn_rows - 1) / gdn_rows;
     const t_ids = e.tables.ptr + ids_at;
     const t_segs = e.tables.ptr + segs_at;
     const t_rows = e.tables.ptr + rowseg_at;
@@ -51,21 +54,23 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     // an image chunk's rows take the tower's features, and rotate at their staged t, h, w positions
     const mpos: u64 = if (e.features != 0) e.tables.ptr + mpos_at else 0;
     if (e.features != 0) try e.run(e.fns.splice, .{ total, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, e.features, e.tables.ptr + src_at, @as(c_int, @intCast(g.hidden)), t_params });
+    // a prompt chunk keeps its last row: past its keys and values, the last layer runs that row alone
+    const tail = prompt and @import("cuda_prompt_tail.zig").fits(e, total, nseg, shape.hidden, shape.paged);
     var di: usize = 0;
     var ai: c_int = 0;
     for (e.layers, 0..) |l, i| {
-        try e.norm(i != 0, l.input_norm, total);
+        try e.normInput(i != 0, l.input_norm, total, prompt);
         if (e.learning) |k| try k.input(i, e.h, total);
         switch (l.mixer) {
             .delta => |m| {
                 const layer: c_int = @intCast(di);
                 try e.projMany(&.{ m.qkv, m.z, m.a, m.b }, e.x, &.{ e.qkv, e.z, e.a, e.b }, total, prompt);
                 if (e.learning) |k| try k.delta(i, e.qkv, e.z, e.b, e.a, total);
-                try e.runAfter(e.fns.gdn_pre, .{ 1, 2 * g.k_heads + g.v_heads, total }, .{ 32, 1, 1 }, .{ geo, e.qkv, t_segs, t_rows, t_par, layer, m.conv, e.a, e.b, m.a_log, m.dt_bias, e.q, e.k, e.v, e.g_, e.beta, t_params });
+                try e.runAfter(e.fns.gdn_pre, .{ 1, 2 * g.k_heads + g.v_heads, gdn_blocks }, .{ 32, gdn_rows, 1 }, .{ geo, e.qkv, t_segs, t_rows, t_par, layer, m.conv, e.a, e.b, m.a_log, m.dt_bias, e.q, e.k, e.v, e.g_, e.beta, t_params });
                 // one recorded window of 2+ rows: gdn_pre logged its tails, conv_commit would only return
                 if (!(record and nseg == 1 and total > 1)) try e.runAfter(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
                 if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else try e.deltaScan(record, shape.slots, nseg, layer);
-                try e.runAfter(e.fns.gdn_post, .{ 1, g.v_heads, total }, .{ 32, 1, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums });
+                try e.runAfter(e.fns.gdn_post, .{ 1, g.v_heads, gdn_blocks }, .{ 32, gdn_rows, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums });
                 try e.projAgain(m.out, e.mix, e.r, total, prompt);
                 di += 1;
             },
@@ -73,13 +78,20 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 const aw = g.attnWidth();
                 try e.projMany(&.{ m.q, m.k, m.v }, e.x, &.{ e.qraw, e.kraw, e.vraw }, total, prompt);
                 if (e.learning) |k| try k.attention(i, e.qraw, e.kraw, e.vraw, total);
-                if (e.kv8) {
+                if (prompt and total > 16 and !e.kv8) {
+                    // Preserve the original two head sums and bf16 boundary before rotary/cache stores.
+                    try e.runAfter(e.fns.head_rope_warp, .{ (total * (g.q_heads + g.kv_heads) + 3) / 4, 1, 1 }, .{ 32, 4, 1 }, .{ geo, e.qraw, e.kraw, e.vraw, m.q_norm, m.k_norm, e.qn, t_segs, t_rows, t_anc, @as(c_int, ai), g.eps, t_params, mpos });
+                } else if (e.kv8) {
                     try e.runAfter(e.fns.head_norm, .{ total * g.q_heads, 1, 1 }, .{ 64, 1, 1 }, .{ e.qraw, m.q_norm, e.qn, @as(c_int, @intCast(g.q_heads)), @as(c_int, @intCast(2 * aw)), @as(c_int, 2 * head_dim), g.eps, t_params });
                     try e.runAfter(e.fns.head_norm, .{ total * g.kv_heads, 1, 1 }, .{ 64, 1, 1 }, .{ e.kraw, m.k_norm, e.kn, @as(c_int, @intCast(g.kv_heads)), @as(c_int, @intCast(g.kv_heads * head_dim)), @as(c_int, head_dim), g.eps, t_params });
                     try launch(e, e.fp8.rope, sig.rope, .{ total, g.q_heads + g.kv_heads, 1 }, .{ head_dim, 1, 1 }, .{ geo, e.qn, e.kn, e.vraw, t_segs, t_rows, t_anc, @as(c_int, ai), t_params, mpos });
                 } else {
                     // both head norms and the rope in one launch: a block a (row, head), each normed head rotated in place
-                    try launchAfter(e, e.fns.norm_rope, sig.norm_rope, .{ total, g.q_heads + g.kv_heads, 1 }, .{ head_dim, 1, 1 }, .{ geo, e.qraw, e.kraw, m.q_norm, m.k_norm, e.qn, e.vraw, t_segs, t_rows, t_anc, @as(c_int, ai), t_params, mpos, g.eps });
+                    try launchAfter(e, e.fns.norm_rope, sig.norm_rope, .{ total, g.q_heads + g.kv_heads, 1 }, .{ head_dim, 1, 1 }, .{ geo, e.qraw, e.kraw, m.q_norm, m.k_norm, e.qn, e.vraw, t_segs, t_rows, t_anc, @as(c_int, ai), t_params, mpos, @as(f32, g.eps) });
+                }
+                if (tail and i == e.layers.len - 1) {
+                    try @import("cuda_prompt_tail.zig").run(e, @intCast(ai), total);
+                    return;
                 }
                 if (shape.paged) {
                     try @import("cuda_attention.zig").partial(e, shape, ai);
@@ -94,6 +106,9 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     if (e.kv8) {
                         try launch(e, e.fp8.attn_partial, sig.attn_partial8, .{ total, max_chunks, g.kv_heads }, .{ 128, 1, 1 }, args);
                         try launch(e, e.fp8.attn_rows, sig.attn_rows8, .{ groups, max_chunks, g.kv_heads }, .{ 256, 1, 1 }, rows_args);
+                    } else if (e.wide_attention and shape.wide_attention and nseg == 1 and total > 16 and total <= 32 and group == 6) {
+                        const wide_groups = (total + 4) / 5;
+                        try sharedSized(e, e.fns.attn_wide, sig.attn_wide, .{ wide_groups, partial_chunks, g.kv_heads }, 128, attn_tile, rows_args);
                     } else {
                         try sharedSized(e, e.fns.attn_partial, sig.attn_partial, .{ total, partial_chunks, g.kv_heads }, 128, attn_tile, args);
                         // streams of caches no longer than GROUP_LEN have no row for attn_rows (its blocks would only return)
@@ -108,7 +123,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 ai += 1;
             },
         }
-        try e.norm(true, l.post_norm, total);
+        try e.normInput(true, l.post_norm, total, prompt);
         if (e.learning) |k| try k.post(i, e.h, e.x, total);
         switch (l.mlp) {
             .dense => |m| {
@@ -175,7 +190,8 @@ fn sharedSized(e: *E.Engine, f: cuda.Function, comptime s: sig.Sig, grid: [3]usi
 pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool) !void {
     if (hidden) return;
     const g = e.g;
-    try e.norm(true, e.final_norm, total);
+    if (e.learning == null and heads < total) try e.normTail(e.final_norm, total, heads) else
+        try e.norm(true, e.final_norm, total);
     if (e.learning) |k| try k.final(e.h, total);
     // the head over the kept rows
     try e.proj(e.head, e.x + (total - heads) * g.hidden * 2, e.logits, heads, false);

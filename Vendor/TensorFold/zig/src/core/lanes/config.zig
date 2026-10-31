@@ -25,6 +25,7 @@ pub const Model = struct {
     depth_rate: f64 = 0, // the newest round's weight in a depth's acceptance estimate (0: the core's)
     plain_guard: bool = false, // plain rounds compete with drafted depths
     draft_confidence: ?f64 = null,
+    fixed_tree_budget: bool = false,
     drafts: u32 = 1, // head drafts a round at most
     window_costs: []const Cost = &.{}, // forward ms by exact window width (timed at load)
     mtp_step_ms: f64 = 0.0, // one chained head step (timed at load)
@@ -43,6 +44,7 @@ pub const Model = struct {
     replay_runs: bool = false, // a round's finals go to the backend together first (Backend.finals)
     lane_costs: []const Cost = &.{}, // a lone stream's window ms by rows, up to its widest tree (timed at load)
     lone_cost_tile: u32 = 0, // live lone-window pricing probes at these target row boundaries (0: off)
+    fixed_tree: bool = false, // diagnostic: verify the complete offered tree
     lone_cost_min_rows: u32 = 1, // smallest forced trial; ordinary allocation still uses every width
     context_copies: bool = false, // a lone head window shares its agreeing copy path and appends the rest
     copy_match: i64 = 8, // matching history tokens a copy needs
@@ -61,6 +63,7 @@ pub const Config = struct {
     plain_guard: bool,
     most_drafts: u32,
     draft_confidence: ?f64 = null,
+    fixed_tree_budget: bool = false,
     family_streams: bool,
     batch_rows: u32,
     batch_streams: u32,
@@ -89,6 +92,7 @@ pub const Config = struct {
     mtp_step_ms: f64,
     draft_step_ms: f64 = 0, // Model.draft_step_ms
     lone_cost_tile: u32 = 0, // Model.lone_cost_tile
+    fixed_tree: bool = false, // diagnostic: verify the complete offered tree
     lone_cost_min_rows: u32 = 1, // Model.lone_cost_min_rows
     context_copies: bool = false, // Model.context_copies, within the existing verification width
     enter_match: i64 = 8, // matching tokens a copy needs (rejects coincidental indentation)
@@ -135,6 +139,8 @@ pub const Config = struct {
             .lone_copies = m.lone_copies,
             .lone_cost_tile = m.lone_cost_tile,
             .lone_cost_min_rows = @max(1, m.lone_cost_min_rows),
+            .fixed_tree = m.fixed_tree,
+            .fixed_tree_budget = m.fixed_tree_budget,
             .family_width = width,
             .max_copy = max_copy,
             .first_copy = first_copy,

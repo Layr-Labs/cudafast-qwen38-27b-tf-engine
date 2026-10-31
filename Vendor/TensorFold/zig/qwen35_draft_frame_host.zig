@@ -132,6 +132,10 @@ test "Draft frames: the real hold adapter emits one frame for every stream and i
     for ([_]usize{ 8, 16 }) |block| try actualFrame(block);
 }
 fn actualFrame(block: usize) !void {
+    _ = setenv("TF_DRAFT_GRAPH", "0", 1);
+    defer _ = unsetenv("TF_DRAFT_GRAPH");
+    _ = setenv("TF_DRAFT_MLP_PAIR", "0", 1);
+    defer _ = unsetenv("TF_DRAFT_MLP_PAIR");
     Record.block = block;
     const F = q.draft.frame;
     var driver: cuda.Driver = undefined;
@@ -154,6 +158,9 @@ fn actualFrame(block: usize) !void {
     e.affine.group_fn = function(&driver, 10);
     e.affine.pdl = false;
     e.affine.wide_verify = false;
+    e.affine.split = null;
+    e.affine.narrow = null;
+    e.affine.cluster_decode = false;
     e.fns.norm = function(&driver, 13);
     e.head = .{ .a4 = weight() };
     e.draws.logprob_rows_fn = function(&driver, 9);
@@ -358,4 +365,96 @@ test "Draft frames: enlarged frame byte counts reject overflow" {
     d.c = config();
     d.c.rank = std.math.maxInt(usize);
     try std.testing.expectError(error.Overflow, d.layout(false));
+}
+
+test "Draft frames: landing observations end with the last released stream" {
+    const gpa = std.testing.allocator;
+    var d: q.draft.Draft = undefined;
+    d.gpa = gpa;
+    d.streams = .empty;
+    defer d.streams.deinit(gpa);
+    d.landing = .{};
+    d.landing.observe(false, -0.1, true);
+    d.landing.observe(true, -1.2, false);
+    const observed = d.landing;
+    var first: lanes.Stream = undefined;
+    var second: lanes.Stream = undefined;
+    const first_ctx = try gpa.create(q.draft.Ctx);
+    var first_owned = true;
+    defer if (first_owned) gpa.destroy(first_ctx);
+    first_ctx.* = undefined;
+    first_ctx.ring.borrowed = true;
+    const second_ctx = try gpa.create(q.draft.Ctx);
+    var second_owned = true;
+    defer if (second_owned) gpa.destroy(second_ctx);
+    second_ctx.* = undefined;
+    second_ctx.ring.borrowed = true;
+    try d.streams.put(gpa, &first, first_ctx);
+    try d.streams.put(gpa, &second, second_ctx);
+    d.drafter().release(&first);
+    first_owned = false;
+    try std.testing.expectEqual(@as(u32, 1), d.streams.count());
+    try std.testing.expectEqualDeep(observed, d.landing);
+    d.drafter().release(&second);
+    second_owned = false;
+    try std.testing.expectEqual(@as(u32, 0), d.streams.count());
+    try std.testing.expectEqualDeep(q.draft.tree.Landing{}, d.landing);
+}
+
+test { _ = @import("qwen35_draft_legacy_host.zig"); }
+
+test "Draft frames: width rule observes twelve rounds and keeps two landed extra nodes" {
+    for ([_]usize{ 0, 1, 2, 31 }) |extra| {
+        var s: q.draft.width_rule.State = .{};
+        for (0..11) |_| { try std.testing.expectEqual(@as(usize, 31), s.nodes()); s.observe(0); }
+        try std.testing.expectEqual(@as(usize, 31), s.nodes());
+        s.observe(extra);
+        try std.testing.expectEqual(@as(usize, if (extra >= 2) 31 else 15), s.nodes());
+        if (extra >= 2) for (0..1000) |_| { s.observe(0); try std.testing.expectEqual(@as(usize, 31), s.nodes()); };
+    }
+}
+
+test "Draft frames: width rule retries after sixteen narrow rounds with two ordinary wide rounds" {
+    for ([_]usize{ 0, 1 }) |extra| {
+        var s: q.draft.width_rule.State = .{};
+        for (0..12) |_| s.observe(0);
+        for (0..16) |_| { try std.testing.expectEqual(@as(usize, 15), s.nodes()); s.observe(99); }
+        try std.testing.expectEqual(@as(usize, 31), s.nodes());
+        s.observe(extra);
+        try std.testing.expectEqual(@as(usize, 31), s.nodes());
+        s.observe(0);
+        try std.testing.expectEqual(@as(usize, if (extra == 1) 31 else 15), s.nodes());
+        s = .{};
+        try std.testing.expectEqual(@as(usize, 31), s.nodes());
+        try std.testing.expectEqual(@as(u8, 0), s.rounds);
+        try std.testing.expectEqual(@as(u16, 0), s.extra);
+    }
+}
+
+test "Draft frames: width reward excludes the pending row, narrow nodes and copied grafts" {
+    const path = [_]u32{0, 1, 15, 16, 17, 31, 32};
+    try std.testing.expectEqual(@as(usize, 0), q.draft.width_rule.extraNodes(&path, 15));
+    try std.testing.expectEqual(@as(usize, 1), q.draft.width_rule.extraNodes(&path, 16));
+    try std.testing.expectEqual(@as(usize, 3), q.draft.width_rule.extraNodes(&path, 31));
+    try std.testing.expectEqual(@as(usize, 0), q.draft.width_rule.extraNodes(&.{}, 31));
+}
+
+test "Draft frames: configured wide default enables the stream controller without overriding an explicit node cap" {
+    _ = unsetenv("TF_DRAFT_NODES");
+    _ = unsetenv("TF_DRAFT_WIDTH_RULE");
+    var d: q.draft.Draft=undefined;
+    d.projection_role=.proposal;d.frame_streams=1;d.scratch_one=0;d.target_taps=0;
+    d.c=config();d.c.block=16;d.c.default_tree_nodes=31;d.step_ms=1;d.n_costs=0;
+    try std.testing.expect(q.draft.widthRule());
+    const wide=d.drafter().facts();
+    try std.testing.expectEqual(@as(u32,31),wide.tree_nodes);
+    try std.testing.expect(wide.fixed_tree_budget);
+    _ = setenv("TF_DRAFT_NODES","15",1);
+    defer _ = unsetenv("TF_DRAFT_NODES");
+    const narrow=d.drafter().facts();
+    try std.testing.expectEqual(@as(u32,15),narrow.tree_nodes);
+    try std.testing.expect(!narrow.fixed_tree_budget);
+    _ = setenv("TF_DRAFT_WIDTH_RULE","0",1);
+    defer _ = unsetenv("TF_DRAFT_WIDTH_RULE");
+    try std.testing.expect(!q.draft.widthRule());
 }

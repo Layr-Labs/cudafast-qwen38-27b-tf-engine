@@ -56,9 +56,37 @@ pub fn steps(st: []u8) []slots.Step {
 pub fn variant(peak: usize) usize {
     return if (peak <= 1) 1 else if (peak <= 2) 2 else if (peak <= 4) 4 else if (peak <= 8) 8 else 16;
 }
+/// A separate graph key for the exact three-slot specialization; wider windows keep their existing dispatch.
+pub fn narrowVariant(rows: usize, peak: usize, enabled: bool) usize {
+    return if (enabled and rows > 1 and rows <= 16 and peak == 3) 35 else variant(peak);
+}
 pub fn build(st: []u8, parts: []const @import("cuda_engine.zig").Part, record: bool) !usize {
     var scratch: [max_rows * @sizeOf(usize)]u8 align(@alignOf(usize)) = undefined;
     return buildWithScratch(st, parts, record, &scratch);
+}
+
+/// Retain the same traversal and internal slot IDs, omitting stores of states no child can read.
+pub fn buildLeaves(st: []u8, parts: []const @import("cuda_engine.zig").Part, record: bool) !usize {
+    _ = try build(st, parts, record);
+    if (!record) return 1;
+    const schedule = steps(st);
+    var first: usize = 0;
+    var peak: usize = 1;
+    for (parts) |p| {
+        var internal: u64 = 0;
+        for (0..p.rows) |row| {
+            const parent: i32 = if (p.parents) |ps| ps[row] else if (row == 0) -1 else @intCast(row - 1);
+            if (parent >= 0) internal |= @as(u64, 1) << @intCast(parent);
+        }
+        for (schedule[first..][0..p.rows]) |*step| {
+            const row = step.row - first;
+            if (internal & (@as(u64, 1) << @intCast(row)) == 0) step.write_slot = -1;
+            if (step.read_slot >= 0) peak = @max(peak, @as(usize, @intCast(step.read_slot)) + 1);
+            if (step.write_slot >= 0) peak = @max(peak, @as(usize, @intCast(step.write_slot)) + 1);
+        }
+        first += p.rows;
+    }
+    return peak;
 }
 
 /// Branch scheduling uses scratch; straight chains only need their staged steps.

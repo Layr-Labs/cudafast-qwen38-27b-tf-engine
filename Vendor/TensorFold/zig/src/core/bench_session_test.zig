@@ -507,3 +507,37 @@ test "a step without top logits is initialized" {
         try std.testing.expectEqual(@as(f32, 0), entry.logit);
     }
 }
+
+test "phase close discards learned planner prices and retained calibration" {
+    const f = try Fixture.initModel(.{
+        .exact_width = 2,
+        .gpu_tokens = true,
+        .hidden_rows = true,
+        .lone_cost_tile = 16,
+        .window_costs = &.{.{ .width = 1, .ms = 80 }},
+    });
+    defer f.deinit();
+    const session = f.adapter.session();
+    _ = try session.seed(&.{ 2, 3 }, false);
+    const a = std.testing.allocator;
+    try f.core.rule.round_ms.put(a, 0, 9);
+    try f.core.rule.greedy_ms.put(a, 0, 8);
+    try f.core.rule.overhead.append(a, .{ .streams = 1, .ms = 7 });
+    try f.core.rule.greedy_overhead.append(a, .{ .streams = 1, .ms = 6 });
+    f.core.rule.shared_rounds = 17;
+    for (&f.core.lone_kept) |*mode| for (mode) |*kept| {
+        kept.* = .{};
+        try kept.*.?.ms.put(a, 0, 5);
+    };
+    const startup = f.core.rule.family_costs.get(1);
+    _ = try session.closePhase();
+    for (f.core.lone_kept) |mode| for (mode) |kept| try std.testing.expect(kept == null);
+    try std.testing.expect(f.core.rule.round_ms.empty());
+    try std.testing.expect(f.core.rule.greedy_ms.empty());
+    try std.testing.expectEqual(@as(usize, 0), f.core.rule.overhead.items.len);
+    try std.testing.expectEqual(@as(usize, 0), f.core.rule.greedy_overhead.items.len);
+    try std.testing.expectEqual(@as(u64, 0), f.core.rule.shared_rounds);
+    try std.testing.expectEqual(startup, f.core.rule.family_costs.get(1));
+    _ = try session.seed(&.{ 7, 8 }, false);
+    _ = try session.closePhase();
+}

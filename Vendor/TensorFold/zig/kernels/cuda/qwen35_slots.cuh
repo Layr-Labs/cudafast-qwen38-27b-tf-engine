@@ -25,16 +25,16 @@ template <int N>
 __host__ __device__ constexpr int q35_log2() { return N <= 1 ? 0 : 1 + q35_log2<N / 2>(); }
 
 // R value rows a warp share a step's loads; its k . state sums reduce with the last step's outputs; slots in shared.
-template <int SLOTS, int R>
+template <int SLOTS, int R, bool REUSE = false, int WARPS = 4>
 __device__ __forceinline__ void q35_slots(Geo geo, const __nv_bfloat16* q, const __nv_bfloat16* k,
         const __nv_bfloat16* v, const float* g, const __nv_bfloat16* beta, const Seg* segs,
         const SlotStep* steps, int layer, __nv_bfloat16* y, const int* P) {
-    __shared__ float4 kept[4][SLOTS * R * 32];
+    __shared__ float4 kept[WARPS][SLOTS * R * 32];
     const int NK = geo.nk, NV = geo.nv;
     if (past_windows(P, blockIdx.z / NV)) return;
     const int hv = blockIdx.z % NV, hk = hv / (NV / NK);
     const Seg sg = segs[blockIdx.z / NV];
-    const int dk = threadIdx.x, dv0 = (blockIdx.y * 4 + threadIdx.y) * R;
+    const int dk = threadIdx.x, dv0 = (blockIdx.y * WARPS + threadIdx.y) * R;
     constexpr int PT = DK / 32;
     static_assert(PT == 4, "a lane's four state entries are one float4 slot");
     const size_t at = ((size_t)hv * DK + dv0) * DK + PT * dk;  // row r's entries are r * DK further
@@ -96,6 +96,7 @@ __device__ __forceinline__ void q35_slots(Geo geo, const __nv_bfloat16* q, const
         step_next = steps[sg.row0];
         load(step_next.row, next);
     }
+    int live_slot = -2;
     for (int item = 0; item < sg.rows; ++item) {
         const SlotStep step = step_next;
         const In in = next;
@@ -107,11 +108,13 @@ __device__ __forceinline__ void q35_slots(Geo geo, const __nv_bfloat16* q, const
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             if (step.read_slot >= 0) {
+                if (!REUSE || step.read_slot != live_slot) {
                 const float4 t = slots[(step.read_slot * R + r) * 32 + dk];
                 state[r][0] = t.x;
                 state[r][1] = t.y;
                 state[r][2] = t.z;
                 state[r][3] = t.w;
+                }
             } else {
 #pragma unroll
                 for (int i = 0; i < PT; ++i) state[r][i] = root[r][i];
@@ -153,6 +156,7 @@ __device__ __forceinline__ void q35_slots(Geo geo, const __nv_bfloat16* q, const
             }
             if (step.write_slot >= 0) slots[(step.write_slot * R + r) * 32 + dk] = make_float4(state[r][0], state[r][1], state[r][2], state[r][3]);
         }
+        if constexpr (REUSE) live_slot = step.write_slot >= 0 ? step.write_slot : -2;
         pend_row = row;
         if (record) {
             const LogRow l = log_row(geo, sg, layer, rr);
@@ -183,13 +187,24 @@ __device__ __forceinline__ void q35_slots(Geo geo, const __nv_bfloat16* q, const
 #pragma unroll
         for (int i = 0; i < PT; ++i) st[r * DK + i] = state[r][i];
 }
-#define TF_Q35_SLOTS(N, R) \
+#define TF_Q35_SLOTS(N, R, REUSE) \
 extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_slots_##N(Geo geo, const __nv_bfloat16* q, \
  const __nv_bfloat16* k, const __nv_bfloat16* v, const float* g, const __nv_bfloat16* beta, const Seg* segs, \
  const SlotStep* steps, int layer, __nv_bfloat16* y, const int* P) { \
-  release_next(); await_prior(); q35_slots<N, R>(geo, q, k, v, g, beta, segs, steps, layer, y, P); }
-TF_Q35_SLOTS(1, 2)
-TF_Q35_SLOTS(2, 2)
-TF_Q35_SLOTS(4, 2)
-TF_Q35_SLOTS(8, 1)
-TF_Q35_SLOTS(16, 1)
+  release_next(); await_prior(); q35_slots<N, R, REUSE>(geo, q, k, v, g, beta, segs, steps, layer, y, P); }
+TF_Q35_SLOTS(1, 2, false)
+TF_Q35_SLOTS(2, 2, false)
+TF_Q35_SLOTS(4, 2, false)
+TF_Q35_SLOTS(8, 1, false)
+TF_Q35_SLOTS(16, 1, false)
+
+TF_Q35_SLOTS(3, 4, true)
+
+#define TF_Q35_WIDE_SLOTS(NAME, S, R, W) \
+extern "C" __global__ void __launch_bounds__(32 * W) tf_q35_gdn_slots_##NAME(Geo geo, const __nv_bfloat16* q, \
+ const __nv_bfloat16* k, const __nv_bfloat16* v, const float* g, const __nv_bfloat16* beta, const Seg* segs, \
+ const SlotStep* steps, int layer, __nv_bfloat16* y, const int* P) { \
+  release_next(); await_prior(); q35_slots<S, R, true, W>(geo, q, k, v, g, beta, segs, steps, layer, y, P); }
+TF_Q35_WIDE_SLOTS(2wide, 2, 4, 8)
+TF_Q35_WIDE_SLOTS(1wide, 1, 4, 8)
+TF_Q35_WIDE_SLOTS(4wide, 4, 2, 4)
