@@ -439,3 +439,26 @@ test "lone price: deadlines a run of streams backed off start the next stream at
     try std.testing.expectEqual(2 + own.carry_most, next.cost_probes[16].after);
     try std.testing.expectEqual(own.carry_most, next.cost_probes[16].spacing);
 }
+
+test "lone price: fixed trees ignore width prices and due trials" {
+    var cfg = try setup();
+    defer cfg.deinit(a);
+    cfg.fixed_tree = true;
+    var target: fake.Fake = .{ .gpa = a };
+    defer target.deinit();
+    var clock: fake.FixedClock = .{};
+    var e = Engine.init(a, &cfg, target.backend(), clock.clock());
+    defer e.deinit();
+    e.alone = true;
+    var s = try Stream.init(a, .{ .id = "fixed", .prompt = &.{3}, .max_new = 128 });
+    defer s.deinit(a);
+    _ = try e.rule.rates(win.who(&s));
+    @memset(s.depth.?.p, 0.001);
+    s.rounds = 8;
+    const tokens: [16]u32 = @splat(7);
+    var plans = [_]win.Plan{.{ .stream = &s, .position = 1, .kind = .head, .tokens = &tokens }};
+    try win.allocate(&e, &plans);
+    try std.testing.expectEqual(@as(usize, 16), plans[0].count());
+    try std.testing.expectEqual(@as(?u32, 16), s.granted);
+    try std.testing.expect(s.cost_probe_trial == null);
+}

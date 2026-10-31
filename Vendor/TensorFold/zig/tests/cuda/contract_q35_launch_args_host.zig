@@ -129,7 +129,7 @@ fn tupleElements(a: std.mem.Allocator, tokens: []const Tok, text: []const u8, op
 
 /// The kind a launch site's argument carries: the geometry struct, a pointer, a count or a scale.
 fn argKind(text: []const u8) sig.Kind {
-    if (std.mem.startsWith(u8, text, "@as(f32")) return .f32;
+    if (std.mem.startsWith(u8, text, "@as(f32") or std.mem.eql(u8, text, "g.eps")) return .f32;
     if (std.mem.startsWith(u8, text, "@as(c_int")) return .i32;
     if (std.mem.eql(u8, text, "geo")) return .geo;
     return .ptr;
@@ -178,7 +178,7 @@ fn sitesIn(a: std.mem.Allocator, path: []const u8, text: [:0]const u8, out: *std
     while (i < list.len) : (i += 1) {
         if (list[i].tag != .identifier) continue;
         const name = text[list[i].loc.start..list[i].loc.end];
-        if (!std.mem.eql(u8, name, "run") and !std.mem.eql(u8, name, "shared") and !std.mem.eql(u8, name, "launch")) continue;
+        if (!std.mem.eql(u8, name, "run") and !std.mem.eql(u8, name, "shared") and !std.mem.eql(u8, name, "sharedSized") and !std.mem.eql(u8, name, "launch") and !std.mem.eql(u8, name, "launchAfter")) continue;
         if (i + 1 >= list.len or list[i + 1].tag != .l_paren) continue;
         var spans: std.ArrayList(Span) = .empty;
         var depth: usize = 0;

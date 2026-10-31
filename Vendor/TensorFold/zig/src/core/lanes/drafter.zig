@@ -17,6 +17,7 @@ pub const Facts = struct {
     trees: bool = false, // hold() takes a tree of lanes (Hold.lanes), each lane its parent's rank-r token
     window_costs: []const Cost = &.{}, // the target's window ms by rows (timed at load), for the depth rule
     lane_costs: []const Cost = &.{}, // the same for the lane planner (Model.lane_costs)
+    fixed_tree: bool = false, // diagnostic: verify the complete offered tree
     cost_probe_min_rows: u32 = 1, // minimum forced target-width trial; no change to ordinary allocation
     tree_nodes: u32 = 0, // hold() without lanes grows its own tree of up to `depth` nodes, at most this many (tree, chances)
 };

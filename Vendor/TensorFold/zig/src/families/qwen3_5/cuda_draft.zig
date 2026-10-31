@@ -119,7 +119,11 @@ pub const Draft = struct {
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, e: *E, dir: []const u8) !*Draft {
         const started = profile.now(io);
-        const c = try Config.read(gpa, io, dir, e.g);
+        var c = try Config.read(gpa, io, dir, e.g);
+        if (e.affine.pdl and e.g.hidden == 5120 and e.g.layers == 64 and e.g.experts == 0) {
+            c.default_tree_nodes = 31;
+            if (platform.c.getenv("TF_DFLASH_COST_PROBE_MIN_ROWS") == null) c.cost_probe_min_rows = 32;
+        }
         const d = try gpa.create(Draft);
         errdefer gpa.destroy(d);
         d.* = .{ .gpa = gpa, .io = io, .e = e, .c = c, .w = undefined, .mod = undefined, .fns = undefined, .scratch = undefined, .taps_in = 0, .th = 0, .thn = 0, .kabs = 0, .kn = 0, .vabs = 0, .xs = 0, .h = 0, .h2 = 0, .x = 0, .xin = 0, .dyn = 0, .qraw = 0, .q = 0, .kraw = 0, .kb = 0, .vb = 0, .att = 0, .o = 0, .gate = 0, .up = 0, .act = 0, .logits = 0, .words = 0, .parts = 0, .hp = 0, .ids = 0, .staged = undefined };
@@ -202,14 +206,14 @@ pub const Draft = struct {
         const B = c.block * d.frame_streams;
         const R = @max(max_rows, B);
         const sizes = .{
-            .{ "taps_in", try bytes(.{ R, c.n_taps, c.hidden, 2 }) },                 .{ "th", try bytes(.{ R, c.hidden, 2 }) },              .{ "thn", try bytes(.{ R, c.hidden, 2 }) },                         .{ "kabs", try bytes(.{ R, c.layers, c.kvWidth(), 2 }) },
-            .{ "kn", try bytes(.{ R, c.kvWidth(), 2 }) },                             .{ "vabs", try bytes(.{ R, c.layers, c.kvWidth(), 2 }) },         .{ "xs", try bytes(.{ R, c.n_taps, (c.hidden / 64), 4 }) },         .{ "h", try bytes(.{ B, c.hidden, 2 }) },
-            .{ "h2", try bytes(.{ B, c.hidden, 2 }) },                                .{ "x", try bytes(.{ B, c.hidden, 2 }) },               .{ "xin", try bytes(.{ B, c.hidden, 2 }) },                         .{ "dyn", try bytes(.{ B, c.dynamic(), 2 }) },
-            .{ "qraw", try bytes(.{ B, c.qWidth(), 2 }) },                            .{ "q", try bytes(.{ B, c.qWidth(), 2 }) },             .{ "kraw", try bytes(.{ B, c.kvWidth(), 2 }) },                     .{ "kb", try bytes(.{ B, c.kvWidth(), 2 }) },
-            .{ "vb", try bytes(.{ B, c.kvWidth(), 2 }) },                             .{ "att", try bytes(.{ B, c.qWidth(), 2 }) },           .{ "o", try bytes(.{ B, c.hidden, 2 }) },                           .{ "gate", try bytes(.{ B, c.intermediate, 2 }) },
-            .{ "up", try bytes(.{ B, c.intermediate, 2 }) },                          .{ "act", try bytes(.{ B, c.intermediate, 2 }) },       .{ "logits", try bytes(.{ B, c.vocab, 2 }) },                       .{ "words", try bytes(.{ B, lp_words, 4 }) },
-            .{ "segments", try bytes(.{ d.frame_streams, @sizeOf(frame.Segment) }) }, .{ "pm", try bytes(.{ B, c.heads, frame.chunks, 4 }) }, .{ "pl", try bytes(.{ B, c.heads, frame.chunks, 4 }) },             .{ "po", try bytes(.{ B, c.heads, frame.chunks, c.head_dim, 4 }) },
-            .{ "hp", try bytes(.{ B, c.rank, 2 }) },                                  .{ "ids", try bytes(.{ B, 4 }) },                       .{ "parts", cuda.sample.Draws.topkPartsBytes(c.vocab, c.topk, B) },
+            .{ "taps_in", try bytes(.{ R, c.n_taps, c.hidden, 2 }) },                 .{ "th", try bytes(.{ R, c.hidden, 2 }) },                .{ "thn", try bytes(.{ R, c.hidden, 2 }) },                         .{ "kabs", try bytes(.{ R, c.layers, c.kvWidth(), 2 }) },
+            .{ "kn", try bytes(.{ R, c.kvWidth(), 2 }) },                             .{ "vabs", try bytes(.{ R, c.layers, c.kvWidth(), 2 }) }, .{ "xs", try bytes(.{ R, c.n_taps, (c.hidden / 64), 4 }) },         .{ "h", try bytes(.{ B, c.hidden, 2 }) },
+            .{ "h2", try bytes(.{ B, c.hidden, 2 }) },                                .{ "x", try bytes(.{ B, c.hidden, 2 }) },                 .{ "xin", try bytes(.{ B, c.hidden, 2 }) },                         .{ "dyn", try bytes(.{ B, c.dynamic(), 2 }) },
+            .{ "qraw", try bytes(.{ B, c.qWidth(), 2 }) },                            .{ "q", try bytes(.{ B, c.qWidth(), 2 }) },               .{ "kraw", try bytes(.{ B, c.kvWidth(), 2 }) },                     .{ "kb", try bytes(.{ B, c.kvWidth(), 2 }) },
+            .{ "vb", try bytes(.{ B, c.kvWidth(), 2 }) },                             .{ "att", try bytes(.{ B, c.qWidth(), 2 }) },             .{ "o", try bytes(.{ B, c.hidden, 2 }) },                           .{ "gate", try bytes(.{ B, c.intermediate, 2 }) },
+            .{ "up", try bytes(.{ B, c.intermediate, 2 }) },                          .{ "act", try bytes(.{ B, c.intermediate, 2 }) },         .{ "logits", try bytes(.{ B, c.vocab, 2 }) },                       .{ "words", try bytes(.{ B, lp_words, 4 }) },
+            .{ "segments", try bytes(.{ d.frame_streams, @sizeOf(frame.Segment) }) }, .{ "pm", try bytes(.{ B, c.heads, frame.chunks, 4 }) },   .{ "pl", try bytes(.{ B, c.heads, frame.chunks, 4 }) },             .{ "po", try bytes(.{ B, c.heads, frame.chunks, c.head_dim, 4 }) },
+            .{ "hp", try bytes(.{ B, c.rank, 2 }) },                                  .{ "ids", try bytes(.{ B, 4 }) },                         .{ "parts", cuda.sample.Draws.topkPartsBytes(c.vocab, c.topk, B) },
         };
         var total: usize = 0;
         inline for (sizes) |s| {
@@ -400,7 +404,7 @@ pub const Draft = struct {
         d.drawn = .{ .sampling = it.sampling, .position = it.position };
         defer d.drawn = .{};
         if (it.lanes) |shape| return d.selectLanes(ctx, it.pending, rows, shape);
-        const limit = if (d.c.block == 16) tree.nodes() else 0;
+        const limit = if (d.c.block == 16) tree.nodesDefault(d.c.default_tree_nodes) else 0;
         if (limit > 0) {
             // the whole budget whenever drafts are asked: the block's forward costs the same at any depth
             const n = if (it.depth == 0) 0 else limit;
@@ -430,7 +434,7 @@ pub const Draft = struct {
     fn factsFn(p: *anyopaque) dr.Facts {
         const d = cast(p);
         // TF_NO_TREES=1: chains only (for comparing)
-        return .{ .depth = @intCast(d.c.block - 1), .step_ms = d.step_ms, .prior = &prior, .plain_guard = true, .batched = true, .stream_bytes = d.c.ringBytes() + d.target_taps + d.scratch_one, .trees = platform.c.getenv("TF_NO_TREES") == null, .window_costs = d.costs[0..d.n_costs], .lane_costs = d.costs[0..d.n_costs], .tree_nodes = @intCast(if (d.c.block == 16) tree.nodes() else 0), .cost_probe_min_rows = 16 };
+        return .{ .depth = @intCast(d.c.block - 1), .step_ms = d.step_ms, .prior = &prior, .plain_guard = true, .batched = true, .stream_bytes = d.c.ringBytes() + d.target_taps + d.scratch_one, .trees = platform.c.getenv("TF_NO_TREES") == null, .window_costs = d.costs[0..d.n_costs], .lane_costs = d.costs[0..d.n_costs], .tree_nodes = @intCast(if (d.c.block == 16) tree.nodesDefault(d.c.default_tree_nodes) else 0), .cost_probe_min_rows = d.c.cost_probe_min_rows, .fixed_tree = d.c.fixed_tree };
     }
 
     fn openFn(p: *anyopaque, s: *Stream) anyerror!void {

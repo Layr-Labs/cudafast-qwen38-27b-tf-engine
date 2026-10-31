@@ -18,7 +18,8 @@ pub fn projectMany(e: *Engine, ls: []const Proj, x: u64, xs: u64, outs: []const 
     }
     const A = cuda.qlinear.Affine4Kernels;
     // GB10 has no split form: a decode or verify window of one row tile groups its projections by kernel instead
-    const by_kernel = e.affine.split != null or (!prompt and rows <= A.max_rows);
+    const wide = e.affine.group_wide and !prompt and rows > A.max_rows and rows <= 32;
+    const by_kernel = e.affine.split != null or (!prompt and rows <= A.max_rows) or wide;
     const segmented = by_kernel and !(prompt and rows > 16) and ls.len <= A.segs_max and for (ls) |l| {
         if (l != .a4 or l.inputs() != ls[0].inputs()) break false;
     } else true;
@@ -29,6 +30,10 @@ pub fn projectMany(e: *Engine, ls: []const Proj, x: u64, xs: u64, outs: []const 
     const k = ls[0].inputs();
     if (sums) try e.run(e.fns.sums, .{ rows, (k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ x, xs, @as(c_int, @intCast(k)), params });
     var many: [A.segs_max]A.Out = undefined;
+    if (wide) {
+        for (ls, outs, many[0..ls.len]) |l, out, *m| m.* = .{ .q = l.a4, .out = out };
+        return e.affine.verifyMany32(e.stream, x, xs, many[0..ls.len], rows);
+    }
     var at: usize = 0;
     while (at < rows) : (at += A.max_rows) {
         for (ls, outs, many[0..ls.len]) |l, out, *m| m.* = .{ .q = l.a4, .out = out + at * l.outputs() * 2 };

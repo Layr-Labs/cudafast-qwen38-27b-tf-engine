@@ -4,6 +4,9 @@ const engine = @import("cuda_engine.zig");
 const max_rows = engine.max_rows;
 const lp_top = 20;
 pub const Config = struct {
+    default_tree_nodes: usize = 15,
+    fixed_tree: bool = false,
+    cost_probe_min_rows: u32 = 16,
     hidden: usize,
     intermediate: usize,
     layers: usize,
@@ -44,7 +47,17 @@ pub const Config = struct {
         defer gpa.free(path);
         const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20));
         defer gpa.free(bytes);
-        return parse(gpa, bytes, target);
+        var c = try parse(gpa, bytes, target);
+        if (@import("sys").c.getenv("TF_DFLASH_FIXED_TREE")) |v| {
+            const value = std.mem.span(v);
+            if (!std.mem.eql(u8, value, "0") and !std.mem.eql(u8, value, "1")) return error.BadDraftTree;
+            c.fixed_tree = std.mem.eql(u8, value, "1");
+        }
+        if (@import("sys").c.getenv("TF_DFLASH_COST_PROBE_MIN_ROWS")) |v| {
+            c.cost_probe_min_rows = std.fmt.parseInt(u32, std.mem.span(v), 10) catch return error.BadDraftTree;
+            if (c.cost_probe_min_rows == 0 or c.cost_probe_min_rows > 129) return error.BadDraftTree;
+        }
+        return c;
     }
 
     pub fn parse(gpa: std.mem.Allocator, bytes: []const u8, target: engine.Geometry) !Config {

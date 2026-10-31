@@ -94,6 +94,9 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     if (e.kv8) {
                         try launch(e, e.fp8.attn_partial, sig.attn_partial8, .{ total, max_chunks, g.kv_heads }, .{ 128, 1, 1 }, args);
                         try launch(e, e.fp8.attn_rows, sig.attn_rows8, .{ groups, max_chunks, g.kv_heads }, .{ 256, 1, 1 }, rows_args);
+                    } else if (e.wide_attention and shape.wide_attention and nseg == 1 and total > 16 and total <= 32 and group == 6) {
+                        const wide_groups = (total + 4) / 5;
+                        try sharedSized(e, e.fns.attn_wide, sig.attn_wide, .{ wide_groups, partial_chunks, g.kv_heads }, 128, attn_tile, rows_args);
                     } else {
                         try sharedSized(e, e.fns.attn_partial, sig.attn_partial, .{ total, partial_chunks, g.kv_heads }, 128, attn_tile, args);
                         // streams of caches no longer than GROUP_LEN have no row for attn_rows (its blocks would only return)

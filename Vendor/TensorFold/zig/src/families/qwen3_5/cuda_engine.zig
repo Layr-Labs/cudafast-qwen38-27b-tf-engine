@@ -14,6 +14,7 @@ const profile = @import("cuda_startup_profile.zig");
 const modelopt = @import("cuda_modelopt.zig");
 const x3w = @import("cuda_exl3_weights.zig");
 pub const recurrent = @import("cuda_recurrent.zig");
+pub const wide_weight_layout = @import("cuda_wide_weights.zig");
 
 pub const Geometry = geometry.Geometry;
 pub const Cache = caches.Cache;
@@ -107,6 +108,8 @@ pub const Engine = struct {
     affine: cuda.qlinear.Affine4Kernels,
     prompt_many: cuda.prompt_many.Kernels, // prompt GEMMs, several projections of one input a launch
     mlp_pair: cuda.mlp_pair.Kernels, // decode gate, up and activation in one launch (qmm_group.cu tf_qmm_mlp_pair)
+    wide_words: ?DeviceBuffer = null,
+    wide_attention: bool,
     wide: cuda.qlinear.AffineNKernels, // the tiles of every width but 4, and their packs
     experts: cuda.experts.Affine4Experts,
     experts3: cuda.experts3.Affine3Experts,
@@ -195,6 +198,8 @@ pub const Engine = struct {
         const d = ctx.d;
         const e = try @import("cuda_prompt_int8.zig").Allocation(Engine).create(gpa);
         errdefer gpa.destroy(e);
+        e.wide_words = null;
+        errdefer if (e.wide_words) |*b| b.free();
         errdefer e.int8.deinit();
         e.gpa = gpa;
         e.dir = try gpa.dupe(u8, dir);
@@ -242,6 +247,8 @@ pub const Engine = struct {
         e.affine.half_prompt = !gb10; // the 27B's prompt tile (Tile<64, 128, 128, 2, 2, 2>), quicker on an RTX 5090
         // GB10: split-K decode/verify projections on the cluster tile (bits unchanged); TF_CLUSTER_DECODE=0 restores lane_gemv
         e.affine.cluster_decode = gb10 and !envOff("TF_CLUSTER_DECODE");
+        e.affine.group_wide = gb10 and !envOff("TF_WIDE_GROUP");
+        e.wide_attention = gb10 and !envOff("TF_WIDE_ATTN");
         errdefer e.affine.deinit();
         e.prompt_many = try cuda.prompt_many.Kernels.resolve(e.mods[1], sms);
         e.mlp_pair = try cuda.mlp_pair.Kernels.resolve(e.mods[0], gb10);
@@ -275,6 +282,8 @@ pub const Engine = struct {
             defer stage.free();
             try weights.load(e, &ck, &stage);
         }
+        if (gb10 and g.hidden == 5120 and g.layers == 64 and g.experts == 0 and !envOff("TF_WIDE_KMAJOR"))
+            e.wide_words = try wide_weight_layout.prepare(e);
         if (e.mo) |*m| try m.reserveParts(e);
         try @import("cuda_engine_tail.zig").finish(e, io, started);
         return e;
@@ -311,6 +320,7 @@ pub const Engine = struct {
         e.host_logits.free();
         e.staged.free();
         e.tables.free();
+        if (e.wide_words) |*b| b.free();
         e.arena.free();
         e.gpa.free(e.layers);
         e.gpa.free(e.dir);
@@ -475,7 +485,9 @@ pub const Engine = struct {
         @memcpy(std.mem.bytesAsSlice(u32, st[ids_at..][0 .. total * 4]), ids);
         @memset(st[ids_at + total * 4 .. ids_at + max_rows * 4], 0); // a bucket's padding rows read token 0
         const segs = std.mem.bytesAsSlice(Seg, st[segs_at..][0 .. parts.len * @sizeOf(Seg)]);
-        const slot_peak = try Round.build(st, parts, record);
+        const leaf_slots = record and parts.len == 1 and total > 16 and total <= 32 and e.affine.pdl and
+            e.g.hidden == 5120 and e.g.layers == 64 and e.g.experts == 0 and !envOff("TF_WIDE_LEAVES");
+        const slot_peak = if (leaf_slots) try Round.buildLeaves(st, parts, record) else try Round.build(st, parts, record);
         for (parts) |p| {
             try p.cache.settle(e);
             // a pending kept prefix rides in this forward's slot scan only when its log half survives `prepare`
@@ -513,7 +525,17 @@ pub const Engine = struct {
             Round.stageImageTables(st, im, p0, total);
         }
         try e.tables.uploadAsync(0, st[0..if (images != null) tables_len else src_at], e.stream.handle); // text: as before
-        var shape = Shape.init(total, parts.len, record, e.n_taps > 0, @intCast(Round.variant(slot_peak)));
+        const wide_slots = total > 16 and total <= 32 and e.affine.pdl and !envOff("TF_WIDE_SLOTS");
+        const slot_variant: usize = if (wide_slots) switch (slot_peak) {
+            1 => if (leaf_slots) 19 else 1,
+            2 => 17, // eight warps, four value rows each, two slots
+            3 => 3,
+            4 => 18, // retain a just-written parent's registers in the four-slot scan
+            else => Round.variant(slot_peak),
+        } else Round.variant(slot_peak);
+        var shape = Shape.init(total, parts.len, record, e.n_taps > 0, @intCast(slot_variant));
+        if (record and @import("sys").c.getenv("TF_GDN_SLOTS_RECEIPTS") != null)
+            std.debug.print("[gdn-slots] rows={d} peak={d} variant={d}\n", .{ total, slot_peak, slot_variant });
         if (record) for (parts) |p| {
             try recurrent.mark(p.cache, false);
             if (p.rows == 1) try recurrent.mark(p.cache, true);
@@ -524,6 +546,9 @@ pub const Engine = struct {
         shape.short = for (parts) |p| {
             if (p.cache.cap > @import("cuda_forward.zig").group_len) break false;
         } else true;
+        shape.wide_attention = e.wide_attention and record and total > 16 and total <= 32 and
+            !shape.paged and !e.kv8 and g.q_heads / g.kv_heads == 6 and shape.short and
+            parts.len == 1 and parts[0].cache.len >= 256;
         if (e.learning != null or e.pockets.any()) {
             var exact = shape;
             exact.total = @intCast(total);
@@ -589,15 +614,20 @@ pub const Engine = struct {
         const scan = if (!record) e.fns.gdn_chain else switch (slot_count) {
             1 => e.fns.gdn_slots_1,
             2 => e.fns.gdn_slots_2,
+            3 => e.fns.gdn_slots_3,
             4 => e.fns.gdn_slots_4,
             8 => e.fns.gdn_slots_8,
             16 => e.fns.gdn_slots_16,
+            17 => e.fns.gdn_slots_2wide,
+            18 => e.fns.gdn_slots_4wide,
+            19 => e.fns.gdn_slots_1wide,
             else => return error.InvalidGdnSlots,
         };
         const input = e.tables.ptr + @as(usize, if (record) Round.steps_at else rowpar_at);
-        // qwen35_slots.cuh: up to four slots scan two value rows a warp, so a block covers eight
-        const rows_a_warp: usize = if (record and slot_count <= 4) 2 else 1;
-        try e.runAfter(scan, .{ 1, geometry.dk / (4 * rows_a_warp), e.g.v_heads * segments }, .{ 32, 4, 1 }, .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, input, layer, e.y, e.tables.ptr + params_at });
+        // qwen35_slots.cuh: each scan keeps its own value rows per warp and warps per block.
+        const rows_a_warp: usize = if (record and (slot_count == 3 or slot_count == 17 or slot_count == 19)) 4 else if (record and (slot_count <= 4 or slot_count == 18)) 2 else 1;
+        const warps: usize = if (record and (slot_count == 17 or slot_count == 19)) 8 else 4;
+        try e.runAfter(scan, .{ 1, geometry.dk / (warps * rows_a_warp), e.g.v_heads * segments }, .{ 32, warps, 1 }, .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, input, layer, e.y, e.tables.ptr + params_at });
     }
 
     /// The launches of a forward of `shape`, from the embedding to the kept rows' logits (captured once a shape).
@@ -614,7 +644,7 @@ pub const Engine = struct {
 test "dense read cost: hidden and slot variants have distinct graph keys" {
     var seen: [32]u32 = undefined;
     var n: usize = 0;
-    for ([_]u8{ 1, 2, 4, 8, 16 }) |slots| {
+    for ([_]u8{ 1, 2, 3, 4, 8, 16 }) |slots| {
         for ([_]bool{ false, true }) |hidden| {
             const shape: Engine.Shape = .{ .total = 1, .nseg = 1, .record = true, .prompt = false, .taps = true, .slots = slots, .hidden = hidden };
             for (seen[0..n]) |key| try std.testing.expect(key != shape.key());

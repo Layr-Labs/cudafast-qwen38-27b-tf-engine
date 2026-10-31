@@ -676,6 +676,36 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_attn_partial(Geo geo, c
     }
 }
 
+// A single short stream, five query rows per block at six heads a key head. Preserve the per-line MMA and softmax
+// chains while sharing each complete prefix tile. Empty chunks write only their statistics, leaving outputs untouched.
+extern "C" __global__ void __launch_bounds__(128) tf_q35_attn_wide(Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
+                                                                     const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
+                                                                     const int* __restrict__ P, float scale, int total,
+                                                                     float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
+    release_next();
+    await_prior();
+    extern __shared__ __align__(16) uint4 attn_tiles[];
+    const int G = geo.qh / geo.kvh, RB = 32 / G, m0 = blockIdx.x * RB;
+    if (m0 >= total || past_rows(P, m0)) return;
+    const Seg sg = segs[rowseg[m0]];
+    const int keys = sg.len + sg.rows, ck = chunk_keys(sg.len + 1), nch = min(MAXCH, (keys + ck - 1) / ck);
+    for (int c = blockIdx.y; c < MAXCH; c += gridDim.y) {
+        if (c != (int)blockIdx.y) __syncthreads();
+        if (c >= nch) {
+            for (int i = threadIdx.x; i < RB * G; i += blockDim.x) {
+                const int m = m0 + i / G;
+                if (m < total && !past_rows(P, m)) {
+                    const size_t at = ((size_t)m * geo.qh + blockIdx.z * G + i % G) * MAXCH + c;
+                    PM[at] = -INFINITY;
+                    PL[at] = 0.0f;
+                }
+            }
+            continue;
+        }
+        tf_q35_tc::attn_rows<2, tf_q35_tc::Bf16Tiles1<128>, true>({attn_tiles, nullptr, nullptr, nullptr}, geo, Q, segs, rowseg, rowanc, layer, P, scale, total, PM, PL, PO, c);
+    }
+}
+
 extern "C" __global__ void __launch_bounds__(256) tf_q35_attn_rows(Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
                                                                      const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
                                                                      const int* __restrict__ P, float scale, int total,

@@ -269,7 +269,9 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
     const costs = if (explicit) &untimed else if (live) &own else &e.cfg.shared_costs;
     const overhead = if (explicit or live) 0 else e.rule.overheadMs(plans.len, anySampled(plans));
     const counts = try alloc.allocate(a, fixed, probs, costs, overhead, @max(plans.len, e.cfg.batch_rows));
-    const trial = if (live) lone_costs.probe(e, plans[0]) else null;
+    const fixed_tree = e.cfg.fixed_tree and e.alone and plans.len == 1 and plans[0].kind == .head;
+    if (fixed_tree) counts[0] = @intCast(@min(probs[0].len, e.cfg.batch_rows - 1));
+    const trial = if (live and !fixed_tree) lone_costs.probe(e, plans[0]) else null;
     if (trial) |count| {
         counts[0] = count;
         plans[0].cost_probe_rows = count + 1;

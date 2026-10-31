@@ -61,6 +61,30 @@ pub fn build(st: []u8, parts: []const @import("cuda_engine.zig").Part, record: b
     return buildWithScratch(st, parts, record, &scratch);
 }
 
+/// Retain the same traversal and internal slot IDs, omitting stores of states no child can read.
+pub fn buildLeaves(st: []u8, parts: []const @import("cuda_engine.zig").Part, record: bool) !usize {
+    _ = try build(st, parts, record);
+    if (!record) return 1;
+    const schedule = steps(st);
+    var first: usize = 0;
+    var peak: usize = 1;
+    for (parts) |p| {
+        var internal: u64 = 0;
+        for (0..p.rows) |row| {
+            const parent: i32 = if (p.parents) |ps| ps[row] else if (row == 0) -1 else @intCast(row - 1);
+            if (parent >= 0) internal |= @as(u64, 1) << @intCast(parent);
+        }
+        for (schedule[first..][0..p.rows]) |*step| {
+            const row = step.row - first;
+            if (internal & (@as(u64, 1) << @intCast(row)) == 0) step.write_slot = -1;
+            if (step.read_slot >= 0) peak = @max(peak, @as(usize, @intCast(step.read_slot)) + 1);
+            if (step.write_slot >= 0) peak = @max(peak, @as(usize, @intCast(step.write_slot)) + 1);
+        }
+        first += p.rows;
+    }
+    return peak;
+}
+
 /// Branch scheduling uses scratch; straight chains only need their staged steps.
 pub fn buildWithScratch(st: []u8, parts: []const @import("cuda_engine.zig").Part, record: bool, scratch: []u8) !usize {
     if (st.len < bytes or @intFromPtr(st.ptr) % @alignOf(Ancestor) != 0 or parts.len == 0 or parts.len > max_segs) return error.InvalidQwenSegments;
