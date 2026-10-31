@@ -213,6 +213,7 @@ pub const Engine = struct {
         const g = try Geometry.read(gpa, io, dir);
         const d = ctx.d;
         const e = try @import("cuda_prompt_int8.zig").Allocation(Engine).create(gpa);
+        e.h_window = null; // Allocation.create leaves fields undefined before the first captured forward.
         errdefer gpa.destroy(e);
         e.projection_streams = null;
         errdefer if (e.projection_streams) |*b| b.free();
@@ -629,9 +630,12 @@ pub const Engine = struct {
         };
         shape.hidden = keep == .hidden;
         shape.paged = @import("cuda_attention.zig").hasPages(segs);
-        // a cache of at most GROUP_LEN positions holds fewer keys than that before any row it verifies
+        // A stream's own length, not its cache's capacity, decides whether the row merge has a row this round:
+        // qwen35.cu's tf_q35_attn_rows reads long_rows off segs[rowseg[m]].len and returns at once unless one of the
+        // window's segments already holds GROUP_LEN positions. `len` is exactly the segment's start this round, so a
+        // capacity test over-launches the 64-chunk grid for every stream that fits under a larger cache.
         shape.short = for (parts) |p| {
-            if (p.cache.cap > @import("cuda_forward.zig").group_len) break false;
+            if (p.cache.len >= @import("cuda_forward.zig").group_len) break false;
         } else true;
         if (e.learning != null or e.pockets.any()) {
             var exact = shape;

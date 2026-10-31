@@ -822,7 +822,7 @@ pub const Affine4Kernels = struct {
             var g: launch_.Args = .{};
             g.add(x); g.add(xs); g.add(parts);
             for ([_]usize{ rows, q.k, q.k }) |v| g.add(int(v));
-            const shared = if (dict) group_smem + q.tabBytesUpTo(linear.out_pair_tab_max) else group_smem;
+            const shared = if (dict) linear.out16_smem + q.tabBytesUpTo(linear.out_pair_tab_max) else linear.out16_smem;
             return launch_.launch(if (dict) a.stream16_dict_fn.? else stream_fn.?, .{ .grid = .{ .x = 80 }, .block = .{ .x = 512 }, .shared = shared, .pdl = a.pdl }, s, &g);
         }
         const tiles = (q.n + 63) / 64;
