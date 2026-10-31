@@ -52,6 +52,7 @@ pub fn aligned(n: usize) usize {
 pub const Geo = extern struct { hid: c_int, nk: c_int, nv: c_int, qh: c_int, kvh: c_int, nl: c_int };
 
 const layers = @import("cuda_layers.zig");
+const draft_tree = @import("cuda_draft_tree.zig");
 pub const Proj = layers.Proj;
 pub const Delta = layers.Delta;
 pub const Attention = layers.Attention;
@@ -174,6 +175,8 @@ pub const Engine = struct {
     logits: u64,
     routed: routed.Scratch = .{}, // qwen3_5_moe's routed rows
     amax: u64, // the argmax slices' bests: most_verify rows of argmaxSlices(vocab) (f32, i32)
+    head_amax: u64, // a greedy verify head's per-tile bests: max rows of 64-id tiles (f32, i32; Shape.amax)
+    head_argmax: bool, // TF_HEAD_ARGMAX=0: greedy verify rows keep their logits and the argmax launches
     picks: u64, // drawRows' slice scratch: most_verify rows of cuda.sample.Draws.row_scratch
     // per-forward tables (ids, segments, rows' segment, parent and ancestors, the draws' rules) staged in pinned memory
     tables: DeviceBuffer,
@@ -213,6 +216,7 @@ pub const Engine = struct {
         const g = try Geometry.read(gpa, io, dir);
         const d = ctx.d;
         const e = try @import("cuda_prompt_int8.zig").Allocation(Engine).create(gpa);
+        e.h_window = null; // Allocation.create leaves fields undefined before the first captured forward.
         errdefer gpa.destroy(e);
         e.projection_streams = null;
         errdefer if (e.projection_streams) |*b| b.free();
@@ -244,6 +248,7 @@ pub const Engine = struct {
         e.rec_scratch = recurrent.Pool.init(gpa, @intFromPtr(e));
         e.n_taps = 0;
         e.features = 0;
+        e.head_argmax = !envOff("TF_HEAD_ARGMAX");
         e.stream = try cuda.Stream.init(d, true);
         errdefer e.stream.deinit();
         e.blocks = .empty; // the field's default does not apply: Allocation(Engine).create leaves the engine undefined
@@ -466,6 +471,7 @@ pub const Engine = struct {
         e.logits = try t.alloc(most_verify * g.vocab * 2);
         if (g.moe()) e.routed = try routed.Scratch.carve(t, g, R);
         e.amax = try t.alloc(most_verify * argmaxSlices(g.vocab) * 8);
+        e.head_amax = try t.alloc(cuda.qlinear.Affine4Kernels.max_rows * ((g.vocab + 63) / 64) * 8);
         e.picks = try t.alloc(most_verify * cuda.sample.Draws.row_scratch);
         return total;
     }
@@ -510,6 +516,17 @@ pub const Engine = struct {
         if (e.embed_bits == 16) return modelopt.embed(e, ids, out, rows); // bf16 rows; padding rows' ids are zeroed
         const f = if (e.embed_bits == 8) e.fns.embed8 else e.fns.embed;
         try e.run(f, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ ids, e.embed_w, e.embed_s, e.embed_b, out, @as(c_int, @intCast(e.g.hidden)), params });
+    }
+
+    /// Whether a verify of `bucket` rows, all drawn by `draws`, takes the head's own argmax (Shape.amax): every row
+    /// greedy and the head on the dictionary tile without K slices (GB10); TF_HEAD_ARGMAX=0 keeps the logits.
+    fn headArgmax(e: *const Engine, bucket: usize, draws: []const Draw) bool {
+        if (!e.head_argmax) return false;
+        for (draws) |p| if (p.rule != null) return false;
+        return switch (e.head) {
+            .a4 => |q| e.affine.headArgmaxFits(q, bucket),
+            else => false,
+        };
     }
 
     /// Logits rows first..first + n's greedy tokens into toks: the highest logit, ties to the lower id.
@@ -573,8 +590,10 @@ pub const Engine = struct {
         @memset(st[ids_at + total * 4 .. ids_at + max_rows * 4], 0); // a bucket's padding rows read token 0
         const segs = std.mem.bytesAsSlice(Seg, st[segs_at..][0 .. parts.len * @sizeOf(Seg)]);
         // past 1 row a window's scan carries each parent's state in the registers to its first child
-        // (tree_slots.carried: one slot fewer, -2 steps); TF_CARRIED=0 restores build's plans
-        const carry = record and total > 1 and !envOff("TF_CARRIED");
+        // (tree_slots.carried: one slot fewer, -2 steps); TF_CARRIED=0 restores build's plans. 2..16-row windows take
+        // the carried and lean scans only while the stream grows at most 15 nodes (cuda_draft_tree.lean16).
+        const lean_floor: usize = if (draft_tree.lean16()) 1 else 16;
+        const carry = record and total > lean_floor and !envOff("TF_CARRIED");
         const slot_peak = try Round.buildCarried(st, parts, record, carry);
         for (parts) |p| {
             try p.cache.settle(e);
@@ -615,7 +634,7 @@ pub const Engine = struct {
         try e.tables.uploadAsync(0, st[0..if (images != null) tables_len else src_at], e.stream.handle); // text: as before
         // carried plans of 2..32 rows (at most 3 slots) scan four value rows a warp on qwen35_slots_lean.cuh (slots_3's
         // arithmetic, its addressing hoisted; 2 slots where they suffice); TF_SLOTS_LEAN=0 keeps prior dispatch
-        const lean = record and total > 1 and total <= 32 and e.affine.pdl and !envOff("TF_SLOTS_LEAN");
+        const lean = record and total > lean_floor and total <= 32 and e.affine.pdl and !envOff("TF_SLOTS_LEAN");
         const wide = total > 16 and total <= 32 and e.affine.pdl and !envOff("TF_WIDE_SLOTS");
         const slot_variant: usize = if (lean and carry and slot_peak <= 3)
             (if (slot_peak <= 2) 37 else 38)
@@ -629,6 +648,7 @@ pub const Engine = struct {
         };
         shape.hidden = keep == .hidden;
         shape.paged = @import("cuda_attention.zig").hasPages(segs);
+        shape.amax = keep == .draws and e.learning == null and !e.pockets.any() and e.headArgmax(shape.total, keep.draws);
         // a cache of at most GROUP_LEN positions holds fewer keys than that before any row it verifies
         shape.short = for (parts) |p| {
             if (p.cache.cap > @import("cuda_forward.zig").group_len) break false;
@@ -683,8 +703,8 @@ pub const Engine = struct {
             .hidden => try e.stream.synchronize(), // mapped layer inputs are ready before the learner reads them
             .draws => |pk| {
                 const toks = e.tables.ptr + tokens_at;
-                var i: usize = 0; // runs of greedy rows argmaxed together, runs of sampled rows drawn together
-                while (i < pk.len) {
+                var i: usize = if (shape.amax) pk.len else 0; // amax: the graph's head wrote every row's token
+                while (i < pk.len) { // runs of greedy rows argmaxed together, runs of sampled rows drawn together
                     const sampled = pk[i].rule != null;
                     var n: usize = 1;
                     while (i + n < pk.len and (pk[i + n].rule != null) == sampled) n += 1;
