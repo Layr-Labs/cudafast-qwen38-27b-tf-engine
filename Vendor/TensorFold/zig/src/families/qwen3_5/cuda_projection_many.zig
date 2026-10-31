@@ -38,7 +38,7 @@ pub fn projectMany(e: *Engine, ls: []const Proj, x: u64, xs: u64, outs: []const 
     var at: usize = 0;
     while (at < rows) : (at += A.max_rows) {
         for (ls, outs, many[0..ls.len]) |l, out, *m| m.* = .{ .q = l.a4, .out = out + at * l.outputs() * 2 };
-        const mixed_attention = rows == 16 and ls.len == 3 and e.affine.pdl and e.affine.cluster_decode and
+        const mixed_attention = (rows >= 8 and rows <= 16) and ls.len == 3 and e.affine.pdl and e.affine.cluster_decode and
             cuda.qlinear.splitK(many[0].q.n, k) == 1 and cuda.qlinear.splitK(many[1].q.n, k) > 1 and
             cuda.qlinear.splitK(many[2].q.n, k) > 1 and mixedAttention();
         if (mixed_attention) try e.affine.decodeAttentionMixed(e.stream, x, xs, many[0..ls.len], rows) else

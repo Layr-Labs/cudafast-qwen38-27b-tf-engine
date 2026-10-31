@@ -16,6 +16,7 @@ pub const symbol = "tf_qmm_mlp_pair";
 /// The dictionary twins (qmm_dict.cuh): gate's and up's scales and biases from their dictionary indices, the same bits.
 pub const symbol_dict = "tf_qmm_mlp_pair_dict";
 pub const symbol_single_dict = "tf_qmm_mlp_single16_dict";
+pub const symbol_single_roll = "tf_qmm_mlp_single16_dict_roll";
 /// The stages' memory and, past it, the (16, 64) bf16 gate tile rank 0 stores into rank 1's.
 pub const smem: u32 = qlinear.group_smem + 16 * 64 * 2;
 pub const kmajor_smem: u32 = 13440 + 16 * 128 * 2;
@@ -37,6 +38,7 @@ pub const Kernels = struct {
     single32_dict_fn: ?Function = null, // tf_qmm_mlp_single32_dict: dictionary-coded twin on the K-major panels
     dict_fn: ?Function = null, // GB10: tf_qmm_mlp_pair's twin, taken when gate and up are both coded (tile-major)
     single_dict_fn: ?Function = null, // tf_qmm_mlp_single16's, when both are coded on the K-major panel's layout
+    single_roll_fn: ?Function = null, // the same twin prefetching each group's words and index runs into L2 two groups ahead
 
     /// From the loaded qmm_group module; `pdl` as the decode tiles' launches (GB10).
     pub fn resolve(group_mod: module.Module, pdl: bool) !Kernels {
@@ -50,6 +52,11 @@ pub const Kernels = struct {
             const fs = try group_mod.function(symbol_single_dict);
             try fs.allowDynamicShared(single_smem + single_dict_dec + 2 * qlinear.dict_tab_max);
             k.single_dict_fn = fs;
+            if (!std.mem.eql(u8, if (std.c.getenv("TF_MLP_ROLL")) |v| std.mem.span(v) else "1", "0")) {
+                const fr = try group_mod.function(symbol_single_roll);
+                try fr.allowDynamicShared(single_smem + single_dict_dec + 2 * qlinear.dict_tab_max);
+                k.single_roll_fn = fr;
+            }
         }
         return k;
     }
@@ -134,7 +141,7 @@ pub const Kernels = struct {
         g.add(act);
         g.add(as);
         for ([_]usize{ rows, gate.k, gate.k, rows_t }) |v| g.add(@as(c_int, @intCast(v)));
-        const f = if (sdict) kk.single_dict_fn.? else if (major) kk.kmajor_fn.? else if (dict) kk.dict_fn.? else kk.pair_fn;
+        const f = if (sdict) kk.single_roll_fn orelse kk.single_dict_fn.? else if (major) kk.kmajor_fn.? else if (dict) kk.dict_fn.? else kk.pair_fn;
         const shared: u32 = if (sdict) single_smem + single_dict_dec + singleTab(gate) + singleTab(up) else if (single) single_smem else if (major) kmajor_smem else if (dict) smem + qlinear.dict_dec + @max(gate.tabBytes(), up.tabBytes()) else smem;
         try launch_.launch(f, .{ .grid = .{ .x = @intCast(@as(usize, if (single) 1 else 2) * rows_t * tiles) }, .block = .{ .x = 128 }, .shared = shared, .cluster = if (single) null else .{ .x = 2 }, .pdl = kk.pdl }, s, &g);
     }

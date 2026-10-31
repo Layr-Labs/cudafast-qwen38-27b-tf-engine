@@ -141,7 +141,7 @@ fn leastSquares(row: []align(1) const u16, start: [2]f32) [2]f32 {
     var best = start;
     var best_err = groupError(row, start);
     var cur = start;
-    for (0..3) |_| {
+    for (0..8) |_| {
         const s = cur[0];
         if (s <= 0) break;
         var sq: f64 = 0;
@@ -245,8 +245,6 @@ fn hostBf16(gpa: std.mem.Allocator, ck: *core.Checkpoint, name: []const u8, shap
 pub fn load(gpa: std.mem.Allocator, io: std.Io, e: *Engine, dir: []const u8, s: Shape) !Weights {
     var ck = try core.Checkpoint.openModel(gpa, io, dir);
     defer ck.close();
-    var sponge = @import("cuda_sponge.zig").take(e.d, total(s));
-    defer sponge.free();
     var w: Weights = .{ .fc = undefined, .hidden_norm = 0, .final_norm = 0, .selector = undefined, .predecessor = &.{}, .successor = &.{}, .layers = &.{}, .arena = try DeviceBuffer.alloc(e.d, total(s)) };
     errdefer w.arena.free();
     try w.arena.fill8(0, null);
