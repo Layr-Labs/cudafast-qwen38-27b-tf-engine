@@ -8,12 +8,12 @@ template<int GS,int BN,int STAGES>using GemvTile=qmm_frag::LaneTile<GS,16,BN,1,4
 // 2 * S bytes after the words hold the CTA's BN / 64 index windows (256 bytes each, a 64-column tile's group) in place
 // of its scales and biases; each warp decodes its BN / 4 columns' scales and biases into `dec` (BN scales, then BN
 // biases, as the arrays' stage holds them) from the part's table after it, so every fma reads the same values.
-template <int GS, int BN, int STAGES, int FutureGroups, bool DICT, typename Map, typename After>
+template <int GS, int BN, int STAGES, int FutureGroups, bool DICT, int ROLL = 0, typename Map, typename After>
 __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs, const Part& P, int M,
                                            int K, int ldx, int items, Map map, float (&acc)[GemvTile<GS, BN, STAGES>::NT][4],
                                            After after) {
     using T = GemvTile<GS, BN, STAGES>;
-    static_assert(!DICT || (FutureGroups == 0 && GS == 64 && BN % 64 == 0 && 2 * T::S == BN / 64 * 256), "coded stages");
+    static_assert(!DICT || (GS == 64 && BN % 64 == 0 && 2 * T::S == BN / 64 * 256), "coded stages");
     const int npad = DICT ? P.tiles : P.npad;
     static_assert(T::MT == 1 && T::THREADS == 128, "one m16 row tile, four column warps");
     constexpr int NT = T::NT;
@@ -113,11 +113,21 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
     if(tid==0) {
 #pragma unroll
         for(int g=1;g<=FutureGroups;++g)if(g<items){
-            const auto at=map(g);const auto* w=reinterpret_cast<const unsigned char*>(P.w)+(size_t(at.x)*(P.npad/64)+at.y/64)*TILE_BYTES;
-            const auto* a=P.scales+size_t(at.x)*P.npad+at.y;const auto* b=P.biases+size_t(at.x)*P.npad+at.y;
+            const auto at=map(g);const auto* w=reinterpret_cast<const unsigned char*>(P.w)+(size_t(at.x)*(npad/64)+at.y/64)*TILE_BYTES;
             asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(w), "n"(BN*GS/2) : "memory");
-            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(a), "n"(BN*2) : "memory");
-            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(b), "n"(BN*2) : "memory");
+            if constexpr(DICT){
+                const int step=qmm_dict::dict_step(P.npad);
+                const size_t window=static_cast<size_t>(at.x)*step&~static_cast<size_t>(63);
+#pragma unroll
+                for(int c=0;c<BN/64;++c){
+                    const auto* idx=reinterpret_cast<const unsigned char*>(P.scales)+static_cast<size_t>(at.y/64+c)*KG*step+window;
+                    asm volatile("cp.async.bulk.prefetch.L2.global [%0], 256;" :: "l"(idx) : "memory");
+                }
+            }else{
+                const auto* a=P.scales+size_t(at.x)*P.npad+at.y;const auto* b=P.biases+size_t(at.x)*P.npad+at.y;
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(a), "n"(BN*2) : "memory");
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(b), "n"(BN*2) : "memory");
+            }
         }
     }
 #endif
@@ -130,6 +140,23 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
     }
     grid_launch();
     for (int it = 0; it < items; ++it) {
+#if __CUDA_ARCH__ >= 900
+        if constexpr (ROLL > 0) if (tid == 0 && it + ROLL < items) {   // group it + ROLL's words and index windows into L2
+            const int2 at = map(it + ROLL);
+            const int g = at.x, n0 = at.y;
+            const unsigned char* wb = reinterpret_cast<const unsigned char*>(P.w) + static_cast<size_t>(n0 / 64) * TILE_BYTES +
+                                      (n0 % 64) * GS / 2 + static_cast<size_t>(g) * (npad / 64) * TILE_BYTES;
+            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(wb), "n"(BN * GS / 2) : "memory");
+            if constexpr (DICT) {
+                const int step = qmm_dict::dict_step(P.npad);
+                const size_t window = static_cast<size_t>(g) * step & ~static_cast<size_t>(63);
+#pragma unroll
+                for (int t = 0; t < BN / 64; ++t)
+                    asm volatile("cp.async.bulk.prefetch.L2.global [%0], 256;" ::"l"(reinterpret_cast<const unsigned char*>(P.scales) +
+                                 static_cast<size_t>(n0 / 64 + t) * KG * step + window) : "memory");
+            }
+        }
+#endif
         wait<STAGES - 2>();
         __syncthreads();
         const int next = it + STAGES - 1;
@@ -262,12 +289,12 @@ __device__ __forceinline__ void gemv_store(const Part& P, int M, int n0, Got got
 }
 
 
-template<int BN,int FutureGroups,bool DICT=false>
+template<int BN,int FutureGroups,bool DICT=false,int ROLL=0>
 __device__ __forceinline__ void tile(const __nv_bfloat16* x,const float* xs,const tf_qmm_group::Part p,int t,int M,int K,int ldx){
     constexpr int NT=GemvTile<64,BN,2>::NT;
     const auto original=p;
     const int KG=K/64,per=KG/p.sk;float acc[NT][4]{},tot[NT][4]{};
-    wide_items<64,BN,2,FutureGroups,DICT>(x,xs,original,M,K,ldx,KG,[&](int g){return make_int2(g,t*BN);},acc,[&](int g){
+    wide_items<64,BN,2,FutureGroups,DICT,ROLL>(x,xs,original,M,K,ldx,KG,[&](int g){return make_int2(g,t*BN);},acc,[&](int g){
         if((g+1)%per!=0)return;bool first=g+1==per;
 #pragma unroll
         for(int j=0;j<NT;++j)
@@ -292,8 +319,8 @@ __device__ __forceinline__ void body_dict(const __nv_bfloat16* x,const float* xs
 #pragma unroll
     for(int i=1;i<4;++i)if(int(blockIdx.x)>=parts.p[i].first)which=i;
     const auto p=parts.p[which];int t=int(blockIdx.x)-p.first;const bool coded=p.tiles>0;
-    if(which<2){if(coded)tile<256,0,true>(x,xs,p,t,M,K,ldx);else tile<256,0>(x,xs,p,t,M,K,ldx);}
-    else{if(coded)tile<64,0,true>(x,xs,p,t,M,K,ldx);else tile<64,0>(x,xs,p,t,M,K,ldx);}
+    if(which<2){if(coded)tile<256,2,true>(x,xs,p,t,M,K,ldx);else tile<256,2>(x,xs,p,t,M,K,ldx);}
+    else{if(coded)tile<64,2,true>(x,xs,p,t,M,K,ldx);else tile<64,2>(x,xs,p,t,M,K,ldx);}
 }
 }
 
@@ -303,6 +330,17 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_gdn_stream16(const __nv
 // tf_qmm_gdn_stream16 with its dictionary-coded parts' index windows: the same loads, MMA chains, fmas and sums.
 extern "C" __global__ void __launch_bounds__(128) tf_qmm_gdn_stream16_dict(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
     tf_qmm_gdn_stream::body_dict(x,xs,parts,M,K,ldx);
+}
+
+// Attention's 16-row q, k and v on 256-column stream tiles of their K-major copies (a coded part carries its real
+// npad in `tiles`, an uncoded one 0): each part's K slices (q one, k and v eight) keep their chains from zero and are
+// summed in slice order inside the CTA, as the cluster tile sums them over distributed shared memory: the same bits.
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_attn_stream16_dict(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
+    int which=0;
+#pragma unroll
+    for(int i=1;i<4;++i)if(i<parts.count&&int(blockIdx.x)>=parts.p[i].first)which=i;
+    const auto p=parts.p[which];const int t=int(blockIdx.x)-p.first;
+    if(p.tiles>0)tf_qmm_gdn_stream::tile<256,0,true>(x,xs,p,t,M,K,ldx);else tf_qmm_gdn_stream::tile<256,0>(x,xs,p,t,M,K,ldx);
 }
 
 namespace tf_qmm_gdn_rows32 {
@@ -590,4 +628,14 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_gdn_stream32(const __nv
 }
 extern "C" __global__ void __launch_bounds__(128) tf_qmm_gdn_stream32_dict(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
     tf_qmm_gdn_rows32::body<true>(x,xs,parts,M,K,ldx);
+}
+
+// tf_qmm_gdn_stream16_dict with each CTA's group it + 2 (words and index windows) prefetched into L2 every group.
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_gdn_stream16_dict_roll(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
+    int which=0;
+#pragma unroll
+    for(int i=1;i<4;++i)if(int(blockIdx.x)>=parts.p[i].first)which=i;
+    const auto p=parts.p[which];int t=int(blockIdx.x)-p.first;const bool coded=p.tiles>0;
+    if(which<2){if(coded)tf_qmm_gdn_stream::tile<256,2,true,2>(x,xs,p,t,M,K,ldx);else tf_qmm_gdn_stream::tile<256,2,false,2>(x,xs,p,t,M,K,ldx);}
+    else{if(coded)tf_qmm_gdn_stream::tile<64,2,true,2>(x,xs,p,t,M,K,ldx);else tf_qmm_gdn_stream::tile<64,2,false,2>(x,xs,p,t,M,K,ldx);}
 }

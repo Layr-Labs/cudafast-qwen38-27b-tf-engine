@@ -18,7 +18,6 @@ __device__ __forceinline__ void dict_decode_at(const qmm_dict::DictLanes& D,cons
 template<int FutureGroups,int Slices=4,int Rolling=0,bool DICT=false>
 __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const float* __restrict__ xs,
         const tf_qmm_group::Parts& parts,int M,int K,int ldx) {
-    static_assert(!DICT||Rolling==0,"coded rolling prefetch is not implemented");
     extern __shared__ __align__(128) unsigned char buf[];
     const auto p=parts.p[0];
     const int slice=threadIdx.x/128,tid=threadIdx.x%128,lane=tid&31,wn=tid>>5;
@@ -69,10 +68,15 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
         #if __CUDA_ARCH__ >= 900
         if constexpr(Rolling>0)if(tid==0&&it+Rolling<per){
             const int g=g0+it+Rolling;const auto* w=weight(g);
-            const auto* s=p.scales+size_t(g)*p.npad+n0;const auto* b=p.biases+size_t(g)*p.npad+n0;
             asm volatile("cp.async.bulk.prefetch.L2.global [%0], 2048;" :: "l"(w) : "memory");
-            asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(s) : "memory");
-            asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(b) : "memory");
+            if constexpr(DICT){   // the group's index window, as load_w reads it
+                const auto* ix=D.src+qmm_dict::dict_window(D,g);
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], 256;" :: "l"(ix) : "memory");
+            } else {
+                const auto* s=p.scales+size_t(g)*p.npad+n0;const auto* b=p.biases+size_t(g)*p.npad+n0;
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(s) : "memory");
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(b) : "memory");
+            }
         }
 #endif
         wait<0>();__syncthreads();
@@ -142,10 +146,16 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
 extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_stream16(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
     tf_qmm_output_stream::body<0>(x,xs,parts,M,K,ldx);
 }
+// tf_qmm_output_stream16_dict with each slice's next-but-one group (words and index window) also prefetched into L2
+// inside the loop for the down projection (K 6144 keeps its four prologue groups).
+extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_stream16_dict_roll(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
+    if(K==6144)tf_qmm_output_stream::body<4,4,0,true>(x,xs,parts,M,K,ldx);
+    else tf_qmm_output_stream::body<2,4,2,true>(x,xs,parts,M,K,ldx);
+}
 // tf_qmm_output_stream16 on a dictionary-coded part: the same loads, MMA chains, fmas and slice-ordered sum.
 extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_stream16_dict(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
     if(K==6144)tf_qmm_output_stream::body<4,4,0,true>(x,xs,parts,M,K,ldx);
-    else tf_qmm_output_stream::body<0,4,0,true>(x,xs,parts,M,K,ldx);
+    else tf_qmm_output_stream::body<2,4,0,true>(x,xs,parts,M,K,ldx);
 }
 extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_prefetch16(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
     tf_qmm_output_stream::body<4>(x,xs,parts,M,K,ldx);

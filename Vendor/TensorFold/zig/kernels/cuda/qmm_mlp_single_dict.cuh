@@ -7,7 +7,9 @@ namespace tf_qmm_mlp_single {
 using namespace tf_qmm_group;
 using namespace qmm_dict;
 constexpr int MLP_DICT_DEC = 512;               // four warps' 32 scales and 32 biases (bf16)
-template <int STAGES, int BN, bool KMAJOR>
+// ROLL > 0: each group, one thread also prefetches group it + ROLL's gate and up words and index runs into L2, so
+// the two-stage ring's DRAM requests run ROLL groups further ahead (only where bytes sit in the cache changes).
+template <int STAGES, int BN, bool KMAJOR, int ROLL = 0>
 __device__ __forceinline__ void mlp_single_dict_body(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
                                               const Parts& parts, __nv_bfloat16* __restrict__ act,
                                               float* __restrict__ as, int M, int K, int ldx, int rows_t) {
@@ -134,6 +136,21 @@ __device__ __forceinline__ void mlp_single_dict_body(const __nv_bfloat16* __rest
     }
     grid_launch();
     for (int it = 0; it < per; ++it) {
+#if __CUDA_ARCH__ >= 900
+        if constexpr (ROLL > 0) if (tid == 0 && it + ROLL < per) {
+            const int g = g0 + it + ROLL;
+#pragma unroll
+            for (int part = 0; part < 2; ++part) {
+                const unsigned char* w = reinterpret_cast<const unsigned char*>(parts.p[part].w) +
+                                         (static_cast<size_t>(n0 / 64) + static_cast<size_t>(g) * (P.npad / 64)) * TILE_BYTES;
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(w), "n"(BN / 2 * GS / 2) : "memory");
+                const int pstep = dict_step(part ? code1 : code0);
+                const unsigned char* ix = reinterpret_cast<const unsigned char*>(parts.p[part].scales) +
+                                          static_cast<size_t>(n0 / 64) * pstep + static_cast<size_t>(g) * (P.npad / 64) * pstep;
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(ix), "r"(((BN / 128) * pstep + 15) & ~15) : "memory");
+            }
+        }
+#endif
         wait<STAGES - 2>();
         __syncthreads();
         const int next = it + STAGES - 1;
@@ -271,4 +288,11 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_single16_dict(
  const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,
  __nv_bfloat16* act,float* sums,int M,int K,int ldx,int rows_t) {
  tf_qmm_mlp_single::mlp_single_dict_body<2,512,true>(x,xs,parts,act,sums,M,K,ldx,rows_t);
+}
+
+// tf_qmm_mlp_single16_dict with each group's words and index runs prefetched into L2 two groups ahead (same bits).
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_single16_dict_roll(
+ const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,
+ __nv_bfloat16* act,float* sums,int M,int K,int ldx,int rows_t) {
+ tf_qmm_mlp_single::mlp_single_dict_body<2,512,true,2>(x,xs,parts,act,sums,M,K,ldx,rows_t);
 }

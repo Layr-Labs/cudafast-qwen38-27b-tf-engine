@@ -1,4 +1,5 @@
 //! Immutable word-only output-projection streams, prepared without any request content.
+const std = @import("std");
 const cuda = @import("cuda");
 const layers = @import("cuda_layers.zig");
 
@@ -14,16 +15,33 @@ fn candidates(layer: *layers.Layer, input: bool, output: bool) [6]?*layers.Proj 
                 list[2] = &m.qkv; list[3] = &m.z; list[4] = &m.a; list[5] = &m.b;
             }
         },
-        .attention => |*m| { if (output) list[1] = &m.o; },
+        .attention => |*m| {
+            if (output) list[1] = &m.o;
+            if (input and attnStream() and m.q == .a4 and m.k == .a4 and m.v == .a4 and
+                m.q.outputs() == 12288 and m.k.outputs() == 1024 and m.v.outputs() == 1024 and
+                m.q.inputs() == 5120 and m.k.inputs() == 5120 and m.v.inputs() == 5120) {
+                list[2] = &m.q; list[3] = &m.k; list[4] = &m.v;
+            }
+        },
     }
     return list;
+}
+
+/// TF_STREAM_ROLL=0: the down and GDN-input twins without their in-kernel L2 look-ahead (the same bits).
+fn streamRoll() bool {
+    return !std.mem.eql(u8, std.mem.span(@import("sys").c.getenv("TF_STREAM_ROLL") orelse "1"), "0");
+}
+
+/// Attention's q, k and v on the stream tiles of their K-major copies (TF_ATTN_STREAM=0: the cluster tile).
+fn attnStream() bool {
+    return !@import("std").mem.eql(u8, @import("std").mem.span(@import("sys").c.getenv("TF_ATTN_STREAM") orelse "1"), "0");
 }
 
 fn size(p: layers.Proj) usize {
     if (p != .a4) return 0;
     const q = p.a4;
     const out = q.n == 5120 and (q.k == 6144 or q.k == 17408) and cuda.qlinear.splitK(q.n, q.k) == 4;
-    const in = q.k == 5120 and (q.n == 10240 or q.n == 6144 or q.n == 48);
+    const in = q.k == 5120 and (q.n == 10240 or q.n == 6144 or q.n == 48 or q.n == 12288 or q.n == 1024);
     if (!out and !in) return 0;
     return q.npad * q.k / 2;
 }
@@ -38,7 +56,8 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     try grouped.allowDynamicShared(22656);
     // its twin for dictionary-coded parts: a 256-column CTA's decoded scales and biases and its part's table
     const grouped_dict: ?cuda.Function = if (e.affine.dict == null) null else blk: {
-        const f = try e.mods[0].function("tf_qmm_gdn_stream16_dict");
+        // TF_STREAM_ROLL=0: the twins without their in-kernel L2 look-ahead two groups ahead (the same bits)
+        const f = try e.mods[0].function(if (streamRoll()) "tf_qmm_gdn_stream16_dict_roll" else "tf_qmm_gdn_stream16_dict");
         try f.allowDynamicShared(22656 + 4 * 256 + @as(u32, @max(cuda.qlinear.dict_tab_max, cuda.qlinear.gdn_pair_tab_max)));
         break :blk f;
     };
@@ -47,7 +66,7 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     try down.allowDynamicShared(35328);
     // its twin for a dictionary-coded down/out/o projection: the table past the stages
     const down_dict: ?cuda.Function = if (e.affine.dict == null) null else blk: {
-        const f = try e.mods[0].function("tf_qmm_output_stream16_dict");
+        const f = try e.mods[0].function(if (streamRoll()) "tf_qmm_output_stream16_dict_roll" else "tf_qmm_output_stream16_dict");
         try f.allowDynamicShared(35328 + @as(u32, @max(cuda.qlinear.dict_tab_max, cuda.qlinear.out_pair_tab_max)));
         break :blk f;
     };
@@ -80,6 +99,11 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     };
     if (output) e.affine.stream16_fns = .{ down, out };
     if (output) e.affine.stream16_dict_fn = down_dict;
+    if (input and attnStream()) {
+        const f = try e.mods[0].function("tf_qmm_attn_stream16_dict");
+        try f.allowDynamicShared(22656 + 4 * 256 + cuda.qlinear.gdn_pair_tab_max);
+        e.affine.attn_stream16_fn = f;
+    }
     if (input) {
         e.affine.gdn_stream16_fn = grouped;
         e.affine.gdn_stream16_dict_fn = grouped_dict;
