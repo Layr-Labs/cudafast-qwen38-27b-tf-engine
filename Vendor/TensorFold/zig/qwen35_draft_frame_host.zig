@@ -17,7 +17,9 @@ test "Draft frames: a grown tree's node budget past the block (TF_DRAFT_NODES) s
     var refs = [_]*q.draft.Ctx{&ctx};
     var items = [_]lanes.drafter.Hold{.{ .stream = @ptrFromInt(0x1000), .pending = 1, .position = 101, .depth = 15 }};
     try F.stage(c, &items, &refs, &storage);
-    items[0].depth = 16;
+    items[0].depth = 31; // the widest policy's tree: a 32-row window
+    try F.stage(c, &items, &refs, &storage);
+    items[0].depth = 32;
     try std.testing.expectError(error.BadDraftFrame, F.stage(c, &items, &refs, &storage));
     _ = setenv("TF_DRAFT_NODES", "24", 1);
     defer _ = unsetenv("TF_DRAFT_NODES");
@@ -179,6 +181,8 @@ fn actualFrame(block: usize) !void {
     d.streams = .empty;
     defer d.streams.deinit(a);
     d.selection_base = 0;
+    d.replay = null;
+    d.replay_ctx = null;
     inline for (@typeInfo(@TypeOf(d.fns)).@"struct".field_names) |name| @field(d.fns, name) = function(&driver, 10);
     d.fns.dyn_conv_batch = function(&driver, 2);
     d.fns.norm_rope_batch = function(&driver, 3);
