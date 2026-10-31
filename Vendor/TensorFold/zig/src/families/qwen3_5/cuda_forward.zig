@@ -49,6 +49,8 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     // an image chunk's rows take the tower's features, and rotate at their staged t, h, w positions
     const mpos: u64 = if (e.features != 0) e.tables.ptr + mpos_at else 0;
     if (e.features != 0) try e.run(e.fns.splice, .{ total, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, e.features, e.tables.ptr + src_at, @as(c_int, @intCast(g.hidden)), t_params });
+    // a prompt chunk keeps its last row: past its keys and values, the last layer runs that row alone
+    const tail = prompt and @import("cuda_prompt_tail.zig").fits(e, total, nseg, shape.hidden, shape.paged);
     var di: usize = 0;
     var ai: c_int = 0;
     for (e.layers, 0..) |l, i| {
@@ -74,6 +76,10 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 try e.runAfter(e.fns.head_norm, .{ total * g.q_heads, 1, 1 }, .{ 64, 1, 1 }, .{ e.qraw, m.q_norm, e.qn, @as(c_int, @intCast(g.q_heads)), @as(c_int, @intCast(2 * aw)), @as(c_int, 2 * head_dim), g.eps, t_params });
                 try e.runAfter(e.fns.head_norm, .{ total * g.kv_heads, 1, 1 }, .{ 64, 1, 1 }, .{ e.kraw, m.k_norm, e.kn, @as(c_int, @intCast(g.kv_heads)), @as(c_int, @intCast(g.kv_heads * head_dim)), @as(c_int, head_dim), g.eps, t_params });
                 if (e.kv8) try launch(e, e.fp8.rope, sig.rope, .{ total, g.q_heads + g.kv_heads, 1 }, .{ head_dim, 1, 1 }, .{ geo, e.qn, e.kn, e.vraw, t_segs, t_rows, t_anc, @as(c_int, ai), t_params, mpos }) else try launchAfter(e, e.fns.rope, sig.rope, .{ total, g.q_heads + g.kv_heads, 1 }, .{ head_dim, 1, 1 }, .{ geo, e.qn, e.kn, e.vraw, t_segs, t_rows, t_anc, @as(c_int, ai), t_params, mpos });
+                if (tail and i == e.layers.len - 1) {
+                    try @import("cuda_prompt_tail.zig").run(e, @intCast(ai), total);
+                    return;
+                }
                 if (shape.paged) {
                     try @import("cuda_attention.zig").partial(e, shape, ai);
                     try launch(e, e.fns.attn_merge, sig.attn_merge, .{ g.q_heads, total, 1 }, .{ 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.y });
