@@ -418,16 +418,13 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35_gdn_post(Geo geo, const 
     if (lane < DK / 64) XS[m * (W / 64) + hv * (DK / 64) + lane] = group_sum(done + lane * 64);
 }
 
-// Per-head RMSNorm of attention rows, out packed (rows, heads, HD); grid (rows * heads), 64 threads of 4 values.
-extern "C" __global__ void __launch_bounds__(64) tf_q35_head_norm(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W,
-                                                                    __nv_bfloat16* __restrict__ OUT, int heads, int stride, int hstride, float eps,
-                                                                    const int* __restrict__ P) {
-    release_next();
-    await_prior();
+__device__ __forceinline__ void head_norm_block(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W,
+                                                __nv_bfloat16* __restrict__ OUT, int heads, int stride, int hstride, float eps,
+                                                const int* __restrict__ P, int block) {
     __shared__ float sums[2];
-    const int head = blockIdx.x % heads;
-    if (past_rows(P, blockIdx.x / heads)) return;
-    const size_t m = blockIdx.x / heads;
+    const int head = block % heads;
+    if (past_rows(P, block / heads)) return;
+    const size_t m = block / heads;
     const int t = threadIdx.x;
     const __nv_bfloat16* x = X + m * stride + head * hstride;
     float v[4], acc = 0.0f;
@@ -445,6 +442,27 @@ extern "C" __global__ void __launch_bounds__(64) tf_q35_head_norm(const __nv_bfl
         const int d = 4 * t + i;
         OUT[(m * heads + head) * HD + d] = __float2bfloat16_rn(bf(W[d]) * (v[i] * inv));
     }
+}
+
+// Per-head RMSNorm of attention rows, out packed (rows, heads, HD); grid (rows * heads), 64 threads of 4 values.
+extern "C" __global__ void __launch_bounds__(64) tf_q35_head_norm(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W,
+                                                                    __nv_bfloat16* __restrict__ OUT, int heads, int stride, int hstride, float eps,
+                                                                    const int* __restrict__ P) {
+    release_next();
+    await_prior();
+    head_norm_block(X, W, OUT, heads, stride, hstride, eps, P, blockIdx.x);
+}
+
+extern "C" __global__ void __launch_bounds__(64) tf_q35_qk_norm(const __nv_bfloat16* __restrict__ QX, const __nv_bfloat16* __restrict__ QW,
+                                                                  __nv_bfloat16* __restrict__ QOUT, const __nv_bfloat16* __restrict__ KX,
+                                                                  const __nv_bfloat16* __restrict__ KW, __nv_bfloat16* __restrict__ KOUT, int qheads,
+                                                                  int kheads, int qstride, int kstride, int qhstride, int khstride, int qblocks,
+                                                                  float eps, const int* __restrict__ P) {
+    release_next();
+    await_prior();
+    const int b = blockIdx.x;
+    if (b < qblocks) head_norm_block(QX, QW, QOUT, qheads, qstride, qhstride, eps, P, b);
+    else head_norm_block(KX, KW, KOUT, kheads, kstride, khstride, eps, P, b - qblocks);
 }
 
 // A key and value as bf16 rows in their cache slot (qwen35.cu's layout: a layer's keys then values, kvh blocks of cap).
@@ -470,13 +488,11 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_rope(Geo geo, __nv_bflo
 // Causal attention in chunks of chunk_keys(the row's keys), a warp a query head; partials by (row, head, chunk).
 #include "qwen35_attn.cuh"
 
-// A row's chunks' partials into each (row, query head)'s output, rows qh * HD wide. Grid (qh, rows), a warp each.
-extern "C" __global__ void __launch_bounds__(32) tf_q35_attn_merge(Geo geo, const float* __restrict__ PM, const float* __restrict__ PL,
-                                                                     const float* __restrict__ PO, const Seg* __restrict__ segs,
-                                                                     const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc,
-                                                                     const int* __restrict__ P, __nv_bfloat16* __restrict__ OUT) {
-    release_next();
-    await_prior();
+template <bool GATE>
+__device__ __forceinline__ void merge_head(Geo geo, const float* __restrict__ PM, const float* __restrict__ PL, const float* __restrict__ PO,
+                                           const Seg* __restrict__ segs, const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc,
+                                           const int* __restrict__ P, __nv_bfloat16* __restrict__ OUT, const __nv_bfloat16* __restrict__ QRAW,
+                                           float* __restrict__ XS) {
     constexpr int DPL = HD / 32;
     const int QH = geo.qh;
     const int lane = threadIdx.x, qh = blockIdx.x;
@@ -498,8 +514,46 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35_attn_merge(Geo geo, cons
 #pragma unroll
         for (int i = 0; i < DPL; i++) acc[i] = fmaf(PO[(base + c) * HD + lane * DPL + i], e, acc[i]);
     }
+    if constexpr (!GATE) {
 #pragma unroll
-    for (int i = 0; i < DPL; i++) OUT[(m * QH + qh) * HD + lane * DPL + i] = __float2bfloat16_rn(acc[i] / lsum);
+        for (int i = 0; i < DPL; i++) OUT[(m * QH + qh) * HD + lane * DPL + i] = __float2bfloat16_rn(acc[i] / lsum);
+    } else {
+        __shared__ __align__(16) __nv_bfloat16 done[HD];
+        const size_t W = (size_t)QH * HD;
+#pragma unroll
+        for (int i = 0; i < DPL; i++) {
+            const int d = lane * DPL + i;
+            const __nv_bfloat16 y = __float2bfloat16_rn(acc[i] / lsum);
+            const float gate = bf(QRAW[m * 2 * W + qh * 2 * HD + HD + d]);
+            const float s = rbf(1.0f / (1.0f + expf(-gate)));
+            const __nv_bfloat16 o = __float2bfloat16_rn(bf(y) * s);
+            OUT[m * W + qh * HD + d] = o;
+            done[d] = o;
+        }
+        if (XS == nullptr) return;
+        __syncwarp();
+        if (lane < HD / 64) XS[(m * W + qh * HD) / 64 + lane] = group_sum(done + lane * 64);
+    }
+}
+
+// A row's chunks' partials into each (row, query head)'s output, rows qh * HD wide. Grid (qh, rows), a warp each.
+extern "C" __global__ void __launch_bounds__(32) tf_q35_attn_merge(Geo geo, const float* __restrict__ PM, const float* __restrict__ PL,
+                                                                     const float* __restrict__ PO, const Seg* __restrict__ segs,
+                                                                     const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc,
+                                                                     const int* __restrict__ P, __nv_bfloat16* __restrict__ OUT) {
+    release_next();
+    await_prior();
+    merge_head<false>(geo, PM, PL, PO, segs, rowseg, rowanc, P, OUT, nullptr, nullptr);
+}
+
+extern "C" __global__ void __launch_bounds__(32) tf_q35_merge_gate(Geo geo, const float* __restrict__ PM, const float* __restrict__ PL,
+                                                                     const float* __restrict__ PO, const Seg* __restrict__ segs,
+                                                                     const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc,
+                                                                     const int* __restrict__ P, __nv_bfloat16* __restrict__ OUT,
+                                                                     const __nv_bfloat16* __restrict__ QRAW, float* __restrict__ XS) {
+    release_next();
+    await_prior();
+    merge_head<true>(geo, PM, PL, PO, segs, rowseg, rowanc, P, OUT, QRAW, XS);
 }
 
 // A 256-thread block's outputs' 64-entry group sums into XS (null: none); rows are whole groups, so a block's are too.
