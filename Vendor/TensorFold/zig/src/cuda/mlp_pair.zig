@@ -25,6 +25,12 @@ pub const single_dict_dec: u32 = 512;
 /// Gate's and up's tables at most for the twin to keep tf_qmm_mlp_single16's two CTAs an SM (GB10: 100 KiB an SM,
 /// 1 KiB of it reserved a CTA), so its 68 CTAs stay one wave; a layer past it keeps the original kernel.
 pub const single_tab_max: u32 = 102400 / 2 - 1024 - single_smem - single_dict_dec;
+/// tf_qmm_mlp_single32 (qmm_stream32.cuh): tf_qmm_mlp_single16 on 17 to 32 rows, eight warps a CTA; its stages, the
+/// inputs of both m16 row tiles and eight warps' pass values, then (the dictionary twin) gate's and up's tables.
+pub const single32_smem: u32 = 41216 + 1024;
+pub const single32_tab_max: u32 = 102400 / 2 - 1024 - single32_smem;
+/// tf_qmm_mlp_single32_pair: its stages and inputs, then eight warps' four passes' values (no table in shared memory)
+pub const single32_pair_smem: u32 = 41216 + 4096;
 
 pub const Kernels = struct {
     pair_fn: Function,
@@ -33,6 +39,10 @@ pub const Kernels = struct {
     kmajor_single: bool = false,
     dict_fn: ?Function = null, // GB10: tf_qmm_mlp_pair's twin, taken when gate and up are both coded (tile-major)
     single_dict_fn: ?Function = null, // tf_qmm_mlp_single16's, when both are coded on the K-major panel's layout
+    single32_fn: ?Function = null, // tf_qmm_mlp_single32: verify windows of 17 to 32 rows on tf_qmm_mlp_single16's panel
+    single32_dict_fn: ?Function = null, // its dictionary twin
+    single32_pair_fn: ?Function = null, // ... on pd4's pair-coded gate and up (both)
+    single32_mixed_fn: ?Function = null, // ... one pair-coded, one value-coded
 
     /// From the loaded qmm_group module; `pdl` as the decode tiles' launches (GB10).
     pub fn resolve(group_mod: module.Module, pdl: bool) !Kernels {
@@ -70,6 +80,8 @@ pub const Kernels = struct {
     /// act (rows, n) = bf16(silu(x through gate) * (x through up)), x's group sums in xs; act's group sums into as.
     pub fn pair(kk: *const Kernels, s: Stream, x: u64, xs: u64, gate: Affine4, up: Affine4, act: u64, as: u64, rows: usize) !void {
         if (!fits(gate, up) or rows == 0) return error.InputMismatch;
+        if (rows > 16 and rows <= 32 and gate.n == 17408 and gate.k == 5120 and gate.verify_w != 0 and up.verify_w != 0 and
+            kk.kmajor_single and kk.single32_fn != null) return kk.pair32(s, x, xs, gate, up, act, as, rows);
         const rows_t = (rows + 15) / 16;
         const major = rows == 16 and gate.n == 17408 and gate.k == 5120 and
             gate.verify_w != 0 and up.verify_w != 0 and kk.kmajor_fn != null;
@@ -106,5 +118,37 @@ pub const Kernels = struct {
         const f = if (sdict) kk.single_dict_fn.? else if (major) kk.kmajor_fn.? else if (dict) kk.dict_fn.? else kk.pair_fn;
         const shared: u32 = if (sdict) single_smem + single_dict_dec + singleTab(gate) + singleTab(up) else if (single) single_smem else if (major) kmajor_smem else if (dict) smem + qlinear.dict_dec + @max(gate.tabBytes(), up.tabBytes()) else smem;
         try launch_.launch(f, .{ .grid = .{ .x = @intCast(@as(usize, if (single) 1 else 2) * rows_t * tiles) }, .block = .{ .x = 128 }, .shared = shared, .cluster = if (single) null else .{ .x = 2 }, .pdl = kk.pdl }, s, &g);
+    }
+
+    /// pair()'s tf_qmm_mlp_single16 launch on 17 to 32 rows: tf_qmm_mlp_single32, both m16 row tiles off one panel stream.
+    fn pair32(kk: *const Kernels, s: Stream, x: u64, xs: u64, gate: Affine4, up: Affine4, act: u64, as: u64, rows: usize) !void {
+        const sdict = kk.single32_dict_fn != null and coded(gate, up, true) and singleTab(gate) + singleTab(up) <= single32_tab_max;
+        const tiles = gate.n / 256;
+        var parts: qlinear.Parts = std.mem.zeroes(qlinear.Parts);
+        for ([2]Affine4{ gate, up }, parts.p[0..2]) |q, *p| p.* = .{
+            .w = q.verify_w,
+            .scales = if (sdict) q.sb else q.s,
+            .biases = if (sdict) q.tab else q.b,
+            .out = 0,
+            .n = @intCast(q.n),
+            .npad = @intCast(q.npad),
+            .sk = 1,
+            .tiles = @intCast(tiles),
+            .first = if (sdict) @bitCast(q.code & ~qlinear.dict_kmajor) else 0,
+        };
+        parts.count = 2;
+        var g: launch_.Args = .{};
+        g.add(x);
+        g.add(xs);
+        g.add(parts);
+        g.add(act);
+        g.add(as);
+        for ([_]usize{ rows, gate.k, gate.k, 1 }) |v| g.add(@as(c_int, @intCast(v)));
+        const shared: u32 = if (sdict) single32_smem + singleTab(gate) + singleTab(up) else single32_smem;
+        const g_pair = gate.code >> 18 & 0x1FFF == 0;
+        const u_pair = up.code >> 18 & 0x1FFF == 0;
+        const twin = if (!sdict) kk.single32_fn.? else if (g_pair and u_pair) kk.single32_pair_fn.? else if (g_pair or u_pair) kk.single32_mixed_fn.? else kk.single32_dict_fn.?;
+        const shared32: u32 = if (sdict and g_pair and u_pair) single32_pair_smem else shared;
+        try launch_.launch(twin, .{ .grid = .{ .x = @intCast(tiles) }, .block = .{ .x = 256 }, .shared = shared32, .pdl = kk.pdl }, s, &g);
     }
 };

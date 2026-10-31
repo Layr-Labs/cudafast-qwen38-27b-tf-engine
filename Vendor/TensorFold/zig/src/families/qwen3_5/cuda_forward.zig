@@ -76,7 +76,11 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
             },
             .attention => |m| {
                 const aw = g.attnWidth();
-                try e.projMany(&.{ m.q, m.k, m.v }, e.x, &.{ e.qraw, e.kraw, e.vraw }, total, prompt);
+                if (tail and i == e.layers.len - 1) {
+                    // the tail's layer: keys and values for every row, queries (and gate) for the last row alone
+                    try e.projMany(&.{ m.k, m.v }, e.x, &.{ e.kraw, e.vraw }, total, prompt);
+                    try @import("cuda_prompt_tail.zig").query(e, m.q.a4, total);
+                } else try e.projMany(&.{ m.q, m.k, m.v }, e.x, &.{ e.qraw, e.kraw, e.vraw }, total, prompt);
                 if (e.learning) |k| try k.attention(i, e.qraw, e.kraw, e.vraw, total);
                 if (prompt and total > 16 and !e.kv8) {
                     // Preserve the original two head sums and bf16 boundary before rotary/cache stores.
