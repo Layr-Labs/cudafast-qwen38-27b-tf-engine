@@ -118,6 +118,7 @@ __global__ void __launch_bounds__(WM * WN * 32) group_kernel(
     };
     uint32_t mask;                              // 0x000F000F, opaque to the compiler (kept in a register)
     asm volatile("mov.b32 %0, 0x000F000F;\n" : "=r"(mask));
+    grid_launch();
 
     float acc[I][J][4];
 #pragma unroll
@@ -144,7 +145,6 @@ __global__ void __launch_bounds__(WM * WN * 32) group_kernel(
             if (s < per) load_x(s, g0 + s);
             commit();
         }
-        grid_launch();
         auto steps = [&](auto live_c) {                   // LIVE: the warp's m16 tiles holding rows below M
             [[maybe_unused]] constexpr int LIVE = decltype(live_c)::value;
             for (int it = 0; it < per; ++it) {
@@ -361,8 +361,15 @@ using namespace qmm_dict;
 constexpr int GROUP_PAIR_SMEM = 14592;
 constexpr int GROUP_PAIR_SMEM_ONE = 32768;
 
+__device__ __forceinline__ void amax_take(float v, int i, float& best, int& id) {
+    if (v > best || (v == best && i < id)) {
+        best = v;
+        id = i;
+    }
+}
+
 // group_kernel with dictionary-coded scales and biases (dict_lanes): no swapped or spread tiles.
-template <int GS, int BM, int BN, int WM, int WN, int STAGES, bool F32, bool SKIP = false>
+template <int GS, int BM, int BN, int WM, int WN, int STAGES, bool F32, bool SKIP = false, bool AMAX = false>
 __global__ void __launch_bounds__(WM * WN * 32) group_kernel_dict(
         const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs, const __grid_constant__ Parts parts,
         int M, int K, int ldx, int rows_t, int C) {
@@ -440,6 +447,7 @@ __global__ void __launch_bounds__(WM * WN * 32) group_kernel_dict(
     };
     uint32_t mask;                              // 0x000F000F, opaque to the compiler (kept in a register)
     asm volatile("mov.b32 %0, 0x000F000F;\n" : "=r"(mask));
+    grid_launch();
 
     float acc[I][J][4];
 #pragma unroll
@@ -468,7 +476,6 @@ __global__ void __launch_bounds__(WM * WN * 32) group_kernel_dict(
             if (s < per) load_x(s, g0 + s);
             commit();
         }
-        grid_launch();
         const int b_off = D.pair ? 0 : 16;
         auto steps = [&](auto live_c) {                   // LIVE: the warp's m16 tiles holding rows below M
             [[maybe_unused]] constexpr int LIVE = decltype(live_c)::value;
@@ -656,6 +663,49 @@ __global__ void __launch_bounds__(WM * WN * 32) group_kernel_dict(
 #endif
     }
     if (!live) return;
+    if constexpr (AMAX) {
+        static_assert(!F32 && WM == 1 && BM == 16 && I == 1, "one m16 row tile, the warps across the tile's columns");
+        float best[2] = {__int_as_float(0xff800000), __int_as_float(0xff800000)};
+        int id[2] = {0x7fffffff, 0x7fffffff};
+#pragma unroll
+        for (int j = 0; j < J; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int h = e >> 1;
+                const int col = n0 + wn * (BN / WN) + j * 8 + (lane & 3) * 2 + (e & 1);
+                const int row = m0 + (lane >> 2) + h * 8;
+                const float v = __bfloat162float(__float2bfloat16_rn(acc[0][j][e]));
+                if (row < M && col < N && v > best[h]) {
+                    best[h] = v;
+                    id[h] = col;
+                }
+            }
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+#pragma unroll
+            for (int m = 1; m <= 2; m <<= 1)
+                amax_take(__shfl_xor_sync(0xffffffffu, best[h], m), __shfl_xor_sync(0xffffffffu, id[h], m), best[h], id[h]);
+        float* wv = reinterpret_cast<float*>(buf);
+        int* wi = reinterpret_cast<int*>(buf + WN * 16 * 4);
+        if ((lane & 3) == 0)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                wv[wn * 16 + (lane >> 2) + h * 8] = best[h];
+                wi[wn * 16 + (lane >> 2) + h * 8] = id[h];
+            }
+        __syncthreads();
+        if (tid < 16 && m0 + tid < M) {
+            float b = __int_as_float(0xff800000);
+            int k = 0x7fffffff;
+#pragma unroll
+            for (int w = 0; w < WN; ++w) amax_take(wv[w * 16 + tid], wi[w * 16 + tid], b, k);
+            float* pv = reinterpret_cast<float*>(P.out);
+            int* pi = reinterpret_cast<int*>(pv + static_cast<size_t>(M) * P.tiles);
+            pv[static_cast<size_t>(m0 + tid) * P.tiles + tile] = b;
+            pi[static_cast<size_t>(m0 + tid) * P.tiles + tile] = k;
+        }
+        return;
+    }
 #pragma unroll
     for (int i = 0; i < I; ++i)
 #pragma unroll
@@ -761,6 +811,7 @@ __device__ __forceinline__ void mlp_pair_body(const __nv_bfloat16* __restrict__ 
     };
     uint32_t mask;
     asm volatile("mov.b32 %0, 0x000F000F;\n" : "=r"(mask));
+    grid_launch();
 
     float acc[I][J][4];
 #pragma unroll
@@ -788,7 +839,6 @@ __device__ __forceinline__ void mlp_pair_body(const __nv_bfloat16* __restrict__ 
         if (s < per) load_x(s, g0 + s);
         commit();
     }
-    grid_launch();
     const int b_off = DICT ? (D.pair ? 0 : 16) : 0;
     for (int it = 0; it < per; ++it) {
         wait<STAGES - 2>();
@@ -932,6 +982,31 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_pair(const __nv_bfl
 // MMA chains, fmas and sums, each scale and bias decoded from its dictionary index (dict_lanes).
 template __global__ void tf_qmm_group::group_kernel_dict<64, 16, 64, 1, 4, 8, false>(
     const __nv_bfloat16* __restrict__, const float* __restrict__, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
+template __global__ void tf_qmm_group::group_kernel_dict<64, 16, 64, 1, 4, 8, false, false, true>(
+    const __nv_bfloat16* __restrict__, const float* __restrict__, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
+
+extern "C" __global__ void __launch_bounds__(256) tf_qmm_head_argmax_merge(const float* __restrict__ PV,
+        const int* __restrict__ PI, int tiles, unsigned* __restrict__ TOK) {
+    qmm_frag::grid_wait();
+    __shared__ float bv[8];
+    __shared__ int bi[8];
+    float best = __int_as_float(0xff800000);
+    int id = 0x7fffffff;
+    const size_t at = static_cast<size_t>(blockIdx.x) * tiles;
+    for (int s = threadIdx.x; s < tiles; s += blockDim.x) tf_qmm_group::amax_take(PV[at + s], PI[at + s], best, id);
+#pragma unroll
+    for (int m = 16; m; m >>= 1)
+        tf_qmm_group::amax_take(__shfl_xor_sync(0xffffffffu, best, m), __shfl_xor_sync(0xffffffffu, id, m), best, id);
+    if ((threadIdx.x & 31) == 0) {
+        bv[threadIdx.x >> 5] = best;
+        bi[threadIdx.x >> 5] = id;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int w = 1; w < 8; w++) tf_qmm_group::amax_take(bv[w], bi[w], best, id);
+        TOK[blockIdx.x] = static_cast<unsigned>(id);
+    }
+}
 
 extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_pair_dict(const __nv_bfloat16* __restrict__ x,
         const float* __restrict__ xs, const __grid_constant__ tf_qmm_group::Parts parts, __nv_bfloat16* __restrict__ act,
@@ -940,4 +1015,5 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_pair_dict(const __n
 }
 
 #include "qmm_mlp_single_dict.cuh"
+#include "qmm_mlp_compact_pair.cuh"
 #include "qmm_mlp_single32.cuh"

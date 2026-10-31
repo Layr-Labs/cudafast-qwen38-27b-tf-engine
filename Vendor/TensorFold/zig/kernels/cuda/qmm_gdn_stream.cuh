@@ -98,6 +98,7 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
     }
     uint32_t mask;
     asm volatile("mov.b32 %0, 0x000F000F;\n" : "=r"(mask));
+    grid_launch();
 
     for (int c = tid; c < 16 * T::CHUNKS; c += T::THREADS)
         if (c / T::CHUNKS >= rows)
@@ -128,7 +129,6 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
         if (s < items) load_x(s, s);
         commit();
     }
-    grid_launch();
     for (int it = 0; it < items; ++it) {
         wait<STAGES - 2>();
         __syncthreads();
@@ -395,6 +395,7 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
     }
     uint32_t mask;
     asm volatile("mov.b32 %0, 0x000F000F;\n" : "=r"(mask));
+    grid_launch();
 
     for (int c = tid; c < 32 * T::CHUNKS; c += T::THREADS)
         if (c / T::CHUNKS >= rows)
@@ -413,7 +414,6 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
         if (s < items) load_x(s, s);
         commit();
     }
-    grid_launch();
     for (int it = 0; it < items; ++it) {
         wait<STAGES - 2>();
         __syncthreads();
