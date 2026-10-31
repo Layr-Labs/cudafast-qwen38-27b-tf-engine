@@ -579,3 +579,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_pair(const __nv_bfl
 #include "qmm_mlp_layout.cuh"
 
 #include "qmm_mlp_single.cuh"
+
+#include "qmm_output_stream.cuh"
+
+#include "qmm_gdn_stream.cuh"
