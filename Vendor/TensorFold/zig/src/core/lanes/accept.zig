@@ -37,6 +37,7 @@ pub fn isChain(parents: []const i32) bool {
 }
 
 /// Rows of the accepted path from row 0: follow the first child (by row) whose token is the target's pick.
+/// Parents must precede their children.
 pub fn acceptPath(gpa: Allocator, tokens: []const u32, parents: []const i32, picks: []const u32) ![]u32 {
     var path: std.ArrayList(u32) = .empty;
     errdefer path.deinit(gpa);
@@ -45,7 +46,8 @@ pub fn acceptPath(gpa: Allocator, tokens: []const u32, parents: []const i32, pic
         const at = path.items[path.items.len - 1];
         const want = picks[at];
         var next: ?u32 = null;
-        for (parents, 0..) |q, row| {
+        const first = @as(usize, at) + 1;
+        for (parents[first..], first..) |q, row| {
             if (q == @as(i32, @intCast(at)) and tokens[row] == want) {
                 next = @intCast(row);
                 break;
@@ -92,6 +94,33 @@ test "accept path follows matching children" {
     const chain = try rowParents(gpa, 3, null);
     defer gpa.free(chain);
     try std.testing.expectEqualSlices(i32, &.{ -1, 0, 1 }, chain);
+}
+
+test "accept path preserves chain boundaries and first matching sibling order" {
+    const Case = struct { tokens: []const u32, parents: []const i32, picks: []const u32, path: []const u32 };
+    const cases = [_]Case{
+        .{ .tokens = &.{99}, .parents = &.{-1}, .picks = &.{7}, .path = &.{0} },
+        .{ .tokens = &.{ 99, 7 }, .parents = &.{ -1, 0 }, .picks = &.{ 8, 0 }, .path = &.{0} },
+        .{ .tokens = &.{ 99, 7, 8 }, .parents = &.{ -1, 0, 1 }, .picks = &.{ 7, 8, 9 }, .path = &.{ 0, 1, 2 } },
+        .{
+            .tokens = &.{ 99, 7, 7, 9, 9, 11 }, .parents = &.{ -1, 0, 0, 1, 2, 3 },
+            .picks = &.{ 7, 9, 9, 11, 11, 0 }, .path = &.{ 0, 1, 3, 5 },
+        },
+        .{
+            .tokens = &.{ 99, 8, 7, 6, 9 }, .parents = &.{ -1, 0, 0, 1, 2 },
+            .picks = &.{ 7, 6, 9, 0, 0 }, .path = &.{ 0, 2, 4 },
+        },
+    };
+    for (cases) |c| {
+        const path = try acceptPath(std.testing.allocator, c.tokens, c.parents, c.picks);
+        defer std.testing.allocator.free(path);
+        try std.testing.expectEqualSlices(u32, c.path, path);
+    }
+}
+
+test "depth validation rejects self and later parents before acceptance" {
+    try std.testing.expectError(error.ParentAfterChild, depths(std.testing.allocator, &.{ -1, 1 }));
+    try std.testing.expectError(error.ParentAfterChild, depths(std.testing.allocator, &.{ -1, 2, 0 }));
 }
 
 test "sanitize drops orphans" {
