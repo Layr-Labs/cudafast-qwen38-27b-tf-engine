@@ -644,12 +644,13 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35_attn_merge_gate(Geo geo,
 
 // tf_q35_head_norm of a (row, head) on threads 0-63, then tf_q35_rope's rotation of it: a query head's into Qn, a key
 // head's with its value into the cache slot. Grid (rows, query heads + key heads), HD threads.
-template <typename Store>
+template <typename Store, bool EARLY = false>
 __device__ __forceinline__ void norm_rope_rows(const Geo& geo, const __nv_bfloat16* __restrict__ QRAW, const __nv_bfloat16* __restrict__ KRAW,
                                                const __nv_bfloat16* __restrict__ WQ, const __nv_bfloat16* __restrict__ WK,
                                                __nv_bfloat16* __restrict__ Qn, const __nv_bfloat16* __restrict__ Vr, const Seg* __restrict__ segs,
                                                const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, const int* __restrict__ P,
-                                               const int* __restrict__ M, float eps, Store store) {
+                                               const int* __restrict__ M, float eps, Store store, uint2 wpre = make_uint2(0, 0),
+                                               float2 rpre = make_float2(0.0f, 1.0f)) {
     __shared__ float sums[2];
     __shared__ __align__(16) __nv_bfloat16 xs[HD];
     const int QH = geo.qh, KVH = geo.kvh;
@@ -676,16 +677,30 @@ __device__ __forceinline__ void norm_rope_rows(const Geo& geo, const __nv_bfloat
 #pragma unroll
         for (int i = 0; i < 4; i++) {
             const int d = 4 * t + i;
-            xs[d] = __float2bfloat16_rn(bf(W[d]) * (v[i] * inv));
+            // EARLY: the head's norm weights were read before the wait (the same values)
+            const __nv_bfloat16 wd = EARLY ? reinterpret_cast<const __nv_bfloat16*>(&wpre)[i] : W[d];
+            xs[d] = __float2bfloat16_rn(bf(wd) * (v[i] * inv));
         }
     }
     __syncthreads();
     const Seg sg = segs[rowseg[m]];
-    int pos[3];
-    row_positions(sg, rowanc[m], m, M, pos);
     const int slot = sg.len + (int)m - sg.row0;
-    if (query) Qn[(m * QH + head) * HD + t] = rotate(xs, t, pos);
-    else store(sg, head, slot, t, rotate(xs, t, pos), Vr[(m * KVH + head) * HD + t]);
+    // EARLY: rotate's angle (sin, cos) came from the same position before the wait
+    __nv_bfloat16 r;
+    if (EARLY) {
+        r = xs[t];
+        if (t < 64) {
+            const int i = t % 32;
+            const float a = bf(xs[i]), b = bf(xs[i + 32]);
+            r = __float2bfloat16_rn(t < 32 ? a * rpre.y - b * rpre.x : b * rpre.y + a * rpre.x);
+        }
+    } else {
+        int pos[3];
+        row_positions(sg, rowanc[m], m, M, pos);
+        r = rotate(xs, t, pos);
+    }
+    if (query) Qn[(m * QH + head) * HD + t] = r;
+    else store(sg, head, slot, t, r, Vr[(m * KVH + head) * HD + t]);
 }
 
 extern "C" __global__ void __launch_bounds__(256) tf_q35_norm_rope(Geo geo, const __nv_bfloat16* __restrict__ QRAW, const __nv_bfloat16* __restrict__ KRAW,
@@ -695,8 +710,27 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm_rope(Geo geo, cons
                                                                      const Ancestor* __restrict__ rowanc, int layer, const int* __restrict__ P,
                                                                      const int* __restrict__ M, float eps) {
     release_next();
+    // ahead of the wait: the head's norm weights (static); after it, this forward's rows. The loads move, the
+    // arithmetic does not
+    uint2 wv = make_uint2(0, 0);
+    if (threadIdx.x < 64) {
+        const __nv_bfloat16* W = blockIdx.y < (unsigned)geo.qh ? WQ : WK;
+        wv = *reinterpret_cast<const uint2*>(plain(W) + 4 * threadIdx.x);
+        asm volatile("" ::"r"(wv.x), "r"(wv.y));  // issued before the wait (keep4's rule)
+    }
+    // and rotate's angle for this thread's pair: the row's position comes from the staged tables (copied before this
+    // forward's first launch, as gdn_pre's conv tail reads them ahead of its wait), so it is settled now
+    float2 rp = make_float2(0.0f, 1.0f);
+    if (threadIdx.x < 64 && !past_rows(P, blockIdx.x)) {
+        int pos[3];
+        row_positions(segs[rowseg[blockIdx.x]], rowanc[blockIdx.x], blockIdx.x, M, pos);
+        const int i = threadIdx.x % 32;
+        const float angle = (float)pos[mrope_axis(i)] * powf(10000000.0f, -(float)i / 32.0f);
+        sincosf(angle, &rp.x, &rp.y);
+    }
+    asm volatile("" ::"f"(rp.x), "f"(rp.y));
     await_prior();
-    norm_rope_rows(geo, after_wait(QRAW), after_wait(KRAW), WQ, WK, after_wait(Qn), after_wait(Vr), segs, rowseg, rowanc, P, M, eps, StoreBf16{layer, geo.kvh});
+    norm_rope_rows<StoreBf16, true>(geo, after_wait(QRAW), after_wait(KRAW), WQ, WK, after_wait(Qn), after_wait(Vr), segs, rowseg, rowanc, P, M, eps, StoreBf16{layer, geo.kvh}, wv, rp);
 }
 
 #include "qwen35_rows.cuh"
