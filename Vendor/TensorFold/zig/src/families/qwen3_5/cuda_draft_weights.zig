@@ -108,13 +108,36 @@ fn quantize(gpa: std.mem.Allocator, w: []align(1) const u16, n: usize, k: usize)
             const row = w[r * k + g * 64 ..][0..64];
             var lo: f32 = std.math.inf(f32);
             var hi: f32 = -std.math.inf(f32);
+            var sum: f64 = 0;
             for (row) |h| {
                 const x = bf16(h);
                 lo = @min(lo, x);
                 hi = @max(hi, x);
+                sum += x;
             }
-            var fit = [2]f32{ (hi - lo) / 15.0, lo };
-            fit = leastSquares(row, fit);
+            const mean: f32 = @floatCast(sum / 64.0);
+            const range: f32 = hi - lo;
+            // search over bias and scale seeds, refine each with leastSquares, keep the best fit
+            var best_fit = [2]f32{ if (range > 0) range / 15.0 else 1.0, lo };
+            var best_err = groupError(row, best_fit);
+            const seeds = [_][2]f32{
+                .{ if (range > 0) range / 15.0 else 1.0, lo },
+                .{ if (range > 0) range / 14.0 else 1.0, lo },
+                .{ if (range > 0) range / 16.0 else 1.0, lo },
+                .{ if (range > 0) range / 15.0 else 1.0, mean },
+                .{ if (range > 0) range / 15.0 else 1.0, (lo + hi) * 0.5 },
+                .{ if (range > 0) range / 8.0 else 1.0, lo },
+            };
+            for (seeds) |seed| {
+                if (!(seed[0] > 0)) continue;
+                const f = leastSquares(row, seed);
+                const e = groupError(row, f);
+                if (e < best_err) {
+                    best_err = e;
+                    best_fit = f;
+                }
+            }
+            var fit = best_fit;
             const scale = toBf16(fit[0]);
             const bias = toBf16(fit[1]);
             scales[r * groups + g] = scale;
@@ -141,7 +164,7 @@ fn leastSquares(row: []align(1) const u16, start: [2]f32) [2]f32 {
     var best = start;
     var best_err = groupError(row, start);
     var cur = start;
-    for (0..3) |_| {
+    for (0..8) |_| {
         const s = cur[0];
         if (s <= 0) break;
         var sq: f64 = 0;
