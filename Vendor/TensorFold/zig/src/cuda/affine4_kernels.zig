@@ -314,29 +314,31 @@ pub const Affine4Kernels = struct {
     /// decode() of each projection of one input; without GB10 one segmented launch, each keeping its split's bits.
     /// On GB10 the K-sliced projections share one lane_gemv launch and the unsliced ones one cluster launch.
     pub fn decodeMany(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, outs: []const Out, rows: usize) !void {
-        const stream_input = rows == 16 and a.pdl and outs.len == 4 and
-            outs[0].q.n == 10240 and outs[1].q.n == 6144 and outs[2].q.n == 48 and outs[3].q.n == 48 and
-            for (outs) |o| { if (o.q.k != 5120 or o.q.stream_w == 0) break false; } else true;
+        const stream_input = rows > 0 and rows <= max_rows and a.pdl and outs.len > 0 and outs.len <= segs_max and
+            for (outs) |o| { if (o.q.k != outs[0].q.k or o.q.k % 64 != 0 or o.q.stream_w == 0) break false; } else true;
         if (stream_input and a.gdn_stream16_fn != null) {
+            var wide_tiles: usize = 0;
+            for (outs) |o| wide_tiles += if (o.q.n % 256 == 0) o.q.n / 256 else (o.q.n + 63) / 64;
+            const use_wide = wide_tiles >= a.sms;
             // coded parts stream their index windows (the dictionary twin): npad holds the code, tiles the real npad
             var dict = false;
             var tab: u32 = 0;
-            if (a.gdn_stream16_dict_fn != null) for (outs) |o| if (a.coded(o.q)) {
+            if (use_wide and a.gdn_stream16_dict_fn != null) for (outs) |o| if (a.coded(o.q)) {
                 dict = true;
                 tab = @max(tab, o.q.tabBytes());
             };
             var parts: Parts = std.mem.zeroes(Parts);
-            parts.count = 4;
+            parts.count = int(outs.len);
             var first: usize = 0;
             for (outs, 0..) |o, index| {
-                const tiles = if (index < 2) o.q.n / 256 else 1;
+                const tiles = if (use_wide and o.q.n % 256 == 0) o.q.n / 256 else (o.q.n + 63) / 64;
                 const twin = dict and a.coded(o.q);
-                parts.p[index] = .{ .w = o.q.stream_w, .scales = if (twin) o.q.sb else o.q.s, .biases = if (twin) o.q.tab else o.q.b, .out = o.out, .n = int(o.q.n), .npad = if (twin) @bitCast(o.q.code) else int(o.q.npad), .sk = int(splitK(o.q.n,o.q.k)), .tiles = if (dict) (if (twin) int(o.q.npad) else 0) else int(tiles), .first = int(first) };
+                parts.p[index] = .{ .w = o.q.stream_w, .scales = if (twin) o.q.sb else o.q.s, .biases = if (twin) o.q.tab else o.q.b, .out = o.out, .n = int(o.q.n), .npad = if (twin) @bitCast(o.q.code) else int(o.q.npad), .sk = int(splitK(o.q.n, o.q.k)), .tiles = if (dict) (if (twin) int(o.q.npad) else 0) else int(tiles), .first = int(first) };
                 first += tiles;
             }
             var g: launch_.Args = .{};
             g.add(x); g.add(xs); g.add(parts);
-            for ([_]usize{ rows, 5120, 5120 }) |v| g.add(int(v));
+            for ([_]usize{ rows, outs[0].q.k, outs[0].q.k }) |v| g.add(int(v));
             const shared: u32 = if (dict) 22656 + 4 * 256 + tab else 22656;
             return launch_.launch(if (dict) a.gdn_stream16_dict_fn.? else a.gdn_stream16_fn.?, .{ .grid = .{ .x = u(first) }, .block = .{ .x = 128 }, .shared = shared, .pdl = true }, s, &g);
         }
@@ -348,6 +350,12 @@ pub const Affine4Kernels = struct {
     /// Attention's full-K Q and ordered sliced K/V tiles in one cluster launch.
     pub fn decodeAttentionMixed(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, outs: []const Out, rows: usize) !void {
         if (rows != 16 or outs.len != 3) return error.InputMismatch;
+        if (a.pdl and a.gdn_stream16_fn != null) {
+            const can_stream = for (outs) |o| {
+                if (o.q.k != outs[0].q.k or o.q.stream_w == 0) break false;
+            } else true;
+            if (can_stream) return a.decodeMany(s, x, xs, outs, rows);
+        }
         var cs: usize = 1;
         for (outs) |o| {
             if (o.q.k != outs[0].q.k) return error.InputMismatch;
@@ -620,18 +628,32 @@ pub const Affine4Kernels = struct {
 
     /// qmm_group's tile 2: a cluster of `sk` CTAs a column tile, its K slices summed over distributed shared memory.
     pub fn cluster(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, q: Affine4, out: u64, rows: usize, sk: usize) !void {
-        const stream_fn = if (q.stream_w == 0) null else a.stream16_fns[@as(usize, if (q.k == 6144) 1 else 0)];
-        if (rows == 16 and sk == 4 and q.n == 5120 and (q.k == 6144 or q.k == 17408) and q.stream_w != 0 and stream_fn != null) {
+        const stream_fn = if (q.stream_w == 0) null else a.stream16_fns[@as(usize, if (q.k == 6144 or q.k == 4096) 1 else 0)];
+        if (rows > 0 and rows <= max_rows and sk == 4 and (q.n == 5120 or q.n == 4096) and (q.k == 4096 or q.k == 6144 or q.k == 12288 or q.k == 17408) and q.stream_w != 0 and stream_fn != null) {
             // a coded down projection streams its index windows in place of its scales and biases (the same bits)
             const dict = q.k == 17408 and q.npad == 5120 and a.coded(q) and a.stream16_dict_fn != null;
+            const stream_tiles = q.npad / 64;
             var parts: Parts = std.mem.zeroes(Parts);
             parts.count = 1;
-            parts.p[0] = .{ .w = q.stream_w, .scales = if (dict) q.sb else q.s, .biases = if (dict) q.tab else q.b, .out = out, .n = int(q.n), .npad = if (dict) @bitCast(q.code) else int(q.npad), .sk = 4, .tiles = 80, .first = 0 };
+            parts.p[0] = .{ .w = q.stream_w, .scales = if (dict) q.sb else q.s, .biases = if (dict) q.tab else q.b, .out = out, .n = int(q.n), .npad = if (dict) @bitCast(q.code) else int(q.npad), .sk = 4, .tiles = int(stream_tiles), .first = 0 };
             var g: launch_.Args = .{};
             g.add(x); g.add(xs); g.add(parts);
             for ([_]usize{ rows, q.k, q.k }) |v| g.add(int(v));
             const shared = if (dict) group_smem + 4 * linear.dict_dec + q.tabBytes() else group_smem;
-            return launch_.launch(if (dict) a.stream16_dict_fn.? else stream_fn.?, .{ .grid = .{ .x = 80 }, .block = .{ .x = 512 }, .shared = shared, .pdl = a.pdl }, s, &g);
+            return launch_.launch(if (dict) a.stream16_dict_fn.? else stream_fn.?, .{ .grid = .{ .x = u(stream_tiles) }, .block = .{ .x = 512 }, .shared = shared, .pdl = a.pdl }, s, &g);
+        }
+        if (rows > 0 and rows <= max_rows and sk == 1 and q.stream_w != 0 and a.pdl and a.gdn_stream16_fn != null) {
+            const use_wide = (q.n / 256) >= a.sms and q.n % 256 == 0;
+            const stream_tiles = if (use_wide) q.n / 256 else (q.n + 63) / 64;
+            const dict = use_wide and a.coded(q) and a.gdn_stream16_dict_fn != null;
+            var parts: Parts = std.mem.zeroes(Parts);
+            parts.count = 1;
+            parts.p[0] = .{ .w = q.stream_w, .scales = if (dict) q.sb else q.s, .biases = if (dict) q.tab else q.b, .out = out, .n = int(q.n), .npad = if (dict) @bitCast(q.code) else int(q.npad), .sk = 1, .tiles = if (dict) int(q.npad) else int(stream_tiles), .first = 0 };
+            var g: launch_.Args = .{};
+            g.add(x); g.add(xs); g.add(parts);
+            for ([_]usize{ rows, q.k, q.k }) |v| g.add(int(v));
+            const shared: u32 = if (dict) 22656 + 4 * 256 + q.tabBytes() else 22656;
+            return launch_.launch(if (dict) a.gdn_stream16_dict_fn.? else a.gdn_stream16_fn.?, .{ .grid = .{ .x = u(stream_tiles) }, .block = .{ .x = 128 }, .shared = shared, .pdl = true }, s, &g);
         }
         const tiles = (q.n + 63) / 64;
         const rows_t = (rows + 15) / 16;

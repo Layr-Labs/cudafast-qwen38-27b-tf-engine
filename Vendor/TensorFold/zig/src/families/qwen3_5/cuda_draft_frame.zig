@@ -220,8 +220,8 @@ fn head(d: anytype, rows: usize) !?u64 {
         .x3, .bf => return full(d, rows),
     };
     if (q.n != spans[1][1] or q.k % 64 != 0) return full(d, rows);
-    const first: cuda.qlinear.Affine4 = .{ .w = q.w, .s = q.s, .b = q.b, .n = spans[0][1], .k = q.k, .npad = q.npad };
-    const tail: cuda.qlinear.Affine4 = .{ .w = q.w + tail_tile * q.k / 2, .s = q.s + tail_tile * 2, .b = q.b + tail_tile * 2, .n = q.n - tail_tile, .k = q.k, .npad = q.npad };
+    const first: cuda.qlinear.Affine4 = .{ .w = q.w, .s = q.s, .b = q.b, .n = spans[0][1], .k = q.k, .npad = q.npad, .stream_w = q.stream_w };
+    const tail: cuda.qlinear.Affine4 = .{ .w = q.w + tail_tile * q.k / 2, .s = q.s + tail_tile * 2, .b = q.b + tail_tile * 2, .n = q.n - tail_tile, .k = q.k, .npad = q.npad, .stream_w = if (q.stream_w != 0) q.stream_w + tail_tile * 32 else 0 };
     const a = d.logits; // rows x 98,304, then rows x 320, then the packed rows x 98,592
     const b = a + rows * first.n * 2;
     const out = b + rows * tail.n * 2;

@@ -428,6 +428,38 @@ pub const Draft = struct {
             // the whole budget whenever drafts are asked: the block's forward costs the same at any depth
             const n = if (it.depth == 0) 0 else limit;
             ctx.grown = tree.grow(d.candidates(rows), it.pending, rows, n, &ctx.held, &ctx.parents, &ctx.own);
+            if (n >= rows and it.tokens.len >= 4) {
+                var ch: [engine.most_window]u32 = undefined;
+                tree.chain(d.candidates(rows), it.pending, ch[0..rows]);
+                const hist = it.tokens;
+                var best_pos: usize = 0;
+                var best_hist: usize = 0;
+                var best_draft: usize = 0;
+                var idx = hist.len - 1;
+                while (idx > 0) {
+                    idx -= 1;
+                    if (hist[idx] != it.pending) continue;
+                    var hm: usize = 1;
+                    while (hm <= idx and hm < 64 and hist[idx - hm] == hist[hist.len - 1 - hm]) hm += 1;
+                    var dm: usize = 0;
+                    while (dm < rows and idx + 1 + dm < hist.len and hist[idx + 1 + dm] == ch[dm]) dm += 1;
+                    if (dm >= 3 and hm + dm >= 6 and (hm + dm > best_hist + best_draft or (hm + dm == best_hist + best_draft and dm > best_draft))) {
+                        best_pos = idx;
+                        best_hist = hm;
+                        best_draft = dm;
+                    }
+                }
+                if (best_draft >= 3 and best_hist + best_draft >= 6) {
+                    const avail = hist.len - (best_pos + 1);
+                    const copy_rows: usize = if (best_draft >= 10 and avail > rows) @min(@as(usize, 31), avail) else rows;
+                    for (0..copy_rows) |r| {
+                        ctx.held[r] = if (best_pos + 1 + r < hist.len) hist[best_pos + 1 + r] else ch[@min(r, rows - 1)];
+                        ctx.parents[r] = @as(i32, @intCast(r)) - 1;
+                        ctx.own[r] = 0.0;
+                    }
+                    ctx.grown = copy_rows;
+                }
+            }
             ctx.held_n = ctx.grown;
         } else {
             d.select(ctx, it.pending, rows);
@@ -478,7 +510,7 @@ pub const Draft = struct {
         for (items) |it| {
             const ctx = d.streams.get(it.stream) orelse return error.UnknownStream;
             if (it.features.space != .device or it.features.dtype != .bf16) return error.UnsupportedFeatures;
-            if (it.offered > 0 and ctx.grown > 0) {
+            if (it.offered > 0 and ctx.grown > 0 and ctx.own[0] < 0) {
                 var prefix: [engine.most_window]u32 = undefined;
                 for (prefix[0..@min(it.follow.len, prefix.len)], 0..) |*x, i| x.* = @intCast(i);
                 const kept = it.rows orelse prefix[0..@min(it.follow.len, prefix.len)];
@@ -530,7 +562,10 @@ pub const Draft = struct {
         const ctx = d.streams.get(s) orelse return error.UnknownStream;
         if (ctx.grown == 0 or out.len > ctx.grown) return false;
         const sampled = s.sampling != null;
-        for (out, ctx.parents[0..out.len], ctx.own[0..out.len]) |*o, parent, own| o.* = d.landing.chance(sampled, own) * (if (parent >= 0) out[@intCast(parent)] else 1);
+        for (out, ctx.parents[0..out.len], ctx.own[0..out.len]) |*o, parent, own| {
+            const step = if (own >= 0) 0.99 else d.landing.chance(sampled, own);
+            o.* = step * (if (parent >= 0) out[@intCast(parent)] else 1);
+        }
         return true;
     }
 

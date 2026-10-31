@@ -58,7 +58,7 @@ pub const Shape = struct { hidden: usize, intermediate: usize, layers: usize, vo
 
 fn packedBytes(n: usize, k: usize) usize {
     const l = Affine4.layout(n, k);
-    return aligned(l.words) + 2 * aligned(l.scales);
+    return 2 * aligned(l.words) + 2 * aligned(l.scales);
 }
 
 /// One projection's quantized words, scales and biases as `linear` stages them, back to back.
@@ -151,8 +151,17 @@ fn linear(gpa: std.mem.Allocator, e: *Engine, stage: *DeviceBuffer, w: *Weights,
         at += p.len;
     }
     const l = Affine4.layout(n, k);
-    const out: Affine4 = .{ .w = try w.alloc(l.words), .s = try w.alloc(l.scales), .b = try w.alloc(l.scales), .n = n, .k = k, .npad = l.npad };
+    const kmajor = try w.alloc(l.words);
+    var out: Affine4 = .{ .w = try w.alloc(l.words), .s = try w.alloc(l.scales), .b = try w.alloc(l.scales), .n = n, .k = k, .npad = l.npad };
     try e.affine.pack(e.stream, raw[0], raw[1], raw[2], out);
+    if (e.affine.pdl) {
+        const pack_kmajor = try e.mods[3].function("tf_pack_kmajor");
+        const words = l.npad * k / 8;
+        try e.run(pack_kmajor, .{ (words + 255) / 256, 1, 1 }, .{ 256, 1, 1 },
+            .{ out.w, kmajor, @as(c_int, @intCast(k / 64)), @as(c_int, @intCast(l.npad / 64)) });
+        if (n == 17408 and k == 5120) out.verify_w = kmajor;
+        out.stream_w = kmajor;
+    }
     try e.stream.synchronize();
     return out;
 }

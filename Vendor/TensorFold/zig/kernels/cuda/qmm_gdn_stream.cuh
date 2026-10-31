@@ -223,18 +223,18 @@ template<int FutureGroups>
 __device__ __forceinline__ void body(const __nv_bfloat16* x,const float* xs,const tf_qmm_group::Parts& parts,int M,int K,int ldx){
     int which=0;
 #pragma unroll
-    for(int i=1;i<4;++i)if(int(blockIdx.x)>=parts.p[i].first)which=i;
+    for(int i=1;i<4;++i)if(i<parts.count&&int(blockIdx.x)>=parts.p[i].first)which=i;
     const auto p=parts.p[which];int t=int(blockIdx.x)-p.first;
-    if(which<2)tile<256,FutureGroups>(x,xs,p,t,M,K,ldx);
+    if(p.tiles*256==p.n)tile<256,FutureGroups>(x,xs,p,t,M,K,ldx);
     else tile<64,FutureGroups>(x,xs,p,t,M,K,ldx);
 }
 // body() on a launch whose coded parts carry their real npad in `tiles` (uncoded parts: tiles 0, npad as stored).
 __device__ __forceinline__ void body_dict(const __nv_bfloat16* x,const float* xs,const tf_qmm_group::Parts& parts,int M,int K,int ldx){
     int which=0;
 #pragma unroll
-    for(int i=1;i<4;++i)if(int(blockIdx.x)>=parts.p[i].first)which=i;
+    for(int i=1;i<4;++i)if(i<parts.count&&int(blockIdx.x)>=parts.p[i].first)which=i;
     const auto p=parts.p[which];int t=int(blockIdx.x)-p.first;const bool coded=p.tiles>0;
-    if(which<2){if(coded)tile<256,0,true>(x,xs,p,t,M,K,ldx);else tile<256,0>(x,xs,p,t,M,K,ldx);}
+    if(p.n%256==0){if(coded)tile<256,0,true>(x,xs,p,t,M,K,ldx);else tile<256,0>(x,xs,p,t,M,K,ldx);}
     else{if(coded)tile<64,0,true>(x,xs,p,t,M,K,ldx);else tile<64,0>(x,xs,p,t,M,K,ldx);}
 }
 }
