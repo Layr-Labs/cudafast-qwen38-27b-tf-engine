@@ -687,6 +687,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm_rope(Geo geo, cons
 #include "qwen35_rows.cuh"
 #include "qwen35_slots.cuh"
 #include "qwen35_slots16.cuh"
+#include "qwen35_slots_lean.cuh"
 #include "qwen35_argmax.cuh"
 
 
@@ -722,6 +723,47 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_attn_partial(Geo geo, c
         if (!first) __syncthreads();
         first = false;
         tf_q35_tc::attn_one<tf_q35_tc::Bf16Tiles1<128>>({attn_tiles, nullptr, nullptr, nullptr}, geo, Q, segs, rowseg, rowanc, layer, P, scale, PM, PL, PO, c);
+    }
+}
+
+// tf_q35_attn_partial for row pairs (attn_two): a block a (row pair, chunk, key head), each chunk's stream-key tiles
+// loaded once for both rows; a 17..64-row window's rows of short streams (cuda_forward.zig), bits as attn_partial's.
+extern "C" __global__ void __launch_bounds__(128) tf_q35_attn_pair(Geo geo, const __nv_bfloat16* __restrict__ Q0, const Seg* __restrict__ segs,
+                                                                     const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
+                                                                     const int* __restrict__ P, float scale,
+                                                                     float* __restrict__ PM0, float* __restrict__ PL0, float* __restrict__ PO0) {
+    release_next();
+    await_prior();
+    const __nv_bfloat16* Q = after_wait(Q0);
+    float* PM = after_wait(PM0);
+    float* PL = after_wait(PL0);
+    float* PO = after_wait(PO0);
+    extern __shared__ __align__(16) uint4 attn_tiles[];
+    // the pair's chunks: every gridDim.y-th of the more of the two rows' (attn_two marks a row's chunk past its keys empty)
+    int most = 0;
+    for (int j = 0; j < 2; j++) {
+        const int m = 2 * (int)blockIdx.x + j;
+        if (past_rows(P, m)) continue;
+        const int keys = segs[rowseg[m]].len + rows_seen(rowanc[m]), ck = chunk_keys(keys);
+        most = max(most, (keys + ck - 1) / ck);
+    }
+    const int G = geo.qh / geo.kvh;
+    bool first = true;
+    for (int c = blockIdx.y; c < MAXCH; c += gridDim.y) {
+        if (c >= most) {
+            // past both rows' keys: attn_partial's empty chunk for each short row
+            for (int j = 0; j < 2; j++) {
+                const size_t m = 2 * (size_t)blockIdx.x + j;
+                if (past_rows(P, (int)m) || segs[rowseg[m]].len >= tf_q35_tc::GROUP_LEN || (int)threadIdx.x >= G) continue;
+                const size_t at = (m * geo.qh + (size_t)blockIdx.z * G + threadIdx.x) * MAXCH + c;
+                PM[at] = -INFINITY;
+                PL[at] = 0.0f;
+            }
+            continue;
+        }
+        if (!first) __syncthreads();
+        first = false;
+        tf_q35_tc::attn_two<tf_q35_tc::Bf16Tiles1<128>>({attn_tiles, nullptr, nullptr, nullptr}, geo, Q, segs, rowseg, rowanc, layer, P, scale, PM, PL, PO, c);
     }
 }
 

@@ -54,7 +54,7 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
         }
     }
 #endif
-    grid_wait();load_x(0);commit();grid_launch();
+    grid_wait();x_keep_l2(x,rows,K,ldx);load_x(0);commit();grid_launch();
     uint32_t mask;asm volatile("mov.b32 %0, 0x000F000F;\n":"=r"(mask));
     float acc[2][4]{};
     for(int it=0;it<per;++it){
