@@ -130,10 +130,17 @@ fn chancesAfter(c: Candidates, r: usize, pred: u32, out: *[lp_top]f64) void {
     const w = ids(c, r);
     const hp = std.mem.bytesAsSlice(u16, c.projected[r * c.rank * 2 ..][0 .. c.rank * 2]);
     var most: f64 = -std.math.inf(f64);
+    // every candidate's edge sum at once, each still over k in order (its own chain): the same f64 bits as one by one
+    var edge: [lp_top]f64 = @splat(0);
+    const pr = c.predecessor[pred * c.rank ..][0..c.rank];
+    var succ: [lp_top][]const u16 = undefined;
+    for (succ[0..c.topk], 0..) |*row, j| row.* = c.successor[w[2 + j] * c.rank ..][0..c.rank];
+    for (0..c.rank) |k| {
+        const ph = bf16(pr[k]) * bf16(hp[k]);
+        for (edge[0..c.topk], succ[0..c.topk]) |*e, row| e.* += ph * bf16(row[k]);
+    }
     for (0..c.topk) |j| {
-        var edge: f64 = 0;
-        for (0..c.rank) |k| edge += bf16(c.predecessor[pred * c.rank + k]) * bf16(hp[k]) * bf16(c.successor[w[2 + j] * c.rank + k]);
-        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edge_weight * edge) / scale;
+        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edge_weight * edge[j]) / scale;
         most = @max(most, out[j]);
     }
     var total: f64 = 0;

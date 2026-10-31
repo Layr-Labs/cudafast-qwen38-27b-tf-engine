@@ -24,11 +24,15 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_tap(const __nv_bfloat16
 }
 
 // out = bf16(silu(gate) * up) over `total` values, rows D wide, four a thread; XS (may be null) their group sums.
-extern "C" __global__ void __launch_bounds__(256) tf_q35_mlp_act(const __nv_bfloat16* __restrict__ GATE, const __nv_bfloat16* __restrict__ UP,
-                                            __nv_bfloat16* __restrict__ OUT, long long total, const int* __restrict__ P, int D, float* __restrict__ XS) {
+extern "C" __global__ void __launch_bounds__(256) tf_q35_mlp_act(const __nv_bfloat16* __restrict__ GATE0, const __nv_bfloat16* __restrict__ UP0,
+                                            __nv_bfloat16* __restrict__ OUT0, long long total, const int* __restrict__ P, int D, float* __restrict__ XS0) {
     __shared__ __align__(16) __nv_bfloat16 done[1024];
     release_next();
     await_prior();
+    const __nv_bfloat16* GATE = after_wait(GATE0);
+    const __nv_bfloat16* UP = after_wait(UP0);
+    __nv_bfloat16* OUT = after_wait(OUT0);
+    float* XS = after_wait(XS0);
     if (P != nullptr) total = (long long)P[2] * D;
     const long long i = ((long long)blockIdx.x * blockDim.x + threadIdx.x) * 4;
     if (i < total) {
