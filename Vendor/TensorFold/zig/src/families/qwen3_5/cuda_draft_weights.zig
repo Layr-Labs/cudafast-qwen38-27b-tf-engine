@@ -94,7 +94,8 @@ fn toBf16(x: f32) u16 {
     return @intCast((u +% rounding) >> 16);
 }
 
-/// MLX affine-4, group 64: minimize weight error with a bf16 scale and bias; pack low nibbles first.
+/// MLX affine-4, group 64: each group's bf16 scale and bias of the lowest weight error found (fitGroup); pack low
+/// nibbles first. Groups are independent: rows go to worker threads, and every byte matches one serial pass.
 fn quantize(gpa: std.mem.Allocator, w: []align(1) const u16, n: usize, k: usize) !struct { words: []u32, scales: []u16, biases: []u16 } {
     const groups = k / 64;
     const words = try gpa.alloc(u32, n * k / 8);
@@ -103,45 +104,99 @@ fn quantize(gpa: std.mem.Allocator, w: []align(1) const u16, n: usize, k: usize)
     errdefer gpa.free(scales);
     const biases = try gpa.alloc(u16, n * groups);
     errdefer gpa.free(biases);
-    for (0..n) |r| {
-        for (0..groups) |g| {
-            const row = w[r * k + g * 64 ..][0..64];
-            var lo: f32 = std.math.inf(f32);
-            var hi: f32 = -std.math.inf(f32);
-            for (row) |h| {
-                const x = bf16(h);
-                lo = @min(lo, x);
-                hi = @max(hi, x);
-            }
-            var fit = [2]f32{ (hi - lo) / 15.0, lo };
-            fit = leastSquares(row, fit);
-            const scale = toBf16(fit[0]);
-            const bias = toBf16(fit[1]);
-            scales[r * groups + g] = scale;
-            biases[r * groups + g] = bias;
-            const s = bf16(scale);
-            const b = bf16(bias);
-            const inv = if (s == 0) 0.0 else 1.0 / s;
-            for (0..8) |j| {
-                var word: u32 = 0;
-                for (0..8) |i| {
-                    const q = std.math.clamp(@round((bf16(row[j * 8 + i]) - b) * inv), 0.0, 15.0);
-                    word |= @as(u32, @intFromFloat(q)) << @intCast(4 * i);
-                }
-                words[(r * k + g * 64) / 8 + j] = word;
-            }
-        }
+    const job: Job = .{ .w = w, .k = k, .words = words, .scales = scales, .biases = biases };
+    const threads = @max(1, @min(std.Thread.getCpuCount() catch 1, 16, n));
+    const per = (n + threads - 1) / threads;
+    const handles = try gpa.alloc(?std.Thread, threads);
+    defer gpa.free(handles);
+    @memset(handles, null);
+    for (handles, 0..) |*h, t| {
+        const first = t * per;
+        if (first >= n) break;
+        h.* = std.Thread.spawn(.{}, Job.run, .{ job, first, @min(n, first + per) }) catch null;
+        if (h.* == null) job.run(first, @min(n, first + per));
     }
+    for (handles) |h| if (h) |thread| thread.join();
     return .{ .words = words, .scales = scales, .biases = biases };
 }
 
-/// A group's (scale, bias) improved by alternating code assignment and a least-squares line fit; kept only where the
-/// squared error with bf16-rounded scale and bias drops.
-fn leastSquares(row: []align(1) const u16, start: [2]f32) [2]f32 {
+const Job = struct {
+    w: []align(1) const u16,
+    k: usize,
+    words: []u32,
+    scales: []u16,
+    biases: []u16,
+
+    fn run(job: Job, first: usize, last: usize) void {
+        const k = job.k;
+        const groups = k / 64;
+        for (first..last) |r| {
+            for (0..groups) |g| {
+                const row = job.w[r * k + g * 64 ..][0..64];
+                const fit = fitGroup(row);
+                const scale = toBf16(fit[0]);
+                const bias = toBf16(fit[1]);
+                job.scales[r * groups + g] = scale;
+                job.biases[r * groups + g] = bias;
+                const s = bf16(scale);
+                const b = bf16(bias);
+                const inv = if (s == 0) 0.0 else 1.0 / s;
+                for (0..8) |j| {
+                    var word: u32 = 0;
+                    for (0..8) |i| {
+                        const q = std.math.clamp(@round((bf16(row[j * 8 + i]) - b) * inv), 0.0, 15.0);
+                        word |= @as(u32, @intFromFloat(q)) << @intCast(4 * i);
+                    }
+                    job.words[(r * k + g * 64) / 8 + j] = word;
+                }
+            }
+        }
+    }
+};
+
+/// A group's (scale, bias) of the lowest bf16-rounded squared error found: the least-squares refit to a fixed point
+/// from min/max, from four ranges shrunk about their middle, and from six one-sided clips of either end.
+fn fitGroup(row: []align(1) const u16) [2]f32 {
+    var lo: f32 = std.math.inf(f32);
+    var hi: f32 = -std.math.inf(f32);
+    for (row) |h| {
+        const x = bf16(h);
+        lo = @min(lo, x);
+        hi = @max(hi, x);
+    }
+    const span = hi - lo;
+    var best = leastSquares(row, .{ span / 15.0, lo }, 16);
+    var best_err = groupError(row, best);
+    if (!(span > 0)) return best;
+    const mid = 0.5 * (lo + hi);
+    for ([_]f32{ 0.96, 0.92, 0.87, 0.81 }) |f| {
+        const cand = leastSquares(row, .{ f * span / 15.0, mid - 0.5 * f * span }, 12);
+        const err = groupError(row, cand);
+        if (err < best_err) {
+            best_err = err;
+            best = cand;
+        }
+    }
+    for ([_]f32{ 0.04, 0.08, 0.13 }) |a| {
+        for ([_][2]f32{ .{ (1 - a) * span / 15.0, lo + a * span }, .{ (1 - a) * span / 15.0, lo } }) |st| {
+            const cand = leastSquares(row, st, 8);
+            const err = groupError(row, cand);
+            if (err < best_err) {
+                best_err = err;
+                best = cand;
+            }
+        }
+    }
+    return best;
+}
+
+/// A group's (scale, bias) improved by alternating code assignment and a least-squares line fit, at most `rounds`
+/// times and until it stops moving; kept only where the squared error with bf16-rounded scale and bias drops.
+fn leastSquares(row: []align(1) const u16, start: [2]f32, rounds: usize) [2]f32 {
     var best = start;
     var best_err = groupError(row, start);
     var cur = start;
-    for (0..3) |_| {
+    for (0..rounds) |_| {
         const s = cur[0];
         if (s <= 0) break;
         var sq: f64 = 0;
@@ -161,7 +216,9 @@ fn leastSquares(row: []align(1) const u16, start: [2]f32) [2]f32 {
         const ns = (64 * sqw - sq * sw) / det;
         const nb = (sw - ns * sq) / 64;
         if (!(ns > 0)) break;
-        cur = .{ @floatCast(ns), @floatCast(nb) };
+        const next: [2]f32 = .{ @floatCast(ns), @floatCast(nb) };
+        if (next[0] == cur[0] and next[1] == cur[1]) break;
+        cur = next;
         const err = groupError(row, cur);
         if (err < best_err) {
             best_err = err;
@@ -311,12 +368,12 @@ test "bf16 rounding of a quantized group's scale and bias" {
 
 test "drafter refit preserves flat groups and improves a linear weight ramp" {
     const flat: [64]u16 = @splat(0x3f80);
-    const unchanged = leastSquares(&flat, .{ 0, 1 });
+    const unchanged = leastSquares(&flat, .{ 0, 1 }, 8);
     try std.testing.expectEqual(@as(f32, 0), unchanged[0]);
     try std.testing.expectEqual(@as(f32, 1), unchanged[1]);
     var row: [64]u16 = undefined;
     for (&row, 0..) |*h, i| h.* = toBf16(@as(f32, @floatFromInt(i)) / 63.0 - 0.5);
     const initial = [2]f32{ 1.0 / 15.0, -0.5 };
-    const fitted = leastSquares(&row, initial);
+    const fitted = leastSquares(&row, initial, 8);
     try std.testing.expect(groupError(&row, fitted) < groupError(&row, initial));
 }
