@@ -594,7 +594,7 @@ pub const Engine = struct {
             16 => e.fns.gdn_slots_16,
             else => return error.InvalidGdnSlots,
         };
-        const input = e.tables.ptr + @as(usize, if (record) Round.steps_at else rowpar_at);
+        const input = e.tables.ptr + @as(usize, if (record) Round.steps_at else Round.rowanc_at);
         // qwen35_slots.cuh: up to four slots scan two value rows a warp, so a block covers eight
         const rows_a_warp: usize = if (record and slot_count <= 4) 2 else 1;
         try e.runAfter(scan, .{ 1, geometry.dk / (4 * rows_a_warp), e.g.v_heads * segments }, .{ 32, 4, 1 }, .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, input, layer, e.y, e.tables.ptr + params_at });

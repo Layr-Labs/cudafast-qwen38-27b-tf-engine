@@ -291,10 +291,11 @@ extern "C" __global__ void tf_q35_conv_commit(Geo geo, const __nv_bfloat16* __re
 }
 
 // Gated delta rule, each row's state its parent's: a chain keeps it in registers, a branch rebuilds it from the log.
+constexpr bool chain_root_state = true;
 extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_chain(Geo geo, const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
                                                                      const __nv_bfloat16* __restrict__ v, const float* __restrict__ g,
                                                                      const __nv_bfloat16* __restrict__ beta, const Seg* __restrict__ segs,
-                                                                     const int* __restrict__ rowpar, int layer, __nv_bfloat16* __restrict__ y,
+                                                                     const Ancestor* __restrict__ rowanc, int layer, __nv_bfloat16* __restrict__ y,
                                                                      const int* __restrict__ P) {
     release_next();
     await_prior();
@@ -309,9 +310,9 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_chain(Geo geo, cons
     const size_t at = ((size_t)hv * DK + dv) * DK + PT * dk;
     float* st = reinterpret_cast<float*>(sg.rec) + (size_t)layer * geo.rec() + at;
     const bool record = recorded(P);
-    float state[PT];
+    float state[PT], base[PT], root[PT];
 #pragma unroll
-    for (int i = 0; i < PT; i++) state[i] = st[i];
+    for (int i = 0; i < PT; i++) state[i] = base[i] = root[i] = st[i];
     int prev = -1;  // the row the registers' state follows
     // row r's inputs, loaded while row r - 1 computes
     float kn[PT], qn[PT], vn = 0.0f, gn = 0.0f, bn = 0.0f;
@@ -344,19 +345,29 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_chain(Geo geo, cons
         const int parent = pn;
         if (r + 1 < sg.rows) load(row + 1);
         if (parent != prev) {
-            // a branch: its parent's state from the stream's and the ancestors' logged updates, oldest first
-            int anc[MAXW];
-            int n = 0;
-            for (int a = parent; a >= 0; a = rowpar[a]) anc[n++] = a;
+            // Root children are the common tree branch: their parent state is already resident.
+            // Deeper branches retain the generic logged replay, in the established order.
+            if (parent == sg.row0) {
 #pragma unroll
-            for (int i = 0; i < PT; i++) state[i] = st[i];
-            for (int j = n - 1; j >= 0; j--) {
-                const int a = anc[j];
-                const float ga = g[a * NV + hv], da = log_row(geo, sg, layer, a - sg.row0).delta[hv * DK + dv];
+                for (int i = 0; i < PT; i++) state[i] = root[i];
+            } else {
+                // The round builder already stages the parent's ancestry for attention.
+                // Iterate it in row order instead of walking rowpar and spilling a stack.
+                unsigned long long bits = rowanc[row].bits;
+                const unsigned long long root_bit = 1ull;
+                const bool from_root = (bits & root_bit) != 0;
+                bits &= ~root_bit;
 #pragma unroll
-                for (int i = 0; i < PT; i++) {
-                    state[i] = state[i] * ga;
-                    state[i] = fmaf(bf(k[((size_t)a * NK + hk) * DK + PT * dk + i]), da, state[i]);
+                for (int i = 0; i < PT; i++) state[i] = from_root ? root[i] : base[i];
+                while (bits != 0) {
+                    const int u = sg.row0 + __ffsll((long long)bits) - 1;
+                    bits &= bits - 1;
+                    const float ga = g[u * NV + hv], da = log_row(geo, sg, layer, u - sg.row0).delta[hv * DK + dv];
+#pragma unroll
+                    for (int i = 0; i < PT; i++) {
+                        state[i] = state[i] * ga;
+                        state[i] = fmaf(bf(k[((size_t)u * NK + hk) * DK + PT * dk + i]), da, state[i]);
+                    }
                 }
             }
         }
@@ -375,6 +386,9 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_chain(Geo geo, cons
             state[i] = fmaf(kc[i], delta, state[i]);
             out += state[i] * qc[i];
         }
+        if (chain_root_state && r == 0)
+#pragma unroll
+            for (int i = 0; i < PT; i++) root[i] = state[i];
         out = warp_sum(out);
         if (dk == 0) y[((size_t)row * NV + hv) * DK + dv] = __float2bfloat16_rn(out);
         if (record) {
