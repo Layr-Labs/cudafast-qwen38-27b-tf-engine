@@ -179,3 +179,10 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_split(const __nv
         const __grid_constant__ tf_qmm_prefill::ManyPart part, int M, int K, int ldx, int group, int full_cols) {
     tf_qmm_prefill::prompt_split_body<64, 128, 128, 1, 4, 2>(x, part, M, K, ldx, group, full_cols);
 }
+
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_sk(const __nv_bfloat16* __restrict__ x,
+        const __grid_constant__ tf_qmm_prefill::ManyParts parts, int M, int K, int ldx, int group, int tiles,
+        float* __restrict__ ws, unsigned* __restrict__ flags, unsigned epoch) {
+    tf_qmm_prefill::prompt_sk_body<64, 128, 128, 1, 4, 2>(x, parts, M, K, ldx, group, tiles, ws, flags, epoch);
+}
+
