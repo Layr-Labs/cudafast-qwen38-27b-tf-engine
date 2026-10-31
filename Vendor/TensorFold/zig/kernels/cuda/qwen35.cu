@@ -80,8 +80,8 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __r
     release_next();
     const int t = threadIdx.x;
     const int E = D / 256;
-    // a programmatic launch (cuda_engine.zig's norm): the weights stream in while the kernel before finishes,
-    // then griddepcontrol.wait before any input (H, R, P) is read; a plain launch's wait returns at once
+    // i34-9's form: the weights (no kernel writes them) stream in under the previous kernel's tail, then the wait
+    // before any input (H, R, P) is read; a plain launch's wait returns at once
     uint4 wv[4];
     if ((E & 3) == 0) {
 #pragma unroll
