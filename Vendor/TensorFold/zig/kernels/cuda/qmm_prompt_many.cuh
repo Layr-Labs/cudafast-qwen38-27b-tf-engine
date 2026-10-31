@@ -39,8 +39,10 @@ __device__ __forceinline__ void prompt_tile(
     auto stage = [&](int s) { return buf + s * T::STAGE; };
     // each thread's copies, addressed once: its input chunk column and rows r0 + i * (THREADS / CHUNKS), its weight
     // tiles' chunk, and (threads below the scales' chunks) its scale or bias chunk; a stage only adds g's offsets
-    static_assert(T::THREADS % T::CHUNKS == 0 && (BM * T::CHUNKS) % T::THREADS == 0, "whole input chunks a thread");
-    constexpr int XC = BM * T::CHUNKS / T::THREADS, RSTEP = T::THREADS / T::CHUNKS;
+    // a short tile's rows may not split evenly over the threads: the last pass copies only rows below BM
+    static_assert(T::THREADS % T::CHUNKS == 0, "whole input chunks a thread");
+    constexpr bool XEVEN = (BM * T::CHUNKS) % T::THREADS == 0;
+    constexpr int XC = (BM * T::CHUNKS + T::THREADS - 1) / T::THREADS, RSTEP = T::THREADS / T::CHUNKS;
     constexpr int TILE_BYTES = 64 * GS / 2, WC = (T::W / 16 + T::THREADS - 1) / T::THREADS;
     const int ch = tid % T::CHUNKS, r0 = tid / T::CHUNKS;
     const int xdst = r0 * T::ROW + swz<T::CHUNKS>(r0, ch) * 16;  // r0 + RSTEP * i keeps r % CHUNKS (RSTEP % CHUNKS == 0)
@@ -61,6 +63,7 @@ __device__ __forceinline__ void prompt_tile(
         unsigned char* p = stage(s);
 #pragma unroll
         for (int i = 0; i < XC; ++i) {
+            if (!XEVEN && r0 + i * RSTEP >= BM) continue;
             const bool ok = m0 + r0 + i * RSTEP < M;
             cp16z(p + xdst + i * RSTEP * T::ROW, ok ? xsrc + static_cast<size_t>(i * RSTEP) * ldx + g * GS : x, ok);
         }
@@ -162,6 +165,10 @@ __device__ __forceinline__ bool short_tile(int rows) {
     return BM / WM > 16 && rows > 0 && rows <= BM - 16 * WM && rows > BM - 32 * WM;
 }
 
+// Whether a warp's rows hold more than one m16 tile, so the shorter instantiation has rows left.
+template <int GS, int BM, int WM, int WN>
+constexpr bool short_fits = BM / WM > 16;
+
 template <int GS, int BM, int BN, int WM, int WN, int STAGES>
 __device__ __forceinline__ void prompt_many_body(
         const __nv_bfloat16* __restrict__ x, const ManyParts& parts, int M, int K, int ldx, int group) {
@@ -171,10 +178,11 @@ __device__ __forceinline__ void prompt_many_body(
         if (i < parts.count && (int)blockIdx.x >= parts.p[i].first) q = i;
     const ManyPart& P = parts.p[q];
     const int2 at = tile_of((int)blockIdx.x - P.first, M, P.n, BM, BN, group);
-    if (short_tile<BM, WM>(M - at.x))
-        prompt_tile<GS, BM - 16 * WM, BN, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x, at.y);
-    else
-        prompt_tile<GS, BM, BN, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x, at.y);
+    if constexpr (short_fits<GS, BM, WM, WN>)
+        if (short_tile<BM, WM>(M - at.x))
+            return prompt_tile<GS, BM - 16 * WM, BN, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx,
+                                                                     at.x, at.y);
+    prompt_tile<GS, BM, BN, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x, at.y);
 }
 
 // One projection whose last column panels run as half-width tiles: the first CTAs take BN-wide panels over columns
@@ -186,18 +194,19 @@ __device__ __forceinline__ void prompt_split_body(
     const int rows_t = (M + BM - 1) / BM, full = rows_t * (full_cols / BN);
     if ((int)blockIdx.x < full) {
         const int2 at = tile_of((int)blockIdx.x, M, full_cols, BM, BN, group);
-        if (short_tile<BM, WM>(M - at.x))
-            prompt_tile<GS, BM - 16 * WM, BN, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x, at.y);
-        else
-            prompt_tile<GS, BM, BN, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x, at.y);
+        if constexpr (short_fits<GS, BM, WM, WN>)
+            if (short_tile<BM, WM>(M - at.x))
+                return prompt_tile<GS, BM - 16 * WM, BN, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K,
+                                                                         ldx, at.x, at.y);
+        prompt_tile<GS, BM, BN, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x, at.y);
     } else {
         const int2 at = tile_of((int)blockIdx.x - full, M, P.n - full_cols, BM, BN / 2, group);
-        if (short_tile<BM, WM>(M - at.x))
-            prompt_tile<GS, BM - 16 * WM, BN / 2, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx,
-                                                                at.x, full_cols + at.y);
-        else
-            prompt_tile<GS, BM, BN / 2, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x,
-                                                        full_cols + at.y);
+        if constexpr (short_fits<GS, BM, WM, WN>)
+            if (short_tile<BM, WM>(M - at.x))
+                return prompt_tile<GS, BM - 16 * WM, BN / 2, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M,
+                                                                             K, ldx, at.x, full_cols + at.y);
+        prompt_tile<GS, BM, BN / 2, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x,
+                                                    full_cols + at.y);
     }
 }
 

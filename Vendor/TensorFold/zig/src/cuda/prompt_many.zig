@@ -18,8 +18,14 @@ pub const mlp_symbol = "tf_qmm_prompt_mlp";
 pub const split_symbol = "tf_qmm_prompt_split";
 pub const parts_max = 4;
 pub const tile_m = 128;
+/// tf_qmm_prompt_mlp's tile: 64 gate and 64 up columns on 1x4 warps.
 pub const tile_n = 128;
 pub const threads = 128;
+/// tf_qmm_prompt_many's and tf_qmm_prompt_split's tile: 256 columns on 1x8 warps.
+pub const many_n = 256;
+pub const many_threads = 256;
+/// Tile<64, 128, 256, 1, 8, 2>::SMEM.
+pub const many_smem: u32 = 2 * (128 * 128 + 256 * 32 + 2 * 256 * 2);
 /// Tile<64, 128, 128, 2, 2, 2>::SMEM: two stages of 128 input rows, 128 columns' words, scales and biases.
 pub const smem: u32 = 2 * (128 * 128 + 128 * 32 + 2 * 128 * 2);
 
@@ -30,6 +36,7 @@ pub const Parts = extern struct { p: [parts_max]Part, count: c_int };
 comptime {
     std.debug.assert(@sizeOf(Part) == 48 and @sizeOf(Parts) == 200);
     std.debug.assert(smem == 41984);
+    std.debug.assert(many_smem == 51200);
 }
 
 /// One projection of the shared input and its output rows.
@@ -41,26 +48,29 @@ pub const Kernels = struct {
     split_fn: Function,
     /// CTAs the device runs at once: two of these tiles an SM.
     slots: usize,
+    /// CTAs of many_fn (and split_fn) the device runs at once.
+    many_slots: usize,
 
     /// From a loaded qmm_prefill module, on a device of `sms` SMs.
     pub fn resolve(prefill_mod: module.Module, sms: usize) !Kernels {
         const f = try prefill_mod.function(symbol);
-        try f.allowDynamicShared(smem);
+        try f.allowDynamicShared(many_smem);
         const m = try prefill_mod.function(mlp_symbol);
         try m.allowDynamicShared(smem);
         const sp = try prefill_mod.function(split_symbol);
-        try sp.allowDynamicShared(smem);
-        return .{ .many_fn = f, .mlp_fn = m, .split_fn = sp, .slots = 2 * sms };
+        try sp.allowDynamicShared(many_smem);
+        const per = @max(1, try f.occupancy(many_threads, many_smem));
+        return .{ .many_fn = f, .mlp_fn = m, .split_fn = sp, .slots = 2 * sms, .many_slots = @as(usize, per) * sms };
     }
 
     /// The columns one projection's whole 128-wide tiles cover when its last panels run 64 wide (null: none do).
     /// Whole tiles past one wave leave a last wave part full (a 496-row prompt's 5120 columns: 160 tiles on a GB10's
     /// 96 slots); a fifth of the panels at half width evens the SMs' shares.
     pub fn splitCols(kk: *const Kernels, n: usize, rows: usize) ?usize {
-        const cols = n / tile_n;
+        const cols = n / many_n;
         const tiles = (rows + tile_m - 1) / tile_m * cols;
-        if (n % tile_n != 0 or cols < 10 or tiles <= kk.slots or tiles % kk.slots == 0) return null;
-        return (cols - cols / 5) * tile_n;
+        if (n % many_n != 0 or cols < 10 or tiles <= kk.many_slots or tiles % kk.many_slots == 0) return null;
+        return (cols - cols / 5) * many_n;
     }
 
     /// Whether `mlp` takes this gate and up: one shape, whole 64-column tiles.
@@ -104,21 +114,21 @@ pub const Kernels = struct {
             g.add(x);
             g.add(part);
             for ([_]usize{ rows, k, k, group, full_cols }) |v| g.add(@as(c_int, @intCast(v)));
-            const blocks = rows_t * (full_cols / tile_n) + rows_t * ((o.q.n - full_cols) / (tile_n / 2));
-            return launch_.launch(kk.split_fn, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = threads }, .shared = smem }, s, &g);
+            const blocks = rows_t * (full_cols / many_n) + rows_t * ((o.q.n - full_cols) / (many_n / 2));
+            return launch_.launch(kk.split_fn, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = many_threads }, .shared = many_smem }, s, &g);
         };
         var parts: Parts = std.mem.zeroes(Parts);
         var blocks: usize = 0;
         for (outs, 0..) |o, i| {
             if (o.q.k != k) return error.InputMismatch;
             parts.p[i] = .{ .w = o.q.w, .scales = o.q.s, .biases = o.q.b, .out = o.out, .n = @intCast(o.q.n), .npad = @intCast(o.q.npad), .first = @intCast(blocks) };
-            blocks += rows_t * ((o.q.n + tile_n - 1) / tile_n);
+            blocks += rows_t * ((o.q.n + many_n - 1) / many_n);
         }
         parts.count = @intCast(outs.len);
         var g: launch_.Args = .{};
         g.add(x);
         g.add(parts);
         for ([_]usize{ rows, k, k, group }) |v| g.add(@as(c_int, @intCast(v)));
-        try launch_.launch(kk.many_fn, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = threads }, .shared = smem }, s, &g);
+        try launch_.launch(kk.many_fn, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = many_threads }, .shared = many_smem }, s, &g);
     }
 };
