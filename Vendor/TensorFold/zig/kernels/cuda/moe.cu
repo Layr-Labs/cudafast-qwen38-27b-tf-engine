@@ -12,12 +12,28 @@ __device__ __forceinline__ float rbf(float v) { return __bfloat162float(__float2
 constexpr int TILE = 16;  // rows and experts a block covers
 constexpr int KC = 256;   // inputs a shared-memory chunk holds
 
+__device__ __forceinline__ void moe_await() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
+}
+
+template <typename T>
+__device__ __forceinline__ T* moe_waited(T* p) {
+    asm volatile("" : "+l"(p)::"memory");
+    return p;
+}
+
 }  // namespace
 
 // OUT[r][e] = fp32 x[r] . w[e] in index order (an fma chain a pair), grid (R / 16, E / 16); skips rows >= P[2].
-extern "C" __global__ void __launch_bounds__(256) tf_moe_router(const __nv_bfloat16* __restrict__ X, int x_stride,
-                                                                  const __nv_bfloat16* __restrict__ W, float* __restrict__ OUT,
-                                                                  int R, int D, int E, const int* __restrict__ P) {
+extern "C" __global__ void __launch_bounds__(256) tf_moe_router(const __nv_bfloat16* __restrict__ X0, int x_stride,
+                                                                  const __nv_bfloat16* __restrict__ W, float* __restrict__ OUT0,
+                                                                  int R, int D, int E, const int* __restrict__ P0) {
+    moe_await();
+    const __nv_bfloat16* X = moe_waited(X0);
+    float* OUT = moe_waited(OUT0);
+    const int* P = moe_waited(P0);
     if (P != nullptr) R = min(R, P[2]);
     if (static_cast<int>(blockIdx.x) * TILE >= R) return;
     __shared__ __nv_bfloat16 xs[TILE][KC + 2];
@@ -50,9 +66,14 @@ __device__ __forceinline__ bool beats(float v, int i, float bv, int bi) { return
 }  // namespace
 
 // Row r by a warp: TOPK experts by logit (ties to lower id), bf16(exp(l - top) / sum), shared slot; r < P[2].
-extern "C" __global__ void __launch_bounds__(32) tf_moe_topk(const float* __restrict__ L, int* __restrict__ PICK,
-                                                              float* __restrict__ WT, int NE, int TOPK,
-                                                              const int* __restrict__ P) {
+extern "C" __global__ void __launch_bounds__(32) tf_moe_topk(const float* __restrict__ L0, int* __restrict__ PICK0,
+                                                              float* __restrict__ WT0, int NE, int TOPK,
+                                                              const int* __restrict__ P0) {
+    moe_await();
+    const float* L = moe_waited(L0);
+    int* PICK = moe_waited(PICK0);
+    float* WT = moe_waited(WT0);
+    const int* P = moe_waited(P0);
     const int64_t r = blockIdx.x;
     if (P != nullptr && r >= P[2]) return;
     const int lane = threadIdx.x;
@@ -102,9 +123,14 @@ extern "C" __global__ void __launch_bounds__(32) tf_moe_topk(const float* __rest
 }
 
 // OUT[r][d] = bf16(sum over slots in order of fma(w[r][s], y[r][s][d])), y fp32 or bf16; rows >= P[2] skipped.
-extern "C" __global__ void __launch_bounds__(256) tf_moe_combine(const void* __restrict__ Y, int y_f32, const float* __restrict__ WT,
-                                                                   __nv_bfloat16* __restrict__ OUT, int S, int D,
-                                                                   const int* __restrict__ P) {
+extern "C" __global__ void __launch_bounds__(256) tf_moe_combine(const void* __restrict__ Y0, int y_f32, const float* __restrict__ WT0,
+                                                                   __nv_bfloat16* __restrict__ OUT0, int S, int D,
+                                                                   const int* __restrict__ P0) {
+    moe_await();
+    const void* Y = moe_waited(Y0);
+    const float* WT = moe_waited(WT0);
+    __nv_bfloat16* OUT = moe_waited(OUT0);
+    const int* P = moe_waited(P0);
     const int64_t r = blockIdx.x;
     if (P != nullptr && r >= P[2]) return;
     for (int d = blockIdx.y * 256 + threadIdx.x; d < D; d += gridDim.y * 256) {

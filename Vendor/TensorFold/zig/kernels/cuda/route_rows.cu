@@ -11,6 +11,18 @@
 
 using namespace tf_glue;
 
+__device__ __forceinline__ void route_await() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
+}
+
+template <typename T>
+__device__ __forceinline__ T* route_waited(T* p) {
+    asm volatile("" : "+l"(p)::"memory");
+    return p;
+}
+
 namespace tf_route {
 
 constexpr int NT = 128;
@@ -47,8 +59,8 @@ using namespace tf_route;
 
 // OUT[m, e] = x[m] . w[e], 8 experts a warp, RT tiles of 16 rows, one mma chain over K, STAGES of KC (row sums fixed).
 template <int WARPS, int STAGES, int KC, int RT = 1>
-__device__ __forceinline__ void route_logits(const __nv_bfloat16* __restrict__ X, int x_ld, const __nv_bfloat16* __restrict__ W,
-                                             float* __restrict__ OUT, int M, int D, int E) {
+__device__ __forceinline__ void route_logits(const __nv_bfloat16* X, int x_ld, const __nv_bfloat16* __restrict__ W,
+                                             float* OUT, int M, int D, int E) {
     constexpr int LD = KC + 8, EB = 8 * WARPS, XR = 16 * RT, ROWS = XR + EB;
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto tile = reinterpret_cast<__nv_bfloat16 (*)[ROWS][LD]>(smem_raw);  // [STAGES] XR input rows, then EB expert rows
@@ -110,30 +122,37 @@ __device__ __forceinline__ void route_logits(const __nv_bfloat16* __restrict__ X
 }
 
 // route_logits over 32 experts a block (prompt chunks: the input rows are read once per 32 experts).
-extern "C" __global__ void __launch_bounds__(128) tf_route_logits(const __nv_bfloat16* __restrict__ X, int x_ld,
-                                                                  const __nv_bfloat16* __restrict__ W, float* __restrict__ OUT,
+extern "C" __global__ void __launch_bounds__(128) tf_route_logits(const __nv_bfloat16* __restrict__ X0, int x_ld,
+                                                                  const __nv_bfloat16* __restrict__ W, float* __restrict__ OUT0,
                                                                   int M, int D, int E) {
-    route_logits<4, 2, 128>(X, x_ld, W, OUT, M, D, E);
+    route_await();
+    route_logits<4, 2, 128>(route_waited(X0), x_ld, W, route_waited(OUT0), M, D, E);
 }
 
 // route_logits over 128 rows and 64 experts a block, eight warps (from 64 rows), the same sums.
-extern "C" __global__ void __launch_bounds__(256) tf_route_logits_wide(const __nv_bfloat16* __restrict__ X, int x_ld,
-                                                                       const __nv_bfloat16* __restrict__ W, float* __restrict__ OUT,
+extern "C" __global__ void __launch_bounds__(256) tf_route_logits_wide(const __nv_bfloat16* __restrict__ X0, int x_ld,
+                                                                       const __nv_bfloat16* __restrict__ W, float* __restrict__ OUT0,
                                                                        int M, int D, int E) {
-    route_logits<8, 2, 64, 8>(X, x_ld, W, OUT, M, D, E);
+    route_await();
+    route_logits<8, 2, 64, 8>(route_waited(X0), x_ld, W, route_waited(OUT0), M, D, E);
 }
 
 // route_logits with three stages of 256 in flight (up to 16 rows, where the router rows' reads set its time).
-extern "C" __global__ void __launch_bounds__(128) tf_route_logits_few(const __nv_bfloat16* __restrict__ X, int x_ld,
-                                                                     const __nv_bfloat16* __restrict__ W, float* __restrict__ OUT,
+extern "C" __global__ void __launch_bounds__(128) tf_route_logits_few(const __nv_bfloat16* __restrict__ X0, int x_ld,
+                                                                     const __nv_bfloat16* __restrict__ W, float* __restrict__ OUT0,
                                                                      int M, int D, int E) {
-    route_logits<4, 3, 256>(X, x_ld, W, OUT, M, D, E);
+    route_await();
+    route_logits<4, 3, 256>(route_waited(X0), x_ld, W, route_waited(OUT0), M, D, E);
 }
 
 // A row's TOPK largest of NE logits (lower id on ties), bf16(e^(l_k - l_0) / sum); `shared`: slot TOPK gated by NE.
-extern "C" __global__ void __launch_bounds__(NT) tf_route_topk(const float* __restrict__ L, int NL, int NE, int TOPK,
-                                                               int* __restrict__ PICK, float* __restrict__ WTS, int SLOTS,
+extern "C" __global__ void __launch_bounds__(NT) tf_route_topk(const float* __restrict__ L0, int NL, int NE, int TOPK,
+                                                               int* __restrict__ PICK0, float* __restrict__ WTS0, int SLOTS,
                                                                int shared) {
+    route_await();
+    const float* L = route_waited(L0);
+    int* PICK = route_waited(PICK0);
+    float* WTS = route_waited(WTS0);
     __shared__ float sv[2][NT / 32];
     __shared__ int si[2][NT / 32];
     const int r = blockIdx.x;

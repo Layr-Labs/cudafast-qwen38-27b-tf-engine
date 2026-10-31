@@ -12,6 +12,11 @@ const Stream = stream_.Stream;
 pub const max_experts = 256;
 pub const max_top_k = 31;
 
+/// The routing glue (moe.cu's tf_moe_router, tf_moe_topk and tf_moe_combine) opens with griddepcontrol.wait, so each of
+/// its launches is issued back to back with the kernel before: the block is resident while that kernel drains, and the
+/// wait keeps every read of its data behind its completion (the order the stream gave, without the launch gap).
+pub const pdl = true;
+
 pub const Fns = struct {
     router_fn: Function,
     topk_fn: Function,
@@ -31,7 +36,7 @@ pub const Fns = struct {
         a.add(logits);
         for ([_]usize{ rows, dims, count }) |v| a.add(int(v));
         a.add(params);
-        const cfg: launch_.Config = .{ .grid = .{ .x = @intCast((rows + 15) / 16), .y = @intCast((count + 15) / 16), .z = 1 }, .block = .{ .x = 256 } };
+        const cfg: launch_.Config = .{ .grid = .{ .x = @intCast((rows + 15) / 16), .y = @intCast((count + 15) / 16), .z = 1 }, .block = .{ .x = 256 }, .pdl = pdl };
         try launch_.launch(f.router_fn, cfg, s, &a);
     }
 
@@ -45,7 +50,7 @@ pub const Fns = struct {
         a.add(int(experts));
         a.add(int(top_k));
         a.add(params);
-        try launch_.launch(f.topk_fn, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = 32 } }, s, &a);
+        try launch_.launch(f.topk_fn, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = 32 }, .pdl = pdl }, s, &a);
     }
 
     /// out[r] = bf16(sum of w[r][s] * y[r][s]) over the slots in order; y fp32 (decode rows) or bf16 (prompt rows).
@@ -59,7 +64,7 @@ pub const Fns = struct {
         a.add(int(dims));
         a.add(params);
         const blocks = @min((dims + 255) / 256, 16);
-        try launch_.launch(f.combine_fn, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(blocks), .z = 1 }, .block = .{ .x = 256 } }, s, &a);
+        try launch_.launch(f.combine_fn, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(blocks), .z = 1 }, .block = .{ .x = 256 }, .pdl = pdl }, s, &a);
     }
 };
 

@@ -20,6 +20,11 @@ pub const few_shared: u32 = 3 * 48 * (256 + 8) * 2;
 /// tf_route_logits_wide's: 128 inputs and 64 experts, two stages of 64.
 pub const wide_shared: u32 = 2 * 192 * (64 + 8) * 2;
 
+/// route_rows.cu's tf_route_logits, tf_route_logits_few, tf_route_logits_wide and tf_route_topk open with
+/// griddepcontrol.wait, so each is issued back to back with the kernel before: the block is resident while that kernel
+/// drains, and the wait holds every read of its data behind its completion (the stream's order, without the launch gap).
+pub const pdl = true;
+
 pub const RouteRows = struct {
     mod: Module,
     logits_fn: Function,
@@ -55,10 +60,10 @@ pub const RouteRows = struct {
         const few = rows <= 16;
         if (rows >= 64) {
             // 128 rows and 64 experts a block: each router row read once per 128 input rows (the same sums)
-            try launch_.launch(g.wide_fn, .{ .grid = .{ .x = @intCast((rows + 127) / 128), .y = @intCast((e + 63) / 64), .z = 1 }, .block = .{ .x = 256 }, .shared = wide_shared }, s, &a);
+            try launch_.launch(g.wide_fn, .{ .grid = .{ .x = @intCast((rows + 127) / 128), .y = @intCast((e + 63) / 64), .z = 1 }, .block = .{ .x = 256 }, .shared = wide_shared, .pdl = pdl }, s, &a);
             return;
         }
-        try launch_.launch(if (few) g.few_fn else g.logits_fn, .{ .grid = .{ .x = @intCast((rows + 15) / 16), .y = @intCast((e + 31) / 32), .z = 1 }, .block = .{ .x = 128 }, .shared = if (few) few_shared else many_shared }, s, &a);
+        try launch_.launch(if (few) g.few_fn else g.logits_fn, .{ .grid = .{ .x = @intCast((rows + 15) / 16), .y = @intCast((e + 31) / 32), .z = 1 }, .block = .{ .x = 128 }, .shared = if (few) few_shared else many_shared, .pdl = pdl }, s, &a);
     }
 
     /// Each row's top_k of its first `experts` logits into picks and weights [rows, slots]; `shared`: slot top_k too.
@@ -73,7 +78,7 @@ pub const RouteRows = struct {
         a.add(wts);
         a.add(@as(i32, @intCast(slots)));
         a.add(@as(i32, @intFromBool(shared)));
-        try launch_.launch(g.topk_fn, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = 128 } }, s, &a);
+        try launch_.launch(g.topk_fn, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = 128 }, .pdl = pdl }, s, &a);
     }
 };
 
