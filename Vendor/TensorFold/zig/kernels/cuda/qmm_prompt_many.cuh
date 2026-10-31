@@ -153,6 +153,11 @@ __device__ __forceinline__ void prompt_tile(
 
 }
 
+template <int BM, int WM>
+__device__ __forceinline__ bool short_tile(int rows) {
+    return BM / WM > 16 && rows > 0 && rows <= BM - 16 * WM && rows > BM - 32 * WM;
+}
+
 template <int GS, int BM, int BN, int WM, int WN, int STAGES>
 __device__ __forceinline__ void prompt_many_body(
         const __nv_bfloat16* __restrict__ x, const ManyParts& parts, int M, int K, int ldx, int group) {
@@ -162,7 +167,10 @@ __device__ __forceinline__ void prompt_many_body(
         if (i < parts.count && (int)blockIdx.x >= parts.p[i].first) q = i;
     const ManyPart& P = parts.p[q];
     const int2 at = tile_of((int)blockIdx.x - P.first, M, P.n, BM, BN, group);
-    prompt_tile<GS, BM, BN, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x, at.y);
+    if (short_tile<BM, WM>(M - at.x))
+        prompt_tile<GS, BM - 16 * WM, BN, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x, at.y);
+    else
+        prompt_tile<GS, BM, BN, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x, at.y);
 }
 
 // One projection whose last column panels run as half-width tiles: the first CTAs take BN-wide panels over columns
@@ -174,11 +182,18 @@ __device__ __forceinline__ void prompt_split_body(
     const int rows_t = (M + BM - 1) / BM, full = rows_t * (full_cols / BN);
     if ((int)blockIdx.x < full) {
         const int2 at = tile_of((int)blockIdx.x, M, full_cols, BM, BN, group);
-        prompt_tile<GS, BM, BN, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x, at.y);
+        if (short_tile<BM, WM>(M - at.x))
+            prompt_tile<GS, BM - 16 * WM, BN, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x, at.y);
+        else
+            prompt_tile<GS, BM, BN, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x, at.y);
     } else {
         const int2 at = tile_of((int)blockIdx.x - full, M, P.n - full_cols, BM, BN / 2, group);
-        prompt_tile<GS, BM, BN / 2, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x,
-                                                    full_cols + at.y);
+        if (short_tile<BM, WM>(M - at.x))
+            prompt_tile<GS, BM - 16 * WM, BN / 2, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx,
+                                                                at.x, full_cols + at.y);
+        else
+            prompt_tile<GS, BM, BN / 2, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x,
+                                                        full_cols + at.y);
     }
 }
 
@@ -188,9 +203,9 @@ __device__ __forceinline__ void prompt_split_body(
 // Each warp owns corresponding gate and up fragments. Both projections round to bf16 before the original
 // SiLU formula, so the activation stays in registers without a shared gate tile or an epilogue barrier.
 template <int GS, int BM, int WM, int WN, int STAGES>
-__device__ __forceinline__ void prompt_mlp_body(
+__device__ __forceinline__ void prompt_mlp_tile(
         const __nv_bfloat16* __restrict__ x, const ManyParts& parts, __nv_bfloat16* __restrict__ act, int M, int K,
-        int ldx, int group) {
+        int ldx, int m0, int n0) {
     constexpr int BN = 128;
     static_assert(WN % 2 == 0, "gate and up use equal column-warp groups");
     using T = Tile<GS, BM, BN, WM, WN, STAGES>;
@@ -203,8 +218,6 @@ __device__ __forceinline__ void prompt_mlp_body(
     const ManyPart& U = parts.p[1];
     const int N = G.n, npad = G.npad;
     const int KG = K / GS, per = KG, g0 = 0;
-    const int2 at = tile_of((int)blockIdx.x, M, N, BM, 64, group);
-    const int m0 = at.x, n0 = at.y;                 // n0: the 64 output columns, of gate and of up
 
     auto stage = [&](int s) { return buf + s * T::STAGE; };
     // each thread's copies addressed once (prompt_tile's): a stage only adds g's offsets
@@ -325,6 +338,17 @@ __device__ __forceinline__ void prompt_mlp_body(
                     if (col + 1 < N) dst[1] = o[1];
                 }
             }
+}
+
+template <int GS, int BM, int WM, int WN, int STAGES>
+__device__ __forceinline__ void prompt_mlp_body(
+        const __nv_bfloat16* __restrict__ x, const ManyParts& parts, __nv_bfloat16* __restrict__ act, int M, int K,
+        int ldx, int group) {
+    const int2 at = tile_of((int)blockIdx.x, M, parts.p[0].n, BM, 64, group);
+    if (short_tile<BM, WM>(M - at.x))
+        prompt_mlp_tile<GS, BM - 16 * WM, WM, WN, STAGES>(x, parts, act, M, K, ldx, at.x, at.y);
+    else
+        prompt_mlp_tile<GS, BM, WM, WN, STAGES>(x, parts, act, M, K, ldx, at.x, at.y);
 }
 
 template <int GS, int BM, int BN, int WM, int WN, int STAGES>
