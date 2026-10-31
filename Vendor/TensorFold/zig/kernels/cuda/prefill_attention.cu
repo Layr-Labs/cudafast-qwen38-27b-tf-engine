@@ -306,7 +306,9 @@ template __global__ void tf_prefill_attention::vision_kernel<80, 8>(const __nv_b
 template __global__ void tf_prefill_attention::hpattn_kernel<256, 8, 2, 2>(const __nv_bfloat16* __restrict__,
     const __nv_bfloat16* __restrict__, const __nv_bfloat16* __restrict__, __nv_bfloat16* __restrict__, int, int, int, int,
     int, float, int);
-template __global__ void tf_prefill_attention::hpattn_kernel<256, 4, 1, 1>(const __nv_bfloat16* __restrict__,
+// Head dim 256, four warps, one query head a warp group, two staging slots: the 27B's odd group (q20/kv4) keeps
+// HPC=1, and the second slot leaves one cp.async group in flight across the tile's MMAs (the fp8 kernel's pattern).
+template __global__ void tf_prefill_attention::hpattn_kernel<256, 4, 1, 2>(const __nv_bfloat16* __restrict__,
     const __nv_bfloat16* __restrict__, const __nv_bfloat16* __restrict__, __nv_bfloat16* __restrict__, int, int, int, int,
     int, float, int);
 template __global__ void tf_prefill_attention::hpattn8_kernel<256, 8, 2, 2>(const __nv_bfloat16* __restrict__,

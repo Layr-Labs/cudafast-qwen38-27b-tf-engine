@@ -41,8 +41,6 @@ pub const Kernels = struct {
     split_fn: Function,
     /// CTAs the device runs at once: two of these tiles an SM.
     slots: usize,
-    /// Native MLP, two-row normal/split projection, and three-row grouped projection.
-    persistent_fns: [4]?Function = @splat(null),
 
     /// From a loaded qmm_prefill module, on a device of `sms` SMs.
     pub fn resolve(prefill_mod: module.Module, sms: usize) !Kernels {
@@ -52,48 +50,7 @@ pub const Kernels = struct {
         try m.allowDynamicShared(smem);
         const sp = try prefill_mod.function(split_symbol);
         try sp.allowDynamicShared(smem);
-        var result: Kernels = .{ .many_fn = f, .mlp_fn = m, .split_fn = sp, .slots = 2 * sms };
-        const disabled = if (std.c.getenv("TF_PROMPT_PERSISTENT")) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
-        if (sms == 48 and !disabled) {
-            const names = [_][:0]const u8{
-                "_ZN17tf_qmm_persistent6kernelILi128ELi1ELb1ELb0EEEvPK13__nv_bfloat16N14tf_qmm_prefill9ManyPartsEPS1_iiiiiii",
-                "_ZN23tf_qmm_persistent_rows26kernelILi128ELi1ELb0ELb0EEEvPK13__nv_bfloat16N14tf_qmm_prefill9ManyPartsEPS1_iiiiiii",
-                "_ZN23tf_qmm_persistent_rows26kernelILi128ELi1ELb0ELb1EEEvPK13__nv_bfloat16N14tf_qmm_prefill9ManyPartsEPS1_iiiiiii",
-                "_ZN23tf_qmm_persistent_rows36kernelILi128ELi1ELb0ELb0EEEvPK13__nv_bfloat16N14tf_qmm_prefill9ManyPartsEPS1_iiiiiii",
-            };
-            for (names, &result.persistent_fns) |name, *dest| {
-                const kernel = try prefill_mod.function(name);
-                try kernel.allowDynamicShared(smem);
-                dest.* = kernel;
-            }
-        }
-        return result;
-    }
-
-    fn persistent(kk: *const Kernels, f: Function, s: Stream, x: u64, parts: Parts, act: u64, rows: usize, k: usize, group: usize, full_cols: c_int, blocks: usize) !void {
-        var g: launch_.Args = .{};
-        g.add(x);
-        g.add(parts);
-        g.add(act);
-        for ([_]usize{ rows, k, k, group }) |v| g.add(@as(c_int, @intCast(v)));
-        g.add(full_cols);
-        g.add(@as(c_int, @intCast(blocks)));
-        g.add(@as(c_int, 1));
-        try launch_.launch(f, .{ .grid = .{ .x = @intCast(@min(blocks, kk.slots)) }, .block = .{ .x = threads }, .shared = smem }, s, &g);
-    }
-
-    fn persistentRows(kk: *const Kernels, rows: usize) bool {
-        return kk.slots == 96 and rows >= 256;
-    }
-
-    fn outputRole(outs: []const Out) bool {
-        return outs.len == 1 and outs[0].q.n == 5120 and (outs[0].q.k == 6144 or outs[0].q.k == 17408);
-    }
-
-    fn recurrentRole(outs: []const Out) bool {
-        if (outs.len != 4 or outs[0].q.k != 5120) return false;
-        for (outs, [_]usize{ 10240, 6144, 48, 48 }) |o, n| if (o.q.n != n) return false;
-        return true;
+        return .{ .many_fn = f, .mlp_fn = m, .split_fn = sp, .slots = 2 * sms };
     }
 
     /// The columns one projection's whole 128-wide tiles cover when its last panels run 64 wide (null: none do).
@@ -129,8 +86,6 @@ pub const Kernels = struct {
         g.add(act);
         for ([_]usize{ rows, k, k, group }) |v| g.add(@as(c_int, @intCast(v)));
         const blocks = rows_t * (gate.n / 64);
-        if (kk.persistentRows(rows) and gate.n == 17408 and gate.k == 5120) if (kk.persistent_fns[0]) |f|
-            return kk.persistent(f, s, x, parts, act, rows, k, group, -1, blocks);
         try launch_.launch(kk.mlp_fn, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = threads }, .shared = smem }, s, &g);
     }
 
@@ -150,12 +105,6 @@ pub const Kernels = struct {
             g.add(part);
             for ([_]usize{ rows, k, k, group, full_cols }) |v| g.add(@as(c_int, @intCast(v)));
             const blocks = rows_t * (full_cols / tile_n) + rows_t * ((o.q.n - full_cols) / (tile_n / 2));
-            if (kk.persistentRows(rows) and outputRole(outs)) if (kk.persistent_fns[2]) |f| {
-                var parts: Parts = std.mem.zeroes(Parts);
-                parts.count = 1;
-                parts.p[0] = part;
-                return kk.persistent(f, s, x, parts, 0, rows, k, group, @intCast(full_cols), blocks);
-            };
             return launch_.launch(kk.split_fn, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = threads }, .shared = smem }, s, &g);
         };
         var parts: Parts = std.mem.zeroes(Parts);
@@ -166,9 +115,6 @@ pub const Kernels = struct {
             blocks += rows_t * ((o.q.n + tile_n - 1) / tile_n);
         }
         parts.count = @intCast(outs.len);
-        const selected: ?usize = if (outputRole(outs)) 1 else if (recurrentRole(outs)) 3 else null;
-        if (kk.persistentRows(rows)) if (selected) |index| if (kk.persistent_fns[index]) |f|
-            return kk.persistent(f, s, x, parts, 0, rows, k, group, -1, blocks);
         var g: launch_.Args = .{};
         g.add(x);
         g.add(parts);

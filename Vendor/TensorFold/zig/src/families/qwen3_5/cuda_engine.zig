@@ -15,7 +15,6 @@ const profile = @import("cuda_startup_profile.zig");
 const modelopt = @import("cuda_modelopt.zig");
 const x3w = @import("cuda_exl3_weights.zig");
 pub const recurrent = @import("cuda_recurrent.zig");
-pub const projection_stream_layout = @import("cuda_projection_streams.zig");
 pub const wide_weight_layout = @import("cuda_wide_weights.zig");
 
 pub const Geometry = geometry.Geometry;
@@ -111,7 +110,6 @@ pub const Engine = struct {
     prompt_many: cuda.prompt_many.Kernels, // prompt GEMMs, several projections of one input a launch
     mlp_pair: cuda.mlp_pair.Kernels, // decode gate, up and activation in one launch (qmm_group.cu tf_qmm_mlp_pair)
     wide_words: ?DeviceBuffer = null,
-    projection_streams: ?DeviceBuffer = null,
     wide: cuda.qlinear.AffineNKernels, // the tiles of every width but 4, and their packs
     experts: cuda.experts.Affine4Experts,
     experts3: cuda.experts3.Affine3Experts,
@@ -201,8 +199,6 @@ pub const Engine = struct {
         const d = ctx.d;
         const e = try @import("cuda_prompt_int8.zig").Allocation(Engine).create(gpa);
         errdefer gpa.destroy(e);
-        e.projection_streams = null;
-        errdefer if (e.projection_streams) |*b| b.free();
         e.wide_words = null;
         errdefer if (e.wide_words) |*b| b.free();
         errdefer e.int8.deinit();
@@ -249,7 +245,7 @@ pub const Engine = struct {
         const minor = try ctx.attribute(.compute_capability_minor);
         const gb10 = major == 12 and minor == 1;
         e.affine = try cuda.qlinear.Affine4Kernels.resolve(d, e.mods[0], e.mods[1], e.mods[2], e.mods[3], sms, gb10);
-        e.affine.half_prompt = !gb10; // the 27B's prompt tile (Tile<64, 128, 128, 2, 2, 2>), quicker on an RTX 5090
+        e.affine.half_prompt = true; // the 27B's prompt tile (Tile<64, 128, 128, 2, 2, 2>), quicker on an RTX 5090; GB10 unmeasured upstream, this trial measures it
         // GB10: split-K decode/verify projections on the cluster tile (bits unchanged); TF_CLUSTER_DECODE=0 restores lane_gemv
         e.affine.cluster_decode = gb10 and !envOff("TF_CLUSTER_DECODE");
         e.affine.group_wide = gb10 and !envOff("TF_WIDE_GROUP");
@@ -297,10 +293,6 @@ pub const Engine = struct {
                 e.verify_weights = try verify_weight_layout.prepare(e, single);
         }
         errdefer if (e.verify_weights) |*b| b.free();
-        const output_stream = !envOff("TF_OUTPUT_STREAMS");
-        const gdn_stream = !envOff("TF_GDN_STREAM");
-        if (gb10 and g.hidden == 5120 and g.layers == 64 and g.experts == 0 and g.pocket == 0 and (output_stream or gdn_stream))
-            e.projection_streams = try projection_stream_layout.prepare(e, gdn_stream, output_stream);
         if (e.mo) |*m| try m.reserveParts(e);
         try @import("cuda_engine_tail.zig").finish(e, io, started);
         return e;
@@ -338,7 +330,6 @@ pub const Engine = struct {
         e.staged.free();
         e.tables.free();
         if (e.wide_words) |*b| b.free();
-        if (e.projection_streams) |*b| b.free();
         if (e.verify_weights) |*b| b.free();
         e.arena.free();
         e.gpa.free(e.layers);

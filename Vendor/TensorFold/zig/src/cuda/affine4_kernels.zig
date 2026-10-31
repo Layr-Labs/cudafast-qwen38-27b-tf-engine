@@ -33,8 +33,6 @@ pub const Affine4Kernels = struct {
     pub const Out = struct { q: Affine4, out: u64 };
 
     group_fn: Function,
-    stream16_fns: [2]?Function = @splat(null),
-    gdn_stream16_fn: ?Function = null,
     gemv_fn: Function,
     verify_fn: Function, // two m16 row tiles share each weight panel on the GB10 verify path
     verify64_fn: Function, // four, for wider shared frames
@@ -86,8 +84,6 @@ pub const Affine4Kernels = struct {
         try a.prefill22_fn.allowDynamicShared(linear.prefill22_smem);
         a.gemv_blocks = @max(1, try a.gemv_fn.occupancy(128, group_smem)) * sms;
         a.pdl = gb10;
-        a.stream16_fns = @splat(null);
-        a.gdn_stream16_fn = null;
         a.wide_fns = @splat(null);
         a.group_wide = false;
         a.wide_verify = false;
@@ -139,23 +135,6 @@ pub const Affine4Kernels = struct {
     /// decode() of each projection of one input; without GB10 one segmented launch, each keeping its split's bits.
     /// On GB10 the K-sliced projections share one lane_gemv launch and the unsliced ones one cluster launch.
     pub fn decodeMany(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, outs: []const Out, rows: usize) !void {
-        const stream_input = rows == 16 and a.pdl and outs.len == 4 and
-            outs[0].q.n == 10240 and outs[1].q.n == 6144 and outs[2].q.n == 48 and outs[3].q.n == 48 and
-            for (outs) |o| { if (o.q.k != 5120 or o.q.stream_w == 0) break false; } else true;
-        if (stream_input and a.gdn_stream16_fn != null) {
-            var parts: Parts = std.mem.zeroes(Parts);
-            parts.count = 4;
-            var first: usize = 0;
-            for (outs, 0..) |o, index| {
-                const tiles = if (index < 2) o.q.n / 256 else 1;
-                parts.p[index] = .{ .w = o.q.stream_w, .scales = o.q.s, .biases = o.q.b, .out = o.out, .n = int(o.q.n), .npad = int(o.q.npad), .sk = int(splitK(o.q.n,o.q.k)), .tiles = int(tiles), .first = int(first) };
-                first += tiles;
-            }
-            var g: launch_.Args = .{};
-            g.add(x); g.add(xs); g.add(parts);
-            for ([_]usize{ rows, 5120, 5120 }) |v| g.add(int(v));
-            return launch_.launch(a.gdn_stream16_fn.?, .{ .grid = .{ .x = u(first) }, .block = .{ .x = 128 }, .shared = 22656, .pdl = true }, s, &g);
-        }
         if (rows > max_rows) return error.WindowTooWide;
         const sp = a.split orelse return a.decodeGrouped(s, x, xs, outs, rows);
         return a.gemvSeg(s, x, xs, outs, rows, sp);
@@ -405,16 +384,6 @@ pub const Affine4Kernels = struct {
 
     /// qmm_group's tile 2: a cluster of `sk` CTAs a column tile, its K slices summed over distributed shared memory.
     pub fn cluster(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, q: Affine4, out: u64, rows: usize, sk: usize) !void {
-        const stream_fn = if (q.stream_w == 0) null else a.stream16_fns[@as(usize, if (q.k == 6144) 1 else 0)];
-        if (rows == 16 and sk == 4 and q.n == 5120 and (q.k == 6144 or q.k == 17408) and q.stream_w != 0 and stream_fn != null) {
-            var parts: Parts = std.mem.zeroes(Parts);
-            parts.count = 1;
-            parts.p[0] = .{ .w = q.stream_w, .scales = q.s, .biases = q.b, .out = out, .n = int(q.n), .npad = int(q.npad), .sk = 4, .tiles = 80, .first = 0 };
-            var g: launch_.Args = .{};
-            g.add(x); g.add(xs); g.add(parts);
-            for ([_]usize{ rows, q.k, q.k }) |v| g.add(int(v));
-            return launch_.launch(stream_fn.?, .{ .grid = .{ .x = 80 }, .block = .{ .x = 512 }, .shared = group_smem, .pdl = a.pdl }, s, &g);
-        }
         const tiles = (q.n + 63) / 64;
         var parts: Parts = std.mem.zeroes(Parts);
         parts.count = 1;
