@@ -229,7 +229,11 @@ pub const Engine = struct {
         defer ck.close();
         // an EXL3 checkpoint's weights are sized by a dry run of its loader (trellis widths come from the tensors)
         const wbytes = if (g.exl3) try x3w.measure(e, &ck) else weights.total(g);
-        e.arena = try DeviceBuffer.alloc(d, wbytes + try e.scratch(.measure));
+        const arena_bytes = wbytes + try e.scratch(.measure);
+        // the small free blocks earlier engines left, held while the weights commit in large ones (cuda_sponge.zig)
+        var sponge = @import("cuda_sponge.zig").take(d, arena_bytes);
+        defer sponge.free();
+        e.arena = try DeviceBuffer.alloc(d, arena_bytes);
         errdefer e.arena.free();
         try e.arena.fill8(0, null); // touched once now: the driver commits memory on first touch, slowly
         const kk = cuda.kernels;
