@@ -57,6 +57,46 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35d_norm_rope_batch(const _
     }
 }
 
+extern "C" __global__ void __launch_bounds__(32) tf_q35d_norm_rope_qk_batch(const __nv_bfloat16* __restrict__ XQ,
+        const __nv_bfloat16* __restrict__ WQ, __nv_bfloat16* __restrict__ OUTQ, int q_heads,
+        const __nv_bfloat16* __restrict__ XK, const __nv_bfloat16* __restrict__ WK, __nv_bfloat16* __restrict__ OUTK,
+        int kv_heads, int rows, const DraftSegment* segments, int block_rows, float eps, float theta) {
+    const int qb = rows * q_heads;
+    const bool isq = blockIdx.x < qb;
+    const int bx = isq ? blockIdx.x : blockIdx.x - qb;
+    const int heads = isq ? q_heads : kv_heads;
+    const __nv_bfloat16* X = isq ? XQ : XK;
+    const __nv_bfloat16* W = isq ? WQ : WK;
+    __nv_bfloat16* OUT = isq ? OUTQ : OUTK;
+    const int head = bx % heads;
+    const size_t m = bx / heads;
+    const int t = threadIdx.x;
+    const __nv_bfloat16* x = X + m * ((size_t)heads * HD) + head * HD;
+    float v[4], acc = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        v[i] = bf(x[4 * t + i]);
+        acc += v[i] * v[i];
+    }
+    acc = warp_sum(acc);
+    const float inv = rsqrtf(acc / (float)HD + eps);
+    float n[4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) n[i] = rbf(rbf(v[i] * inv) * bf(W[4 * t + i]));
+    const float pos = (float)(segments[m / block_rows].position + (long long)(m % block_rows));
+    __nv_bfloat16* out = OUT + (m * heads + head) * HD;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const int d = 4 * t + i;
+        const float partner = __shfl_xor_sync(0xffffffffu, n[i], 16);
+        const int j = d < HD / 2 ? d : d - HD / 2;
+        const float angle = pos * powf(theta, -(float)j / (float)(HD / 2));
+        float sn, cs;
+        sincosf(angle, &sn, &cs);
+        out[d] = __float2bfloat16_rn(d < HD / 2 ? n[i] * cs - partner * sn : n[i] * cs + partner * sn);
+    }
+}
+
 // Remove each stream's pending row before the output head and selector; rows stay grouped by stream.
 extern "C" __global__ void tf_q35d_mask_rows(const __nv_bfloat16* X, __nv_bfloat16* OUT, int D, int block_rows) {
     const int row = blockIdx.x, source = row / (block_rows - 1) * block_rows + 1 + row % (block_rows - 1);
