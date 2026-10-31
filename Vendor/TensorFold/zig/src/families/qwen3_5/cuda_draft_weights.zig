@@ -94,7 +94,7 @@ fn toBf16(x: f32) u16 {
     return @intCast((u +% rounding) >> 16);
 }
 
-/// MLX affine-4, group 64: minimize weight error with a bf16 scale and bias; pack low nibbles first.
+/// MLX affine-4, group 64: scale bf16((max - min) / 15), bias bf16(min), nibbles round((w - bias) / scale), low first.
 fn quantize(gpa: std.mem.Allocator, w: []align(1) const u16, n: usize, k: usize) !struct { words: []u32, scales: []u16, biases: []u16 } {
     const groups = k / 64;
     const words = try gpa.alloc(u32, n * k / 8);
@@ -113,10 +113,8 @@ fn quantize(gpa: std.mem.Allocator, w: []align(1) const u16, n: usize, k: usize)
                 lo = @min(lo, x);
                 hi = @max(hi, x);
             }
-            var fit = [2]f32{ (hi - lo) / 15.0, lo };
-            fit = leastSquares(row, fit);
-            const scale = toBf16(fit[0]);
-            const bias = toBf16(fit[1]);
+            const scale = toBf16((hi - lo) / 15.0);
+            const bias = toBf16(lo);
             scales[r * groups + g] = scale;
             biases[r * groups + g] = bias;
             const s = bf16(scale);
@@ -133,57 +131,6 @@ fn quantize(gpa: std.mem.Allocator, w: []align(1) const u16, n: usize, k: usize)
         }
     }
     return .{ .words = words, .scales = scales, .biases = biases };
-}
-
-/// A group's (scale, bias) improved by alternating code assignment and a least-squares line fit; kept only where the
-/// squared error with bf16-rounded scale and bias drops.
-fn leastSquares(row: []align(1) const u16, start: [2]f32) [2]f32 {
-    var best = start;
-    var best_err = groupError(row, start);
-    var cur = start;
-    for (0..3) |_| {
-        const s = cur[0];
-        if (s <= 0) break;
-        var sq: f64 = 0;
-        var sqq: f64 = 0;
-        var sw: f64 = 0;
-        var sqw: f64 = 0;
-        for (row) |h| {
-            const x: f64 = bf16(h);
-            const q: f64 = std.math.clamp(@round((x - cur[1]) / s), 0.0, 15.0);
-            sq += q;
-            sqq += q * q;
-            sw += x;
-            sqw += q * x;
-        }
-        const det = 64 * sqq - sq * sq;
-        if (det <= 0) break;
-        const ns = (64 * sqw - sq * sw) / det;
-        const nb = (sw - ns * sq) / 64;
-        if (!(ns > 0)) break;
-        cur = .{ @floatCast(ns), @floatCast(nb) };
-        const err = groupError(row, cur);
-        if (err < best_err) {
-            best_err = err;
-            best = cur;
-        }
-    }
-    return best;
-}
-
-/// The group's squared error under bf16-rounded scale and bias, as quantize then stores and the kernels read it.
-fn groupError(row: []align(1) const u16, fit: [2]f32) f64 {
-    const s = bf16(toBf16(fit[0]));
-    const b = bf16(toBf16(fit[1]));
-    const inv = if (s == 0) 0.0 else 1.0 / s;
-    var err: f64 = 0;
-    for (row) |h| {
-        const x = bf16(h);
-        const q = std.math.clamp(@round((x - b) * inv), 0.0, 15.0);
-        const d: f64 = x - (q * s + b);
-        err += d * d;
-    }
-    return err;
 }
 
 /// A bf16 (n, k) tensor quantized and packed through `stage` into the drafter's arena.
@@ -245,8 +192,6 @@ fn hostBf16(gpa: std.mem.Allocator, ck: *core.Checkpoint, name: []const u8, shap
 pub fn load(gpa: std.mem.Allocator, io: std.Io, e: *Engine, dir: []const u8, s: Shape) !Weights {
     var ck = try core.Checkpoint.openModel(gpa, io, dir);
     defer ck.close();
-    var sponge = @import("cuda_sponge.zig").take(e.d, total(s));
-    defer sponge.free();
     var w: Weights = .{ .fc = undefined, .hidden_norm = 0, .final_norm = 0, .selector = undefined, .predecessor = &.{}, .successor = &.{}, .layers = &.{}, .arena = try DeviceBuffer.alloc(e.d, total(s)) };
     errdefer w.arena.free();
     try w.arena.fill8(0, null);
@@ -306,17 +251,4 @@ test "bf16 rounding of a quantized group's scale and bias" {
     try std.testing.expectEqual(@as(u16, 0), q.scales[0]);
     try std.testing.expectEqual(@as(u16, 0x3f80), q.biases[0]);
     try std.testing.expectEqual(@as(u32, 0), q.words[0]);
-}
-
-
-test "drafter refit preserves flat groups and improves a linear weight ramp" {
-    const flat: [64]u16 = @splat(0x3f80);
-    const unchanged = leastSquares(&flat, .{ 0, 1 });
-    try std.testing.expectEqual(@as(f32, 0), unchanged[0]);
-    try std.testing.expectEqual(@as(f32, 1), unchanged[1]);
-    var row: [64]u16 = undefined;
-    for (&row, 0..) |*h, i| h.* = toBf16(@as(f32, @floatFromInt(i)) / 63.0 - 0.5);
-    const initial = [2]f32{ 1.0 / 15.0, -0.5 };
-    const fitted = leastSquares(&row, initial);
-    try std.testing.expect(groupError(&row, fitted) < groupError(&row, initial));
 }
