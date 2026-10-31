@@ -36,9 +36,21 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     const pack = try e.mods[3].function("tf_pack_kmajor");
     const grouped = try e.mods[0].function("tf_qmm_gdn_stream16");
     try grouped.allowDynamicShared(22656);
+    // its twin for dictionary-coded parts: a 256-column CTA's decoded scales and biases and its part's table
+    const grouped_dict: ?cuda.Function = if (e.affine.dict == null) null else blk: {
+        const f = try e.mods[0].function("tf_qmm_gdn_stream16_dict");
+        try f.allowDynamicShared(22656 + 4 * 256 + cuda.qlinear.dict_tab_max);
+        break :blk f;
+    };
     const down = try e.mods[0].function("tf_qmm_output_stream16");
     const out = try e.mods[0].function("tf_qmm_output_prefetch16");
     try down.allowDynamicShared(35328);
+    // its twin for a dictionary-coded down projection: four slices' decoded groups and the table past the stages
+    const down_dict: ?cuda.Function = if (e.affine.dict == null) null else blk: {
+        const f = try e.mods[0].function("tf_qmm_output_stream16_dict");
+        try f.allowDynamicShared(35328 + 4 * cuda.qlinear.dict_dec + cuda.qlinear.dict_tab_max);
+        break :blk f;
+    };
     try out.allowDynamicShared(35328);
     var buffer = try cuda.DeviceBuffer.alloc(e.d, bytes);
     errdefer buffer.free();
@@ -67,6 +79,8 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
         }
     };
     if (output) e.affine.stream16_fns = .{ down, out };
+    if (output) e.affine.stream16_dict_fn = down_dict;
     if (input) e.affine.gdn_stream16_fn = grouped;
+    if (input) e.affine.gdn_stream16_dict_fn = grouped_dict;
     return buffer;
 }

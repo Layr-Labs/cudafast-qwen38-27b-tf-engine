@@ -1,30 +1,50 @@
 // Four native K slices share a CTA, with their original ordered sum in shared memory.
 #pragma once
 #include "qmm_frag.cuh"
+#include "qmm_dict.cuh"
 namespace tf_qmm_output_stream {
 using namespace qmm_frag;
 constexpr int Stage=4416, SliceBytes=Stage*2, Bytes=SliceBytes*4;
 
-template<int FutureGroups,int Slices=4,int Rolling=0>
+// A dictionary-coded part (qmm_dict.cuh): a stage's 256 bytes at 4096 hold the group's index window in place of its
+// scales and biases; each slice decodes its group into its own 256 bytes past Bytes, from the one table after them.
+// The part's npad holds the code, so the word stream's tile count is the grid's (one CTA a 64-column tile).
+__device__ __forceinline__ void dict_decode_at(const qmm_dict::DictLanes& D,const unsigned char* packed,unsigned char* dec,
+        const unsigned char* table,int g){
+    const uint32_t* pk=reinterpret_cast<const uint32_t*>(packed);
+    const int off=(g*D.step&63)*8+D.bit0;
+    const uint32_t idx=__funnelshift_r(pk[off>>5],pk[(off>>5)+1],off&31)&D.mask;
+    reinterpret_cast<unsigned short*>(dec)[D.pos]=reinterpret_cast<const unsigned short*>(table)[D.base+idx];
+}
+
+template<int FutureGroups,int Slices=4,int Rolling=0,bool DICT=false>
 __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const float* __restrict__ xs,
         const tf_qmm_group::Parts& parts,int M,int K,int ldx) {
+    static_assert(!DICT||(FutureGroups==0&&Rolling==0),"a coded part's L2 prefetch would target its index windows");
     extern __shared__ __align__(128) unsigned char buf[];
     const auto p=parts.p[0];
     const int slice=threadIdx.x/128,tid=threadIdx.x%128,lane=tid&31,wn=tid>>5;
     const int KG=K/64,per=KG/Slices,g0=slice*per,tile=blockIdx.x,n0=tile*64,rows=min(M,16);
+    const int tiles=DICT?int(gridDim.x):p.npad/64;
     auto* local=buf+slice*SliceBytes;
     auto stage=[&](int it){return local+(it&1)*Stage;};
-    auto weight=[&](int g){return reinterpret_cast<const unsigned char*>(p.w)+(size_t(g)*(p.npad/64)+tile)*2048;};
+    auto weight=[&](int g){return reinterpret_cast<const unsigned char*>(p.w)+(size_t(g)*tiles+tile)*2048;};
+    qmm_dict::DictLanes D{};
+    if constexpr(DICT)D=qmm_dict::dict_lanes<64,4>(p,n0,KG,tid);
+    unsigned char* dec=buf+Bytes+slice*qmm_dict::DICT_DEC;
+    unsigned char* table=buf+Bytes+Slices*qmm_dict::DICT_DEC;
     auto load_w=[&](int it){
         auto* dst=stage(it);const int g=g0+it;
         cp16(dst+2048+tid*16,weight(g)+tid*16);
-        if(tid<16){const auto* table=tid<8?p.scales:p.biases;cp16(dst+4096+tid*16,table+size_t(g)*p.npad+n0+(tid%8)*8);}
+        if constexpr(DICT){if(D.ok)cp16(dst+4096+tid*16,D.src+qmm_dict::dict_window(D,g));}
+        else if(tid<16){const auto* table=tid<8?p.scales:p.biases;cp16(dst+4096+tid*16,table+size_t(g)*p.npad+n0+(tid%8)*8);}
     };
     auto load_x=[&](int it){
         auto* dst=stage(it);const int row=tid/8,ch=tid%8,g=g0+it;
         cp16z(dst+row*128+swz<8>(row,ch)*16,x+size_t(min(row,rows-1))*ldx+g*64+ch*8,row<rows);
         if(tid<16){if(tid<rows)cp4(dst+4352+tid*4,xs+size_t(tid)*KG+g);else *reinterpret_cast<float*>(dst+4352+tid*4)=0;}
     };
+    if constexpr(DICT)qmm_dict::dict_table<Slices*128>(p,table,threadIdx.x);
     load_w(0);commit();
 #if __CUDA_ARCH__ >= 900
     if(tid==0) {
@@ -53,7 +73,8 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
         wait<0>();__syncthreads();
         if(it+1<per){load_w(it+1);load_x(it+1);}commit();
         const auto* at=stage(it);const auto* wp=reinterpret_cast<const uint32_t*>(at+2048);
-        const auto* sp=reinterpret_cast<const __nv_bfloat16*>(at+4096);const auto* sums=reinterpret_cast<const float*>(at+4352);
+        if constexpr(DICT){dict_decode_at(D,at+4096,dec,table,g0+it);__syncwarp();}
+        const auto* sp=reinterpret_cast<const __nv_bfloat16*>(DICT?dec:at+4096);const auto* sums=reinterpret_cast<const float*>(at+4352);
         uint32_t words[2][2];
 #pragma unroll
         for(int j=0;j<2;++j)
@@ -104,6 +125,10 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
 
 extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_stream16(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
     tf_qmm_output_stream::body<0>(x,xs,parts,M,K,ldx);
+}
+// tf_qmm_output_stream16 on a dictionary-coded part: the same loads, MMA chains, fmas and slice-ordered sum.
+extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_stream16_dict(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
+    tf_qmm_output_stream::body<0,4,0,true>(x,xs,parts,M,K,ldx);
 }
 extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_prefetch16(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
     tf_qmm_output_stream::body<4>(x,xs,parts,M,K,ldx);

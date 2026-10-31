@@ -175,8 +175,11 @@ fn stageParts(stage: *DeviceBuffer, parts: [3][]const u8) ![3]u64 {
 /// Staged affine-4 parts packed into qlinear's tiles out of `into`'s arena (the caller waits before restaging).
 fn pack4(e: *Engine, into: anytype, raw: [3]u64, n: usize, k: usize) !Affine4 {
     const l = Affine4.layout(n, k);
-    const q: Affine4 = .{ .w = try into.alloc(l.words), .s = try into.alloc(l.scales), .b = try into.alloc(l.scales), .n = n, .k = k, .npad = l.npad };
+    var q: Affine4 = .{ .w = try into.alloc(l.words), .s = try into.alloc(l.scales), .b = try into.alloc(l.scales), .n = n, .k = k, .npad = l.npad };
     try e.affine.pack(e.stream, raw[0], raw[1], raw[2], q);
+    // the target's projections: their scales and biases dictionary-coded for the decode kernels too (gate and up's
+    // group-major for tf_qmm_mlp_single16's K-major panels, when the engine runs it; tile-major for the rest)
+    if (comptime @TypeOf(into) == *Engine) if (e.dict) |*ds| try e.affine.encode(e.stream, &q, ds, e.dict_kmajor and n == 17408 and k == 5120);
     return q;
 }
 

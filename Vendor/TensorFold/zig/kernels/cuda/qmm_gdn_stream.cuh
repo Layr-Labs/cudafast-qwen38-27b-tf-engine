@@ -1,13 +1,20 @@
 // Native grouped-input MMA and slice order, with one wider word-only K-major stream per CTA.
 #pragma once
+#include "qmm_dict.cuh"
 namespace tf_qmm_gdn_stream {
 using namespace tf_qmm_group;
 template<int GS,int BN,int STAGES>using GemvTile=qmm_frag::LaneTile<GS,16,BN,1,4,STAGES>;
-template <int GS, int BN, int STAGES, int FutureGroups, typename Map, typename After>
+// A dictionary-coded part (qmm_dict.cuh, DICT): its npad holds the code and its tiles field the real npad. A stage's
+// 2 * S bytes after the words hold the CTA's BN / 64 index windows (256 bytes each, a 64-column tile's group) in place
+// of its scales and biases; each warp decodes its BN / 4 columns' scales and biases into `dec` (BN scales, then BN
+// biases, as the arrays' stage holds them) from the part's table after it, so every fma reads the same values.
+template <int GS, int BN, int STAGES, int FutureGroups, bool DICT, typename Map, typename After>
 __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs, const Part& P, int M,
                                            int K, int ldx, int items, Map map, float (&acc)[GemvTile<GS, BN, STAGES>::NT][4],
                                            After after) {
     using T = GemvTile<GS, BN, STAGES>;
+    static_assert(!DICT || (FutureGroups == 0 && GS == 64 && BN % 64 == 0 && 2 * T::S == BN / 64 * 256), "coded stages");
+    const int npad = DICT ? P.tiles : P.npad;
     static_assert(T::MT == 1 && T::THREADS == 128, "one m16 row tile, four column warps");
     constexpr int NT = T::NT;
     extern __shared__ __align__(128) unsigned char buf[];
@@ -62,11 +69,23 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
                                   static_cast<size_t>(n0 / 64) * TILE_BYTES + (n0 % 64) * GS / 2;
 #pragma unroll
         for (int j = 0; j < WC; ++j)
-            if (wok[j]) cp16(p + wdst[j], wb + woff[j] + static_cast<size_t>(g) * (P.npad/64) * TILE_BYTES);
+            if (wok[j]) cp16(p + wdst[j], wb + woff[j] + static_cast<size_t>(g) * (npad/64) * TILE_BYTES);
+        if constexpr (DICT) {
+            // the CTA's tiles' index windows: tile n0 / 64 + c / 16, chunk c % 16, from each group's 64-byte line
+            const int step = 16 * qmm_dict::dict_bits(P.npad);
+            const size_t window = static_cast<size_t>(g) * step & ~static_cast<size_t>(63);
+            for (int c = tid; c < BN / 4; c += T::THREADS)
+                cp16(p + T::X + T::W + c * 16, reinterpret_cast<const unsigned char*>(P.scales) +
+                     static_cast<size_t>(n0 / 64 + c / 16) * KG * step + window + (c % 16) * 16);
+        } else {
 #pragma unroll
         for (int j = 0; j < SC; ++j)
             if (sok[j]) cp16(p + sdst[j], (sbias[j] ? P.biases : P.scales) + n0 + soff[j] + static_cast<size_t>(g) * P.npad);
+        }
     };
+    unsigned char* dec = buf + T::SMEM;  // DICT: BN decoded scales, BN biases, then the part's table
+    unsigned char* table = dec + 4 * BN;
+    if constexpr (DICT) qmm_dict::dict_table<T::THREADS>(P, table, tid);
     uint32_t mask;
     asm volatile("mov.b32 %0, 0x000F000F;\n" : "=r"(mask));
 
@@ -110,7 +129,22 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
         commit();
         const unsigned char* p = stage(it % STAGES);
         const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
-        const __nv_bfloat16* ps = reinterpret_cast<const __nv_bfloat16*>(p + T::X + T::W);
+        if constexpr (DICT) {
+            // the lane's BN / 64 values of its warp's BN / 4 columns: value q is column q % (BN / 4)'s scale, then bias
+            const int code = P.npad, bits = qmm_dict::dict_bits(code), step = 16 * bits, g = map(it).x;
+            const uint32_t mask_bits = (1u << bits) - 1u;
+#pragma unroll
+            for (int v = 0; v < BN / 64; ++v) {
+                const int q = lane + 32 * v, half = q / (BN / 4), col = wn * (BN / 4) + q % (BN / 4);
+                const uint32_t* pk = reinterpret_cast<const uint32_t*>(p + T::X + T::W + (col / 64) * 256);
+                const int off = (g * step & 63) * 8 + (half * 64 + col % 64) * bits;
+                const uint32_t idx = __funnelshift_r(pk[off >> 5], pk[(off >> 5) + 1], off & 31) & mask_bits;
+                reinterpret_cast<unsigned short*>(dec)[half * BN + col] =
+                    reinterpret_cast<const unsigned short*>(table)[(half ? qmm_dict::dict_ns(code) : 0) + idx];
+            }
+            __syncwarp();
+        }
+        const __nv_bfloat16* ps = reinterpret_cast<const __nv_bfloat16*>(DICT ? dec : p + T::X + T::W);
         const float* px = reinterpret_cast<const float*>(p + T::X + T::W + 2 * T::S);
         uint32_t words[NT][GS / 32];
 #pragma unroll
@@ -170,12 +204,12 @@ __device__ __forceinline__ void gemv_store(const Part& P, int M, int n0, Got got
 }
 
 
-template<int BN,int FutureGroups>
+template<int BN,int FutureGroups,bool DICT=false>
 __device__ __forceinline__ void tile(const __nv_bfloat16* x,const float* xs,const tf_qmm_group::Part p,int t,int M,int K,int ldx){
     constexpr int NT=GemvTile<64,BN,2>::NT;
     const auto original=p;
     const int KG=K/64,per=KG/p.sk;float acc[NT][4]{},tot[NT][4]{};
-    wide_items<64,BN,2,FutureGroups>(x,xs,original,M,K,ldx,KG,[&](int g){return make_int2(g,t*BN);},acc,[&](int g){
+    wide_items<64,BN,2,FutureGroups,DICT>(x,xs,original,M,K,ldx,KG,[&](int g){return make_int2(g,t*BN);},acc,[&](int g){
         if((g+1)%per!=0)return;bool first=g+1==per;
 #pragma unroll
         for(int j=0;j<NT;++j)
@@ -194,8 +228,21 @@ __device__ __forceinline__ void body(const __nv_bfloat16* x,const float* xs,cons
     if(which<2)tile<256,FutureGroups>(x,xs,p,t,M,K,ldx);
     else tile<64,FutureGroups>(x,xs,p,t,M,K,ldx);
 }
+// body() on a launch whose coded parts carry their real npad in `tiles` (uncoded parts: tiles 0, npad as stored).
+__device__ __forceinline__ void body_dict(const __nv_bfloat16* x,const float* xs,const tf_qmm_group::Parts& parts,int M,int K,int ldx){
+    int which=0;
+#pragma unroll
+    for(int i=1;i<4;++i)if(int(blockIdx.x)>=parts.p[i].first)which=i;
+    const auto p=parts.p[which];int t=int(blockIdx.x)-p.first;const bool coded=p.tiles>0;
+    if(which<2){if(coded)tile<256,0,true>(x,xs,p,t,M,K,ldx);else tile<256,0>(x,xs,p,t,M,K,ldx);}
+    else{if(coded)tile<64,0,true>(x,xs,p,t,M,K,ldx);else tile<64,0>(x,xs,p,t,M,K,ldx);}
+}
 }
 
 extern "C" __global__ void __launch_bounds__(128) tf_qmm_gdn_stream16(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
     tf_qmm_gdn_stream::body<0>(x,xs,parts,M,K,ldx);
+}
+// tf_qmm_gdn_stream16 with its dictionary-coded parts' index windows: the same loads, MMA chains, fmas and sums.
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_gdn_stream16_dict(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
+    tf_qmm_gdn_stream::body_dict(x,xs,parts,M,K,ldx);
 }
