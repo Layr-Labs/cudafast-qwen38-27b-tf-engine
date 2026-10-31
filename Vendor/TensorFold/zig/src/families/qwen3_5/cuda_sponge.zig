@@ -11,8 +11,9 @@ const builtin = @import("builtin");
 const cuda = @import("cuda");
 const linux = std.os.linux;
 
-/// Free blocks smaller than this are what the buffer takes.
-const below: usize = 32 << 20;
+/// Free blocks smaller than this are what the buffer takes, or smaller than the kernel's largest block where that is less
+/// (4 KiB pages: 4 MiB, so the weights commit in whole 4 MiB blocks).
+const below_most: usize = 32 << 20;
 /// Memory left free beyond the engine's own buffers; the buffer never takes more than `most`.
 const margin: usize = 24 << 30;
 const most: usize = 40 << 30;
@@ -30,13 +31,11 @@ pub const Sponge = struct {
     }
 };
 
-/// Commits a buffer over the free memory in blocks below `below`, keeping `need` bytes and `margin` free; an
-/// empty Sponge when the kernel's pages are small (4 KiB pages: its largest block is 4 MiB), the counts are
-/// unreadable, memory is short, or a driver call fails. Never fails the load.
+/// Commits a buffer over the free memory in blocks below the bound (`below`), keeping `need` bytes and `margin` free;
+/// an empty Sponge when the counts are unreadable, memory is short, or a driver call fails. Never fails the load.
 pub fn take(d: *const cuda.Driver, need: usize) Sponge {
     if (comptime builtin.os.tag != .linux) return .{};
     const page = std.heap.pageSize();
-    if (page < 64 << 10) return .{};
     var buf: [16384]u8 = undefined;
     const small = smallFree(read("/proc/buddyinfo", &buf) orelse return .{}, page);
     const avail = memAvailable(read("/proc/meminfo", &buf) orelse return .{}) orelse return .{};
@@ -77,6 +76,7 @@ fn read(path: [:0]const u8, buf: []u8) ?[]const u8 {
 
 /// Bytes free in blocks below `below`, every zone: /proc/buddyinfo's "Node 0, zone Normal c0 c1 ..." counts by order.
 fn smallFree(text: []const u8, page: usize) usize {
+    const under = below(text, page);
     var total: usize = 0;
     var lines = std.mem.tokenizeScalar(u8, text, '\n');
     while (lines.next()) |line| {
@@ -87,12 +87,27 @@ fn smallFree(text: []const u8, page: usize) usize {
             if (i < 4) continue; // Node, its number, zone, its name
             const n = std.fmt.parseInt(usize, tok, 10) catch break;
             const block = std.math.shlExact(usize, page, order) catch break;
-            if (block < below) total +|= n *| block;
+            if (block < under) total +|= n *| block;
             order += 1;
             if (order == 63) break;
         }
     }
     return total;
+}
+
+/// The bound: 32 MiB, or the kernel's largest block (its last buddyinfo order) where that is smaller.
+fn below(text: []const u8, page: usize) usize {
+    var orders: usize = 0;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        var it = std.mem.tokenizeAny(u8, line, " \t,");
+        var i: usize = 0;
+        while (it.next()) |_| : (i += 1) {}
+        if (i > 4) orders = @max(orders, i - 4);
+    }
+    if (orders == 0) return below_most;
+    const largest = std.math.shlExact(usize, page, @intCast(@min(orders - 1, 62))) catch return below_most;
+    return @min(below_most, largest);
 }
 
 fn memAvailable(text: []const u8) ?usize {
@@ -115,6 +130,13 @@ test "sponge: small blocks counted by order, sized within the memory kept free" 
     const k: usize = 64 << 10;
     const want = (3 + 1000) * k + (2 + 500) * 2 * k + (1 + 100) * 4 * k + 10 * 8 * k + 4 * 16 * k + 2 * 32 * k + 1 * 64 * k;
     try t.expectEqual(want, smallFree(info, k));
+    // 4 KiB pages, orders 0-10 (4 KiB .. 4 MiB): every block below the largest, 4 MiB
+    const small =
+        \\Node 0, zone   Normal      8      4      2      1      0      0      0      0      0      1      7
+    ;
+    const p: usize = 4 << 10;
+    try t.expectEqual(@as(usize, 4 << 20), below(small, p));
+    try t.expectEqual(8 * p + 4 * 2 * p + 2 * 4 * p + 1 * 8 * p + 1 * 512 * p, smallFree(small, p));
     try t.expectEqual(@as(?usize, 123456 * 1024), memAvailable("MemTotal:  999 kB\nMemAvailable:   123456 kB\n"));
     try t.expectEqual(@as(?usize, null), memAvailable("MemTotal: 1 kB\n"));
     const g: usize = 1 << 30;
