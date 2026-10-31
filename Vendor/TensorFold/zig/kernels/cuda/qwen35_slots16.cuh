@@ -182,5 +182,5 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_slots16_3(Geo geo,
  const __nv_bfloat16* beta,const Seg* segs,const SlotStep* steps,int layer,
  __nv_bfloat16* y,const int* P) {
  release_next(); await_prior();
- q35_slots16_ready<3,4,1,false,true>(geo,q,k,v,g,beta,segs,steps,layer,y,P);
+ q35_slots16_ready<3,4,1,false,true>(geo,after_wait(q),after_wait(k),after_wait(v),after_wait(g),after_wait(beta),segs,steps,layer,after_wait(y),P);
 }

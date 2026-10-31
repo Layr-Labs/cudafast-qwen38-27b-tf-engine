@@ -107,6 +107,8 @@ pub const Engine = struct {
     int8: @import("cuda_prompt_int8.zig").State = .{}, // prompt projections with int8 activations, when on
     draws: cuda.sample.Draws,
     affine: cuda.qlinear.Affine4Kernels,
+    dict: ?cuda.qlinear.DictStore, // the decode kernels' dictionary-coded scales and biases (GB10; TF_DICT=0: none)
+    dict_kmajor: bool, // gate and up coded group-major, for tf_qmm_mlp_single16 on the K-major panels (TF_MLP_KMAJOR=2)
     prompt_many: cuda.prompt_many.Kernels, // prompt GEMMs, several projections of one input a launch
     mlp_pair: cuda.mlp_pair.Kernels, // decode gate, up and activation in one launch (qmm_group.cu tf_qmm_mlp_pair)
     wide_words: ?DeviceBuffer = null,
@@ -211,6 +213,8 @@ pub const Engine = struct {
         e.mlp = null;
         e.taught = 0;
         e.kit = null;
+        e.dict = null;
+        e.dict_kmajor = false;
         e.d = d;
         e.g = g;
         e.geo = .{ .hid = @intCast(g.hidden), .nk = @intCast(g.k_heads), .nv = @intCast(g.v_heads), .qh = @intCast(g.q_heads), .kvh = @intCast(g.kv_heads), .nl = @intCast(g.deltas()) };
@@ -249,9 +253,21 @@ pub const Engine = struct {
         // GB10: split-K decode/verify projections on the cluster tile (bits unchanged); TF_CLUSTER_DECODE=0 restores lane_gemv
         e.affine.cluster_decode = gb10 and !envOff("TF_CLUSTER_DECODE");
         e.affine.group_wide = gb10 and !envOff("TF_WIDE_GROUP");
+        // GB10: out/o (short K slices) on lane_gemv's column CTAs instead (bits unchanged); TF_SHORT_LANE=0 restores the cluster tile
+        e.affine.short_lane = gb10 and !envOff("TF_SHORT_LANE");
         errdefer e.affine.deinit();
         e.prompt_many = try cuda.prompt_many.Kernels.resolve(e.mods[1], sms);
         e.mlp_pair = try cuda.mlp_pair.Kernels.resolve(e.mods[0], gb10);
+        // GB10: the decode projections read their scales and biases as dictionary indices built at load (exact: the
+        // tables hold every value); TF_DICT=0 keeps every launch on the (kg, npad) arrays
+        if (envOff("TF_DICT")) {
+            e.affine.dict = null;
+            e.mlp_pair.dict_fn = null;
+        }
+        if (e.affine.dict != null) e.dict = try cuda.qlinear.DictStore.init(d);
+        // the same choice as verify_weight_layout.prepare's below: tf_qmm_mlp_single16 unless TF_MLP_KMAJOR says otherwise
+        e.dict_kmajor = gb10 and std.mem.eql(u8, std.mem.span(@import("sys").c.getenv("TF_MLP_KMAJOR") orelse "2"), "2");
+        errdefer if (e.dict) |*ds| ds.deinit();
         // sm_120 too: a 32-row window of the 27B verifies in 17.8 ms on one weight pass, 22.3 ms on two 16-row ones
         if (major == 12 and minor == 0) e.affine.wide_verify = true;
         e.wide = try cuda.qlinear.AffineNKernels.resolve(d, e.mods[7], e.mods[8], e.mods[3], sms, gb10);
@@ -337,6 +353,7 @@ pub const Engine = struct {
         for (e.blocks.items) |*b| b.buffer.free();
         e.blocks.deinit(e.gpa);
         @import("cuda_cache.zig").forget(e);
+        if (e.dict) |*ds| ds.deinit();
         e.affine.deinit();
         e.wide.deinit();
         e.int8.deinit();
