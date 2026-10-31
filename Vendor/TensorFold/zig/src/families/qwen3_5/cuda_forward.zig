@@ -36,12 +36,12 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     const record = shape.record;
     const prompt = shape.prompt;
     const heads: usize = if (record) total else 1;
-    // Independent prompt rows share a block; decode keeps one warp per row. A 16..64-row window's gdn_pre rows share
+    // Independent prompt rows share a block; decode keeps one warp per row. An 8..64-row window's gdn_pre rows share
     // blocks too (four row warps a block: its warps are independent, the same bits); TF_GDN_ROWS4=0 keeps one warp a
     // block there. gdn_post keeps a warp a block in windows (four a block measured slower).
     const gdn_rows: usize = if (prompt and total > 16) 4 else 1;
     const gdn_blocks = (total + gdn_rows - 1) / gdn_rows;
-    const pre_rows: usize = if ((prompt and total > 16) or (total >= 16 and rows4On())) 4 else 1;
+    const pre_rows: usize = if ((prompt and total > 16) or (total >= 8 and rows4On())) 4 else 1;
     const pre_blocks = (total + pre_rows - 1) / pre_rows;
     const t_ids = e.tables.ptr + ids_at;
     const t_segs = e.tables.ptr + segs_at;
@@ -116,8 +116,8 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     } else {
                         // a 2..64-row window: row pairs share each chunk's stream-key tiles (attn_pair, the same bits);
                         // TF_ATTN_PAIR=0 keeps attn_partial's block a row
-                        if (record and total >= 2 and total % 2 == 0 and 2 * group <= 16 and pairOn())
-                            try sharedSized(e, e.fns.attn_pair, sig.attn_pair, .{ total / 2, partial_chunks, g.kv_heads }, 128, attn_tile, args)
+                        if (record and total >= 2 and 2 * group <= 16 and pairOn())
+                            try sharedSized(e, e.fns.attn_pair, sig.attn_pair, .{ (total + 1) / 2, partial_chunks, g.kv_heads }, 128, attn_tile, args)
                         else
                             try sharedSized(e, e.fns.attn_partial, sig.attn_partial, .{ total, partial_chunks, g.kv_heads }, 128, attn_tile, args);
                         // streams of caches no longer than GROUP_LEN have no row for attn_rows (its blocks would only return)
@@ -168,7 +168,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
         // a captured forward's first layer is a graph of its own (cuda_engine.zig's cutCapture)
         if (i == 0) try e.cutCapture();
     }
-    try finish(e, total, heads, shape.hidden);
+    try finish(e, total, heads, shape.hidden, if (@hasField(@TypeOf(shape), "amax")) shape.amax else false);
 }
 
 /// TF_GDN_ROWS4=0: 16..64-row windows keep one row warp a block in tf_q35_gdn_pre.
@@ -210,7 +210,7 @@ fn sharedSized(e: *E.Engine, f: cuda.Function, comptime s: sig.Sig, grid: [3]usi
 }
 
 /// Layer inputs are already kept; hidden reads need neither the final norm nor the vocabulary head.
-pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool) !void {
+pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool, amax: bool) !void {
     if (hidden) return;
     const g = e.g;
     if (e.learning == null and heads < total) {
@@ -220,6 +220,12 @@ pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool) !void {
     } else {
         try e.norm(true, e.final_norm, total);
         if (e.learning) |k| try k.final(e.h, total);
+        if (@hasField(@TypeOf(e.*), "head_amax")) if (amax) {
+            // a greedy verify: the norm wrote the rows' group sums (projAgain's input); the head's tile writes each
+            // row's best a tile and the merge each row's token (cuda_engine.zig forward then skips its argmax)
+            const x = e.x + (total - heads) * g.hidden * 2;
+            return e.affine.headArgmax(e.stream, x, e.xs, e.head.a4, e.head_amax, heads, e.tables.ptr + @import("cuda_round.zig").tokens_at);
+        };
         if (@hasDecl(@TypeOf(e.*), "projAgain"))
             try e.projAgain(e.head, e.x + (total - heads) * g.hidden * 2, e.logits, heads, false)
         else
