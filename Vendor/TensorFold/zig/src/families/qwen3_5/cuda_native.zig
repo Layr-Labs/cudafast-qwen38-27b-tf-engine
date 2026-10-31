@@ -413,7 +413,7 @@ const Lanes = struct {
 
     fn closeDrafts(self: *Lanes) u64 {
         if (self.draft) |draft| while (draft.pool.pop()) |ctx| {
-            ctx.ring.free();
+            if (ctx.ring.borrowed) ctx.ring.free() else cache_mod.giveBlock(&ctx.ring); // the next phase's ring, zeroed then
             draft.gpa.destroy(ctx);
         };
         var bytes: u64 = 0;

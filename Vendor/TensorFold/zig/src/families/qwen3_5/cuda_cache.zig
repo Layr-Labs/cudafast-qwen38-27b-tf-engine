@@ -46,6 +46,17 @@ fn take(e: *Engine, len: usize) !DeviceBuffer {
 /// The engine whose pool `give` fills: the one that allocated through `take` (one engine a process).
 var pool_of: ?*Engine = null;
 
+/// `take` for the engine's other per-phase device buffers (recurrent scratch, drafter rings): a pooled block of exactly
+/// `len` bytes or a new one, which the caller zeroes or overwrites before any read.
+pub fn takeBlock(e: *Engine, len: usize) !DeviceBuffer {
+    return take(e, len);
+}
+
+/// `give` for those buffers: kept for the next phase's same-size buffer, or freed.
+pub fn giveBlock(b: *DeviceBuffer) void {
+    give(b);
+}
+
 /// Stop recycling into `e`'s pool (its deinit).
 pub fn forget(e: *Engine) void {
     if (pool_of == e) pool_of = null;
@@ -316,10 +327,21 @@ pub const Cache = struct {
         const g = e.g;
         const sg = self.seg(e, last.start, 0, last.rows);
         try recurrent.mark(self, false);
-        if (!prefix) try e.run(e.keeps.apply, .{ 1, geometry.dk / 4, g.v_heads * g.deltas() }, .{ 32, 4, 1 }, .{ e.geo, sg, p });
+        // a tree's path is replayed now only without a log to move; otherwise its rows move down the log (below)
+        const moved = !prefix and self.log.len > 0;
+        if (!prefix and !moved) try e.run(e.keeps.apply, .{ 1, geometry.dk / 4, g.v_heads * g.deltas() }, .{ 32, 4, 1 }, .{ e.geo, sg, p });
         try e.run(e.keeps.conv, .{ g.deltas(), (g.convBytes() / 2 + 255) / 256, 1 }, .{ 256, 1, 1 }, .{ e.geo, sg, @as(c_int, @intCast(path[path.len - 1])) });
         if (!prefix and g.attentions() > 0) try e.run(if (e.kv8) e.fp8.compact else e.keeps.compact, .{ g.attentions(), g.kv_heads, 1 }, .{ geometry.head_dim, 1, 1 }, .{ e.geo, sg, p });
-        if (prefix) {
+        if (moved) {
+            // the path's log rows move down to rows 0 .. n - 1 (row j from path[j]: ascending, so each copy lands on a
+            // row already read and below every later source), after conv read the last one. The kept path is then a
+            // prefix of the log, and the next recorded slot scan folds it with apply's arithmetic (decay, then the
+            // key's fma, row by row), instead of a whole-recurrence apply here.
+            const row_bytes = g.deltas() * g.logRowBytes();
+            const half = sg.log - self.log.ptr;
+            for (path, 0..) |r, j| if (r != j) try self.log.copyFrom(half + j * row_bytes, sg.log + r * row_bytes, row_bytes, e.stream.handle);
+        }
+        if (prefix or moved) {
             // a chain's prefix: the next recorded slot scan replays it from this log half while it loads the state
             self.pend = p.n;
             self.pend_log = sg.log;

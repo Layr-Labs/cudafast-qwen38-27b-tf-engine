@@ -106,6 +106,7 @@ pub const Engine = struct {
     draws: cuda.sample.Draws,
     affine: cuda.qlinear.Affine4Kernels,
     prompt_many: cuda.prompt_many.Kernels, // prompt GEMMs, several projections of one input a launch
+    mlp_pair: cuda.mlp_pair.Kernels, // decode gate, up and activation in one launch (qmm_group.cu tf_qmm_mlp_pair)
     wide: cuda.qlinear.AffineNKernels, // the tiles of every width but 4, and their packs
     experts: cuda.experts.Affine4Experts,
     experts3: cuda.experts3.Affine3Experts,
@@ -243,6 +244,7 @@ pub const Engine = struct {
         e.affine.cluster_decode = gb10 and !envOff("TF_CLUSTER_DECODE");
         errdefer e.affine.deinit();
         e.prompt_many = try cuda.prompt_many.Kernels.resolve(e.mods[1], sms);
+        e.mlp_pair = try cuda.mlp_pair.Kernels.resolve(e.mods[0], gb10);
         // sm_120 too: a 32-row window of the 27B verifies in 17.8 ms on one weight pass, 22.3 ms on two 16-row ones
         if (major == 12 and minor == 0) e.affine.wide_verify = true;
         e.wide = try cuda.qlinear.AffineNKernels.resolve(d, e.mods[7], e.mods[8], e.mods[3], sms, gb10);
@@ -518,6 +520,10 @@ pub const Engine = struct {
         };
         shape.hidden = keep == .hidden;
         shape.paged = @import("cuda_attention.zig").hasPages(segs);
+        // a cache of at most GROUP_LEN positions holds fewer keys than that before any row it verifies
+        shape.short = for (parts) |p| {
+            if (p.cache.cap > @import("cuda_forward.zig").group_len) break false;
+        } else true;
         if (e.learning != null or e.pockets.any()) {
             var exact = shape;
             exact.total = @intCast(total);
