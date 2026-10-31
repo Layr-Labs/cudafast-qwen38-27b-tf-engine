@@ -585,9 +585,3 @@ __device__ __forceinline__ void body(const __nv_bfloat16* x,const float* xs,cons
 }
 }
 
-extern "C" __global__ void __launch_bounds__(128) tf_qmm_gdn_stream32(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
-    tf_qmm_gdn_rows32::body<false>(x,xs,parts,M,K,ldx);
-}
-extern "C" __global__ void __launch_bounds__(128) tf_qmm_gdn_stream32_dict(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
-    tf_qmm_gdn_rows32::body<true>(x,xs,parts,M,K,ldx);
-}
