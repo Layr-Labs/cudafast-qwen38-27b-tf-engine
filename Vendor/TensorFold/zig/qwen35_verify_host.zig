@@ -82,13 +82,6 @@ fn device(d: *cuda.Driver, gb10: bool, wide: bool) q.engine.Engine {
     e.affine.group_fn = function(d, 3);
     e.affine.stream16_fns = @splat(null);
     e.affine.gdn_stream16_fn = null;
-    e.affine.stream16_dict_fn = null;
-    e.affine.gdn_stream16_dict_fn = null;
-    e.affine.gdn_stream32_fn = null;
-    e.affine.gdn_stream32_dict_fn = null;
-    e.affine.dict = null;
-    e.affine.short_lane = false;
-    e.affine.sms = 48;
     e.affine.prefill_fn = function(d, 4);
     e.affine.prefill22_fn = function(d, 4);
     e.prompt_many = .{ .many_fn = function(d, 14), .mlp_fn = function(d, 4), .split_fn = function(d, 15), .slots = 96 };
@@ -453,44 +446,6 @@ test "fused MLP: alternate words require both views and exactly sixteen rows" {
     try t.expectEqual(@as(usize, 20), PairTrace.id);
 }
 
-test "compact MLP: sixteen pair-coded rows use both half panels and preserve fallbacks" {
-    var d: cuda.Driver = undefined;
-    d.api.cuLaunchKernelEx = PairTrace.launch;
-    var pair: cuda.mlp_pair.Kernels = .{
-        .pair_fn = function(&d, 20), .kmajor_fn = function(&d, 21), .pdl = true,
-        .kmajor_single = true, .single_dict_fn = function(&d, 22), .compact_pair_fn = function(&d, 23),
-    };
-    const stream: cuda.Stream = .{ .d = &d, .handle = null };
-    const code = cuda.qlinear.dict_kmajor | (1000 << 5) | 10;
-    const gate: cuda.qlinear.Affine4 = .{ .w = 10, .verify_w = 100, .s = 20, .b = 30,
-        .sb = 40, .tab = 50, .code = code, .n = 17408, .k = 5120, .npad = 17408 };
-    var up = gate; up.verify_w = 400;
-    try pair.pair(stream, 1000, 2000, gate, up, 3000, 4000, 16);
-    try t.expectEqual(@as(usize, 23), PairTrace.id);
-    try t.expectEqual(@as(u32, 136), PairTrace.grid);
-    try t.expectEqual(@as(u32, 17536), PairTrace.shared);
-    try t.expectEqual(@as(u32, 1), PairTrace.cluster);
-    try t.expectEqual(@as(c_int, 136), PairTrace.parts.p[0].tiles);
-    try t.expectEqual(@as(u64, 100), PairTrace.parts.p[0].w);
-    try t.expectEqual(@as(u64, 400), PairTrace.parts.p[1].w);
-    try t.expectEqual(@as(u64, 40), PairTrace.parts.p[0].scales);
-    try t.expectEqual(@as(u64, 50), PairTrace.parts.p[0].biases);
-    try t.expectEqual(@as(u32, code & ~cuda.qlinear.dict_kmajor), @as(u32, @bitCast(PairTrace.parts.p[0].first)));
-    up.code = cuda.qlinear.dict_kmajor | (120 << 18) | (100 << 5) | 8;
-    try pair.pair(stream, 1000, 2000, gate, up, 3000, 4000, 16);
-    try t.expectEqual(@as(usize, 22), PairTrace.id);
-    try t.expectEqual(@as(u32, 68), PairTrace.grid);
-    up = gate; pair.compact_pair_fn = null;
-    try pair.pair(stream, 1000, 2000, gate, up, 3000, 4000, 16);
-    try t.expectEqual(@as(usize, 22), PairTrace.id);
-    try t.expectEqual(@as(u32, 68), PairTrace.grid);
-    pair.compact_pair_fn = function(&d, 23);
-    for ([_]usize{ 1, 15, 17, 32 }) |rows| {
-        try pair.pair(stream, 1000, 2000, gate, up, 3000, 4000, rows);
-        try t.expectEqual(@as(usize, 20), PairTrace.id);
-    }
-}
-
 test "verify weights: preparation owns one weight-only view and retains original consumers" {
     for ([_]bool{ false, true }) |single| {
     var d: cuda.Driver = undefined;
@@ -594,14 +549,14 @@ test "prompt persistence: target MLP retains canonical parts and passes total ti
     up.w = 40;
     for ([_]usize{ 1, 128, 255, 256, 496, 512, 513 }) |rows| {
         try kernels.mlp(stream, 1000, gate, up, 3000, rows);
-        const selected = true;
+        const selected = rows >= 256;
         try t.expectEqual(@as(usize, if (selected) 40 else 4), PromptPersistentTrace.id);
         const total = (rows + 127) / 128 * 272;
         try t.expectEqual(@as(u32, @intCast(if (selected) @min(total, 96) else total)), PromptPersistentTrace.grid);
         try t.expectEqual(@as(u32, 128), PromptPersistentTrace.block);
         try t.expectEqual(@as(u32, 41984), PromptPersistentTrace.shared);
         if (selected) {
-            try t.expectEqualSlices(c_int, &.{ @intCast(rows), 5120, 5120, @intCast(@min((rows + 127) / 128, 25)), -1, @intCast(total), 1 }, &PromptPersistentTrace.scalar);
+            try t.expectEqualSlices(c_int, &.{ @intCast(rows), 5120, 5120, @intCast(@min((rows + 127) / 128, 9)), -1, @intCast(total), 1 }, &PromptPersistentTrace.scalar);
             try t.expectEqual(@as(u64, 3000), PromptPersistentTrace.act);
             try t.expectEqual(@as(c_int, 2), PromptPersistentTrace.parts.count);
             try t.expectEqual(@as(u64, 10), PromptPersistentTrace.parts.p[0].w);
@@ -637,10 +592,9 @@ test "prompt persistence: only measured projection roles select row rings and pr
     }
     const short = [_]cuda.prompt_many.Out{.{ .q = PromptPersistentTrace.matrix(5120, 6144), .out = 3000 }};
     try kernels.prompt(stream, 1000, &short, 256);
-    try t.expectEqual(@as(usize, 42), PromptPersistentTrace.id);
-    try t.expectEqual(@as(u32, 96), PromptPersistentTrace.grid);
-    try t.expectEqual(@as(c_int, 0), PromptPersistentTrace.scalar[4]);
-    try t.expectEqual(@as(c_int, 160), PromptPersistentTrace.scalar[5]);
+    try t.expectEqual(@as(usize, 41), PromptPersistentTrace.id);
+    try t.expectEqual(@as(u32, 80), PromptPersistentTrace.grid);
+    try t.expectEqual(@as(c_int, -1), PromptPersistentTrace.scalar[4]);
     var recurrent: [4]cuda.prompt_many.Out = undefined;
     for (&recurrent, [_]usize{ 10240, 6144, 48, 48 }, 0..) |*o, n, i| o.* = .{ .q = PromptPersistentTrace.matrix(n, 5120), .out = 3000 + i * 100 };
     try kernels.prompt(stream, 1000, &recurrent, 496);
@@ -656,9 +610,8 @@ test "prompt persistence: only measured projection roles select row rings and pr
     try t.expectError(error.InputMismatch, kernels.prompt(stream, 1000, &recurrent, 496));
     const attention = [_]cuda.prompt_many.Out{ .{ .q = PromptPersistentTrace.matrix(12288, 5120), .out = 3000 }, .{ .q = PromptPersistentTrace.matrix(1024, 5120), .out = 4000 }, .{ .q = PromptPersistentTrace.matrix(1024, 5120), .out = 5000 } };
     try kernels.prompt(stream, 1000, &attention, 496);
-    try t.expectEqual(@as(usize, 43), PromptPersistentTrace.id);
-    try t.expectEqual(@as(u32, 96), PromptPersistentTrace.grid);
-    try t.expectEqual(@as(c_int, 448), PromptPersistentTrace.scalar[5]);
+    try t.expectEqual(@as(usize, 14), PromptPersistentTrace.id);
+    try t.expectEqual(@as(u32, 448), PromptPersistentTrace.grid);
     const head = [_]cuda.prompt_many.Out{.{ .q = PromptPersistentTrace.matrix(248320, 5120), .out = 3000 }};
     try kernels.prompt(stream, 1000, &head, 496);
     try t.expect(PromptPersistentTrace.id == 14 or PromptPersistentTrace.id == 15);

@@ -237,31 +237,14 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_pre(Geo geo, const 
                                                                   __nv_bfloat16* __restrict__ V0, float* __restrict__ G0, __nv_bfloat16* __restrict__ BETA0,
                                                                   const int* __restrict__ P) {
     release_next();
-    const int lane = threadIdx.x;
-    const int head = blockIdx.y;
-    const int w = blockIdx.z * blockDim.y + threadIdx.y;
-    if (past_rows(P, w)) return;
-    const int NK = geo.nk, NV = geo.nv, C = geo.conv();
-    const Seg sg = segs[rowseg[w]];
-    const __nv_bfloat16* CS = reinterpret_cast<const __nv_bfloat16*>(sg.conv) + (size_t)layer * geo.conv_rows();
-    const bool isq = head < NK, isk = !isq && head < 2 * NK;
-    const int c0 = head * DK;  // q, k and v channels are consecutive heads of DK
-    int src[TAPS];  // tap t reads the row TAPS - 1 - t tokens back: a forward row, or -1 - (tail row)
-#pragma unroll
-    for (int tap = 0; tap < TAPS; tap++) src[tap] = back(rowpar, w, TAPS - 1 - tap);
     constexpr int PER = DK / 32;
-    const bool rec = recorded(P);
-    // a recorded window's row logs the tail after it (taps 1..TAPS-1) here, so conv_commit only moves the stream's
-    __nv_bfloat16* tail = rec ? log_row(geo, sg, layer, w - sg.row0).conv : nullptr;
-    // a lane's PER channels in 8-byte loads: each tap's row, the weights (PER x TAPS in a row), the logged tail
-    static_assert(PER == 4 && TAPS == 4, "a tap's channels and a channel's taps are one uint2");
-    const int cl = c0 + lane * PER;
-    uint2 xw[TAPS], ww[TAPS];
+    const int lane = threadIdx.x, head = blockIdx.y;
+    const int cl = head * DK + lane * PER;
+    uint4 ww[2];
 #pragma unroll
-    for (int tap = 0; tap < TAPS; tap++) {
-        ww[tap] = *reinterpret_cast<const uint2*>(CW + (size_t)cl * TAPS + tap * PER);
-        if (rec && src[tap] < 0) xw[tap] = *reinterpret_cast<const uint2*>(CS + (size_t)(-1 - src[tap]) * C + cl);
-    }
+    for (int j = 0; j < 2; ++j) ww[j] = *reinterpret_cast<const uint4*>(plain(CW) + (size_t)cl * TAPS + j * 8);
+#pragma unroll
+    for (int j = 0; j < 2; ++j) keep4(ww[j]);
     await_prior();
     const __nv_bfloat16* QKV = after_wait(QKV0);
     const __nv_bfloat16* Ain = after_wait(Ain0);
@@ -271,11 +254,24 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_pre(Geo geo, const 
     __nv_bfloat16* V = after_wait(V0);
     float* G = after_wait(G0);
     __nv_bfloat16* BETA = after_wait(BETA0);
+    const int w = blockIdx.z * blockDim.y + threadIdx.y;
+    if (past_rows(P, w)) return;
+    const int NK = geo.nk, NV = geo.nv, C = geo.conv();
+    const Seg sg = segs[rowseg[w]];
+    const __nv_bfloat16* CS = reinterpret_cast<const __nv_bfloat16*>(sg.conv) + (size_t)layer * geo.conv_rows();
+    const bool isq = head < NK, isk = !isq && head < 2 * NK;
+    int src[TAPS];  // tap t reads the row TAPS - 1 - t tokens back: a forward row, or -1 - (tail row)
+#pragma unroll
+    for (int tap = 0; tap < TAPS; tap++) src[tap] = back(rowpar, w, TAPS - 1 - tap);
+    // a recorded window's row logs the tail after it (taps 1..TAPS-1) here, so conv_commit only moves the stream's
+    __nv_bfloat16* tail = recorded(P) ? log_row(geo, sg, layer, w - sg.row0).conv : nullptr;
+    // Each tap's row and logged tail use 8-byte loads; immutable weights are already in registers.
+    static_assert(PER == 4 && TAPS == 4, "a tap's channels and a channel's taps are one uint2");
+    uint2 xw[TAPS];
 #pragma unroll
     for (int tap = 0; tap < TAPS; tap++) {
         const int at = src[tap];
-        if (at >= 0) xw[tap] = *reinterpret_cast<const uint2*>(QKV + (size_t)at * C + cl);
-        else if (!rec) xw[tap] = *reinterpret_cast<const uint2*>(CS + (size_t)(-1 - at) * C + cl);
+        xw[tap] = *reinterpret_cast<const uint2*>(at < 0 ? CS + (size_t)(-1 - at) * C + cl : QKV + (size_t)at * C + cl);
         if (tail != nullptr && tap > 0) *reinterpret_cast<uint2*>(tail + (size_t)(tap - 1) * C + cl) = xw[tap];
     }
     const __nv_bfloat16* cw = reinterpret_cast<const __nv_bfloat16*>(ww);
@@ -465,11 +461,6 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post(Geo geo, const
     __nv_bfloat16* done = row_done[threadIdx.y];
     const int lane = threadIdx.x, hv = blockIdx.y;
     release_next();
-    // ahead of the wait: the layer's norm weights (static); after it, this forward's rows. The loads move, the
-    // arithmetic does not
-    constexpr int PER0 = DK / 32;
-    const uint2 nw = *reinterpret_cast<const uint2*>(plain(NW) + lane * PER0);
-    asm volatile("" ::"r"(nw.x), "r"(nw.y));  // the load issues before the wait (keep4's rule)
     await_prior();
     const __nv_bfloat16* Y = after_wait(Y0);
     const __nv_bfloat16* Z = after_wait(Z0);
@@ -482,6 +473,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post(Geo geo, const
     const size_t at = m * W + hv * DK + lane * PER;
     const uint2 yw = *reinterpret_cast<const uint2*>(Y + at);
     const uint2 zw = *reinterpret_cast<const uint2*>(Z + at);
+    const uint2 nw = *reinterpret_cast<const uint2*>(NW + lane * PER);
     const __nv_bfloat16* yp = reinterpret_cast<const __nv_bfloat16*>(&yw);
     const __nv_bfloat16* zp = reinterpret_cast<const __nv_bfloat16*>(&zw);
     const __nv_bfloat16* wp = reinterpret_cast<const __nv_bfloat16*>(&nw);

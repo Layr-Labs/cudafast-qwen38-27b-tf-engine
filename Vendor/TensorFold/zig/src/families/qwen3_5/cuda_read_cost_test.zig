@@ -49,15 +49,10 @@ test "dense read cost: hidden taps skip only the output tail and a scoring pass 
     try t.expectEqual(@as(u64, 456), r.src);
 }
 
-const cuda = @import("cuda");
 const NormRecorder = struct {
-    var active: *@This() = undefined;
-    affine: struct { pdl: bool = false } = .{},
-    h_window: ?cuda.abi.AccessPolicyWindow = null,
-    stream: cuda.Stream = undefined,
     g: struct { hidden: usize = 5120, eps: f32 = 1e-6 } = .{},
     int8: struct { on: bool = false } = .{},
-    fns: struct { norm: cuda.Function } = undefined,
+    fns: struct { norm: usize = 7 } = .{},
     tables: struct { ptr: u64 = 0x80000 } = .{},
     h: u64 = 0x10000,
     r: u64 = 0x20000,
@@ -65,16 +60,8 @@ const NormRecorder = struct {
     xs: u64 = 0x40000,
     rows: usize = 0,
     pointers: [4]u64 = @splat(0),
-    fn launch(_: cuda.abi.Function, gx: c_uint, _: c_uint, _: c_uint, bx: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, raw: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
-        const r = active;
-        if (bx != 256) return 1;
-        const a = raw.?;
-        r.rows = gx;
-        inline for (.{ 0, 1, 3, 7 }, 0..) |at, i| r.pointers[i] = @as(*const u64, @ptrCast(@alignCast(a[at].?))).*;
-        return 0;
-    }
-    pub fn runAfter(r: *@This(), f: cuda.Function, grid: [3]usize, threads: [3]usize, args: anytype) !void {
-        try t.expectEqual(r.fns.norm.handle, f.handle);
+    pub fn runAfter(r: *@This(), f: usize, grid: [3]usize, threads: [3]usize, args: anytype) !void {
+        try t.expectEqual(r.fns.norm, f);
         try t.expectEqual([3]usize{ 256, 1, 1 }, threads);
         try t.expectEqual(@as(usize, 1), grid[1]);
         try t.expectEqual(@as(usize, 1), grid[2]);
@@ -89,12 +76,7 @@ const NormRecorder = struct {
 
 test "dense read cost: prompt sums retain int8 and native boundary consumers" {
     const norm = @import("cuda_norm.zig");
-    var driver: cuda.Driver = undefined;
-    driver.api.cuLaunchKernel = NormRecorder.launch;
     var r: NormRecorder = .{};
-    r.fns = .{ .norm = .{ .d = &driver, .handle = @ptrFromInt(7) } };
-    r.stream = .{ .d = &driver, .handle = null };
-    NormRecorder.active = &r;
     for ([_]bool{ false, true }) |int8| for ([_]bool{ false, true }) |prompt| {
         r.int8.on = int8;
         for ([_]usize{ 1, 16, 17, 496 }) |rows| for ([_]bool{ false, true }) |residual| {
