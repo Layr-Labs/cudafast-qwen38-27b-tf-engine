@@ -141,7 +141,7 @@ fn leastSquares(row: []align(1) const u16, start: [2]f32) [2]f32 {
     var best = start;
     var best_err = groupError(row, start);
     var cur = start;
-    for (0..3) |_| {
+    for (0..10) |_| {
         const s = cur[0];
         if (s <= 0) break;
         var sq: f64 = 0;
@@ -168,7 +168,31 @@ fn leastSquares(row: []align(1) const u16, start: [2]f32) [2]f32 {
             best = cur;
         }
     }
-    return best;
+    // The stored parameters are bf16-rounded, so the rounded optimum can sit a ulp or two off the
+    // continuous fit's; search the best pair's neighborhood in bf16 space.
+    const bs = toBf16(best[0]);
+    const bb = toBf16(best[1]);
+    var improved = best;
+    var improved_err = best_err;
+    for ([_]i8{ -2, -1, 0, 1, 2 }) |ds| for ([_]i8{ -2, -1, 0, 1, 2 }) |db| {
+        if (ds == 0 and db == 0) continue;
+        const s = ulpBump(bs, ds);
+        const b = ulpBump(bb, db);
+        if (bf16(s) <= 0) continue;
+        const e = groupError(row, .{ bf16(s), bf16(b) });
+        if (e < improved_err) {
+            improved_err = e;
+            improved = .{ bf16(s), bf16(b) };
+        }
+    };
+    return improved;
+}
+
+/// `n` ulps along the bf16 bits: the IEEE ordered representation, so the step is monotone.
+fn ulpBump(h: u16, n: i8) u16 {
+    const v: i16 = @bitCast(h);
+    const w = std.math.clamp(@as(i32, v) + n, std.math.minInt(i16), std.math.maxInt(i16));
+    return @bitCast(@as(i16, @intCast(w)));
 }
 
 /// The group's squared error under bf16-rounded scale and bias, as quantize then stores and the kernels read it.
