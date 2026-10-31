@@ -15,6 +15,9 @@ const spans = [2][2]usize{ .{ 0, 98304 }, .{ 248032, 248320 } };
 const span_width = spans[0][1] + spans[1][1] - spans[1][0];
 /// The tail span's 64-row tile: projected from row 248,000, its first 32 columns dropped.
 const tail_tile = spans[1][0] / 64 * 64;
+/// Compile-time switch: the drafter's gate, up and activation in one tf_qmm_mlp_pair launch (false: two projections
+/// and mlp_act, every bit the same).
+pub const draft_mlp_pair = true;
 pub const Segment = extern struct { ring: u64, begin: i64, position: i64 };
 pub const segments_at = max_rows * 4;
 pub const words_at = segments_at + max_streams * @sizeOf(Segment);
@@ -108,10 +111,25 @@ pub fn forward(d: anytype, items: []const dr.Hold, contexts: []const *draft.Ctx)
         try d.norm(d.h2, l.post_norm, d.x, B);
         try d.projAgain(l.mlp_conv, d.x, d.dyn, B);
         try conv(d, d.x, l.mlp_base, 0, d.xin, B, 0);
-        try d.proj(l.gate, d.xin, d.gate, B);
-        try d.projAgain(l.up, d.xin, d.up, B);
-        try e.run(e.fns.mlp_act, .{ (B * c.intermediate + 1023) / 1024, 1, 1 }, .{ 256, 1, 1 }, .{ d.gate, d.up, d.act, @as(c_longlong, @intCast(B * c.intermediate)), @as(u64, 0), @as(c_int, @intCast(c.intermediate)), d.xs });
-        try d.projAgain(l.down, d.act, d.o, B);
+        // gate, up and the activation in one tf_qmm_mlp_pair launch where proj/projAgain/mlp_act would take the verify
+        // tiles: the target's verify window does the same (cuda_forward.zig), and prompt rows keep prompt_many
+        const use_pair = draft_mlp_pair and e.affine.split == null and B <= @import("cuda_engine.zig").most_verify and
+            !draft.precision.prompt(d.projection_role, B, draft.precision.dflash_projection_prompt_cutoff) and
+            cuda.mlp_pair.Kernels.fits(l.gate, l.up) and l.gate.n == c.intermediate and c.hidden + c.intermediate <= c.n_taps * c.hidden;
+        if (use_pair)
+        {
+            // gate, up and the activation in one launch, as the target's verify window takes them: xin's group sums
+            // first (as proj(gate) took them), act's sums past them in xs (it holds R >= B rows of n_taps * hidden / 64)
+            const act_sums = d.xs + B * (c.hidden / 64) * 4;
+            try e.run(e.fns.sums, .{ B, (c.hidden / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ d.xin, d.xs, @as(c_int, @intCast(c.hidden)), @as(u64, 0) });
+            try e.mlp_pair.pair(e.stream, d.xin, d.xs, l.gate, l.up, d.act, act_sums, B);
+            try draft.precision.affine(e, l.down, d.act, act_sums, d.o, B, false, d.projection_role);
+        } else {
+            try d.proj(l.gate, d.xin, d.gate, B);
+            try d.projAgain(l.up, d.xin, d.up, B);
+            try e.run(e.fns.mlp_act, .{ (B * c.intermediate + 1023) / 1024, 1, 1 }, .{ 256, 1, 1 }, .{ d.gate, d.up, d.act, @as(c_longlong, @intCast(B * c.intermediate)), @as(u64, 0), @as(c_int, @intCast(c.intermediate)), d.xs });
+            try d.projAgain(l.down, d.act, d.o, B);
+        }
         try conv(d, d.o, l.mlp_base, d.h2, d.h, B, 1);
     }
     const rows = items.len * (c.block - 1);
