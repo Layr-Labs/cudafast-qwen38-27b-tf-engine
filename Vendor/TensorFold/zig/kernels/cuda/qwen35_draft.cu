@@ -16,6 +16,24 @@ __device__ __forceinline__ float warp_sum(float x) {
     return x;
 }
 
+__device__ __forceinline__ void release_next() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+#endif
+}
+
+__device__ __forceinline__ void await_prior() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
+}
+
+template <typename T>
+__device__ __forceinline__ T* after_wait(T* p) {
+    asm volatile("" : "+l"(p)::"memory");
+    return p;
+}
+
 // A row of `width` bf16 from src to dst by the block: 16-byte words, four in flight a thread, when both rows allow.
 __device__ __forceinline__ void copy_row(const __nv_bfloat16* __restrict__ src, __nv_bfloat16* __restrict__ dst, int width) {
     if ((width & 7) == 0 && ((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst)) & 15) == 0) {
@@ -41,8 +59,12 @@ __device__ __forceinline__ void copy_row(const __nv_bfloat16* __restrict__ src, 
 using namespace tf_q35d;
 
 // Tap rows (start + i) of a stream's ring of R rows, `width` bf16 each, into OUT rows 0..n. Grid (n), 256 threads.
-extern "C" __global__ void tf_q35d_gather_taps(const __nv_bfloat16* __restrict__ RING, int R, long long start, int width,
-                                                 __nv_bfloat16* __restrict__ OUT) {
+extern "C" __global__ void tf_q35d_gather_taps(const __nv_bfloat16* __restrict__ RING0, int R, long long start, int width,
+                                                 __nv_bfloat16* __restrict__ OUT0) {
+    release_next();
+    await_prior();
+    const __nv_bfloat16* RING = after_wait(RING0);
+    __nv_bfloat16* OUT = after_wait(OUT0);
     const long long row = start + blockIdx.x;
     copy_row(RING + (size_t)(row % R) * width, OUT + (size_t)blockIdx.x * width, width);
 }
@@ -54,16 +76,26 @@ struct TapRows {
 };
 
 // Tap rows (start + rows.rows[i]) of a stream's ring into OUT rows 0..n: a kept path's rows in order. Grid (n).
-extern "C" __global__ void tf_q35d_gather_rows(const __nv_bfloat16* __restrict__ RING, int R, long long start, TapRows rows, int width,
-                                                 __nv_bfloat16* __restrict__ OUT) {
+extern "C" __global__ void tf_q35d_gather_rows(const __nv_bfloat16* __restrict__ RING0, int R, long long start, TapRows rows, int width,
+                                                 __nv_bfloat16* __restrict__ OUT0) {
+    release_next();
+    await_prior();
+    const __nv_bfloat16* RING = after_wait(RING0);
+    __nv_bfloat16* OUT = after_wait(OUT0);
     const long long row = start + rows.rows[blockIdx.x];
     copy_row(RING + (size_t)(row % R) * width, OUT + (size_t)blockIdx.x * width, width);
 }
 
 // y[t, c] = sum over lags l of (BASE[l, c] + DYN[t, l, c / group]) * x[t - l, c] in bf16 steps; x[-1] = 0; RES last.
-extern "C" __global__ void tf_q35d_dyn_conv(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ DYN,
-                                              const __nv_bfloat16* __restrict__ BASE, const __nv_bfloat16* __restrict__ RES,
-                                              __nv_bfloat16* __restrict__ OUT, int D, int group, int branch) {
+extern "C" __global__ void tf_q35d_dyn_conv(const __nv_bfloat16* __restrict__ X0, const __nv_bfloat16* __restrict__ DYN0,
+                                              const __nv_bfloat16* __restrict__ BASE, const __nv_bfloat16* __restrict__ RES0,
+                                              __nv_bfloat16* __restrict__ OUT0, int D, int group, int branch) {
+    release_next();
+    await_prior();
+    const __nv_bfloat16* X = after_wait(X0);
+    const __nv_bfloat16* DYN = after_wait(DYN0);
+    const __nv_bfloat16* RES = after_wait(RES0);
+    __nv_bfloat16* OUT = after_wait(OUT0);
     const int t = blockIdx.x;
     const int groups = D / group;
     for (int c = threadIdx.x; c < D; c += blockDim.x) {
@@ -82,9 +114,13 @@ extern "C" __global__ void tf_q35d_dyn_conv(const __nv_bfloat16* __restrict__ X,
 }
 
 // Per-head RMSNorm then rotate-half RoPE at position pos0 + row; OUT packed (rows, heads, HD), grid (rows * heads).
-extern "C" __global__ void __launch_bounds__(32) tf_q35d_norm_rope(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W,
-                                                                     __nv_bfloat16* __restrict__ OUT, int heads, int stride, long long pos0,
+extern "C" __global__ void __launch_bounds__(32) tf_q35d_norm_rope(const __nv_bfloat16* __restrict__ X0, const __nv_bfloat16* __restrict__ W,
+                                                                     __nv_bfloat16* __restrict__ OUT0, int heads, int stride, long long pos0,
                                                                      float eps, float theta) {
+    release_next();
+    await_prior();
+    const __nv_bfloat16* X = after_wait(X0);
+    __nv_bfloat16* OUT = after_wait(OUT0);
     const int head = blockIdx.x % heads;
     const size_t m = blockIdx.x / heads;
     const int t = threadIdx.x;
@@ -116,8 +152,14 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35d_norm_rope(const __nv_bf
 }
 
 // Rows of packed (kv_heads, HD) keys and values at positions pos0 + i into a layer's rings (slot pos % W).
-extern "C" __global__ void tf_q35d_ring_put(const __nv_bfloat16* __restrict__ K, const __nv_bfloat16* __restrict__ V,
-                                              __nv_bfloat16* __restrict__ RK, __nv_bfloat16* __restrict__ RV, int width, long long pos0, int W) {
+extern "C" __global__ void tf_q35d_ring_put(const __nv_bfloat16* __restrict__ K0, const __nv_bfloat16* __restrict__ V0,
+                                              __nv_bfloat16* __restrict__ RK0, __nv_bfloat16* __restrict__ RV0, int width, long long pos0, int W) {
+    release_next();
+    await_prior();
+    const __nv_bfloat16* K = after_wait(K0);
+    const __nv_bfloat16* V = after_wait(V0);
+    __nv_bfloat16* RK = after_wait(RK0);
+    __nv_bfloat16* RV = after_wait(RV0);
     const int i = blockIdx.x;
     const size_t slot = (size_t)((pos0 + i) % W);
     for (int c = threadIdx.x; c < width; c += blockDim.x) {
