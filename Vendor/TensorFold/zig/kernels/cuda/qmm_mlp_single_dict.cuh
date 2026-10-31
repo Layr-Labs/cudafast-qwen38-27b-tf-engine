@@ -124,6 +124,7 @@ __device__ __forceinline__ void mlp_single_dict_body(const __nv_bfloat16* __rest
         commit();
     }
     grid_wait();
+    x_keep_l2(x, M, K, ldx);
 #pragma unroll
     for (int s = 0; s < STAGES - 1; ++s) {
         if (s < per) load_x(s, g0 + s);

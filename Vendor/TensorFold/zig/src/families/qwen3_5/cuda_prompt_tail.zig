@@ -13,6 +13,7 @@ const prompt = @import("cuda_prompt.zig");
 pub fn fits(e: *const E.Engine, total: usize, nseg: usize, hidden: bool, paged: bool) bool {
     const g = e.g;
     if (total <= 16 or nseg != 1 or hidden or paged) return false;
+    if (e.layers.len == 0 or e.n_taps > e.taps.len or g.kv_heads == 0) return false;
     if (e.learning != null or e.mlp != null or e.features != 0 or e.kv8 or e.int8.on) return false;
     if ((g.q_heads / g.kv_heads) % 2 != 0) return false;
     const last = e.layers.len - 1;
@@ -23,13 +24,22 @@ pub fn fits(e: *const E.Engine, total: usize, nseg: usize, hidden: bool, paged: 
         .attention => |a| a,
         else => return false,
     };
-    if (m.o != .a4) return false;
+    if (m.o != .a4 or m.q != .a4) return false;
     const d = switch (l.mlp) {
         .dense => |x| x,
         else => return false,
     };
     if (d.gate != .a4 or d.up != .a4 or d.down != .a4) return false;
     return cuda.prompt_many.Kernels.mlpFits(d.gate.a4, d.up.a4) and d.gate.a4.n == g.intermediate;
+}
+
+/// The last layer's query projection (queries and gate) for row total - 1 only: the prompt GEMM at one row, each
+/// element's MMA chain as in the every-row launch. The other rows' query rows are not written: the layer's
+/// head_rope_warp still normalizes and rotates them (its key heads go to the cache for every row), but nothing past
+/// it reads them.
+pub fn query(e: *E.Engine, q: cuda.qlinear.Affine4, total: usize) !void {
+    const row = total - 1;
+    try e.prompt_many.prompt(e.stream, e.x + row * e.g.hidden * 2, &.{.{ .q = q, .out = e.qraw + row * 2 * e.g.attnWidth() * 2 }}, 1);
 }
 
 /// The last layer from its attention on (its keys and values already in the cache), then the final norm and

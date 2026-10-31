@@ -120,6 +120,7 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
     }
 #endif
     grid_wait();
+    x_keep_l2(x, rows, K, ldx);
 #pragma unroll
     for (int s = 0; s < STAGES - 1; ++s) {
         if (s < items) load_x(s, s);
