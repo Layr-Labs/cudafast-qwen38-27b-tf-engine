@@ -1,4 +1,4 @@
-//! Immutable word-only output-projection streams, prepared without any request content.
+//! Immutable word-only projection streams, prepared without any request content.
 const cuda = @import("cuda");
 const layers = @import("cuda_layers.zig");
 
@@ -14,7 +14,14 @@ fn candidates(layer: *layers.Layer, input: bool, output: bool) [6]?*layers.Proj 
                 list[2] = &m.qkv; list[3] = &m.z; list[4] = &m.a; list[5] = &m.b;
             }
         },
-        .attention => |*m| { if (output) list[1] = &m.o; },
+        .attention => |*m| {
+            if (output) list[1] = &m.o;
+            if (input and m.q == .a4 and m.k == .a4 and m.v == .a4 and
+                m.q.outputs() == 12288 and m.k.outputs() == 1024 and m.v.outputs() == 1024 and
+                m.q.inputs() == 5120 and m.k.inputs() == 5120 and m.v.inputs() == 5120) {
+                list[2] = &m.q; list[3] = &m.k; list[4] = &m.v;
+            }
+        },
     }
     return list;
 }
@@ -23,7 +30,7 @@ fn size(p: layers.Proj) usize {
     if (p != .a4) return 0;
     const q = p.a4;
     const out = q.n == 5120 and (q.k == 6144 or q.k == 17408) and cuda.qlinear.splitK(q.n, q.k) == 4;
-    const in = q.k == 5120 and (q.n == 10240 or q.n == 6144 or q.n == 48);
+    const in = q.k == 5120 and (q.n == 10240 or q.n == 6144 or q.n == 48 or q.n == 12288 or q.n == 1024);
     if (!out and !in) return 0;
     return q.npad * q.k / 2;
 }
@@ -95,5 +102,65 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
             }
         }
     }
+    if (input and e.affine.dict != null) {
+        const off = if (@import("sys").c.getenv("TF_ATTN_STREAM")) |v| @import("std").mem.eql(u8, @import("std").mem.span(v), "0") else false;
+        if (!off) {
+            const f = try e.mods[0].function("tf_qmm_attention_stream16_dict");
+            try f.allowDynamicShared(28032);
+            try f.setAttribute(.preferred_shared_memory_carveout, 100);
+            try validateAttention(e, f);
+            e.affine.attention_stream16_fn = f;
+        }
+    }
     return buffer;
+}
+
+// A deterministic nonzero input validates every new attention projection against its original cluster route.
+fn validateAttention(e: anytype, f: cuda.Function) !void {
+    const std = @import("std");
+    const N = 12288 + 2 * 1024;
+    const x_bytes = 16 * 5120 * 2;
+    const xs_bytes = 16 * (5120 / 64) * 4;
+    const out_bytes = 16 * N * 2;
+    const old_at = x_bytes + xs_bytes;
+    const new_at = old_at + out_bytes;
+    const bad_at = new_at + out_bytes;
+    var scratch = try cuda.DeviceBuffer.alloc(e.d, bad_at + 4);
+    defer scratch.free();
+    errdefer cuda.completion.drain(e.d, e.stream, "attention view validation failed before draining");
+    const fill = try e.mods[0].function("tf_attention_validate_fill");
+    const check = try e.mods[0].function("tf_attention_validate_equal");
+    try scratch.fill8(0, e.stream.handle);
+    try e.run(fill, .{ (16 * 5120 + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ scratch.ptr, @as(c_int, 16 * 5120) });
+    try e.run(e.fns.sums, .{ 16, 2, 1 }, .{ 64, 1, 1 }, .{ scratch.ptr, scratch.ptr + x_bytes, @as(c_int, 5120), @as(u64, 0) });
+    var original = e.affine;
+    original.attention_stream16_fn = null;
+    var candidate = e.affine;
+    candidate.attention_stream16_fn = f;
+    var checked: usize = 0;
+    for (e.layers) |layer| switch (layer.mixer) {
+        .attention => |m| {
+            if (m.q != .a4 or m.k != .a4 or m.v != .a4) continue;
+            var old: [3]cuda.qlinear.Affine4Kernels.Out = undefined;
+            var fresh: [3]cuda.qlinear.Affine4Kernels.Out = undefined;
+            var offset: usize = 0;
+            for ([_]cuda.qlinear.Affine4{ m.q.a4, m.k.a4, m.v.a4 }, 0..) |q, i| {
+                old[i] = .{ .q = q, .out = scratch.ptr + old_at + offset };
+                fresh[i] = .{ .q = q, .out = scratch.ptr + new_at + offset };
+                offset += 16 * q.n * 2;
+            }
+            if (!candidate.attentionStreamable(&fresh, 16)) continue;
+            try original.decodeAttentionMixed(e.stream, scratch.ptr, scratch.ptr + x_bytes, &old, 16);
+            try candidate.decodeAttentionMixed(e.stream, scratch.ptr, scratch.ptr + x_bytes, &fresh, 16);
+            try e.run(check, .{ (16 * N + 255) / 256, 1, 1 }, .{ 256, 1, 1 },
+                .{ scratch.ptr + old_at, scratch.ptr + new_at, @as(c_int, 16 * N), scratch.ptr + bad_at });
+            checked += 1;
+        },
+        else => {},
+    };
+    try e.stream.synchronize();
+    var mismatches: u32 = 0;
+    try scratch.download(bad_at, std.mem.asBytes(&mismatches));
+    if (mismatches != 0) return error.InvalidAttentionStream;
+    std.debug.print("info: exact attention stream: {d} layers, {d} BF16 outputs verified\n", .{ checked, checked * 16 * N });
 }
