@@ -114,7 +114,7 @@ fn quantize(gpa: std.mem.Allocator, w: []align(1) const u16, n: usize, k: usize)
                 hi = @max(hi, x);
             }
             var fit = [2]f32{ (hi - lo) / 15.0, lo };
-            fit = leastSquares(row, fit);
+            fit = refit(row, lo, hi, fit);
             const scale = toBf16(fit[0]);
             const bias = toBf16(fit[1]);
             scales[r * groups + g] = scale;
@@ -141,7 +141,7 @@ fn leastSquares(row: []align(1) const u16, start: [2]f32) [2]f32 {
     var best = start;
     var best_err = groupError(row, start);
     var cur = start;
-    for (0..3) |_| {
+    for (0..8) |_| {
         const s = cur[0];
         if (s <= 0) break;
         var sq: f64 = 0;
@@ -169,6 +169,63 @@ fn leastSquares(row: []align(1) const u16, start: [2]f32) [2]f32 {
         }
     }
     return best;
+}
+
+/// Starting ranges of the multi-start refit: the group's [min, max] shrunk about its centre to these fractions.
+const shrink = [_]f32{ 1.0, 0.95, 0.9, 0.85 };
+/// Code assignments and least-squares refits each start runs.
+const passes = 9;
+
+/// A group's (scale, bias): the least-squares refit from the min/max line, then four more starts from the group's range
+/// shrunk about its centre, each alternating code assignment and a least-squares line fit rounded to bf16; the line with
+/// the smallest squared error under bf16-rounded scale and bias (groupError, as quantize stores it) is kept.
+fn refit(row: []align(1) const u16, lo: f32, hi: f32, start: [2]f32) [2]f32 {
+    var best = leastSquares(row, start);
+    var best_err = groupError(row, best);
+    if (!(hi > lo)) return best;
+    const centre = (hi + lo) / 2;
+    for (shrink) |fraction| {
+        const radius = (hi - lo) / 2 * fraction;
+        var cur = [2]f32{ bf16(toBf16(@max(2 * radius / 15, 1e-12))), bf16(toBf16(centre - radius)) };
+        for (0..passes) |_| {
+            const next = lineFit(row, cur) orelse break;
+            if (next[0] == cur[0] and next[1] == cur[1]) break; // a fixed point: every later pass returns it again
+            cur = next;
+            const err = groupError(row, cur);
+            if (err < best_err) {
+                best_err = err;
+                best = cur;
+            }
+        }
+    }
+    return best;
+}
+
+/// Codes assigned under `cur`, then the least-squares (scale, bias) of the group on those codes, each rounded to bf16;
+/// null when the codes are all equal or the fit is not a finite positive scale.
+fn lineFit(row: []align(1) const u16, cur: [2]f32) ?[2]f32 {
+    var q: [64]f64 = undefined;
+    var qm: f64 = 0;
+    var wm: f64 = 0;
+    for (row, &q) |h, *c| {
+        const x = bf16(h);
+        c.* = std.math.clamp(@round((x - cur[1]) / cur[0]), 0.0, 15.0);
+        qm += c.*;
+        wm += x;
+    }
+    qm /= 64;
+    wm /= 64;
+    var variance: f64 = 0;
+    var covariance: f64 = 0;
+    for (row, q) |h, c| {
+        variance += (c - qm) * (c - qm);
+        covariance += (c - qm) * (@as(f64, bf16(h)) - wm);
+    }
+    if (variance == 0) return null;
+    const scale = bf16(toBf16(@floatCast(covariance / variance)));
+    const bias = bf16(toBf16(@floatCast(wm - @as(f64, scale) * qm)));
+    if (!(scale > 0) or !std.math.isFinite(scale) or !std.math.isFinite(bias)) return null;
+    return .{ scale, bias };
 }
 
 /// The group's squared error under bf16-rounded scale and bias, as quantize then stores and the kernels read it.
@@ -319,4 +376,24 @@ test "drafter refit preserves flat groups and improves a linear weight ramp" {
     const initial = [2]f32{ 1.0 / 15.0, -0.5 };
     const fitted = leastSquares(&row, initial);
     try std.testing.expect(groupError(&row, fitted) < groupError(&row, initial));
+}
+
+test "multi-start refit never loses to the least-squares refit and keeps flat groups" {
+    const flat: [64]u16 = @splat(0x3f80);
+    const kept = refit(&flat, 1, 1, .{ 0, 1 });
+    try std.testing.expectEqual(@as(f32, 0), kept[0]);
+    try std.testing.expectEqual(@as(f32, 1), kept[1]);
+    var prng = std.Random.DefaultPrng.init(7);
+    for (0..200) |_| {
+        var row: [64]u16 = undefined;
+        var lo: f32 = std.math.inf(f32);
+        var hi: f32 = -std.math.inf(f32);
+        for (&row) |*h| {
+            h.* = toBf16(prng.random().floatNorm(f32) * 0.02);
+            lo = @min(lo, bf16(h.*));
+            hi = @max(hi, bf16(h.*));
+        }
+        const start = [2]f32{ (hi - lo) / 15.0, lo };
+        try std.testing.expect(groupError(&row, refit(&row, lo, hi, start)) <= groupError(&row, leastSquares(&row, start)));
+    }
 }
