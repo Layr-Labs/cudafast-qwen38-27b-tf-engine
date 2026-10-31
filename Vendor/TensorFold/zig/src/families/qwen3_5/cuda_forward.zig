@@ -41,7 +41,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     // block there. gdn_post keeps a warp a block in windows (four a block measured slower).
     const gdn_rows: usize = if (prompt and total > 16) 4 else 1;
     const gdn_blocks = (total + gdn_rows - 1) / gdn_rows;
-    const pre_rows: usize = if ((prompt and total > 16) or (total >= 16 and rows4On())) 4 else 1;
+    const pre_rows: usize = if ((prompt and total > 16) or (total >= 8 and rows4On())) 4 else 1;
     const pre_blocks = (total + pre_rows - 1) / pre_rows;
     const t_ids = e.tables.ptr + ids_at;
     const t_segs = e.tables.ptr + segs_at;
@@ -171,7 +171,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     try finish(e, total, heads, shape.hidden);
 }
 
-/// TF_GDN_ROWS4=0: 16..64-row windows keep one row warp a block in tf_q35_gdn_pre.
+/// TF_GDN_ROWS4=0: 8..64-row windows keep one row warp a block in tf_q35_gdn_pre.
 fn rows4On() bool {
     const v = @import("sys").c.getenv("TF_GDN_ROWS4") orelse return true;
     return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
