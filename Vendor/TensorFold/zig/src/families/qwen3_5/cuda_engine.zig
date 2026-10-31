@@ -98,6 +98,9 @@ pub const Engine = struct {
     geo: Geo,
     stream: cuda.Stream,
     blocks: std.ArrayListUnmanaged(cuda.DeviceBuffer) = .empty, // closed streams' device blocks (cuda_cache.zig take/give)
+    side: ?cuda.Stream = null, // GB10 prompt chunks: a delta layer's z projection beside its delta rule (cuda_forward.zig)
+    side_x: ?cuda.Event = null, // the layer's qkv/a/b launch issued: e.x is final and the side stream may read it
+    side_z: ?cuda.Event = null, // the side stream's z written
     mods: [19]cuda.Module,
     kv8: bool, // attention caches as e4m3 rows with a scale each
     fp8: Kv8,
@@ -212,6 +215,9 @@ pub const Engine = struct {
         e.window_rows = most_window;
         e.arena_at = 0;
         e.graphs = .empty;
+        e.side = null;
+        e.side_x = null;
+        e.side_z = null;
         e.rec_scratch = recurrent.Pool.init(gpa, @intFromPtr(e));
         e.n_taps = 0;
         e.features = 0;
@@ -238,6 +244,11 @@ pub const Engine = struct {
         const minor = try ctx.attribute(.compute_capability_minor);
         const gb10 = major == 12 and minor == 1;
         e.affine = try cuda.qlinear.Affine4Kernels.resolve(d, e.mods[0], e.mods[1], e.mods[2], e.mods[3], sms, gb10);
+        if (gb10) {
+            e.side = try cuda.Stream.init(d, true);
+            e.side_x = try cuda.Event.init(d, false);
+            e.side_z = try cuda.Event.init(d, false);
+        }
         e.affine.half_prompt = !gb10; // the 27B's prompt tile (Tile<64, 128, 128, 2, 2, 2>), quicker on an RTX 5090
         // GB10: split-K decode/verify projections on the cluster tile (bits unchanged); TF_CLUSTER_DECODE=0 restores lane_gemv
         e.affine.cluster_decode = gb10 and !envOff("TF_CLUSTER_DECODE");
@@ -316,6 +327,9 @@ pub const Engine = struct {
         e.blocks.deinit(e.gpa);
         @import("cuda_cache.zig").forget(e);
         e.affine.deinit();
+        if (e.side_z) |*v| v.deinit();
+        if (e.side_x) |*v| v.deinit();
+        if (e.side) |*v| v.deinit();
         e.wide.deinit();
         e.int8.deinit();
         if (e.mo) |*m| m.unload();
