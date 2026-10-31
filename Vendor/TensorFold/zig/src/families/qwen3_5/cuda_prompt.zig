@@ -6,15 +6,16 @@ const geometry = @import("cuda_geometry.zig");
 const Seg = @import("cuda_cache.zig").Seg;
 const head_dim = geometry.head_dim;
 
-/// One bf16 key slot beside four warps of queries; fp8 retains its two-slot, eight-warp kernel.
-pub const smem: u32 = 49152;
+/// Two bf16 key slots beside four warps of queries: one cp.async group stays in flight across the tile's MMAs
+/// (wait_group<NS-1>); fp8 keeps its two-slot, eight-warp kernel. Geometry unchanged (HPC=1: the group is odd).
+pub const smem: u32 = 65536;
 const fp8_smem: u32 = 98304;
 const block_rows = 64;
 
 pub const Fns = struct { bf16: cuda.Function, fp8: cuda.Function, chain: cuda.Function };
 
 pub const symbols = struct {
-    pub const bf16 = "_ZN20tf_prefill_attention13hpattn_kernelILi256ELi4ELi1ELi1EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiifi";
+    pub const bf16 = "_ZN20tf_prefill_attention13hpattn_kernelILi256ELi4ELi1ELi2EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiifi";
     pub const fp8 = "_ZN20tf_prefill_attention14hpattn8_kernelILi256ELi8ELi2ELi2EEEvPK13__nv_bfloat16PKhS5_PKfS7_PS1_iiiiifi";
     pub const chain = "_ZN14tf_gdn_prefill12chain_kernelI13__nv_bfloat16S1_Li64ELi16EEEvPKT_S4_PKS1_PKfPKT0_S8_PfPS1_iii";
 };
