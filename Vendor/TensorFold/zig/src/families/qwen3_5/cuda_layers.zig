@@ -61,6 +61,8 @@ pub const Fns = struct {
     gdn_lean_2: cuda.Function,
     gdn_lean_3: cuda.Function,
     gdn_post: cuda.Function,
+    gdn_post_ilp: cuda.Function,
+    attn_gate8: cuda.Function,
     head_norm: cuda.Function,
     head_rope_warp: cuda.Function,
     rope: cuda.Function,

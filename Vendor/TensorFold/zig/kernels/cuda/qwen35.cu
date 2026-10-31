@@ -508,6 +508,69 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post(Geo geo, const
     if (lane < DK / 64) XS[m * (W / 64) + hv * (DK / 64) + lane] = group_sum(done + lane * 64);
 }
 
+// A prompt chunk's tf_q35_gdn_post with RPW rows a warp: every row's y and z load before any row computes; each row's
+// norm, gate and roundings are tf_q35_gdn_post's (the norm weights loaded once a warp).
+extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post_ilp(Geo geo, const __nv_bfloat16* __restrict__ Y0, const __nv_bfloat16* __restrict__ Z0,
+                                                                       const __nv_bfloat16* __restrict__ NW, float eps, __nv_bfloat16* __restrict__ OUT0,
+                                                                       const int* __restrict__ P, float* __restrict__ XS0) {
+    constexpr int RPW = 8;
+    __shared__ __align__(16) __nv_bfloat16 row_done[4][DK];
+    __nv_bfloat16* done = row_done[threadIdx.y];
+    const int lane = threadIdx.x, hv = blockIdx.y;
+    release_next();
+    constexpr int PER = DK / 32;
+    const uint2 nw = *reinterpret_cast<const uint2*>(plain(NW) + lane * PER);
+    asm volatile("" ::"r"(nw.x), "r"(nw.y));  // the load issues before the wait (keep4's rule)
+    await_prior();
+    const __nv_bfloat16* Y = after_wait(Y0);
+    const __nv_bfloat16* Z = after_wait(Z0);
+    __nv_bfloat16* OUT = after_wait(OUT0);
+    float* XS = after_wait(XS0);
+    const int rows = P[2];
+    const size_t W = (size_t)geo.nv * DK;
+    const size_t m0 = ((size_t)blockIdx.z * blockDim.y + threadIdx.y) * RPW;
+    if (m0 >= (size_t)rows) return;
+    uint2 yw[RPW], zw[RPW];
+#pragma unroll
+    for (int r = 0; r < RPW; r++) {
+        const size_t m = m0 + r < (size_t)rows ? m0 + r : (size_t)rows - 1;
+        const size_t at = m * W + hv * DK + lane * PER;
+        yw[r] = *reinterpret_cast<const uint2*>(Y + at);
+        zw[r] = *reinterpret_cast<const uint2*>(Z + at);
+    }
+    const __nv_bfloat16* wp = reinterpret_cast<const __nv_bfloat16*>(&nw);
+#pragma unroll
+    for (int r = 0; r < RPW; r++) {
+        const size_t m = m0 + r;
+        if (m >= (size_t)rows) break;
+        const size_t at = m * W + hv * DK + lane * PER;
+        const __nv_bfloat16* yp = reinterpret_cast<const __nv_bfloat16*>(&yw[r]);
+        const __nv_bfloat16* zp = reinterpret_cast<const __nv_bfloat16*>(&zw[r]);
+        float yv[PER], ss = 0.0f;
+#pragma unroll
+        for (int j = 0; j < PER; j++) {
+            yv[j] = bf(yp[j]);
+            ss += yv[j] * yv[j];
+        }
+        ss = warp_sum(ss);
+        const float inv = rsqrtf(ss / (float)DK + eps);
+        uint2 ow;
+        __nv_bfloat16* op = reinterpret_cast<__nv_bfloat16*>(&ow);
+#pragma unroll
+        for (int j = 0; j < PER; j++) {
+            const float x = rbf(bf(wp[j]) * (yv[j] * inv));
+            const float zf = bf(zp[j]);
+            op[j] = __float2bfloat16_rn(zf / (1.0f + expf(-zf)) * x);
+        }
+        *reinterpret_cast<uint2*>(OUT + at) = ow;
+        if (XS == nullptr) continue;
+        __syncwarp();
+        *reinterpret_cast<uint2*>(done + lane * PER) = ow;
+        __syncwarp();
+        if (lane < DK / 64) XS[m * (W / 64) + hv * (DK / 64) + lane] = group_sum(done + lane * 64);
+    }
+}
+
 #include "qwen35_head_norm.cuh"
 #include "qwen35_head_rope.cuh"
 
@@ -589,6 +652,36 @@ extern "C" __global__ void tf_q35_attn_gate(Geo geo, const __nv_bfloat16* __rest
         OUT[i] = done[threadIdx.x] = __float2bfloat16_rn(bf(Y[i]) * s);
     }
     block_sums(done, (size_t)rows * W, XS);
+}
+
+// A prompt chunk's tf_q35_attn_gate without group sums: eight consecutive entries a thread (one 16-byte load of y and of
+// the gate, one store), each entry's sigmoid, rounding and product as there.
+extern "C" __global__ void __launch_bounds__(256) tf_q35_attn_gate8(Geo geo, const __nv_bfloat16* __restrict__ Y0, const __nv_bfloat16* __restrict__ QRAW0,
+                                                                     __nv_bfloat16* __restrict__ OUT0, int rows, const int* __restrict__ P) {
+    release_next();
+    await_prior();
+    const __nv_bfloat16* Y = after_wait(Y0);
+    const __nv_bfloat16* QRAW = after_wait(QRAW0);
+    __nv_bfloat16* OUT = after_wait(OUT0);
+    const size_t W = (size_t)geo.qh * HD;
+    if (P != nullptr) rows = P[2];
+    const size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    if (i >= (size_t)rows * W) return;
+    const size_t r = i / W;
+    const int d = (int)(i % W), head = d / HD;
+    const uint4 yw = *reinterpret_cast<const uint4*>(Y + i);
+    const uint4 gw = *reinterpret_cast<const uint4*>(QRAW + r * 2 * W + head * 2 * HD + HD + d % HD);
+    const __nv_bfloat16* yb = reinterpret_cast<const __nv_bfloat16*>(&yw);
+    const __nv_bfloat16* gb = reinterpret_cast<const __nv_bfloat16*>(&gw);
+    uint4 ow;
+    __nv_bfloat16* ob = reinterpret_cast<__nv_bfloat16*>(&ow);
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        const float gate = bf(gb[j]);
+        const float s = rbf(1.0f / (1.0f + expf(-gate)));
+        ob[j] = __float2bfloat16_rn(bf(yb[j]) * s);
+    }
+    *reinterpret_cast<uint4*>(OUT + i) = ow;
 }
 
 // tf_q35_attn_merge then tf_q35_attn_gate in one warp a (row, query head): the merge's bf16 output gated as attn_gate
