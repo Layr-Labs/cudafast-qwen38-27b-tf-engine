@@ -327,6 +327,7 @@ pub const dict_kmajor: u32 = 1 << 31;
 pub const dict_pair_max: u32 = 8191;
 /// The lane twins' (lane_gemv.cu) and gdn_stream16 twin's (qmm_gdn_stream.cuh) shared pair-table room at two CTAs an SM.
 pub const lane_pair_tab_max: u32 = 14592;
+pub const out_pair_tab_max: u32 = 14336;
 pub const gdn_pair_tab_max: u32 = 26496;
 /// group_kernel_dict's (qmm_group.cu GROUP_PAIR_SMEM, GROUP_PAIR_SMEM_ONE): two CTAs an SM in a cluster launch; any
 /// table in a launch of single CTAs (one CTA an SM there beats reading a large table through L2).
@@ -334,10 +335,10 @@ pub const group_pair_tab_max: u32 = 14592;
 pub const group_pair_tab_one: u32 = 32768;
 /// The largest pair table each decode twin of an (n, k) projection keeps in shared memory or reads through L2 at no
 /// loss: the group (cluster) and lane twins read a larger one through L2 slower than the separate coding.
-/// tf_qmm_mlp_single16 (K-major gate and up) and tf_qmm_output_stream16 (down) read any through L2; the gdn_stream16
+/// tf_qmm_mlp_single16 (K-major gate and up) and tf_qmm_output_stream16 (down, out, o) read any through L2; the gdn_stream16
 /// twin (the GDN input projections) keeps its room; the vocabulary projection is a launch of single CTAs.
 pub fn pairTabRoom(n: usize, k: usize, kmajor: bool) u32 {
-    if (kmajor or k == 17408) return 32768;
+    if (kmajor or k == 17408 or (k == 6144 and n == 5120)) return 32768;
     if (n >= 65536) return group_pair_tab_one;
     if (k == 5120 and (n == 10240 or n == 6144 or n == 48)) return gdn_pair_tab_max;
     return @min(group_pair_tab_max, lane_pair_tab_max);
