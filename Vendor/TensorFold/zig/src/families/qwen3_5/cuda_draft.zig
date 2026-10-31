@@ -135,7 +135,7 @@ pub const Draft = struct {
         try d.scratch.fill8(0, null);
         d.at = 0;
         _ = try d.layout(true);
-        d.staged = try cuda.HostBuffer.alloc(e.d, try frame.stagedBytes(c.rank));
+        d.staged = try cuda.HostBuffer.alloc(e.d, try frame.stagedBytes(weights.selector_parts * c.rank));
         errdefer d.staged.free();
         // the first context, and a hold timed on it (the quickest of several: the first ones pay the driver's stalls)
         const ctx = try d.create();
@@ -217,7 +217,7 @@ pub const Draft = struct {
             .{ "vb", try bytes(.{ B, c.kvWidth(), 2 }) },                             .{ "att", try bytes(.{ B, c.qWidth(), 2 }) },           .{ "o", try bytes(.{ B, c.hidden, 2 }) },                           .{ "gate", try bytes(.{ B, c.intermediate, 2 }) },
             .{ "up", try bytes(.{ B, c.intermediate, 2 }) },                          .{ "act", try bytes(.{ B, c.intermediate, 2 }) },       .{ "logits", try bytes(.{ B, c.vocab, 2 }) },                       .{ "words", try bytes(.{ B, lp_words, 4 }) },
             .{ "segments", try bytes(.{ d.frame_streams, @sizeOf(frame.Segment) }) }, .{ "pm", try bytes(.{ B, c.heads, frame.chunks, 4 }) }, .{ "pl", try bytes(.{ B, c.heads, frame.chunks, 4 }) },             .{ "po", try bytes(.{ B, c.heads, frame.chunks, c.head_dim, 4 }) },
-            .{ "hp", try bytes(.{ B, c.rank, 2 }) },                                  .{ "ids", try bytes(.{ B, 4 }) },                       .{ "parts", cuda.sample.Draws.topkPartsBytes(c.vocab, c.topk, B) },
+            .{ "hp", try bytes(.{ B, weights.selector_parts * c.rank, 2 }) },                                  .{ "ids", try bytes(.{ B, 4 }) },                       .{ "parts", cuda.sample.Draws.topkPartsBytes(c.vocab, c.topk, B) },
         };
         var total: usize = 0;
         inline for (sizes) |s| {

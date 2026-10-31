@@ -185,8 +185,18 @@ pub fn forward(d: anytype, items: []const dr.Hold, contexts: []const *draft.Ctx)
     const rows = items.len * (c.block - 1);
     const spanned = try run(d, items.len, narrow(contexts));
     try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + words_at, d.words, rows * lp_words * 4, e.stream.handle), "cuMemcpyDtoHAsync");
-    try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + hp_at, d.hp, rows * c.rank * 2, e.stream.handle), "cuMemcpyDtoHAsync");
+    const parts = @import("cuda_draft_weights.zig").selector_parts;
+    try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + hp_at, d.hp, rows * parts * c.rank * 2, e.stream.handle), "cuMemcpyDtoHAsync");
     try e.stream.synchronize();
+    // each row's selector passes (cuda_draft_weights.zig residualLinear) add back into one rank-wide row, in place:
+    // row r's sum lands at r * rank, at or before both of its halves and every later row's
+    const hp = std.mem.bytesAsSlice(u16, st[hp_at..][0 .. rows * parts * c.rank * 2]);
+    for (0..rows) |r| for (0..c.rank) |k| {
+        var sum: f32 = 0;
+        for (0..parts) |p| sum += @as(f32, @bitCast(@as(u32, hp[(r * parts + p) * c.rank + k]) << 16));
+        const u: u32 = @bitCast(sum);
+        hp[r * c.rank + k] = @intCast((u +% (0x7fff + ((u >> 16) & 1))) >> 16);
+    };
     if (spanned != null) for (0..rows) |r| {
         const w = std.mem.bytesAsSlice(u32, st[words_at + r * lp_words * 4 ..][0 .. lp_words * 4]);
         for (w[2..][0..c.topk]) |*id| if (id.* >= spans[0][1]) {

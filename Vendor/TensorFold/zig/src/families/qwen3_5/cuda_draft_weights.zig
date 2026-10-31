@@ -69,14 +69,17 @@ fn rawBytes(n: usize, k: usize) usize {
 /// The largest projection `load` stages: the staging buffer it allocates for the load and frees after.
 pub fn stageBytes(s: Shape) usize {
     var most: usize = 0;
-    const shapes = [_][2]usize{ .{ s.hidden, s.taps * s.hidden }, .{ s.rank, s.hidden }, .{ s.q_width, s.hidden }, .{ s.kv_width, s.hidden }, .{ s.hidden, s.q_width }, .{ s.intermediate, s.hidden }, .{ s.hidden, s.intermediate }, .{ s.dynamic, s.hidden } };
+    const shapes = [_][2]usize{ .{ s.hidden, s.taps * s.hidden }, .{ selector_parts * s.rank, s.hidden }, .{ s.q_width, s.hidden }, .{ s.kv_width, s.hidden }, .{ s.hidden, s.q_width }, .{ s.intermediate, s.hidden }, .{ s.hidden, s.intermediate }, .{ s.dynamic, s.hidden } };
     for (shapes) |nk| most = @max(most, rawBytes(nk[0], nk[1]));
     return most;
 }
 
+/// The selector's stacked passes (residualLinear): its projection writes this many rank-wide halves a row.
+pub const selector_parts = 2;
+
 /// Device bytes of everything `load` packs.
 pub fn total(s: Shape) usize {
-    var t = packedBytes(s.hidden, s.taps * s.hidden) + packedBytes(s.rank, s.hidden) + 2 * aligned(s.hidden * 2);
+    var t = packedBytes(s.hidden, s.taps * s.hidden) + packedBytes(selector_parts * s.rank, s.hidden) + 2 * aligned(s.hidden * 2);
     t += s.layers * (2 * aligned(s.hidden * 2) + packedBytes(s.q_width, s.hidden) + 2 * packedBytes(s.kv_width, s.hidden) + packedBytes(s.hidden, s.q_width) +
         2 * aligned(s.head_dim * 2) + 2 * packedBytes(s.intermediate, s.hidden) + packedBytes(s.hidden, s.intermediate) + 2 * packedBytes(s.dynamic, s.hidden) + 2 * aligned(4 * s.hidden * 2) +
         2 * aligned(Affine4.layout(s.intermediate, s.hidden).words) + aligned(Affine4.layout(s.hidden, s.intermediate).words));
@@ -213,7 +216,54 @@ fn linear(gpa: std.mem.Allocator, e: *Engine, stage: *DeviceBuffer, w: *Weights,
         gpa.free(q.scales);
         gpa.free(q.biases);
     }
-    const parts = [_][]const u8{ std.mem.sliceAsBytes(q.words), std.mem.sliceAsBytes(q.scales), std.mem.sliceAsBytes(q.biases) };
+    return place(e, stage, w, q.words, q.scales, q.biases, n, k);
+}
+
+/// The candidate selector's projection in two affine-4 passes, stacked as one (2n, k) matrix: rows n.. hold the
+/// first pass's residual (bf16 weight minus its stored value), quantized the same way. The frame's two halves of a
+/// row add back on the host (cuda_draft_frame.zig), so the selector reads about eight bits a weight.
+fn residualLinear(gpa: std.mem.Allocator, e: *Engine, stage: *DeviceBuffer, w: *Weights, ck: *core.Checkpoint, name: []const u8, n: usize, k: usize) !Affine4 {
+    const t = try ck.expect(name, .bf16, &.{ n, k });
+    const src = std.mem.bytesAsSlice(u16, t.bytes);
+    const q = try quantize(gpa, src, n, k);
+    defer {
+        gpa.free(q.words);
+        gpa.free(q.scales);
+        gpa.free(q.biases);
+    }
+    const groups = k / 64;
+    const res = try gpa.alloc(u16, n * k);
+    defer gpa.free(res);
+    for (0..n) |r| for (0..k) |c| {
+        const g = r * groups + c / 64;
+        const code: u32 = (q.words[(r * k + c) / 8] >> @intCast(4 * (c % 8))) & 15;
+        const stored = @as(f32, @floatFromInt(code)) * bf16(q.scales[g]) + bf16(q.biases[g]);
+        res[r * k + c] = toBf16(bf16(src[r * k + c]) - stored);
+    };
+    const q2 = try quantize(gpa, res, n, k);
+    defer {
+        gpa.free(q2.words);
+        gpa.free(q2.scales);
+        gpa.free(q2.biases);
+    }
+    const words = try gpa.alloc(u32, 2 * q.words.len);
+    defer gpa.free(words);
+    const scales = try gpa.alloc(u16, 2 * q.scales.len);
+    defer gpa.free(scales);
+    const biases = try gpa.alloc(u16, 2 * q.biases.len);
+    defer gpa.free(biases);
+    @memcpy(words[0..q.words.len], q.words);
+    @memcpy(words[q.words.len..], q2.words);
+    @memcpy(scales[0..q.scales.len], q.scales);
+    @memcpy(scales[q.scales.len..], q2.scales);
+    @memcpy(biases[0..q.biases.len], q.biases);
+    @memcpy(biases[q.biases.len..], q2.biases);
+    return place(e, stage, w, words, scales, biases, 2 * n, k);
+}
+
+/// Quantized words, scales and biases of an (n, k) projection uploaded through `stage` and packed into the arena.
+fn place(e: *Engine, stage: *DeviceBuffer, w: *Weights, qwords: []const u32, qscales: []const u16, qbiases: []const u16, n: usize, k: usize) !Affine4 {
+    const parts = [_][]const u8{ std.mem.sliceAsBytes(qwords), std.mem.sliceAsBytes(qscales), std.mem.sliceAsBytes(qbiases) };
     var raw: [3]u64 = undefined;
     var at: usize = 0;
     for (parts, &raw) |p, *r| {
@@ -275,7 +325,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: *Engine, dir: []const u8, s: 
     w.fc = try linear(gpa, e, &stage, &w, &ck, "fc.weight", s.hidden, s.taps * s.hidden);
     w.hidden_norm = try vector(&w, &ck, "hidden_norm.weight", &.{s.hidden});
     w.final_norm = try vector(&w, &ck, "norm.weight", &.{s.hidden});
-    w.selector = try linear(gpa, e, &stage, &w, &ck, "candidate_selector.hidden_projection.weight", s.rank, s.hidden);
+    w.selector = try residualLinear(gpa, e, &stage, &w, &ck, "candidate_selector.hidden_projection.weight", s.rank, s.hidden);
     w.predecessor = try hostBf16(gpa, &ck, "candidate_selector.predecessor_codebook", &.{ s.vocab, s.rank });
     errdefer gpa.free(w.predecessor);
     w.successor = try hostBf16(gpa, &ck, "candidate_selector.successor_codebook", &.{ s.vocab, s.rank });
