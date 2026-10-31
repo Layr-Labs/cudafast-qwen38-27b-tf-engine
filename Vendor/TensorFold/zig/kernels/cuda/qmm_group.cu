@@ -356,6 +356,8 @@ namespace tf_qmm_group {
 
 using namespace qmm_dict;
 
+// group_kernel_dict's shared pair-table room (qlinear.zig group_pair_tab_max, group_pair_tab_one): two CTAs an SM past the
+// stages and dec[] in a cluster launch; any table (np <= 8191) in a launch of single CTAs
 constexpr int GROUP_PAIR_SMEM = 14592;
 constexpr int GROUP_PAIR_SMEM_ONE = 32768;
 
@@ -415,6 +417,8 @@ __global__ void __launch_bounds__(WM * WN * 32) group_kernel_dict(
         ssrc[j] = (which ? P.biases : P.scales) + n0 + off * 8;
         sdst[j] = T::X + T::W + which * T::S + off * 16;
     }
+    // the pair-table room: two CTAs an SM for a cluster launch (its CTAs co-scheduled a GPC at a time), a whole
+    // table for a launch of single CTAs (one an SM beats reading a large table through L2)
     const int room = C > 1 ? GROUP_PAIR_SMEM : GROUP_PAIR_SMEM_ONE;
     DictLanes D = dict_lanes<BN, WN>(P, n0, KG, tid);
     dict_room(D, P, room);
@@ -477,6 +481,7 @@ __global__ void __launch_bounds__(WM * WN * 32) group_kernel_dict(
                 commit();
                 const unsigned char* p = stage(it % STAGES);
                 const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
+                // the lane's scale or bias, fetched now and stored after the MMAs (a global pair table's latency)
                 const uint32_t dv = dict_fetch(D, p + T::X + T::W, buf + T::SMEM + DICT_DEC, g0 + it);
                 const __nv_bfloat16* ps = reinterpret_cast<const __nv_bfloat16*>(buf + T::SMEM);
                 const float* px = reinterpret_cast<const float*>(p + T::X + T::W + 2 * T::S);
@@ -534,15 +539,12 @@ __global__ void __launch_bounds__(WM * WN * 32) group_kernel_dict(
                             }
                         }
                     }
-                    dict_put(D, buf + T::SMEM, dv);
-                    __syncwarp();                 // the warp's decoded scales and biases
+                    const float dval = __bfloat162float(__ushort_as_bfloat16(static_cast<unsigned short>(dv)));
 #pragma unroll
                     for (int j = 0; j < T::NT; ++j) {
-                        const int col = wn * (BN / WN) + j * 8 + (lane & 3) * 2;
-                        const __nv_bfloat162 s2 = *reinterpret_cast<const __nv_bfloat162*>(ps + col);
-                        const __nv_bfloat162 b2 = *reinterpret_cast<const __nv_bfloat162*>(ps + BN + col);
-                        const float sv[2] = {__low2float(s2), __high2float(s2)};
-                        const float bv[2] = {__low2float(b2), __high2float(b2)};
+                        const int c0 = j * 8 + (lane & 3) * 2;
+                        const float sv[2] = {__shfl_sync(0xffffffffu, dval, c0), __shfl_sync(0xffffffffu, dval, c0 + 1)};
+                        const float bv[2] = {__shfl_sync(0xffffffffu, dval, 16 + c0), __shfl_sync(0xffffffffu, dval, 16 + c0 + 1)};
 #pragma unroll
                         for (int i = 0; i < LIVE; ++i) {
                             const int row = wm * (BM / WM) + i * 16 + (lane >> 2);
@@ -791,6 +793,7 @@ __device__ __forceinline__ void mlp_pair_body(const __nv_bfloat16* __restrict__ 
         commit();
         const unsigned char* p = stage(it % STAGES);
         const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
+        // the lane's scale or bias, fetched now and stored after the MMAs (a global pair table's latency)
         uint32_t dv = 0;
         if constexpr (DICT) dv = dict_fetch(D, p + T::X + T::W, buf + T::SMEM + BM * BN * 2 + DICT_DEC, g0 + it);
         const __nv_bfloat16* ps = DICT ? reinterpret_cast<const __nv_bfloat16*>(buf + T::SMEM + BM * BN * 2)
@@ -822,17 +825,25 @@ __device__ __forceinline__ void mlp_pair_body(const __nv_bfloat16* __restrict__ 
                 }
             }
         }
-        if constexpr (DICT) {
-            dict_put(D, buf + T::SMEM + BM * BN * 2, dv);
-            __syncwarp();
-        }
+        [[maybe_unused]] const float dval = DICT ? __bfloat162float(__ushort_as_bfloat16(static_cast<unsigned short>(dv))) : 0.0f;
 #pragma unroll
         for (int j = 0; j < T::NT; ++j) {
-            const int col = wn * (BN / WN) + j * 8 + (lane & 3) * 2;
-            const __nv_bfloat162 s2 = *reinterpret_cast<const __nv_bfloat162*>(ps + col);
-            const __nv_bfloat162 b2 = *reinterpret_cast<const __nv_bfloat162*>(ps + BN + col);
-            const float sv[2] = {__low2float(s2), __high2float(s2)};
-            const float bv[2] = {__low2float(b2), __high2float(b2)};
+            float sv[2], bv[2];
+            if constexpr (DICT) {
+                const int c0 = j * 8 + (lane & 3) * 2;
+                sv[0] = __shfl_sync(0xffffffffu, dval, c0);
+                sv[1] = __shfl_sync(0xffffffffu, dval, c0 + 1);
+                bv[0] = __shfl_sync(0xffffffffu, dval, 16 + c0);
+                bv[1] = __shfl_sync(0xffffffffu, dval, 16 + c0 + 1);
+            } else {
+                const int col = wn * (BN / WN) + j * 8 + (lane & 3) * 2;
+                const __nv_bfloat162 s2 = *reinterpret_cast<const __nv_bfloat162*>(ps + col);
+                const __nv_bfloat162 b2 = *reinterpret_cast<const __nv_bfloat162*>(ps + BN + col);
+                sv[0] = __low2float(s2);
+                sv[1] = __high2float(s2);
+                bv[0] = __low2float(b2);
+                bv[1] = __high2float(b2);
+            }
 #pragma unroll
             for (int i = 0; i < I; ++i) {
                 const int row = wm * (BM / WM) + i * 16 + (lane >> 2);
@@ -920,3 +931,4 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_pair_dict(const __n
 }
 
 #include "qmm_mlp_single_dict.cuh"
+#include "qmm_mlp_single32.cuh"
