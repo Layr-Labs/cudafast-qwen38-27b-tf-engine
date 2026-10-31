@@ -745,8 +745,10 @@ jobs:
         # stderr file in RUNNER_TEMP and, when it reads Seccomp 2 and
         # NoNewPrivs 1 in the adapter's /proc status, writes a runner-owned
         # <file>.guard beside it, plus <file>.time with the adapter's run time.
-        # One line per start (file name, proof, run time) and a summary; a
-        # start that ran 1 s or longer without proof is a warning. Nothing
+        # A start with no <file>.time ended before the wrapper could write it
+        # (benchd kills a worker it is done with), so its run time is unknown:
+        # it counts as a long start. One line per start (file name, proof, run
+        # time) and a summary; a long start without proof is a warning. Nothing
         # from the adapter's own stderr is read or printed.
         if: always()
         continue-on-error: true
@@ -760,16 +762,16 @@ jobs:
             if [[ -f "${f}.guard" && "$(head -c 64 "${f}.guard")" == "Seccomp=2 NoNewPrivs=1" ]]; then
               proof=yes; guarded=$((guarded + 1))
             fi
-            ms="$(head -c 32 "${f}.time" 2>/dev/null | sed -n 's/^ms=\([0-9]\{1,12\}\)$/\1/p')"
-            if [[ -n "${ms}" && "${ms}" -ge 1000 ]]; then
+            ms="$(head -c 32 "${f}.time" 2>/dev/null | sed -n 's/^ms=\([0-9]\{1,12\}\)$/\1/p' || true)"
+            if [[ -z "${ms}" || "${ms}" -ge 1000 ]]; then
               long=$((long + 1))
-              [[ "${proof}" == yes ]] && long_guarded=$((long_guarded + 1))
+              if [[ "${proof}" == yes ]]; then long_guarded=$((long_guarded + 1)); fi
             fi
             echo "keyring guard: $(basename "${f}"): proof ${proof}, ran ${ms:-?} ms"
           done
-          echo "keyring guard: ${guarded} of ${total} adapter starts ran with Seccomp=2 NoNewPrivs=1; starts that ran 1 s or longer: ${long_guarded} of ${long}"
+          echo "keyring guard: ${guarded} of ${total} adapter starts ran with Seccomp=2 NoNewPrivs=1; long or unknown-length starts: ${long_guarded} of ${long}"
           if [[ "${long_guarded}" -ne "${long}" ]]; then
-            echo "::warning title=Keyring guard::$((long - long_guarded)) of ${long} adapter starts that ran 1 s or longer have no guard proof"
+            echo "::warning title=Keyring guard::$((long - long_guarded)) of ${long} long or unknown-length adapter starts have no guard proof"
           fi
 
       - name: Sandbox cleanup (kill qwen38sub processes, remove per-job dirs)
