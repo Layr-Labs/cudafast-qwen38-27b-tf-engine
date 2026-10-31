@@ -581,9 +581,7 @@ extern "C" __global__ void tf_q35_attn_gate(Geo geo, const __nv_bfloat16* __rest
     block_sums(done, (size_t)rows * W, XS);
 }
 
-// tf_q35_attn_merge then tf_q35_attn_gate in one warp a (row, query head): the merge's bf16 output gated as attn_gate
-// does, and the head's four 64-entry group sums of the gated row, each as block_sums adds them (null XS: none).
-extern "C" __global__ void __launch_bounds__(32) tf_q35_attn_merge_gate(Geo geo, const float* __restrict__ PM0, const float* __restrict__ PL0,
+extern "C" __global__ void __launch_bounds__(HD) tf_q35_attn_merge_gate(Geo geo, const float* __restrict__ PM0, const float* __restrict__ PL0,
                                                                           const float* __restrict__ PO0, const Seg* __restrict__ segs,
                                                                           const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc,
                                                                           const int* __restrict__ P, const __nv_bfloat16* __restrict__ QRAW0,
@@ -597,7 +595,7 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35_attn_merge_gate(Geo geo,
     const __nv_bfloat16* QRAW = after_wait(QRAW0);
     __nv_bfloat16* OUT = after_wait(OUT0);
     float* XS = after_wait(XS0);
-    constexpr int DPL = HD / 32;
+    constexpr int DPL = 1;
     const int QH = geo.qh;
     const int lane = threadIdx.x, qh = blockIdx.x;
     if (past_rows(P, blockIdx.y)) return;
@@ -628,7 +626,7 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35_attn_merge_gate(Geo geo,
         OUT[m * W + qh * HD + d] = done[d] = __float2bfloat16_rn(bf(y) * s);
     }
     if (XS == nullptr) return;
-    __syncwarp();
+    __syncthreads();
     if (lane < HD / 64) XS[m * (W / 64) + qh * (HD / 64) + lane] = group_sum(done + lane * 64);
 }
 
