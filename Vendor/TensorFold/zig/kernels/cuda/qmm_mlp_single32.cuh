@@ -99,6 +99,17 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x, const 
                 if (sok[j]) cp16(p + sdst[j], ssrc[j] + static_cast<size_t>(g) * P.npad);
         }
     };
+    constexpr int PF = 4;
+    auto prefetch_w = [&](int g) {
+#if __CUDA_ARCH__ >= 900
+        if (g < per && tid == 0)
+#pragma unroll
+            for (int t = 0; t < 2; ++t)
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], 4096;" ::
+                    "l"(reinterpret_cast<const unsigned char*>(parts.p[t].w) +
+                        static_cast<size_t>(n0 / 64) * TILE_BYTES + static_cast<size_t>(g) * wstride) : "memory");
+#endif
+    };
     uint32_t mask;
     asm volatile("mov.b32 %0, 0x000F000F;\n" : "=r"(mask));
 
@@ -126,6 +137,8 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x, const 
         if (s < per) load_w(s, s);
         commit();
     }
+#pragma unroll
+    for (int g = 1; g <= PF; ++g) prefetch_w(g + STAGES - 1);
     grid_wait();
     qmm_dict::x_keep_l2(x + static_cast<size_t>(m0) * ldx, rows, K, ldx);
 #pragma unroll
@@ -143,6 +156,7 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x, const 
             load_w(next % STAGES, next);
         }
         commit();
+        prefetch_w(next + PF);
         const unsigned char* p = stage(it % STAGES);
         const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
         const uint32_t* pk = reinterpret_cast<const uint32_t*>(p + T::X + T::W + mrun);
