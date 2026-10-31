@@ -20,10 +20,18 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q, 
     float* st = reinterpret_cast<float*>(sg.rec) + (size_t)layer * geo.rec() + at;
     float4* slots = kept[threadIdx.y];
     float root[R][PT], state[R][PT];
+    if ((reinterpret_cast<uintptr_t>(st) & (alignof(float4) - 1)) == 0) {
 #pragma unroll
-    for (int r = 0; r < R; ++r)
+        for (int r = 0; r < R; ++r) {
+            const float4 x = *reinterpret_cast<const float4*>(st + r * DK);
+            root[r][0] = x.x; root[r][1] = x.y; root[r][2] = x.z; root[r][3] = x.w;
+        }
+    } else {
 #pragma unroll
-        for (int i = 0; i < PT; ++i) root[r][i] = st[r * DK + i];
+        for (int r = 0; r < R; ++r)
+#pragma unroll
+            for (int i = 0; i < PT; ++i) root[r][i] = st[r * DK + i];
+    }
     if (sg.pn > 0) {
         Seg prev = sg;
         prev.log = sg.plog;
