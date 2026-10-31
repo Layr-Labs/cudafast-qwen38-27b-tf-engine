@@ -20,6 +20,8 @@ pub const symbol_single_dict = "tf_qmm_mlp_single16_dict";
 pub const smem: u32 = qlinear.group_smem + 16 * 64 * 2;
 pub const kmajor_smem: u32 = 13440 + 16 * 128 * 2;
 pub const single_smem: u32 = 41088;
+/// Pair-only half panel: two weight/index/sum stages, direct input fragments.
+pub const compact_pair_smem: u32 = 17536;
 /// tf_qmm_mlp_single32: two stages of 32 input rows, four 2 KB weight tiles, 256 scales and biases, 32 sums.
 pub const single32_smem: u32 = 2 * (32 * 128 + 256 * 32 + 2 * 256 * 2 + 32 * 4);
 /// tf_qmm_mlp_single16_dict past single_smem: four warps' decoded values, then gate's and up's tables.
@@ -36,6 +38,7 @@ pub const Kernels = struct {
     single32_fn: ?Function = null, // tf_qmm_mlp_single32: 17 to 32-row windows on the K-major panels, one weight pass
     single32_dict_fn: ?Function = null, // tf_qmm_mlp_single32_dict: dictionary-coded twin on the K-major panels
     dict_fn: ?Function = null, // GB10: tf_qmm_mlp_pair's twin, taken when gate and up are both coded (tile-major)
+    compact_pair_fn: ?Function = null,
     single_dict_fn: ?Function = null, // tf_qmm_mlp_single16's, when both are coded on the K-major panel's layout
 
     /// From the loaded qmm_group module; `pdl` as the decode tiles' launches (GB10).
@@ -50,6 +53,12 @@ pub const Kernels = struct {
             const fs = try group_mod.function(symbol_single_dict);
             try fs.allowDynamicShared(single_smem + single_dict_dec + 2 * qlinear.dict_tab_max);
             k.single_dict_fn = fs;
+            const fc = try group_mod.function("tf_qmm_mlp_single16_compact_pair");
+            try fc.allowDynamicShared(compact_pair_smem);
+            // 50% rounds upward to the 64 KiB carveout on GB10. This is a hint,
+            // allowing the driver to avoid disruptive per-node reconfiguration.
+            try fc.setAttribute(.preferred_shared_memory_carveout, 50);
+            k.compact_pair_fn = fc;
         }
         return k;
     }
@@ -105,7 +114,9 @@ pub const Kernels = struct {
         const major = rows == 16 and gate.n == 17408 and gate.k == 5120 and
             gate.verify_w != 0 and up.verify_w != 0 and kk.kmajor_fn != null;
         const single = major and kk.kmajor_single;
-        const tiles = gate.n / @as(usize, if (single) 256 else if (major) 128 else 64);
+        const compact = single and kk.single_dict_fn != null and kk.compact_pair_fn != null and coded(gate, up, true) and
+            qlinear.pairCode(gate.code) and qlinear.pairCode(up.code);
+        const tiles = gate.n / @as(usize, if (compact) 128 else if (single) 256 else if (major) 128 else 64);
         // the twins: tf_qmm_mlp_pair's (npad carries the code) and tf_qmm_mlp_single16's (first carries it; npad
         // stays, the panel's group pitch); tf_qmm_mlp_pair_kmajor16 has none
         const dict = !major and kk.dict_fn != null and coded(gate, up, false);
@@ -134,8 +145,8 @@ pub const Kernels = struct {
         g.add(act);
         g.add(as);
         for ([_]usize{ rows, gate.k, gate.k, rows_t }) |v| g.add(@as(c_int, @intCast(v)));
-        const f = if (sdict) kk.single_dict_fn.? else if (major) kk.kmajor_fn.? else if (dict) kk.dict_fn.? else kk.pair_fn;
-        const shared: u32 = if (sdict) single_smem + single_dict_dec + singleTab(gate) + singleTab(up) else if (single) single_smem else if (major) kmajor_smem else if (dict) smem + qlinear.dict_dec + @max(gate.tabBytes(), up.tabBytes()) else smem;
+        const f = if (compact) kk.compact_pair_fn.? else if (sdict) kk.single_dict_fn.? else if (major) kk.kmajor_fn.? else if (dict) kk.dict_fn.? else kk.pair_fn;
+        const shared: u32 = if (compact) compact_pair_smem else if (sdict) single_smem + single_dict_dec + singleTab(gate) + singleTab(up) else if (single) single_smem else if (major) kmajor_smem else if (dict) smem + qlinear.dict_dec + @max(gate.tabBytes(), up.tabBytes()) else smem;
         try launch_.launch(f, .{ .grid = .{ .x = @intCast(@as(usize, if (single) 1 else 2) * rows_t * tiles) }, .block = .{ .x = 128 }, .shared = shared, .cluster = if (single) null else .{ .x = 2 }, .pdl = kk.pdl }, s, &g);
     }
 };
