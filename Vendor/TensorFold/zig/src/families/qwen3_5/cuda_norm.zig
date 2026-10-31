@@ -19,6 +19,11 @@ pub fn normInput(e: anytype, residual: bool, w: u64, rows: usize, prompt: bool) 
 
 /// The vocabulary head consumes only these final rows; earlier prompt rows have already supplied their taps.
 pub fn normTail(e: anytype, w: u64, total: usize, heads: usize) !void {
+    return normTailRows(e, true, w, total, heads);
+}
+
+/// normTail; residual false when the last projection already added its rows into h.
+pub fn normTailRows(e: anytype, residual: bool, w: u64, total: usize, heads: usize) !void {
     const offset = (total - heads) * e.g.hidden * 2;
-    try e.runAfter(e.fns.norm, .{ heads, 1, 1 }, .{ 256, 1, 1 }, .{ e.h + offset, e.r + offset, w, e.x + offset, e.g.eps, @as(c_int, @intCast(e.g.hidden)), e.tables.ptr + Engine.params_at, @as(u64, 0) });
+    try e.runAfter(e.fns.norm, .{ heads, 1, 1 }, .{ 256, 1, 1 }, .{ e.h + offset, if (residual) e.r + offset else @as(u64, 0), w, e.x + offset, e.g.eps, @as(c_int, @intCast(e.g.hidden)), e.tables.ptr + Engine.params_at, @as(u64, 0) });
 }

@@ -2,18 +2,29 @@
 #pragma once
 
 // A tapped layer's residual bf16(h + r) into the segment's tap ring at the row's position; grid (rows, D / 2048).
-extern "C" __global__ void __launch_bounds__(256) tf_q35_tap(const __nv_bfloat16* __restrict__ H, const __nv_bfloat16* __restrict__ R,
+extern "C" __global__ void __launch_bounds__(256) tf_q35_tap(const __nv_bfloat16* __restrict__ H0, const __nv_bfloat16* __restrict__ R0,
                                                               const Seg* __restrict__ segs, const int* __restrict__ rowseg, int tap, int D,
-                                                              const int* __restrict__ P) {
+                                                              const int* __restrict__ P0) {
+    release_next();
+    await_prior();
+    const __nv_bfloat16* H = after_wait(H0);
+    const __nv_bfloat16* R = after_wait(R0);
+    const int* P = after_wait(P0);
     if (past_rows(P, blockIdx.x)) return;
     const size_t m = blockIdx.x;
     const Seg sg = segs[rowseg[m]];
     if (sg.tap == 0) return;
     const long long pos = sg.len + (long long)m - sg.row0;
-    __nv_bfloat16* out = reinterpret_cast<__nv_bfloat16*>(sg.tap) + ((size_t)(pos % sg.tap_rows) * sg.taps + tap) * D;
+    __nv_bfloat16* out = after_wait(reinterpret_cast<__nv_bfloat16*>(sg.tap)) + ((size_t)(pos % sg.tap_rows) * sg.taps + tap) * D;
     const int i = (blockIdx.y * blockDim.x + threadIdx.x) * 8;  // eight entries a thread, grid (rows, D / 2048)
     if (i >= D) return;
-    const uint4 hw = *reinterpret_cast<const uint4*>(H + m * D + i), rw = *reinterpret_cast<const uint4*>(R + m * D + i);
+    const uint4 hw = *reinterpret_cast<const uint4*>(H + m * D + i);
+    // R null: the down projection already added its rows into H (a prompt's rows2 residual tiles)
+    if (R == nullptr) {
+        *reinterpret_cast<uint4*>(out + i) = hw;
+        return;
+    }
+    const uint4 rw = *reinterpret_cast<const uint4*>(R + m * D + i);
     const __nv_bfloat16* hb = reinterpret_cast<const __nv_bfloat16*>(&hw);
     const __nv_bfloat16* rb = reinterpret_cast<const __nv_bfloat16*>(&rw);
     uint4 ow;
