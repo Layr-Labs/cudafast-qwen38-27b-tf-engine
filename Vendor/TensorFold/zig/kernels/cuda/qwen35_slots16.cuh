@@ -104,7 +104,7 @@ __device__ __forceinline__ void q35_slots16_ready(Geo geo, const __nv_bfloat16* 
                 state[r][1] = t.y;
                 state[r][2] = t.z;
                 state[r][3] = t.w;
-            } } else {
+            } } else if (step.read_slot == -1) {
 #pragma unroll
                 for (int i = 0; i < PT; ++i) state[r][i] = root[r][i];
             }

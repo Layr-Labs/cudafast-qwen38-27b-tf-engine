@@ -5,6 +5,13 @@
 extern "C" __global__ void __launch_bounds__(256) tf_q35_tap(const __nv_bfloat16* __restrict__ H, const __nv_bfloat16* __restrict__ R,
                                                               const Seg* __restrict__ segs, const int* __restrict__ rowseg, int tap, int D,
                                                               const int* __restrict__ P) {
+    release_next();
+    await_prior();
+    H = after_wait(H);
+    R = after_wait(R);
+    segs = after_wait(segs);
+    rowseg = after_wait(rowseg);
+    P = after_wait(P);
     if (past_rows(P, blockIdx.x)) return;
     const size_t m = blockIdx.x;
     const Seg sg = segs[rowseg[m]];

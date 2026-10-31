@@ -91,6 +91,15 @@ __device__ __forceinline__ void grid_wait() {
 #endif
 }
 
+__device__ __forceinline__ void x_keep_l2(const void* x, int rows, int K, int ldx) {
+#if __CUDA_ARCH__ >= 900
+    const int per = K / 64, total = rows * per;
+    const unsigned char* base = static_cast<const unsigned char*>(x);
+    for (int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); i < total; i += static_cast<int>(gridDim.x * blockDim.x))
+        asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(base + (static_cast<size_t>(i / per) * ldx + (i % per) * 64) * 2));
+#endif
+}
+
 __device__ __forceinline__ void grid_launch() {
 #if __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");

@@ -36,9 +36,13 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     const record = shape.record;
     const prompt = shape.prompt;
     const heads: usize = if (record) total else 1;
-    // Independent prompt rows share a block; decode keeps one warp per row.
+    // Independent prompt rows share a block; decode keeps one warp per row. A 17..64-row window's gdn_pre rows share
+    // blocks too (four row warps a block: its warps are independent, the same bits); TF_GDN_ROWS4=0 keeps one warp a
+    // block there. gdn_post keeps a warp a block in windows (four a block measured slower).
     const gdn_rows: usize = if (prompt and total > 16) 4 else 1;
     const gdn_blocks = (total + gdn_rows - 1) / gdn_rows;
+    const pre_rows: usize = if ((prompt and total > 16) or (total >= 16 and rows4On())) 4 else 1;
+    const pre_blocks = (total + pre_rows - 1) / pre_rows;
     const t_ids = e.tables.ptr + ids_at;
     const t_segs = e.tables.ptr + segs_at;
     const t_rows = e.tables.ptr + rowseg_at;
@@ -66,7 +70,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 const layer: c_int = @intCast(di);
                 try e.projMany(&.{ m.qkv, m.z, m.a, m.b }, e.x, &.{ e.qkv, e.z, e.a, e.b }, total, prompt);
                 if (e.learning) |k| try k.delta(i, e.qkv, e.z, e.b, e.a, total);
-                try e.runAfter(e.fns.gdn_pre, .{ 1, 2 * g.k_heads + g.v_heads, gdn_blocks }, .{ 32, gdn_rows, 1 }, .{ geo, e.qkv, t_segs, t_rows, t_par, layer, m.conv, e.a, e.b, m.a_log, m.dt_bias, e.q, e.k, e.v, e.g_, e.beta, t_params });
+                try e.runAfter(e.fns.gdn_pre, .{ 1, 2 * g.k_heads + g.v_heads, pre_blocks }, .{ 32, pre_rows, 1 }, .{ geo, e.qkv, t_segs, t_rows, t_par, layer, m.conv, e.a, e.b, m.a_log, m.dt_bias, e.q, e.k, e.v, e.g_, e.beta, t_params });
                 // one recorded window of 2+ rows: gdn_pre logged its tails, conv_commit would only return
                 if (!(record and nseg == 1 and total > 1)) try e.runAfter(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
                 if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else try e.deltaScan(record, shape.slots, nseg, layer);
@@ -76,7 +80,11 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
             },
             .attention => |m| {
                 const aw = g.attnWidth();
-                try e.projMany(&.{ m.q, m.k, m.v }, e.x, &.{ e.qraw, e.kraw, e.vraw }, total, prompt);
+                if (tail and i == e.layers.len - 1) {
+                    // the tail's layer: keys and values for every row, queries (and gate) for the last row alone
+                    try e.projMany(&.{ m.k, m.v }, e.x, &.{ e.kraw, e.vraw }, total, prompt);
+                    try @import("cuda_prompt_tail.zig").query(e, m.q.a4, total);
+                } else try e.projMany(&.{ m.q, m.k, m.v }, e.x, &.{ e.qraw, e.kraw, e.vraw }, total, prompt);
                 if (e.learning) |k| try k.attention(i, e.qraw, e.kraw, e.vraw, total);
                 if (prompt and total > 16 and !e.kv8) {
                     // Preserve the original two head sums and bf16 boundary before rotary/cache stores.
@@ -109,7 +117,12 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                         try launch(e, e.fp8.attn_partial, sig.attn_partial8, .{ total, max_chunks, g.kv_heads }, .{ 128, 1, 1 }, args);
                         try launch(e, e.fp8.attn_rows, sig.attn_rows8, .{ groups, max_chunks, g.kv_heads }, .{ 256, 1, 1 }, rows_args);
                     } else {
-                        try sharedSized(e, e.fns.attn_partial, sig.attn_partial, .{ total, partial_chunks, g.kv_heads }, 128, attn_tile, args);
+                        // a 17..64-row window: row pairs share each chunk's stream-key tiles (attn_pair, the same bits);
+                        // TF_ATTN_PAIR=0 keeps attn_partial's block a row
+                        if (record and total >= 2 and total % 2 == 0 and 2 * group <= 16 and pairOn())
+                            try sharedSized(e, e.fns.attn_pair, sig.attn_pair, .{ total / 2, partial_chunks, g.kv_heads }, 128, attn_tile, args)
+                        else
+                            try sharedSized(e, e.fns.attn_partial, sig.attn_partial, .{ total, partial_chunks, g.kv_heads }, 128, attn_tile, args);
                         // streams of caches no longer than GROUP_LEN have no row for attn_rows (its blocks would only return)
                         if (!shape.short) try shared(e, e.fns.attn_rows, sig.attn_rows, .{ groups, max_chunks, g.kv_heads }, 256, rows_args);
                     }
@@ -154,12 +167,24 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
             .moe => |m| try e.routedRows(m.router, m.experts, e.x, e.r, total, promptMoe(prompt, total), t_params),
         }
         if (shape.taps) for (e.taps[0..e.n_taps], 0..) |t, ti| if (t == i) {
-            try e.run(e.fns.tap, .{ total, (g.hidden + 2047) / 2048, 1 }, .{ 256, 1, 1 }, .{ e.h, e.r, t_segs, t_rows, @as(c_int, @intCast(ti)), @as(c_int, @intCast(g.hidden)), t_params });
+            try e.runAfter(e.fns.tap, .{ total, (g.hidden + 2047) / 2048, 1 }, .{ 256, 1, 1 }, .{ e.h, e.r, t_segs, t_rows, @as(c_int, @intCast(ti)), @as(c_int, @intCast(g.hidden)), t_params });
         };
         // a captured forward's first layer is a graph of its own (cuda_engine.zig's cutCapture)
         if (i == 0) try e.cutCapture();
     }
     try finish(e, total, heads, shape.hidden);
+}
+
+/// TF_GDN_ROWS4=0: 17..64-row windows keep one row warp a block in tf_q35_gdn_pre and tf_q35_gdn_post.
+fn rows4On() bool {
+    const v = @import("sys").c.getenv("TF_GDN_ROWS4") orelse return true;
+    return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
+}
+
+/// TF_ATTN_PAIR=0: 17..64-row windows keep tf_q35_attn_partial (a block a row).
+fn pairOn() bool {
+    const v = @import("sys").c.getenv("TF_ATTN_PAIR") orelse return true;
+    return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
 }
 
 /// A launch whose arguments are checked against the kernel's .cu signature: a wrong count or kind does not build.
