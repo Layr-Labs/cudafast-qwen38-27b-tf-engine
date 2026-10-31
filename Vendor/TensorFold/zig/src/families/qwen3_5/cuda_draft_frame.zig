@@ -54,13 +54,19 @@ pub fn stage(c: draft.Config, items: []const dr.Hold, contexts: []const *draft.C
 /// A launch whose arguments are checked against the kernel's .cu signature: a wrong count or kind does not build.
 fn launch(d: anytype, f: cuda.Function, comptime s: sig.Sig, grid: [3]usize, block: [3]usize, args: anytype) !void {
     sig.check(s, @TypeOf(args));
-    return d.e.run(f, grid, block, args);
+    return d.e.runAfter(f, grid, block, args);
 }
 fn conv(d: anytype, x: u64, base: u64, res: u64, out: u64, rows: usize, branch: c_int) !void {
-    try d.e.run(d.fns.dyn_conv_batch, .{ rows, (d.c.hidden + 255) / 256, 1 }, .{ 256, 1, 1 }, .{ x, d.dyn, base, res, out, @as(c_int, @intCast(d.c.hidden)), @as(c_int, @intCast(d.c.group)), branch, @as(c_int, @intCast(d.c.block)) });
+    try d.e.runAfter(d.fns.dyn_conv_batch, .{ rows, (d.c.hidden + 255) / 256, 1 }, .{ 256, 1, 1 }, .{ x, d.dyn, base, res, out, @as(c_int, @intCast(d.c.hidden)), @as(c_int, @intCast(d.c.group)), branch, @as(c_int, @intCast(d.c.block)) });
 }
-fn rope(d: anytype, x: u64, w: u64, out: u64, rows: usize, heads: usize) !void {
-    try d.e.run(d.fns.norm_rope_batch, .{ rows * heads, 1, 1 }, .{ 32, 1, 1 }, .{ x, w, out, @as(c_int, @intCast(heads)), @as(c_int, @intCast(heads * 128)), d.segments, @as(c_int, @intCast(d.c.block)), d.c.eps, d.c.theta });
+fn ropeQk(d: anytype, xq: u64, wq: u64, outq: u64, xk: u64, wk: u64, outk: u64, rows: usize) !void {
+    const c = d.c;
+    const limit: usize = std.math.maxInt(c_int);
+    if (rows == 0 or c.heads == 0 or c.kv_heads == 0 or c.block == 0 or rows > limit or c.heads > limit or c.kv_heads > limit or c.block > limit) return error.BadDraftFrame;
+    const heads = std.math.add(usize, c.heads, c.kv_heads) catch return error.BadDraftFrame;
+    const blocks = std.math.mul(usize, rows, heads) catch return error.BadDraftFrame;
+    if (blocks > limit) return error.BadDraftFrame;
+    try d.e.runAfter(d.fns.norm_rope_qk_batch, .{ blocks, 1, 1 }, .{ 32, 1, 1 }, .{ xq, wq, outq, @as(c_int, @intCast(c.heads)), xk, wk, outk, @as(c_int, @intCast(c.kv_heads)), @as(c_int, @intCast(rows)), d.segments, @as(c_int, @intCast(c.block)), c.eps, c.theta });
 }
 pub fn attention(d: anytype, rows: usize, layer: usize) !void {
     const c = d.c;
@@ -86,7 +92,7 @@ pub fn mlp(d: anytype, l: anytype, B: usize) !void {
     const e = d.e;
     const c = d.c;
     if (draft.pairedMlp() and B > 0 and B <= 16 and cuda.mlp_pair.Kernels.fits(l.gate, l.up)) {
-        try e.run(e.fns.sums, .{ B, (l.gate.k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ d.xin, d.xs, @as(c_int, @intCast(l.gate.k)), @as(u64, 0) });
+        try e.runAfter(e.fns.sums, .{ B, (l.gate.k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ d.xin, d.xs, @as(c_int, @intCast(l.gate.k)), @as(u64, 0) });
         // The unused gate buffer has room for the FP32 group sums. Never overwrite xs while pair reads it.
         const act_sums = d.gate;
         try e.mlp_pair.pair(e.stream, d.xin, d.xs, l.gate, l.up, d.act, act_sums, B);
@@ -94,7 +100,7 @@ pub fn mlp(d: anytype, l: anytype, B: usize) !void {
     } else {
         try d.proj(l.gate, d.xin, d.gate, B);
         try d.projAgain(l.up, d.xin, d.up, B);
-        try e.run(e.fns.mlp_act, .{ (B * c.intermediate + 1023) / 1024, 1, 1 }, .{ 256, 1, 1 }, .{ d.gate, d.up, d.act, @as(c_longlong, @intCast(B * c.intermediate)), @as(u64, 0), @as(c_int, @intCast(c.intermediate)), d.xs });
+        try e.runAfter(e.fns.mlp_act, .{ (B * c.intermediate + 1023) / 1024, 1, 1 }, .{ 256, 1, 1 }, .{ d.gate, d.up, d.act, @as(c_longlong, @intCast(B * c.intermediate)), @as(u64, 0), @as(c_int, @intCast(c.intermediate)), d.xs });
         try d.projAgain(l.down, d.act, d.o, B);
     }
 }
@@ -110,8 +116,7 @@ fn body(d: anytype, n: usize, narrow_: bool) !?u64 {
         try d.projAgain(l.attn_conv, d.x, d.dyn, B);
         try conv(d, d.x, l.attn_base, 0, d.xin, B, 0);
         try d.projMany(&.{ l.q, l.k, l.v }, d.xin, &.{ d.qraw, d.kraw, d.vb }, B);
-        try rope(d, d.qraw, l.q_norm, d.q, B, c.heads);
-        try rope(d, d.kraw, l.k_norm, d.kb, B, c.kv_heads);
+        try ropeQk(d, d.qraw, l.q_norm, d.q, d.kraw, l.k_norm, d.kb, B);
         try attention(d, B, i);
         try d.proj(l.o, d.att, d.o, B);
         try conv(d, d.o, l.attn_base, d.h, d.h2, B, 1);
