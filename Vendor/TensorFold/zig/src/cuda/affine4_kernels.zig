@@ -102,6 +102,7 @@ pub const DictStore = struct {
 /// The dictionary twins (qmm_dict.cuh) of the decode kernels, and the load-time encoder (affine4_pack.cu).
 pub const DictKernels = struct {
     group: Function, // group_kernel_dict<64, 16, 64, 1, 4, 8>: decode()'s cluster tile
+    verify32: ?Function, // group_kernel_dict<64, 32, 64, 1, 4, 5>: verify32's (verifyMany32); null with TF_STREAM32=0
     gemv: Function, // gemv_kernel<64, 64, 8>'s twin
     many: Function, // tf_lane_gemv_many's
     mark: Function,
@@ -120,6 +121,7 @@ pub const DictKernels = struct {
 /// The affine-4 kernels: qmm_group's cluster tile, lane_gemv and its split-K form, qmm_prefill's prompt GEMM.
 pub const Affine4Kernels = struct {
     pub const max_rows = 16; // rows decode() takes: its kernels tile 16 rows
+    pub const gdn_stream32_smem: u32 = 17664;
     pub const segs_max = 4; // projections one segmented launch takes
     pub const narrow_tiles = 24; // GB10: column tiles at most that decode() runs in the split form (half its 48 SMs)
     pub const lane_min = 32; // GB10 with short_lane: K slices of fewer groups go to lane_gemv rather than the cluster tile
@@ -131,8 +133,15 @@ pub const Affine4Kernels = struct {
     group_fn: Function,
     stream16_fns: [2]?Function = @splat(null),
     stream16_dict_fn: ?Function = null, // tf_qmm_output_stream16 on a dictionary-coded down projection
+    // ercumentyildirim's 32-row twins (qmm_stream32.cuh) of the output streams for verify windows of 17 to 32 rows
+    stream32_fns: [2]?Function = @splat(null), // tf_qmm_output_stream32 (K = 17408), tf_qmm_output_prefetch32 (K = 6144)
+    stream32_dict_fn: ?Function = null, // tf_qmm_output_stream32_dict on a dictionary-coded part
+    lane32_fns: [2]?Function = @splat(null), // tf_qmm_lane32, its dictionary twin: GDN out / attention o on 17..32 rows
+    down_lane32: bool = false, // TF_W32_DOWN_LANE=1: down in the lane form too (A/B)
     gdn_stream16_dict_fn: ?Function = null, // tf_qmm_gdn_stream16 with its dictionary-coded parts
     gdn_stream16_fn: ?Function = null,
+    gdn_stream32_fn: ?Function = null,
+    gdn_stream32_dict_fn: ?Function = null,
     gemv_fn: Function,
     verify_fn: Function, // two m16 row tiles share each weight panel on the GB10 verify path
     verify64_fn: Function, // four, for wider shared frames
@@ -188,8 +197,14 @@ pub const Affine4Kernels = struct {
         a.pdl = gb10;
         a.stream16_fns = @splat(null);
         a.stream16_dict_fn = null;
+        a.stream32_fns = @splat(null);
+        a.stream32_dict_fn = null;
+        a.lane32_fns = @splat(null);
+        a.down_lane32 = false;
         a.gdn_stream16_dict_fn = null;
         a.gdn_stream16_fn = null;
+        a.gdn_stream32_fn = null;
+        a.gdn_stream32_dict_fn = null;
         a.wide_fns = @splat(null);
         a.group_wide = false;
         a.wide_verify = false;
@@ -201,6 +216,7 @@ pub const Affine4Kernels = struct {
         if (gb10) {
             var t: DictKernels = undefined;
             t.group = try group_mod.function(symbols.group_dict);
+            t.verify32 = if (stream32On()) try group_mod.function(symbols.verify32_dict) else null;
             t.gemv = try gemv_mod.function(symbols.gemv_dict);
             t.many = try gemv_mod.function(symbols.gemv_many_dict);
             t.mark = try pack_mod.function(symbols.dict_mark);
@@ -216,6 +232,7 @@ pub const Affine4Kernels = struct {
             // the lane twins keep pair tables of up to lane_pair_tab_max in shared memory (lane_gemv.cu LANE_PAIR_SMEM)
             const lane_room = linear.dict_dec + @max(linear.dict_tab_max, linear.lane_pair_tab_max);
             try t.group.allowDynamicShared(group_smem + linear.dict_dec + @max(linear.dict_tab_max, linear.group_pair_tab_one));
+            if (t.verify32) |f| try f.allowDynamicShared(linear.verify_smem + linear.dict_dec + @max(linear.dict_tab_max, linear.group_pair_tab_one));
             try t.gemv.allowDynamicShared(group_smem + lane_room);
             try t.many.allowDynamicShared(group_smem + lane_room);
             // resident lane CTAs at the largest table a projection keeps coded (GB10: the originals' count)
@@ -228,6 +245,21 @@ pub const Affine4Kernels = struct {
     /// The dictionary twin's view of q when q is coded (tile-major) and a twin is loaded.
     fn coded(a: *const Affine4Kernels, q: Affine4) bool {
         return a.dict != null and tileCoded(q);
+    }
+
+    /// The output stream is selectable only for exactly the geometry cluster() handles.
+    fn streamed(a: *const Affine4Kernels, q: Affine4, rows: usize, sk: usize) bool {
+        if (q.stream_w == 0) return false;
+        const f = a.stream16_fns[@as(usize, if (q.k == 6144) 1 else 0)];
+        return f != null and rows == 16 and sk == 4 and q.n == 5120 and (q.k == 6144 or q.k == 17408);
+    }
+
+    /// The existing coded four-slice stream can also consume a 16-row out/o projection.
+    /// Keep the ordinary short-lane route whenever its view or kernel is unavailable.
+    fn dictOutStream(a: *const Affine4Kernels, q: Affine4, rows: usize, sk: usize) bool {
+        return a.short_lane and a.cluster_decode and rows == 16 and sk == 4 and
+            q.n == 5120 and q.npad == 5120 and q.k == 6144 and q.stream_w != 0 and
+            a.stream16_fns[1] != null and a.stream16_dict_fn != null and a.coded(q);
     }
 
     /// q's scales and biases as dictionary indices and a table (qmm_dict.cuh) out of `store`, from the tiled arrays
@@ -468,21 +500,29 @@ pub const Affine4Kernels = struct {
         // clusters of four, each CTA chaining the tile's slices in order (the same bits); the down projection's long
         // slices (68 groups) stay on the cluster tile, and so does a short K (the drafter's K = 4096, 64 groups a
         // lane CTA: its 80 CTAs keep too few bytes in flight)
-        if (sk > 1 and a.cluster_decode and !(a.short_lane and q.k / 64 / sk < lane_min and q.k / 64 >= lane_groups)) return a.cluster(s, x, xs, q, out, rows, sk);
+        const short = sk > 1 and a.cluster_decode and a.short_lane and q.k / 64 / sk < lane_min and q.k / 64 >= lane_groups and !a.streamed(q, rows, sk);
+        if (sk > 1 and a.cluster_decode and !short) return a.cluster(s, x, xs, q, out, rows, sk);
         return if (sk > 1) a.gemv(s, x, xs, q, out, rows, sk) else a.cluster(s, x, xs, q, out, rows, sk);
     }
 
     /// decode() of each projection of one input; without GB10 one segmented launch, each keeping its split's bits.
     /// On GB10 the K-sliced projections share one lane_gemv launch and the unsliced ones one cluster launch.
+    pub fn streamable(a: *const Affine4Kernels, outs: []const Out, rows: usize) bool {
+        const gdn_streamed = rows == 16 or (rows > 16 and rows <= 32 and a.gdn_stream32_fn != null);
+        if (!gdn_streamed or !a.pdl or a.gdn_stream16_fn == null) return false;
+        for (outs) |o| if (o.q.k != 5120 or o.q.stream_w == 0) return false;
+        return outs.len == 4 and outs[0].q.n == 10240 and outs[1].q.n == 6144 and outs[2].q.n == 48 and outs[3].q.n == 48;
+    }
+
     pub fn decodeMany(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, outs: []const Out, rows: usize) !void {
-        const stream_input = rows == 16 and a.pdl and outs.len == 4 and
-            outs[0].q.n == 10240 and outs[1].q.n == 6144 and outs[2].q.n == 48 and outs[3].q.n == 48 and
-            for (outs) |o| { if (o.q.k != 5120 or o.q.stream_w == 0) break false; } else true;
-        if (stream_input and a.gdn_stream16_fn != null) {
+        if (a.streamable(outs, rows)) {
+            const rows32 = rows > 16;
+            const bn: usize = if (rows32) 128 else 256;
+            const dict_fn = if (rows32) a.gdn_stream32_dict_fn else a.gdn_stream16_dict_fn;
             // coded parts stream their index windows (the dictionary twin): npad holds the code, tiles the real npad
             var dict = false;
             var tab: u32 = 0;
-            if (a.gdn_stream16_dict_fn != null) for (outs) |o| if (a.coded(o.q)) {
+            if (dict_fn != null) for (outs) |o| if (a.coded(o.q)) {
                 dict = true;
                 tab = @max(tab, o.q.tabBytesUpTo(linear.gdn_pair_tab_max));
             };
@@ -490,7 +530,7 @@ pub const Affine4Kernels = struct {
             parts.count = 4;
             var first: usize = 0;
             for (outs, 0..) |o, index| {
-                const tiles = if (index < 2) o.q.n / 256 else 1;
+                const tiles = if (index < 2) o.q.n / bn else 1;
                 const twin = dict and a.coded(o.q);
                 parts.p[index] = .{ .w = o.q.stream_w, .scales = if (twin) o.q.sb else o.q.s, .biases = if (twin) o.q.tab else o.q.b, .out = o.out, .n = int(o.q.n), .npad = if (twin) @bitCast(o.q.code) else int(o.q.npad), .sk = int(splitK(o.q.n,o.q.k)), .tiles = if (dict) (if (twin) int(o.q.npad) else 0) else int(tiles), .first = int(first) };
                 first += tiles;
@@ -498,8 +538,10 @@ pub const Affine4Kernels = struct {
             var g: launch_.Args = .{};
             g.add(x); g.add(xs); g.add(parts);
             for ([_]usize{ rows, 5120, 5120 }) |v| g.add(int(v));
-            const shared: u32 = if (dict) 22656 + 4 * 256 + tab else 22656;
-            return launch_.launch(if (dict) a.gdn_stream16_dict_fn.? else a.gdn_stream16_fn.?, .{ .grid = .{ .x = u(first) }, .block = .{ .x = 128 }, .shared = shared, .pdl = true }, s, &g);
+            const base: u32 = if (rows32) gdn_stream32_smem else 22656;
+            const shared: u32 = if (dict) base + 4 * @as(u32, @intCast(bn)) + tab else base;
+            const f = if (dict) dict_fn.? else if (rows32) a.gdn_stream32_fn.? else a.gdn_stream16_fn.?;
+            return launch_.launch(f, .{ .grid = .{ .x = u(first) }, .block = .{ .x = 128 }, .shared = shared, .pdl = true }, s, &g);
         }
         if (rows > max_rows) return error.WindowTooWide;
         const sp = a.split orelse return a.decodeGrouped(s, x, xs, outs, rows);
@@ -656,6 +698,7 @@ pub const Affine4Kernels = struct {
         if (rows == 0 or rows > a.verifyRows()) return error.WindowTooWide;
         if (rows <= max_rows) return a.decode(s, x, xs, weight, out, rows);
         if (rows <= 32) {
+            if (try a.stream32(s, x, xs, weight, out, rows)) return;
             if (weight.wide_w != 0) return a.packed32(s, x, xs, weight, out, rows);
             return a.cluster32(s, x, xs, weight, out, rows);
         }
@@ -665,6 +708,19 @@ pub const Affine4Kernels = struct {
 
     /// The same ordered group and K-slice chains as decode(), with both row tiles reusing the loaded weights.
     pub fn cluster32(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, weight: Affine4, out: u64, rows: usize) !void {
+        // a coded projection (the LM head) on verify32's dictionary twin when its CTAs fill the GPU, as cluster() does
+        const sk = splitK(weight.n, weight.k);
+        const tiles = (weight.n + 63) / 64;
+        if (a.dict != null and a.dict.?.verify32 != null and a.coded(weight) and tiles * sk >= a.sms and rows > 0 and rows <= 32) {
+            var parts: Parts = std.mem.zeroes(Parts);
+            parts.count = 1;
+            parts.p[0] = groupPart(weight, true, out, sk, tiles, 0);
+            var g: launch_.Args = .{};
+            g.add(x); g.add(xs); g.add(parts);
+            for ([_]usize{ rows, weight.k, weight.k, 1, sk }) |v| g.add(int(v));
+            return launch_.launch(a.dict.?.verify32.?, .{ .grid = .{ .x = u(tiles * sk) }, .block = .{ .x = 128 }, .shared = linear.verify_smem + linear.dict_dec + weight.tabBytesUpTo(if (sk > 1) linear.group_pair_tab_max else linear.group_pair_tab_one),
+                .cluster = if (sk > 1) .{ .x = u(sk) } else null, .pdl = a.pdl }, s, &g);
+        }
         return a.wide(a.verify_fn, linear.verify_smem, 32, s, x, xs, weight, out, rows);
     }
 
@@ -672,22 +728,64 @@ pub const Affine4Kernels = struct {
     pub fn verifyMany32(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, outs: []const Out, rows: usize) !void {
         if (rows <= max_rows or rows > 32 or rows > a.verifyRows()) return error.WindowTooWide;
         if (outs.len == 0 or outs.len > segs_max) return error.TooManyParts;
+        // GDN's qkv, z, a and b: decodeMany()'s word-stream launch (tf_qmm_gdn_stream32 / _dict at 17 to 32 rows)
+        if (stream32On() and a.streamable(outs, rows)) return a.decodeMany(s, x, xs, outs, rows);
         const k = outs[0].q.k;
         for (outs) |o| if (o.q.k != k) return error.InputMismatch;
         const alternate = for (outs) |o| {
             if (o.q.wide_w == 0 or o.q.wide_kind != 1) break false;
         } else true;
+        mixed: {
+            // attention's q (full K) and its sliced k and v, all coded: one verify32 dictionary-twin launch whose
+            // clusters take the widest slice count, each holding one part's tiles (ercumentyildirim's 366d8a17)
+            if (alternate or a.dict == null or a.dict.?.verify32 == null or !mixed32On()) break :mixed;
+            var cs: usize = 1;
+            var tab: u32 = 0;
+            for (outs) |o| {
+                if (!tileCoded(o.q)) break :mixed;
+                cs = @max(cs, splitK(o.q.n, k));
+                tab = @max(tab, o.q.tabBytesUpTo(linear.group_pair_tab_max)); // a cluster launch's room
+            }
+            const differ = for (outs) |o| {
+                if (splitK(o.q.n, k) != cs) break true;
+            } else false;
+            if (cs == 1 or !differ) break :mixed;
+            var parts: Parts = std.mem.zeroes(Parts);
+            var clusters: usize = 0;
+            for (outs) |o| {
+                const tiles = (o.q.n + 63) / 64;
+                const sk = splitK(o.q.n, k);
+                parts.p[@intCast(parts.count)] = groupPart(o.q, true, o.out, sk, tiles, clusters);
+                parts.count += 1;
+                clusters += (tiles * sk + cs - 1) / cs;
+            }
+            var args: launch_.Args = .{};
+            args.add(x); args.add(xs); args.add(parts);
+            for ([_]usize{ rows, k, k, 1, cs }) |v| args.add(int(v));
+            return launch_.launch(a.dict.?.verify32.?, .{ .grid = .{ .x = u(clusters * cs) }, .block = .{ .x = 128 }, .shared = linear.verify_smem + linear.dict_dec + tab, .cluster = .{ .x = u(cs) }, .pdl = a.pdl }, s, &args);
+        }
         const bn: usize = if (alternate) 128 else 64;
         const function = if (alternate) a.wide_fns[0] orelse return error.FormatNotLoaded else a.verify_fn;
         const shared: u32 = if (alternate) 26496 else linear.verify_smem;
         for ([_]usize{ 1, 2, 4, 8 }) |sk| {
+            // the dictionary twin when every part of the launch is coded and its CTAs fill the GPU (as cluster())
+            var dict = !alternate and a.dict != null and a.dict.?.verify32 != null;
+            var tab: u32 = 0;
+            var ctas: usize = 0;
+            for (outs) |o| {
+                if (splitK(o.q.n, k) != sk) continue;
+                dict = dict and tileCoded(o.q);
+                if (tileCoded(o.q)) tab = @max(tab, o.q.tabBytesUpTo(if (sk > 1) linear.group_pair_tab_max else linear.group_pair_tab_one));
+                ctas += (o.q.n + bn - 1) / bn * sk;
+            }
+            dict = dict and ctas >= a.sms;
             var parts: Parts = std.mem.zeroes(Parts);
             var clusters: usize = 0;
             for (outs) |o| {
                 if (splitK(o.q.n, k) != sk) continue;
                 const tiles = (o.q.n + bn - 1) / bn;
                 const at: usize = @intCast(parts.count);
-                parts.p[at] = .{ .w = if (alternate) o.q.wide_w else o.q.w, .scales = o.q.s, .biases = o.q.b, .out = o.out, .n = int(o.q.n), .npad = int(o.q.npad), .sk = int(sk), .tiles = int(tiles), .first = int(clusters) };
+                parts.p[at] = if (dict) groupPart(o.q, true, o.out, sk, tiles, clusters) else .{ .w = if (alternate) o.q.wide_w else o.q.w, .scales = o.q.s, .biases = o.q.b, .out = o.out, .n = int(o.q.n), .npad = int(o.q.npad), .sk = int(sk), .tiles = int(tiles), .first = int(clusters) };
                 parts.count += 1;
                 clusters += tiles;
             }
@@ -697,8 +795,39 @@ pub const Affine4Kernels = struct {
             args.add(xs);
             args.add(parts);
             for ([_]usize{ rows, k, k, 1, sk }) |v| args.add(int(v));
-            try launch_.launch(function, .{ .grid = .{ .x = u(clusters * sk) }, .block = .{ .x = 128 }, .shared = shared, .cluster = if (sk > 1) .{ .x = u(sk) } else null, .pdl = a.pdl }, s, &args);
+            try launch_.launch(if (dict) a.dict.?.verify32.? else function, .{ .grid = .{ .x = u(clusters * sk) }, .block = .{ .x = 128 }, .shared = if (dict) linear.verify_smem + linear.dict_dec + tab else shared, .cluster = if (sk > 1) .{ .x = u(sk) } else null, .pdl = a.pdl }, s, &args);
         }
+    }
+
+    /// cluster()'s 16-row output streams on 17 to 32 rows (down, GDN out and attention o, whose four K slices a CTA
+    /// sums in slice order): tf_qmm_output_stream32 / prefetch32 / stream32_dict / lane32, the same bits (366d8a17).
+    /// False: not streamed.
+    fn stream32(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, q: Affine4, out: u64, rows: usize) !bool {
+        if (rows <= max_rows or rows > 32 or q.stream_w == 0 or q.n != 5120 or (q.k != 6144 and q.k != 17408) or splitK(q.n, q.k) != 4) return false;
+        const plain = a.stream32_fns[@as(usize, if (q.k == 6144) 1 else 0)] orelse return false;
+        const dict = q.npad == 5120 and a.coded(q) and a.stream32_dict_fn != null;
+        if ((q.k == 6144 or a.down_lane32) and a.lane32_fns[0] != null) {
+            // the lane form (lane_gemv's at 16 rows): one 64-column CTA a tile, its four K slices chained
+            const ldict = dict and a.lane32_fns[1] != null;
+            var lp: Parts = std.mem.zeroes(Parts);
+            lp.count = 1;
+            lp.p[0] = .{ .w = q.stream_w, .scales = if (ldict) q.sb else q.s, .biases = if (ldict) q.tab else q.b, .out = out, .n = int(q.n), .npad = if (ldict) @bitCast(q.code) else int(q.npad), .sk = 4, .tiles = if (ldict) int(q.npad) else 80, .first = 0 };
+            var lg: launch_.Args = .{};
+            lg.add(x); lg.add(xs); lg.add(lp);
+            for ([_]usize{ rows, q.k, q.k }) |v| lg.add(int(v));
+            const lshared = if (ldict) linear.lane32_smem + 4 * 64 + q.tabBytesUpTo(linear.lane32_pair_tab_max) else linear.lane32_smem;
+            try launch_.launch(a.lane32_fns[@intFromBool(ldict)].?, .{ .grid = .{ .x = 80 }, .block = .{ .x = 128 }, .shared = lshared, .pdl = a.pdl }, s, &lg);
+            return true;
+        }
+        var parts: Parts = std.mem.zeroes(Parts);
+        parts.count = 1;
+        parts.p[0] = .{ .w = q.stream_w, .scales = if (dict) q.sb else q.s, .biases = if (dict) q.tab else q.b, .out = out, .n = int(q.n), .npad = if (dict) @bitCast(q.code) else int(q.npad), .sk = 4, .tiles = 80, .first = 0 };
+        var g: launch_.Args = .{};
+        g.add(x); g.add(xs); g.add(parts);
+        for ([_]usize{ rows, q.k, q.k }) |v| g.add(int(v));
+        const shared = if (dict) linear.out32_smem + 4 * linear.dict_dec + q.tabBytes() else linear.out32_smem;
+        try launch_.launch(if (dict) a.stream32_dict_fn.? else plain, .{ .grid = .{ .x = 80 }, .block = .{ .x = 256 }, .shared = shared, .pdl = a.pdl }, s, &g);
+        return true;
     }
 
     /// The same K slices through an input-independent alternate word-panel view.
@@ -783,15 +912,16 @@ pub const Affine4Kernels = struct {
     pub fn cluster(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, q: Affine4, out: u64, rows: usize, sk: usize) !void {
         const stream_fn = if (q.stream_w == 0) null else a.stream16_fns[@as(usize, if (q.k == 6144) 1 else 0)];
         if (rows == 16 and sk == 4 and q.n == 5120 and (q.k == 6144 or q.k == 17408) and q.stream_w != 0 and stream_fn != null) {
-            // a coded down projection streams its index windows in place of its scales and biases (the same bits)
-            const dict = q.k == 17408 and q.npad == 5120 and a.coded(q) and a.stream16_dict_fn != null;
+            // A coded down projection, or an eligible out/o projection, streams its index windows.
+            const dict = q.npad == 5120 and a.coded(q) and a.stream16_dict_fn != null and
+                (q.k == 17408 or a.dictOutStream(q, rows, sk));
             var parts: Parts = std.mem.zeroes(Parts);
             parts.count = 1;
             parts.p[0] = .{ .w = q.stream_w, .scales = if (dict) q.sb else q.s, .biases = if (dict) q.tab else q.b, .out = out, .n = int(q.n), .npad = if (dict) @bitCast(q.code) else int(q.npad), .sk = 4, .tiles = 80, .first = 0 };
             var g: launch_.Args = .{};
             g.add(x); g.add(xs); g.add(parts);
             for ([_]usize{ rows, q.k, q.k }) |v| g.add(int(v));
-            const shared = if (dict) group_smem + 4 * linear.dict_dec + q.tabBytes() else group_smem;
+            const shared = if (dict) group_smem + q.tabBytesUpTo(linear.out_pair_tab_max) else group_smem;
             return launch_.launch(if (dict) a.stream16_dict_fn.? else stream_fn.?, .{ .grid = .{ .x = 80 }, .block = .{ .x = 512 }, .shared = shared, .pdl = a.pdl }, s, &g);
         }
         const tiles = (q.n + 63) / 64;
@@ -831,3 +961,15 @@ pub const Affine4Kernels = struct {
         try launch_.launch(f, .{ .grid = .{ .x = u(grid), .y = 1, .z = 1 }, .block = .{ .x = threads }, .shared = smem }, s, &g);
     }
 };
+
+/// The 32-row twins' switch (qmm_stream32.cuh): TF_STREAM32=0 keeps 17 to 32-row windows on the earlier kernels.
+pub fn stream32On() bool {
+    const v = @import("sys").c.getenv("TF_STREAM32") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
+
+/// TF_W32_MIXED=0: attention's 17 to 32-row q and k/v back on two launches (A/B).
+fn mixed32On() bool {
+    const v = @import("sys").c.getenv("TF_W32_MIXED") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
