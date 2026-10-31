@@ -169,7 +169,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
         // a captured forward's first layer is a graph of its own (cuda_engine.zig's cutCapture)
         if (i == 0) try e.cutCapture();
     }
-    try finish(e, total, heads, shape.hidden);
+    try finish(e, total, heads, shape.hidden, if (@hasField(@TypeOf(shape), "amax")) shape.amax else false);
 }
 
 /// TF_GDN_ROWS4=0: 16..64-row windows keep one row warp a block in tf_q35_gdn_pre.
@@ -216,7 +216,7 @@ fn sharedSized(e: *E.Engine, f: cuda.Function, comptime s: sig.Sig, grid: [3]usi
 }
 
 /// Layer inputs are already kept; hidden reads need neither the final norm nor the vocabulary head.
-pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool) !void {
+pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool, amax: bool) !void {
     if (hidden) return;
     const g = e.g;
     if (e.learning == null and heads < total) {
@@ -226,6 +226,12 @@ pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool) !void {
     } else {
         try e.norm(true, e.final_norm, total);
         if (e.learning) |k| try k.final(e.h, total);
+        if (@hasField(@TypeOf(e.*), "head_amax")) if (amax) {
+            // a greedy verify: the norm wrote the rows' group sums (projAgain's input); the head's tile writes each
+            // row's best a tile and the merge each row's token (cuda_engine.zig forward then skips its argmax)
+            const x = e.x + (total - heads) * g.hidden * 2;
+            return e.affine.headArgmax(e.stream, x, e.xs, e.head.a4, e.head_amax, heads, e.tables.ptr + @import("cuda_round.zig").tokens_at);
+        };
         if (@hasDecl(@TypeOf(e.*), "projAgain"))
             try e.projAgain(e.head, e.x + (total - heads) * g.hidden * 2, e.logits, heads, false)
         else
