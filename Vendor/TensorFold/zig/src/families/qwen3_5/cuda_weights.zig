@@ -179,7 +179,10 @@ fn pack4(e: *Engine, into: anytype, raw: [3]u64, n: usize, k: usize) !Affine4 {
     try e.affine.pack(e.stream, raw[0], raw[1], raw[2], q);
     // the target's projections: their scales and biases dictionary-coded for the decode kernels too (gate and up's
     // group-major for tf_qmm_mlp_single16's K-major panels, when the engine runs it; tile-major for the rest)
-    if (comptime @TypeOf(into) == *Engine) if (e.dict) |*ds| try e.affine.encode(e.stream, &q, ds, e.dict_kmajor and n == 17408 and k == 5120);
+    if (comptime @TypeOf(into) == *Engine) if (e.dict) |*ds| {
+        const kmajor = e.dict_kmajor and n == 17408 and k == 5120;
+        try e.affine.encode(e.stream, &q, ds, kmajor, cuda.qlinear.pairTabRoom(n, k, kmajor));
+    };
     return q;
 }
 

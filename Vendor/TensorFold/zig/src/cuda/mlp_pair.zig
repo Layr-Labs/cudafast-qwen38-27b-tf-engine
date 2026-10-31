@@ -56,6 +56,11 @@ pub const Kernels = struct {
         return gate.code != 0 and up.code != 0 and gate.code & qlinear.dict_kmajor == want and up.code & qlinear.dict_kmajor == want;
     }
 
+    /// tf_qmm_mlp_single16's shared table bytes for q: a pair code's table is read through L2 there (none).
+    fn singleTab(q: Affine4) u32 {
+        return if (qlinear.pairCode(q.code)) 0 else q.tabBytes();
+    }
+
     /// Whether `pair` takes this gate and up: one shape whose decode() is group_kernel's one-slice tile.
     pub fn fits(gate: Affine4, up: Affine4) bool {
         return gate.n == up.n and gate.k == up.k and gate.npad == up.npad and gate.n % 64 == 0 and gate.k % 64 == 0 and
@@ -73,7 +78,7 @@ pub const Kernels = struct {
         // the twins: tf_qmm_mlp_pair's (npad carries the code) and tf_qmm_mlp_single16's (first carries it; npad
         // stays, the panel's group pitch); tf_qmm_mlp_pair_kmajor16 has none
         const dict = !major and kk.dict_fn != null and coded(gate, up, false);
-        const sdict = single and kk.single_dict_fn != null and coded(gate, up, true) and gate.tabBytes() + up.tabBytes() <= single_tab_max;
+        const sdict = single and kk.single_dict_fn != null and coded(gate, up, true) and singleTab(gate) + singleTab(up) <= single_tab_max;
         var parts: qlinear.Parts = std.mem.zeroes(qlinear.Parts);
         for ([2]Affine4{ gate, up }, parts.p[0..2]) |q, *p| p.* = .{
             .w = q.w,
@@ -99,7 +104,7 @@ pub const Kernels = struct {
         g.add(as);
         for ([_]usize{ rows, gate.k, gate.k, rows_t }) |v| g.add(@as(c_int, @intCast(v)));
         const f = if (sdict) kk.single_dict_fn.? else if (major) kk.kmajor_fn.? else if (dict) kk.dict_fn.? else kk.pair_fn;
-        const shared: u32 = if (sdict) single_smem + single_dict_dec + gate.tabBytes() + up.tabBytes() else if (single) single_smem else if (major) kmajor_smem else if (dict) smem + qlinear.dict_dec + @max(gate.tabBytes(), up.tabBytes()) else smem;
+        const shared: u32 = if (sdict) single_smem + single_dict_dec + singleTab(gate) + singleTab(up) else if (single) single_smem else if (major) kmajor_smem else if (dict) smem + qlinear.dict_dec + @max(gate.tabBytes(), up.tabBytes()) else smem;
         try launch_.launch(f, .{ .grid = .{ .x = @intCast(@as(usize, if (single) 1 else 2) * rows_t * tiles) }, .block = .{ .x = 128 }, .shared = shared, .cluster = if (single) null else .{ .x = 2 }, .pdl = kk.pdl }, s, &g);
     }
 };

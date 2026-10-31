@@ -76,7 +76,11 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
             },
             .attention => |m| {
                 const aw = g.attnWidth();
-                try e.projMany(&.{ m.q, m.k, m.v }, e.x, &.{ e.qraw, e.kraw, e.vraw }, total, prompt);
+                if (tail and i == e.layers.len - 1) {
+                    // the tail's layer: keys and values for every row, queries (and gate) for the last row alone
+                    try e.projMany(&.{ m.k, m.v }, e.x, &.{ e.kraw, e.vraw }, total, prompt);
+                    try @import("cuda_prompt_tail.zig").query(e, m.q.a4, total);
+                } else try e.projMany(&.{ m.q, m.k, m.v }, e.x, &.{ e.qraw, e.kraw, e.vraw }, total, prompt);
                 if (e.learning) |k| try k.attention(i, e.qraw, e.kraw, e.vraw, total);
                 if (prompt and total > 16 and !e.kv8) {
                     // Preserve the original two head sums and bf16 boundary before rotary/cache stores.
@@ -153,6 +157,8 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
         if (shape.taps) for (e.taps[0..e.n_taps], 0..) |t, ti| if (t == i) {
             try e.run(e.fns.tap, .{ total, (g.hidden + 2047) / 2048, 1 }, .{ 256, 1, 1 }, .{ e.h, e.r, t_segs, t_rows, @as(c_int, @intCast(ti)), @as(c_int, @intCast(g.hidden)), t_params });
         };
+        // a captured forward's first layer is a graph of its own (cuda_engine.zig's cutCapture)
+        if (i == 0) try e.cutCapture();
     }
     try finish(e, total, heads, shape.hidden);
 }
