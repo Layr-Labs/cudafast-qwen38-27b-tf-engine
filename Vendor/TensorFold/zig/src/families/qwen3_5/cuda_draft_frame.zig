@@ -172,13 +172,18 @@ pub fn forward(d: anytype, items: []const dr.Hold, contexts: []const *draft.Ctx)
     try publish(d, items, contexts);
 }
 
-/// A lane stream's prompt and reply tokens since the last scan: one outside the spans marks the stream wide.
+/// A stream's tokens outside the spans may outnumber this share of its tokens before the frame reads the whole head.
+const wide_share = 32;
+
+/// A lane stream's prompt and reply tokens since the last scan: the stream is wide (the frame reads the whole head)
+/// once tokens outside the spans are more than 1 in `wide_share` of its tokens. A few rare tokens in a prompt keep the
+/// span head: the whole head costs a 248,320-row projection every frame, against 98,592 rows for the spans.
 pub fn scan(ctx: *draft.Ctx, toks: []const u32) void {
-    if (!ctx.wide) for (toks[@min(ctx.scanned, toks.len)..]) |t| if (t >= spans[0][1] and t < spans[1][0]) {
-        ctx.wide = true;
-        break;
+    for (toks[@min(ctx.scanned, toks.len)..]) |t| if (t >= spans[0][1] and t < spans[1][0]) {
+        ctx.outside += 1;
     };
     ctx.scanned = toks.len;
+    ctx.wide = ctx.outside * wide_share > ctx.scanned;
 }
 
 /// Whether every stream's tokens so far keep to the spans (a warmup's or standalone hold's context reads none).
