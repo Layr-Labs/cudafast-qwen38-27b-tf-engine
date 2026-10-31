@@ -136,12 +136,14 @@ fn quantize(gpa: std.mem.Allocator, w: []align(1) const u16, n: usize, k: usize)
 }
 
 /// A group's (scale, bias) improved by alternating code assignment and a least-squares line fit; kept only where the
-/// squared error with bf16-rounded scale and bias drops.
+/// squared error with bf16-rounded scale and bias drops. Each pass keeps the best fit seen, so the returned group error
+/// is monotone non-increasing in the pass count: sixteen passes a group, twice the eight the earlier tree fitted with,
+/// where the alternation had not yet reached its fixed point. This runs once at load, on the drafter's weights only.
 fn leastSquares(row: []align(1) const u16, start: [2]f32) [2]f32 {
     var best = start;
     var best_err = groupError(row, start);
     var cur = start;
-    for (0..3) |_| {
+    for (0..16) |_| {
         const s = cur[0];
         if (s <= 0) break;
         var sq: f64 = 0;
