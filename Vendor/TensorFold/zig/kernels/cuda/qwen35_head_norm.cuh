@@ -1,9 +1,11 @@
 // Per-head RMSNorm of attention rows, out packed (rows, heads, HD); grid (rows * heads), 64 threads of 4 values.
-extern "C" __global__ void __launch_bounds__(64) tf_q35_head_norm(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W,
-                                                                    __nv_bfloat16* __restrict__ OUT, int heads, int stride, int hstride, float eps,
+extern "C" __global__ void __launch_bounds__(64) tf_q35_head_norm(const __nv_bfloat16* __restrict__ X0, const __nv_bfloat16* __restrict__ W,
+                                                                    __nv_bfloat16* __restrict__ OUT0, int heads, int stride, int hstride, float eps,
                                                                     const int* __restrict__ P) {
     release_next();
     await_prior();
+    const __nv_bfloat16* X = after_wait(X0);
+    __nv_bfloat16* OUT = after_wait(OUT0);
     __shared__ float sums[2];
     const int head = blockIdx.x % heads;
     if (past_rows(P, blockIdx.x / heads)) return;

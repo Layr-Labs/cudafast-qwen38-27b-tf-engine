@@ -16,6 +16,25 @@ __device__ __forceinline__ float warp_sum(float x) {
     return x;
 }
 
+__device__ __forceinline__ void copy_row(const __nv_bfloat16* __restrict__ src, __nv_bfloat16* __restrict__ dst, int width) {
+    if ((width & 7) == 0 && ((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst)) & 15) == 0) {
+        const uint4* s = reinterpret_cast<const uint4*>(src);
+        uint4* d = reinterpret_cast<uint4*>(dst);
+        const int n = width / 8, step = blockDim.x;
+        int i = threadIdx.x;
+        for (; i + 3 * step < n; i += 4 * step) {
+            const uint4 a = s[i], b = s[i + step], c = s[i + 2 * step], e = s[i + 3 * step];
+            d[i] = a;
+            d[i + step] = b;
+            d[i + 2 * step] = c;
+            d[i + 3 * step] = e;
+        }
+        for (; i < n; i += step) d[i] = s[i];
+        return;
+    }
+    for (int i = threadIdx.x; i < width; i += blockDim.x) dst[i] = src[i];
+}
+
 }  // namespace tf_q35d
 
 using namespace tf_q35d;
@@ -24,9 +43,7 @@ using namespace tf_q35d;
 extern "C" __global__ void tf_q35d_gather_taps(const __nv_bfloat16* __restrict__ RING, int R, long long start, int width,
                                                  __nv_bfloat16* __restrict__ OUT) {
     const long long row = start + blockIdx.x;
-    const __nv_bfloat16* src = RING + (size_t)(row % R) * width;
-    __nv_bfloat16* dst = OUT + (size_t)blockIdx.x * width;
-    for (int i = threadIdx.x; i < width; i += blockDim.x) dst[i] = src[i];
+    copy_row(RING + (size_t)(row % R) * width, OUT + (size_t)blockIdx.x * width, width);
 }
 
 // Rows of a window to gather, by value (a tree's kept path).
@@ -39,9 +56,7 @@ struct TapRows {
 extern "C" __global__ void tf_q35d_gather_rows(const __nv_bfloat16* __restrict__ RING, int R, long long start, TapRows rows, int width,
                                                  __nv_bfloat16* __restrict__ OUT) {
     const long long row = start + rows.rows[blockIdx.x];
-    const __nv_bfloat16* src = RING + (size_t)(row % R) * width;
-    __nv_bfloat16* dst = OUT + (size_t)blockIdx.x * width;
-    for (int i = threadIdx.x; i < width; i += blockDim.x) dst[i] = src[i];
+    copy_row(RING + (size_t)(row % R) * width, OUT + (size_t)blockIdx.x * width, width);
 }
 
 // y[t, c] = sum over lags l of (BASE[l, c] + DYN[t, l, c / group]) * x[t - l, c] in bf16 steps; x[-1] = 0; RES last.

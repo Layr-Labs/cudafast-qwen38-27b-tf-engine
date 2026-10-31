@@ -5,10 +5,12 @@
 #include <stdint.h>
 
 #include "qmm_frag.cuh"
+#include "qmm_dict.cuh"
 
 namespace tf_lane_gemv {
 
 using namespace qmm_frag;
+using namespace qmm_dict;
 
 struct Part {
     const uint32_t* w;
@@ -34,7 +36,7 @@ template <int GS, int BN, int STAGES>
 using GemvTile = LaneTile<GS, 16, BN, 1, 4, STAGES>;
 
 // Visit mapped groups in order, preserving group_kernel's MMA and fma chain before after(i).
-template <int GS, int BN, int STAGES, typename Map, typename After>
+template <int GS, int BN, int STAGES, bool DICT = false, typename Map, typename After>
 __device__ __forceinline__ void gemv_items(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs, const Part& P, int M,
                                            int K, int ldx, int items, Map map, float (&acc)[GemvTile<GS, BN, STAGES>::NT][4],
                                            After after) {
@@ -75,6 +77,10 @@ __device__ __forceinline__ void gemv_items(const __nv_bfloat16* __restrict__ x, 
         soff[j] = off * 8;
         sdst[j] = T::X + T::W + which * T::S + off * 16;
     }
+    [[maybe_unused]] const DictLanes D = [&] {
+        if constexpr (DICT) return dict_lanes<BN, 4>(P, 0, KG, tid);
+        else return DictLanes{};
+    }();
     const bool xsok = tid < rows;
     const float* xssrc = xs + static_cast<size_t>(min(tid, rows - 1)) * KG;
     auto load_x = [&](int s, int i) {
@@ -94,9 +100,13 @@ __device__ __forceinline__ void gemv_items(const __nv_bfloat16* __restrict__ x, 
 #pragma unroll
         for (int j = 0; j < WC; ++j)
             if (wok[j]) cp16(p + wdst[j], wb + woff[j] + static_cast<size_t>(g) * TILE_BYTES);
+        if constexpr (DICT) {
+            if (D.ok) cp16(p + T::X + T::W + tid * 16, D.src + static_cast<size_t>(n0 / 64) * KG * D.step + dict_window(D, g));
+        } else {
 #pragma unroll
-        for (int j = 0; j < SC; ++j)
-            if (sok[j]) cp16(p + sdst[j], (sbias[j] ? P.biases : P.scales) + n0 + soff[j] + static_cast<size_t>(g) * P.npad);
+            for (int j = 0; j < SC; ++j)
+                if (sok[j]) cp16(p + sdst[j], (sbias[j] ? P.biases : P.scales) + n0 + soff[j] + static_cast<size_t>(g) * P.npad);
+        }
     };
     uint32_t mask;
     asm volatile("mov.b32 %0, 0x000F000F;\n" : "=r"(mask));
@@ -106,6 +116,7 @@ __device__ __forceinline__ void gemv_items(const __nv_bfloat16* __restrict__ x, 
 #pragma unroll
             for (int s = 0; s < STAGES; ++s)
                 *reinterpret_cast<uint4*>(stage(s) + c / T::CHUNKS * T::ROW + c % T::CHUNKS * 16) = uint4{};
+    if constexpr (DICT) dict_table<T::THREADS>(P, buf + T::SMEM + DICT_DEC, tid);
 #pragma unroll
     for (int s = 0; s < STAGES - 1; ++s) {
         if (s < items) load_w(s, s);
@@ -129,7 +140,9 @@ __device__ __forceinline__ void gemv_items(const __nv_bfloat16* __restrict__ x, 
         commit();
         const unsigned char* p = stage(it % STAGES);
         const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
-        const __nv_bfloat16* ps = reinterpret_cast<const __nv_bfloat16*>(p + T::X + T::W);
+        if constexpr (DICT) dict_decode(D, p + T::X + T::W, buf + T::SMEM, map(it).x);
+        const __nv_bfloat16* ps = DICT ? reinterpret_cast<const __nv_bfloat16*>(buf + T::SMEM)
+                                       : reinterpret_cast<const __nv_bfloat16*>(p + T::X + T::W);
         const float* px = reinterpret_cast<const float*>(p + T::X + T::W + 2 * T::S);
         uint32_t words[NT][GS / 32];
 #pragma unroll
@@ -150,6 +163,7 @@ __device__ __forceinline__ void gemv_items(const __nv_bfloat16* __restrict__ x, 
                 else mma(d[j], a, b0, b1);
             }
         }
+        if constexpr (DICT) __syncwarp();
         const int row = lane >> 2;
         const float xv[2] = {px[row], px[row + 8]};
 #pragma unroll
@@ -188,7 +202,7 @@ __device__ __forceinline__ void gemv_store(const Part& P, int M, int n0, Got got
         }
 }
 
-template <int GS, int BN, int STAGES>
+template <int GS, int BN, int STAGES, bool DICT = false>
 __device__ __forceinline__ void gemv_tiles(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs, const Part& P, int M,
                                            int K, int ldx, int bid, int nb) {
     constexpr int NT = GemvTile<GS, BN, STAGES>::NT;
@@ -200,7 +214,7 @@ __device__ __forceinline__ void gemv_tiles(const __nv_bfloat16* __restrict__ x, 
     for (int j = 0; j < NT; ++j)
 #pragma unroll
         for (int e = 0; e < 4; ++e) acc[j][e] = tot[j][e] = 0.0f;
-    gemv_items<GS, BN, STAGES>(x, xs, P, M, K, ldx, mine * KG, [&](int i) { return make_int2(i % KG, tile_of_item(i) * BN); }, acc,
+    gemv_items<GS, BN, STAGES, DICT>(x, xs, P, M, K, ldx, mine * KG, [&](int i) { return make_int2(i % KG, tile_of_item(i) * BN); }, acc,
                                [&](int it) {
                                    const int g = it % KG;
                                    if ((g + 1) % per != 0) return;
@@ -334,4 +348,23 @@ extern "C" __global__ void __launch_bounds__(128) tf_lane_gemv_many(const __nv_b
             end = i + 1 < S.count ? S.first[i + 1] : (int)gridDim.x;
         }
     tf_lane_gemv::gemv_tiles<64, 64, 8>(x, xs, P, M, K, ldx, (int)blockIdx.x - first, end - first);
+}
+
+extern "C" __global__ void __launch_bounds__(128) tf_lane_gemv_dict(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
+                                                                    const __grid_constant__ tf_lane_gemv::Part P, int M, int K, int ldx) {
+    tf_lane_gemv::gemv_tiles<64, 64, 8, true>(x, xs, P, M, K, ldx, (int)blockIdx.x, (int)gridDim.x);
+}
+
+extern "C" __global__ void __launch_bounds__(128) tf_lane_gemv_many_dict(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
+                                                                         const __grid_constant__ tf_lane_gemv::Many S, int M, int K, int ldx) {
+    tf_lane_gemv::Part P = S.p[0];
+    int first = 0, end = S.count > 1 ? S.first[1] : (int)gridDim.x;
+#pragma unroll
+    for (int i = 1; i < tf_lane_gemv::MANY; ++i)
+        if (i < S.count && (int)blockIdx.x >= S.first[i]) {
+            P = S.p[i];
+            first = S.first[i];
+            end = i + 1 < S.count ? S.first[i + 1] : (int)gridDim.x;
+        }
+    tf_lane_gemv::gemv_tiles<64, 64, 8, true>(x, xs, P, M, K, ldx, (int)blockIdx.x - first, end - first);
 }

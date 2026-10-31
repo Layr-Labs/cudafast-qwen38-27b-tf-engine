@@ -32,6 +32,8 @@ pub const max_rows = Round.max_rows;
 pub const max_segs = Round.max_segs;
 /// Rows of a verify forward at most: each row's logits are kept and drawn.
 pub const most_verify = Round.most_verify;
+/// L2 set aside for a prompt chunk's residual rows (a 496-row chunk's are 5 MB; GB10 allows 18 MB).
+const l2_persist_bytes: usize = 8 << 20;
 /// tf_q35_argmax_slices' blocks a row (ARGMAX_SLICE entries each).
 fn argmaxSlices(vocab: usize) usize {
     return (vocab + 4095) / 4096;
@@ -108,8 +110,14 @@ pub const Engine = struct {
     int8: @import("cuda_prompt_int8.zig").State = .{}, // prompt projections with int8 activations, when on
     draws: cuda.sample.Draws,
     affine: cuda.qlinear.Affine4Kernels,
+    dict: ?cuda.qlinear.DictStore, // the decode kernels' dictionary-coded scales and biases (GB10; TF_DICT=0: none)
+    dict_kmajor: bool, // gate and up coded group-major, for tf_qmm_mlp_single16 on the K-major panels (TF_MLP_KMAJOR=2)
     prompt_many: cuda.prompt_many.Kernels, // prompt GEMMs, several projections of one input a launch
     mlp_pair: cuda.mlp_pair.Kernels, // decode gate, up and activation in one launch (qmm_group.cu tf_qmm_mlp_pair)
+    /// L2 set aside for persisting lines (0: none) and, during a prompt chunk's forward, the residual rows' window:
+    /// each norm writes the rows it reads a sublayer later, past a projection's weights streaming through L2.
+    l2_persist: usize = 0,
+    h_window: ?cuda.abi.AccessPolicyWindow = null,
     wide_words: ?DeviceBuffer = null,
     projection_streams: ?DeviceBuffer = null,
     wide: cuda.qlinear.AffineNKernels, // the tiles of every width but 4, and their packs
@@ -215,6 +223,8 @@ pub const Engine = struct {
         e.mlp = null;
         e.taught = 0;
         e.kit = null;
+        e.dict = null;
+        e.dict_kmajor = false;
         e.d = d;
         e.g = g;
         e.geo = .{ .hid = @intCast(g.hidden), .nk = @intCast(g.k_heads), .nv = @intCast(g.v_heads), .qh = @intCast(g.q_heads), .kvh = @intCast(g.kv_heads), .nl = @intCast(g.deltas()) };
@@ -233,7 +243,11 @@ pub const Engine = struct {
         defer ck.close();
         // an EXL3 checkpoint's weights are sized by a dry run of its loader (trellis widths come from the tensors)
         const wbytes = if (g.exl3) try x3w.measure(e, &ck) else weights.total(g);
-        e.arena = try DeviceBuffer.alloc(d, wbytes + try e.scratch(.measure));
+        const arena_bytes = wbytes + try e.scratch(.measure);
+        // the small free blocks earlier engines left, held while the weights commit in large ones (cuda_sponge.zig)
+        var sponge = @import("cuda_sponge.zig").take(d, arena_bytes);
+        defer sponge.free();
+        e.arena = try DeviceBuffer.alloc(d, arena_bytes);
         errdefer e.arena.free();
         try e.arena.fill8(0, null); // touched once now: the driver commits memory on first touch, slowly
         const kk = cuda.kernels;
@@ -252,10 +266,25 @@ pub const Engine = struct {
         e.affine.half_prompt = !gb10; // the 27B's prompt tile (Tile<64, 128, 128, 2, 2, 2>), quicker on an RTX 5090
         // GB10: split-K decode/verify projections on the cluster tile (bits unchanged); TF_CLUSTER_DECODE=0 restores lane_gemv
         e.affine.cluster_decode = gb10 and !envOff("TF_CLUSTER_DECODE");
+        // prompt chunks keep the residual rows in L2 across their projections (cache residency only, never a value)
+        e.l2_persist = 0;
+        if (gb10 and !envOff("TF_L2_PERSIST") and d.api.cuCtxSetLimit(cuda.abi.limit_persisting_l2, l2_persist_bytes) == cuda.abi.success) e.l2_persist = l2_persist_bytes;
         e.affine.group_wide = gb10 and !envOff("TF_WIDE_GROUP");
+        // GB10: out/o (short K slices) on lane_gemv's column CTAs instead (bits unchanged); TF_SHORT_LANE=0 restores the cluster tile
+        e.affine.short_lane = gb10 and !envOff("TF_SHORT_LANE");
         errdefer e.affine.deinit();
         e.prompt_many = try cuda.prompt_many.Kernels.resolve(e.mods[1], sms);
         e.mlp_pair = try cuda.mlp_pair.Kernels.resolve(e.mods[0], gb10);
+        // GB10: the decode projections read their scales and biases as dictionary indices built at load (exact: the
+        // tables hold every value); TF_DICT=0 keeps every launch on the (kg, npad) arrays
+        if (envOff("TF_DICT")) {
+            e.affine.dict = null;
+            e.mlp_pair.dict_fn = null;
+        }
+        if (e.affine.dict != null) e.dict = try cuda.qlinear.DictStore.init(d);
+        // the same choice as verify_weight_layout.prepare's below: tf_qmm_mlp_single16 unless TF_MLP_KMAJOR says otherwise
+        e.dict_kmajor = gb10 and std.mem.eql(u8, std.mem.span(@import("sys").c.getenv("TF_MLP_KMAJOR") orelse "2"), "2");
+        errdefer if (e.dict) |*ds| ds.deinit();
         // sm_120 too: a 32-row window of the 27B verifies in 17.8 ms on one weight pass, 22.3 ms on two 16-row ones
         if (major == 12 and minor == 0) e.affine.wide_verify = true;
         e.wide = try cuda.qlinear.AffineNKernels.resolve(d, e.mods[7], e.mods[8], e.mods[3], sms, gb10);
@@ -346,6 +375,7 @@ pub const Engine = struct {
         for (e.blocks.items) |*b| b.buffer.free();
         e.blocks.deinit(e.gpa);
         @import("cuda_cache.zig").forget(e);
+        if (e.dict) |*ds| ds.deinit();
         e.affine.deinit();
         e.wide.deinit();
         e.int8.deinit();
@@ -464,6 +494,14 @@ pub const Engine = struct {
 
     pub const norm = @import("cuda_norm.zig").norm;
     pub const normInput = @import("cuda_norm.zig").normInput;
+
+    /// The residual rows of a prompt chunk of `rows` as a persisting L2 window (null: none set aside, or a window).
+    pub fn hWindow(e: *const Engine, rows: usize) ?cuda.abi.AccessPolicyWindow {
+        if (e.l2_persist == 0 or rows <= 16) return null;
+        const bytes = rows * e.g.hidden * 2;
+        const ratio: f32 = @min(1.0, @as(f32, @floatFromInt(e.l2_persist)) / @as(f32, @floatFromInt(bytes)));
+        return .{ .base = e.h, .bytes = bytes, .hit_ratio = ratio, .hit_prop = cuda.abi.access_persisting, .miss_prop = cuda.abi.access_streaming };
+    }
     pub const normTail = @import("cuda_norm.zig").normTail;
 
     /// Refuse the whole frame before settling any prior window or launching work.
@@ -568,6 +606,8 @@ pub const Engine = struct {
             // uncaptured: a prompt chunk's GEMMs dwarf its launches, and each length's graph would pay the stall
             e.features = if (images) |im| im.features else 0;
             defer e.features = 0;
+            e.h_window = e.hWindow(total);
+            defer e.h_window = null;
             try e.body(shape);
         } else {
             const gop = try e.graphs.getOrPut(e.gpa, shape.key());
@@ -609,6 +649,8 @@ pub const Engine = struct {
                 const out = e.host_logits.bytes[0 .. heads * g.vocab * 2];
                 try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(out.ptr, e.logits, out.len, e.stream.handle), "cuMemcpyDtoHAsync");
                 try e.stream.synchronize();
+                // the chunk is done: its persisting lines turn normal, so decode has all of L2
+                if (prompt and e.l2_persist > 0) _ = e.d.api.cuCtxResetPersistingL2Cache();
                 if (keep == .last) @memcpy(parts[0].cache.logits, e.rowLogits(0));
             },
         }
