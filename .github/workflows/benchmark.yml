@@ -75,6 +75,7 @@
 #
 # FAIL-CLOSED INVENTORY -- items 1-6 abort before benchd runs, so no
 # score.json can exist, and none of them has a degraded path:
+#   Guard: preflight stops leaked exact-name residents while holding the GPU lock.
 #   1. benchd resolve mismatch. ./tools/fetch-benchd.sh accepts only a binary
 #      matching the channel's benchd.manifest.json {sha256, bytes} AND the
 #      aarch64-unknown-linux-gnu platform (target_triple plus the binary's own
@@ -452,6 +453,10 @@ jobs:
           fi
           printf 'SERVE_UP_LOG_DIR=%s\n' "${resident_log_dir}" >> "${GITHUB_ENV}"
 
+      # A cancelled job cannot run its own --stop.
+      - name: Stop resident containers left by an earlier job (GPU lock, exact name match)
+        run: ./tools/stop-leaked-residents.sh --mode preflight --lock-wait 900
+
       - name: Ranked box preflight (staged assets, contract pins, no credential)
         # Items 2-5 of the fail-closed inventory in this file's header. Runs
         # before ./setup.sh, so a mis-staged box is refused before it spends
@@ -784,6 +789,10 @@ jobs:
           fi
           job_dir="${SANDBOX_ROOT}/${SANDBOX_JOB}"
           rc=0
+          # Fail closed: if an exact-name resident exists, any non-zero exit (including
+          # 3 when the GPU lock is held) leaves no cleanup-ok, so nothing is revealed.
+          # The next job's preflight stops any leftover container.
+          ./tools/stop-leaked-residents.sh --mode cleanup --lock-wait 120 || rc=1
           if command -v sudo >/dev/null 2>&1; then
             sudo -n -u "${SANDBOX_USER}" -- kill -KILL -1 >/dev/null 2>&1 || true
             for sub in zig-global-cache zig-cache out sock adapter-home; do
