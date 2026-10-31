@@ -382,3 +382,31 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35d_attn_merge(const float*
 #pragma unroll
     for (int i = 0; i < DPL; ++i) OUT[((size_t)m * heads + h) * HD + lane * DPL + i] = __float2bfloat16_rn(out[i] / sum);
 }
+
+// Concatenate two head-column spans in the native [tile][group][j][lane][v] layout. Payload words are copied
+// unchanged; only their column address moves. Scales and biases keep the exact bf16 values, padding is zero.
+extern "C" __global__ void tf_q35d_pack_head(const uint32_t* W, const uint16_t* S, const uint16_t* B,
+        uint32_t* OW, uint16_t* OS, uint16_t* OB, int kg, int npad, int outpad, int first, int tail, int width) {
+    const size_t at = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t words = size_t(outpad) * kg * 8;
+    if (at < words) {
+        const int v = at & 1, lane = (at >> 1) & 31, j = (at >> 6) & 7;
+        const size_t tg = at >> 9;
+        const int g = tg % kg;
+        const int col = (tg / kg) * 64 + j * 8 + (lane >> 2);
+        uint32_t w = 0;
+        if (col < width) {
+            const int src = col < first ? col : tail + col - first;
+            const size_t pos = (((size_t(src / 64) * kg + g) * 8 + (src % 64) / 8) * 32
+                + (src % 8) * 4 + (lane & 3)) * 2 + v;
+            w = W[pos];
+        }
+        OW[at] = w;
+    }
+    if (at < size_t(outpad) * kg) {
+        const int col = at % outpad, g = at / outpad;
+        const int src = col < first ? col : tail + col - first;
+        OS[at] = col < width ? S[size_t(g) * npad + src] : 0;
+        OB[at] = col < width ? B[size_t(g) * npad + src] : 0;
+    }
+}

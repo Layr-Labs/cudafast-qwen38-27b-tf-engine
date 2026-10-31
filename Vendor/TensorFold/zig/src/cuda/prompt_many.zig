@@ -41,6 +41,8 @@ pub const Kernels = struct {
     split_fn: Function,
     /// CTAs the device runs at once: two of these tiles an SM.
     slots: usize,
+    terminal_many_fn: ?Function = null,
+    terminal_mlp_fn: ?Function = null,
     /// Native MLP, two-row normal/split projection, and three-row grouped projection.
     persistent_fns: [4]?Function = @splat(null),
 
@@ -67,6 +69,15 @@ pub const Kernels = struct {
                 dest.* = kernel;
             }
         }
+        const terminal_disabled = if (std.c.getenv("TF_PROMPT_TERMINAL")) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
+        if (sms == 48 and !terminal_disabled) {
+            const tm = try prefill_mod.function("tf_qmm_prompt_terminal_many");
+            const tl = try prefill_mod.function("tf_qmm_prompt_terminal_mlp");
+            try tm.allowDynamicShared(13312);
+            try tl.allowDynamicShared(13312);
+            result.terminal_many_fn = tm;
+            result.terminal_mlp_fn = tl;
+        }
         return result;
     }
 
@@ -87,13 +98,11 @@ pub const Kernels = struct {
     }
 
     fn outputRole(outs: []const Out) bool {
-        return outs.len == 1 and outs[0].q.n == 5120 and (outs[0].q.k == 6144 or outs[0].q.k == 17408);
+        return outs.len == 1 and outs[0].q.n == 5120 and (outs[0].q.k == 4096 or outs[0].q.k == 6144 or outs[0].q.k == 17408 or outs[0].q.k == 25600);
     }
 
     fn recurrentRole(outs: []const Out) bool {
-        if (outs.len != 4 or outs[0].q.k != 5120) return false;
-        for (outs, [_]usize{ 10240, 6144, 48, 48 }) |o, n| if (o.q.n != n) return false;
-        return true;
+        return outs.len >= 2 and outs[0].q.k == 5120;
     }
 
     /// The columns one projection's whole 128-wide tiles cover when its last panels run 64 wide (null: none do).
@@ -102,7 +111,8 @@ pub const Kernels = struct {
     pub fn splitCols(kk: *const Kernels, n: usize, rows: usize) ?usize {
         const cols = n / tile_n;
         const tiles = (rows + tile_m - 1) / tile_m * cols;
-        if (n % tile_n != 0 or cols < 10 or tiles <= kk.slots or tiles % kk.slots == 0) return null;
+        if (n % tile_n != 0 or cols < 10 or tiles % kk.slots == 0) return null;
+        if (tiles < kk.slots) return 0;
         return (cols - cols / 5) * tile_n;
     }
 
@@ -117,7 +127,7 @@ pub const Kernels = struct {
         if (!mlpFits(gate, up) or rows == 0) return error.InputMismatch;
         const k = gate.k;
         const rows_t = (rows + tile_m - 1) / tile_m;
-        const band = (12 << 20) / (tile_m * k * 2);
+        const band = (32 << 20) / (tile_m * k * 2);
         const group = @max(1, @min(rows_t, band));
         var parts: Parts = std.mem.zeroes(Parts);
         parts.p[0] = .{ .w = gate.w, .scales = gate.s, .biases = gate.b, .out = 0, .n = @intCast(gate.n), .npad = @intCast(gate.npad), .first = 0 };
@@ -129,9 +139,44 @@ pub const Kernels = struct {
         g.add(act);
         for ([_]usize{ rows, k, k, group }) |v| g.add(@as(c_int, @intCast(v)));
         const blocks = rows_t * (gate.n / 64);
-        if (kk.persistentRows(rows) and gate.n == 17408 and gate.k == 5120) if (kk.persistent_fns[0]) |f|
+        if (kk.slots == 96 and blocks > kk.slots and gate.n == 17408 and gate.k == 5120) if (kk.persistent_fns[0]) |f|
             return kk.persistent(f, s, x, parts, act, rows, k, group, -1, blocks);
         try launch_.launch(kk.mlp_fn, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = threads }, .shared = smem }, s, &g);
+    }
+
+    /// One final consumed row, with the prompt kernels' exact K16 arithmetic.
+    /// Its caller proves all other final-MLP rows have no remaining consumer.
+    pub fn mlpTerminal(kk: *const Kernels, s: Stream, x: u64, gate: Affine4, up: Affine4, down: Affine4, act: u64, out: u64) !void {
+        if (kk.terminal_mlp_fn == null or kk.terminal_many_fn == null) {
+            try kk.mlp(s, x, gate, up, act, 1);
+            return kk.prompt(s, act, &.{.{ .q = down, .out = out }}, 1);
+        }
+        if (!mlpFits(gate, up) or down.k != gate.n or down.n == 0 or down.n % 64 != 0) return error.InputMismatch;
+        var parts: Parts = std.mem.zeroes(Parts);
+        parts.p[0] = .{ .w = gate.w, .scales = gate.s, .biases = gate.b, .out = 0, .n = @intCast(gate.n), .npad = @intCast(gate.npad), .first = 0 };
+        parts.p[1] = .{ .w = up.w, .scales = up.s, .biases = up.b, .out = 0, .n = @intCast(up.n), .npad = @intCast(up.npad), .first = 0 };
+        parts.count = 2;
+        var a: launch_.Args = .{};
+        a.add(x);
+        a.add(parts);
+        a.add(act);
+        for ([_]usize{ 1, gate.k, gate.k, 1 }) |v| a.add(@as(c_int, @intCast(v)));
+        try launch_.launch(kk.terminal_mlp_fn.?, .{ .grid = .{ .x = @intCast(gate.n / 64) }, .block = .{ .x = threads }, .shared = 13312 }, s, &a);
+        try kk.projectTerminal(s, act, down, out);
+    }
+
+    /// One consumed row through a projection, with the native prompt K16 chain.
+    pub fn projectTerminal(kk: *const Kernels, s: Stream, x: u64, q: Affine4, out: u64) !void {
+        if (kk.terminal_many_fn == null) return kk.prompt(s, x, &.{.{ .q = q, .out = out }}, 1);
+        if (q.k == 0 or q.k % 64 != 0 or q.n == 0 or q.n % 64 != 0) return error.InputMismatch;
+        var parts: Parts = std.mem.zeroes(Parts);
+        parts.count = 1;
+        parts.p[0] = .{ .w = q.w, .scales = q.s, .biases = q.b, .out = out, .n = @intCast(q.n), .npad = @intCast(q.npad), .first = 0 };
+        var a: launch_.Args = .{};
+        a.add(x);
+        a.add(parts);
+        for ([_]usize{ 1, q.k, q.k, 1 }) |v| a.add(@as(c_int, @intCast(v)));
+        try launch_.launch(kk.terminal_many_fn.?, .{ .grid = .{ .x = @intCast((q.n + 127) / 128) }, .block = .{ .x = threads }, .shared = 13312 }, s, &a);
     }
 
     /// out_i (rows, n_i) = x (rows, k) through each of `outs`, every one with prefill_kernel's bits.
@@ -140,7 +185,7 @@ pub const Kernels = struct {
         const k = outs[0].q.k;
         const rows_t = (rows + tile_m - 1) / tile_m;
         // prefill_kernel's row band: the row tiles of a column panel that share it from L2
-        const band = (12 << 20) / (tile_m * k * 2);
+        const band = (32 << 20) / (tile_m * k * 2);
         const group = @max(1, @min(rows_t, band));
         if (outs.len == 1) if (kk.splitCols(outs[0].q.n, rows)) |full_cols| {
             const o = outs[0];
@@ -167,7 +212,7 @@ pub const Kernels = struct {
         }
         parts.count = @intCast(outs.len);
         const selected: ?usize = if (outputRole(outs)) 1 else if (recurrentRole(outs)) 3 else null;
-        if (kk.persistentRows(rows)) if (selected) |index| if (kk.persistent_fns[index]) |f|
+        if (kk.persistentRows(rows) and blocks > kk.slots) if (selected) |index| if (kk.persistent_fns[index]) |f|
             return kk.persistent(f, s, x, parts, 0, rows, k, group, -1, blocks);
         var g: launch_.Args = .{};
         g.add(x);

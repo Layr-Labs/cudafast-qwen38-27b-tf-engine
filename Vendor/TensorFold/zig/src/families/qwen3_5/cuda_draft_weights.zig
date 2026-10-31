@@ -192,7 +192,7 @@ fn hostBf16(gpa: std.mem.Allocator, ck: *core.Checkpoint, name: []const u8, shap
 pub fn load(gpa: std.mem.Allocator, io: std.Io, e: *Engine, dir: []const u8, s: Shape) !Weights {
     var ck = try core.Checkpoint.openModel(gpa, io, dir);
     defer ck.close();
-    var w: Weights = .{ .fc = undefined, .hidden_norm = 0, .final_norm = 0, .selector = undefined, .predecessor = &.{}, .successor = &.{}, .layers = &.{}, .arena = try DeviceBuffer.alloc(e.d, total(s)) };
+    var w: Weights = .{ .fc = undefined, .hidden_norm = 0, .final_norm = 0, .selector = undefined, .predecessor = &.{}, .successor = &.{}, .layers = &.{}, .arena = try @import("cuda_sponge.zig").allocHot(e.d, total(s)) };
     errdefer w.arena.free();
     try w.arena.fill8(0, null);
     var stage = try DeviceBuffer.alloc(e.d, stageBytes(s));

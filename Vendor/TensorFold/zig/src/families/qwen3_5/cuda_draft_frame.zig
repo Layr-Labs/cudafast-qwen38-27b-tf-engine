@@ -211,9 +211,35 @@ fn narrow(contexts: []const *draft.Ctx) bool {
     return true;
 }
 
+/// A value-exact compact view of the target head, built once without prompt content. The packed columns feed
+/// the existing projection directly, so the two temporary projections and their row-packing copies disappear.
+pub fn prepareHead(d: anytype) !void {
+    if (!draft.packedHead()) return;
+    const q = switch (d.e.head) { .a4 => |q| q, else => return };
+    if (q.n != spans[1][1] or q.k % 64 != 0) return;
+    const layout = cuda.qlinear.Affine4.layout(span_width, q.k);
+    var storage = try cuda.DeviceBuffer.alloc(d.e.d, layout.words + 2 * layout.scales);
+    errdefer storage.free();
+    var compact: cuda.qlinear.Affine4 = .{ .w = storage.ptr, .s = storage.ptr + layout.words,
+        .b = storage.ptr + layout.words + layout.scales, .n = span_width, .k = q.k, .npad = layout.npad };
+    const f = try d.mod.function("tf_q35d_pack_head");
+    try d.e.run(f, .{ (layout.words / 4 + 255) / 256, 1, 1 }, .{ 256, 1, 1 },
+        .{ q.w, q.s, q.b, compact.w, compact.s, compact.b, @as(c_int, @intCast(q.k / 64)),
+        @as(c_int, @intCast(q.npad)), @as(c_int, @intCast(compact.npad)), @as(c_int, @intCast(spans[0][1])),
+        @as(c_int, @intCast(spans[1][0])), @as(c_int, @intCast(span_width)) });
+    if (draft.dictionary()) if (d.e.dict) |*ds| try d.e.affine.encode(d.e.stream, &compact, ds, false, cuda.qlinear.pairTabRoom(compact.n, compact.k, false));
+    try d.e.stream.synchronize();
+    d.span_storage = storage;
+    d.span_head = compact;
+}
+
 /// The rows' draft logits over the spans' columns, packed in d.logits after the two projections (null: not this head).
 fn head(d: anytype, rows: usize) !?u64 {
     const e = d.e;
+    if (d.span_head) |q| {
+        try draft.precision.project(e, layers.Proj{ .a4 = q }, d.x, d.xs, d.logits, rows, .proposal, draft.precision.dflash_projection_prompt_cutoff);
+        return d.logits;
+    }
     const q = switch (e.head) {
         .a4 => |q| q,
         .an, .ql => return full(d, rows),

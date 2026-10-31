@@ -190,3 +190,5 @@ template __global__ void tf_qmm_persistent::kernel<128,1,true,false>(const __nv_
 template __global__ void tf_qmm_persistent_rows2::kernel<128,1,false,false>(const __nv_bfloat16* __restrict__, const __grid_constant__ tf_qmm_prefill::ManyParts, __nv_bfloat16* __restrict__, int,int,int,int,int,int,int);
 template __global__ void tf_qmm_persistent_rows2::kernel<128,1,false,true>(const __nv_bfloat16* __restrict__, const __grid_constant__ tf_qmm_prefill::ManyParts, __nv_bfloat16* __restrict__, int,int,int,int,int,int,int);
 template __global__ void tf_qmm_persistent_rows3::kernel<128,1,false,false>(const __nv_bfloat16* __restrict__, const __grid_constant__ tf_qmm_prefill::ManyParts, __nv_bfloat16* __restrict__, int,int,int,int,int,int,int);
+
+#include "qmm_prompt_terminal.cuh"

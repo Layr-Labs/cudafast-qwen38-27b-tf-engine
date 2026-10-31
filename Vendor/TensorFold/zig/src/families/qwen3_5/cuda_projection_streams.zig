@@ -2,7 +2,7 @@
 const cuda = @import("cuda");
 const layers = @import("cuda_layers.zig");
 
-fn candidates(layer: *layers.Layer, input: bool, output: bool) [6]?*layers.Proj {
+fn candidates(layer: *layers.Layer, input: bool, output: bool, attention: bool) [6]?*layers.Proj {
     var list: [6]?*layers.Proj = @splat(null);
     if (output) switch (layer.mlp) { .dense => |*m| { list[0] = &m.down; }, else => {} };
     switch (layer.mixer) {
@@ -14,7 +14,14 @@ fn candidates(layer: *layers.Layer, input: bool, output: bool) [6]?*layers.Proj 
                 list[2] = &m.qkv; list[3] = &m.z; list[4] = &m.a; list[5] = &m.b;
             }
         },
-        .attention => |*m| { if (output) list[1] = &m.o; },
+        .attention => |*m| {
+            if (output) list[1] = &m.o;
+            if (attention and m.q == .a4 and m.k == .a4 and m.v == .a4 and
+                m.q.outputs() == 12288 and m.k.outputs() == 1024 and m.v.outputs() == 1024 and
+                m.q.inputs() == 5120 and m.k.inputs() == 5120 and m.v.inputs() == 5120) {
+                list[2] = &m.q; list[3] = &m.k; list[4] = &m.v;
+            }
+        },
     }
     return list;
 }
@@ -23,17 +30,24 @@ fn size(p: layers.Proj) usize {
     if (p != .a4) return 0;
     const q = p.a4;
     const out = q.n == 5120 and (q.k == 6144 or q.k == 17408) and cuda.qlinear.splitK(q.n, q.k) == 4;
-    const in = q.k == 5120 and (q.n == 10240 or q.n == 6144 or q.n == 48);
+    const in = q.k == 5120 and (q.n == 10240 or q.n == 6144 or q.n == 48 or q.n == 12288 or q.n == 1024);
     if (!out and !in) return 0;
     return q.npad * q.k / 2;
 }
 
 /// Existing views remain available to every other projection role and row count.
-pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
+pub fn prepare(e: anytype, input: bool, output: bool, attention: bool) !?cuda.DeviceBuffer {
     var bytes: usize = 0;
-    for (e.layers) |*layer| for (candidates(layer, input, output)) |maybe| { if (maybe) |p| { bytes += size(p.*); } };
+    for (e.layers) |*layer| for (candidates(layer, input, output, attention)) |maybe| { if (maybe) |p| { bytes += size(p.*); } };
     if (bytes == 0) return null;
     const pack = try e.mods[3].function("tf_pack_kmajor");
+    const attn = try e.mods[0].function("tf_qmm_attention_stream16");
+    try attn.allowDynamicShared(22656);
+    const attn_dict: ?cuda.Function = if (e.affine.dict == null) null else blk: {
+        const f = try e.mods[0].function("tf_qmm_attention_stream16_dict");
+        try f.allowDynamicShared(22656 + 4 * 256 + @as(u32, @max(cuda.qlinear.dict_tab_max, cuda.qlinear.gdn_pair_tab_max)));
+        break :blk f;
+    };
     const grouped = try e.mods[0].function("tf_qmm_gdn_stream16");
     try grouped.allowDynamicShared(22656);
     // its twin for dictionary-coded parts: a 256-column CTA's decoded scales and biases and its part's table
@@ -52,12 +66,49 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
         break :blk f;
     };
     try out.allowDynamicShared(35328);
-    var buffer = try cuda.DeviceBuffer.alloc(e.d, bytes);
+    // the 32-row twins (qmm_stream32.cuh) for verify windows of 17 to 32 rows; TF_STREAM32=0 keeps those on cluster32
+    const wide = !envOff("TF_STREAM32");
+    var wide_fns: [2]?cuda.Function = @splat(null);
+    var wide_dict: ?cuda.Function = null;
+    var wide_gdn: ?cuda.Function = null;
+    var wide_gdn_dict: ?cuda.Function = null;
+    if (wide) {
+        if (output) {
+            const q = cuda.qlinear;
+            wide_fns = .{ try e.mods[0].function("tf_qmm_output_stream32"), try e.mods[0].function("tf_qmm_output_prefetch32") };
+            for (wide_fns) |f| try f.?.allowDynamicShared(q.out32_smem);
+            if (e.affine.dict != null) {
+                wide_dict = try e.mods[0].function("tf_qmm_output_stream32_dict");
+                try wide_dict.?.allowDynamicShared(q.out32_smem + 4 * q.dict_dec + q.dict_tab_max);
+            }
+            // GDN out / attention o in the lane form (TF_W32_OUT_STREAM=1: the four-slice stream twin instead)
+            if (!envOn("TF_W32_OUT_STREAM")) {
+                const l0 = try e.mods[0].function("tf_qmm_lane32");
+                try l0.allowDynamicShared(q.lane32_smem);
+                var l1: ?cuda.Function = null;
+                if (e.affine.dict != null) {
+                    l1 = try e.mods[0].function("tf_qmm_lane32_dict");
+                    try l1.?.allowDynamicShared(q.lane32_smem + 4 * 64 + @max(q.dict_tab_max, q.lane32_pair_tab_max));
+                }
+                e.affine.lane32_fns = .{ l0, l1 };
+                e.affine.down_lane32 = envOn("TF_W32_DOWN_LANE");
+            }
+        }
+        if (input) {
+            wide_gdn = try e.mods[0].function("tf_qmm_gdn_stream32");
+            try wide_gdn.?.allowDynamicShared(cuda.qlinear.gdn32_smem);
+            if (e.affine.dict != null) {
+                wide_gdn_dict = try e.mods[0].function("tf_qmm_gdn_stream32_dict");
+                try wide_gdn_dict.?.allowDynamicShared(cuda.qlinear.gdn32_smem + 4 * 256 + @max(cuda.qlinear.dict_tab_max, cuda.qlinear.gdn32_pair_tab_max));
+            }
+        }
+    }
+    var buffer = try @import("cuda_sponge.zig").allocHot(e.d, bytes);
     errdefer buffer.free();
     try buffer.fill8(0, null);
     errdefer cuda.completion.drain(e.d, e.stream, "projection stream packing failed before draining");
     var at: usize = 0;
-    for (e.layers) |*layer| for (candidates(layer, input, output)) |maybe| {
+    for (e.layers) |*layer| for (candidates(layer, input, output, attention)) |maybe| {
         if (maybe) |p| {
             const nbytes = size(p.*);
             if (nbytes == 0) continue;
@@ -70,7 +121,7 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     };
     try e.stream.synchronize();
     at = 0;
-    for (e.layers) |*layer| for (candidates(layer, input, output)) |maybe| {
+    for (e.layers) |*layer| for (candidates(layer, input, output, attention)) |maybe| {
         if (maybe) |p| {
             const nbytes = size(p.*);
             if (nbytes == 0) continue;
@@ -82,5 +133,21 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     if (output) e.affine.stream16_dict_fn = down_dict;
     if (input) e.affine.gdn_stream16_fn = grouped;
     if (input) e.affine.gdn_stream16_dict_fn = grouped_dict;
+    if (attention) e.affine.attention_stream16_fn = attn;
+    if (attention) e.affine.attention_stream16_dict_fn = attn_dict;
+    if (output) e.affine.stream32_fns = wide_fns;
+    if (output) e.affine.stream32_dict_fn = wide_dict;
+    if (input) e.affine.gdn_stream32_fn = wide_gdn;
+    if (input) e.affine.gdn_stream32_dict_fn = wide_gdn_dict;
     return buffer;
+}
+
+fn envOn(name: [*:0]const u8) bool {
+    const v = @import("sys").c.getenv(name) orelse return false;
+    return @import("std").mem.eql(u8, @import("std").mem.span(v), "1");
+}
+
+fn envOff(name: [*:0]const u8) bool {
+    const v = @import("sys").c.getenv(name) orelse return false;
+    return @import("std").mem.eql(u8, @import("std").mem.span(v), "0");
 }

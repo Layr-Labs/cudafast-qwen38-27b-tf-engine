@@ -31,14 +31,35 @@ pub const Sponge = struct {
 };
 
 /// Commits a buffer over the free memory in blocks below `below`, keeping `need` bytes and `margin` free; an
-/// empty Sponge when the kernel's pages are small (4 KiB pages: its largest block is 4 MiB), the counts are
+/// empty Sponge when the original target policy requires larger pages, the counts are
 /// unreadable, memory is short, or a driver call fails. Never fails the load.
 pub fn take(d: *const cuda.Driver, need: usize) Sponge {
+    return takeImpl(d, need, false);
+}
+
+/// The hot immutable copies commit while free small blocks are held, before their pack kernels run.
+pub fn allocHot(d: *const cuda.Driver, bytes: usize) !cuda.DeviceBuffer {
+    if (comptime builtin.is_test) return cuda.DeviceBuffer.alloc(d, bytes);
+    if (std.mem.eql(u8, std.mem.span(@import("sys").c.getenv("TF_HOT_SPONGE") orelse "1"), "0"))
+        return cuda.DeviceBuffer.alloc(d, bytes);
+    var held = takeImpl(d, bytes, true);
+    defer held.free();
+    var b = try cuda.DeviceBuffer.alloc(d, bytes);
+    errdefer b.free();
+    if (held.ptr != 0) {
+        try b.fill8(0, null);
+        try d.synchronize(); // commit every page before the held small blocks return to the free lists
+    }
+    return b;
+}
+
+fn takeImpl(d: *const cuda.Driver, need: usize, extended: bool) Sponge {
     if (comptime builtin.os.tag != .linux) return .{};
     const page = std.heap.pageSize();
-    if (page < 64 << 10) return .{};
     var buf: [16384]u8 = undefined;
-    const small = smallFree(read("/proc/buddyinfo", &buf) orelse return .{}, page);
+    const buddy = read("/proc/buddyinfo", &buf) orelse return .{};
+    if (page < 64 << 10 and (!extended or !supportsLarge(buddy, page))) return .{};
+    const small = smallFree(buddy, page);
     const avail = memAvailable(read("/proc/meminfo", &buf) orelse return .{}) orelse return .{};
     const len = size(small, avail, need);
     if (len == 0) return .{};
@@ -123,4 +144,28 @@ test "sponge: small blocks counted by order, sized within the memory kept free" 
     try t.expectEqual(@as(usize, 6 * g), size(20 * g, 60 * g, 30 * g)); // the kept memory first
     try t.expectEqual(@as(usize, 0), size(20 * g, 50 * g, 30 * g));
     try t.expectEqual(@as(usize, 0), size(g / 2, 100 * g, 30 * g));
+}
+
+/// The number of buddy columns, rather than the base page size, determines the largest supported block.
+fn supportsLarge(text: []const u8, page: usize) bool {
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        var it = std.mem.tokenizeAny(u8, line, " \t,");
+        var i: usize = 0;
+        var block = page;
+        while (it.next()) |tok| : (i += 1) {
+            if (i < 4) continue;
+            _ = std.fmt.parseInt(usize, tok, 10) catch break;
+            if (block >= below) return true;
+            block = std.math.mul(usize, block, 2) catch break;
+        }
+    }
+    return false;
+}
+
+test "sponge: buddy column count admits 32 MiB blocks with 4 KiB base pages" {
+    const t = std.testing;
+    try t.expect(supportsLarge("Node 0, zone Normal 1 1 1 1 1 1 1 1 1 1 1 1 1 1", 4096));
+    try t.expect(!supportsLarge("Node 0, zone Normal 1 1 1 1 1 1 1 1 1 1 1", 4096));
+    try t.expect(supportsLarge("Node 0, zone Normal 1 1 1 1 1 1 1 1 1 1 1", 65536));
 }

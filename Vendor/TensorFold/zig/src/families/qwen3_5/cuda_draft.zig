@@ -58,6 +58,8 @@ pub const Draft = struct {
     fns: Fns,
     scratch: DeviceBuffer,
     selection_base: usize = 0,
+    span_head: ?cuda.qlinear.Affine4 = null,
+    span_storage: ?DeviceBuffer = null,
     drawn: struct { sampling: ?lanes.Sampling = null, position: u64 = 0 } = .{},
     segments: u64 = 0,
     pm: u64 = 0,
@@ -129,6 +131,8 @@ pub const Draft = struct {
         inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(d.fns, name) = try d.mod.function("tf_q35d_" ++ name);
         d.w = try weights.load(gpa, io, e, dir, .{ .hidden = c.hidden, .intermediate = c.intermediate, .layers = c.layers, .vocab = c.vocab, .q_width = c.qWidth(), .kv_width = c.kvWidth(), .head_dim = c.head_dim, .dynamic = c.dynamic(), .rank = c.rank, .taps = c.n_taps });
         errdefer d.w.deinit(gpa);
+        try frame.prepareHead(d);
+        errdefer if (d.span_storage) |*buf| buf.free();
         d.scratch = try DeviceBuffer.alloc(e.d, try d.scratchBytes());
         errdefer d.scratch.free();
         d.scratch_one = d.scratch.len;
@@ -187,6 +191,7 @@ pub const Draft = struct {
         d.pool.deinit(d.gpa);
         d.staged.free();
         d.scratch.free();
+        if (d.span_storage) |*buf| buf.free();
         d.w.deinit(d.gpa);
         d.mod.unload();
         d.gpa.destroy(d);
@@ -593,5 +598,15 @@ pub fn liveGroups() bool {
 
 pub fn pairedMlp() bool {
     const value = platform.c.getenv("TF_DRAFT_MLP_PAIR") orelse return true;
+    return std.mem.eql(u8, std.mem.span(value), "1");
+}
+
+/// Drafter-only value-exact load-time views; 0 retains the original arrays and head launches.
+pub fn dictionary() bool {
+    const value = platform.c.getenv("TF_DRAFT_DICT") orelse return true;
+    return std.mem.eql(u8, std.mem.span(value), "1");
+}
+pub fn packedHead() bool {
+    const value = platform.c.getenv("TF_DRAFT_PACKED_HEAD") orelse return true;
     return std.mem.eql(u8, std.mem.span(value), "1");
 }

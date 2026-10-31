@@ -17,7 +17,9 @@ test "Draft frames: a grown tree's node budget past the block (TF_DRAFT_NODES) s
     var refs = [_]*q.draft.Ctx{&ctx};
     var items = [_]lanes.drafter.Hold{.{ .stream = @ptrFromInt(0x1000), .pending = 1, .position = 101, .depth = 15 }};
     try F.stage(c, &items, &refs, &storage);
-    items[0].depth = 16;
+    items[0].depth = 31;
+    try F.stage(c, &items, &refs, &storage);
+    items[0].depth = 32;
     try std.testing.expectError(error.BadDraftFrame, F.stage(c, &items, &refs, &storage));
     _ = setenv("TF_DRAFT_NODES", "24", 1);
     defer _ = unsetenv("TF_DRAFT_NODES");

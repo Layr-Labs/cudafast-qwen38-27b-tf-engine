@@ -6,13 +6,14 @@
 //! alone runs on: the same kernels at the same arithmetic a row (the prompt GEMM at one row: each element's MMA
 //! chain does not depend on the rows beside it; the attention's row over its own keys), from the row's pointers.
 const cuda = @import("cuda");
+const sig = @import("cuda_signatures.zig");
 const E = @import("cuda_engine.zig");
 const prompt = @import("cuda_prompt.zig");
 
 /// Whether a forward of `total` prompt rows can end on its last row at the last layer.
 pub fn fits(e: *const E.Engine, total: usize, nseg: usize, hidden: bool, paged: bool) bool {
     const g = e.g;
-    if (total <= 16 or nseg != 1 or hidden or paged) return false;
+    if (e.layers.len == 0 or total <= 16 or nseg != 1 or hidden or paged) return false;
     if (e.learning != null or e.mlp != null or e.features != 0 or e.kv8 or e.int8.on) return false;
     if ((g.q_heads / g.kv_heads) % 2 != 0) return false;
     const last = e.layers.len - 1;
@@ -23,13 +24,22 @@ pub fn fits(e: *const E.Engine, total: usize, nseg: usize, hidden: bool, paged: 
         .attention => |a| a,
         else => return false,
     };
-    if (m.o != .a4) return false;
+    if (m.o != .a4 or m.q != .a4) return false;
     const d = switch (l.mlp) {
         .dense => |x| x,
         else => return false,
     };
     if (d.gate != .a4 or d.up != .a4 or d.down != .a4) return false;
     return cuda.prompt_many.Kernels.mlpFits(d.gate.a4, d.up.a4) and d.gate.a4.n == g.intermediate;
+}
+
+/// The last layer's query projection (queries and gate) for row total - 1 only: the prompt GEMM at one row, each
+/// element's MMA chain as in the every-row launch. The other rows' query rows are not written: the layer's
+/// head_rope_warp still normalizes and rotates them (its key heads go to the cache for every row), but nothing past
+/// it reads them.
+pub fn query(e: *E.Engine, q: cuda.qlinear.Affine4, total: usize) !void {
+    const row = total - 1;
+    try e.prompt_many.prompt(e.stream, e.x + row * e.g.hidden * 2, &.{.{ .q = q, .out = e.qraw + row * 2 * e.g.attnWidth() * 2 }}, 1);
 }
 
 /// The last layer from its attention on (its keys and values already in the cache), then the final norm and
@@ -40,6 +50,7 @@ pub fn run(e: *E.Engine, layer: usize, total: usize) !void {
     const m = l.mixer.attention;
     const d = l.mlp.dense;
     const row = total - 1;
+    const geo = e.geo;
     const aw = g.attnWidth();
     const hid = g.hidden;
     const params = e.tables.ptr + E.Engine.params_at;
@@ -50,11 +61,15 @@ pub fn run(e: *E.Engine, layer: usize, total: usize) !void {
     const x = e.x + row * hid * 2;
     const act = e.act + row * g.intermediate * 2;
     try prompt.runFrom(e, layer, row, total);
-    try e.run(e.fns.attn_gate, .{ (aw + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ e.geo, y, e.qraw + row * 2 * aw * 2, mix, @as(c_int, 1), @as(u64, 0), @as(u64, 0) });
+    try launch(e, e.fns.attn_gate, sig.attn_gate, .{ (aw + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, y, e.qraw + row * 2 * aw * 2, mix, @as(c_int, 1), @as(u64, 0), @as(u64, 0) });
     try e.prompt_many.prompt(e.stream, mix, &.{.{ .q = m.o.a4, .out = r }}, 1);
     try e.run(e.fns.norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, .{ h, r, l.post_norm, x, g.eps, @as(c_int, @intCast(hid)), params, @as(u64, 0) });
-    try e.prompt_many.mlp(e.stream, x, d.gate.a4, d.up.a4, act, 1);
-    try e.prompt_many.prompt(e.stream, act, &.{.{ .q = d.down.a4, .out = r }}, 1);
+    try e.prompt_many.mlpTerminal(e.stream, x, d.gate.a4, d.up.a4, d.down.a4, act, r);
     try e.run(e.fns.norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, .{ h, r, e.final_norm, x, g.eps, @as(c_int, @intCast(hid)), params, @as(u64, 0) });
     try e.proj(e.head, x, e.logits, 1, false);
+}
+
+fn launch(e: *E.Engine, f: cuda.Function, comptime s: sig.Sig, grid: [3]usize, block: [3]usize, args: anytype) !void {
+    sig.check(s, @TypeOf(args));
+    return e.run(f, grid, block, args);
 }

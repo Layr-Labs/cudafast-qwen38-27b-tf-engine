@@ -82,6 +82,13 @@ fn device(d: *cuda.Driver, gb10: bool, wide: bool) q.engine.Engine {
     e.affine.group_fn = function(d, 3);
     e.affine.stream16_fns = @splat(null);
     e.affine.gdn_stream16_fn = null;
+    e.affine.attention_stream16_fn = null;
+    e.affine.attention_stream16_dict_fn = null;
+    e.affine.stream16_dict_fn = null;
+    e.affine.gdn_stream16_dict_fn = null;
+    e.affine.dict = null;
+    e.affine.short_lane = false;
+    e.affine.sms = 48;
     e.affine.prefill_fn = function(d, 4);
     e.affine.prefill22_fn = function(d, 4);
     e.prompt_many = .{ .many_fn = function(d, 14), .mlp_fn = function(d, 4), .split_fn = function(d, 15), .slots = 96 };
@@ -515,6 +522,9 @@ const PromptPersistentTrace = struct {
     var parts: cuda.prompt_many.Parts = undefined;
     var act: u64 = 0;
     var scalar: [7]c_int = undefined;
+    var terminal_parts: cuda.prompt_many.Parts = undefined;
+    var terminal_act: u64 = 0;
+    var terminal_rows: c_int = 0;
     fn value(comptime T: type, args: [*]?*anyopaque, index: usize) T {
         return @as(*const T, @ptrCast(@alignCast(args[index].?))).*;
     }
@@ -528,6 +538,14 @@ const PromptPersistentTrace = struct {
             parts = value(cuda.prompt_many.Parts, args, 1);
             act = value(u64, args, 2);
             for (&scalar, 0..) |*v, i| v.* = value(c_int, args, 3 + i);
+        } else if (id == 51 or id == 14 or id == 52 or id == 4) {
+            const args = raw.?;
+            parts = value(cuda.prompt_many.Parts, args, 1);
+            const mlp = id == 52 or id == 4;
+            act = if (mlp) value(u64, args, 2) else 0;
+            scalar = @splat(0);
+            for (scalar[0..4], 0..) |*v, i| v.* = value(c_int, args, (if (mlp) @as(usize, 3) else 2) + i);
+            if (id == 52) { terminal_parts = parts; terminal_act = act; terminal_rows = scalar[0]; }
         }
         return 0;
     }
@@ -717,7 +735,7 @@ test "projection streams: weight-only views cover all roles without replacing or
         .out = StreamPackTrace.projection(5120, 6144, 60), .conv = 0, .norm = 0, .a_log = 0, .dt_bias = 0 } };
     e.layers = &layers;
     StreamPackTrace.count = 0; PackTrace.touched = false; PackTrace.synced = false;
-    var buffer = (try q.engine.projection_stream_layout.prepare(&e, true, true)).?;
+    var buffer = (try q.engine.projection_stream_layout.prepare(&e, true, true, true)).?;
     defer buffer.free();
     try t.expectEqual(@as(usize, 6), StreamPackTrace.count);
     try t.expectEqual([6]u64{ 50, 60, 10, 20, 30, 40 }, StreamPackTrace.original);
@@ -728,4 +746,126 @@ test "projection streams: weight-only views cover all roles without replacing or
     try t.expectEqual(StreamPackTrace.alternate[2], m.qkv.a4.stream_w);
     try t.expectEqual(StreamPackTrace.alternate[5], m.b.a4.stream_w);
     try t.expect(e.affine.stream16_fns[0] != null and e.affine.stream16_fns[1] != null and e.affine.gdn_stream16_fn != null);
+}
+
+test "attention stream: complete native matrices retain their individual ordered partitions" {
+    var d: cuda.Driver = undefined;
+    var e = engine(&d, true);
+    d.api.cuLaunchKernelEx = OutputStreamTrace.launch;
+    e.affine.attention_stream16_fn = function(&d, 31);
+    var outs: [3]cuda.qlinear.Affine4Kernels.Out = undefined;
+    for (&outs, [_]usize{ 12288, 1024, 1024 }, 0..) |*o, n, index| {
+        o.* = .{ .q = .{ .w = 10 + index, .stream_w = 100 + index, .s = 20 + index, .b = 30 + index, .n = n, .npad = n, .k = 5120 }, .out = 1000 + index };
+    }
+    try e.affine.decodeAttentionMixed(e.stream, 2000, 3000, &outs, 16);
+    try t.expectEqual(@as(usize, 31), OutputStreamTrace.id);
+    try t.expectEqual(@as(u32, 56), OutputStreamTrace.grid);
+    try t.expectEqual(@as(u32, 128), OutputStreamTrace.threads);
+    try t.expect(!OutputStreamTrace.cluster);
+    for (OutputStreamTrace.parts.p[0..3], [_]c_int{ 1, 8, 8 }, [_]c_int{ 0, 48, 52 }, 0..) |part, sk, first, index| {
+        try t.expectEqual(sk, part.sk);
+        try t.expectEqual(first, part.first);
+        try t.expectEqual(@as(u64, 100 + index), part.w);
+        try t.expectEqual(@as(u64, 20 + index), part.scales);
+    }
+    outs[2].q.stream_w = 0;
+    try e.affine.decodeAttentionMixed(e.stream, 2000, 3000, &outs, 16);
+    try t.expectEqual(@as(usize, 3), OutputStreamTrace.id);
+    try t.expect(OutputStreamTrace.cluster);
+    try t.expectEqual(@as(u64, 10), OutputStreamTrace.parts.p[0].w);
+    try t.expectError(error.InputMismatch, e.affine.decodeAttentionMixed(e.stream, 2000, 3000, &outs, 15));
+}
+
+test "attention stream views: only the complete requested attention inputs receive alternate words" {
+    var d: cuda.Driver = undefined;
+    var e = engine(&d, true);
+    d.api.cuMemAlloc_v2 = PackTrace.alloc;
+    d.api.cuMemFree_v2 = PackTrace.free;
+    d.api.cuMemsetD8_v2 = PackTrace.memset;
+    d.api.cuModuleGetFunction = Resolve.get;
+    d.api.cuFuncSetAttribute = Resolve.attribute;
+    d.api.cuStreamSynchronize = PackTrace.sync;
+    d.api.cuLaunchKernel = StreamPackTrace.launch;
+    e.mods[0] = .{ .d = &d, .handle = null }; e.mods[3] = .{ .d = &d, .handle = null };
+    const query = StreamPackTrace.projection(12288, 5120, 70);
+    var layers: [1]q.engine.Layer = undefined;
+    layers[0].mlp = .{ .dense = .{ .gate = query, .up = query, .down = StreamPackTrace.projection(5120, 17408, 50) } };
+    layers[0].mixer = .{ .attention = .{ .q = query, .k = StreamPackTrace.projection(1024, 5120, 80),
+        .v = StreamPackTrace.projection(1024, 5120, 90), .o = StreamPackTrace.projection(5120, 6144, 100), .q_norm = 0, .k_norm = 0 } };
+    e.layers = &layers; StreamPackTrace.count = 0; PackTrace.touched = false; PackTrace.synced = false;
+    var buffer = (try q.engine.projection_stream_layout.prepare(&e, false, false, true)).?;
+    defer buffer.free();
+    try t.expectEqual(@as(usize, 3), StreamPackTrace.count);
+    try t.expectEqual([3]u64{ 70, 80, 90 }, StreamPackTrace.original[0..3].*);
+    try t.expect(PackTrace.touched and PackTrace.synced);
+    const m = layers[0].mixer.attention;
+    try t.expectEqual(@as(u64, 70), m.q.a4.w);
+    try t.expectEqual(@as(u64, 90), m.v.a4.w);
+    try t.expectEqual(StreamPackTrace.alternate[0], m.q.a4.stream_w);
+    try t.expectEqual(StreamPackTrace.alternate[2], m.v.a4.stream_w);
+    try t.expectEqual(@as(u64, 0), m.o.a4.stream_w);
+    try t.expect(e.affine.attention_stream16_fn != null and e.affine.stream16_fns[0] == null and e.affine.gdn_stream16_fn == null);
+}
+
+test "attention stream: coded and array members share one exact native launch" {
+    var d: cuda.Driver = undefined;
+    var e = engine(&d, true);
+    d.api.cuLaunchKernelEx = OutputStreamTrace.launch;
+    e.affine.attention_stream16_fn = function(&d, 31);
+    e.affine.attention_stream16_dict_fn = function(&d, 32);
+    e.affine.dict = .{ .group = function(&d, 3), .verify32 = null, .gemv = function(&d, 2), .many = function(&d, 42),
+        .mark = function(&d, 40), .rank = function(&d, 40), .table = function(&d, 40), .pack = function(&d, 40),
+        .pair_mark = function(&d, 40), .pair_rank = function(&d, 40), .pair_offsets = function(&d, 40),
+        .pair_table = function(&d, 40), .pair_pack = function(&d, 40), .pair_check = function(&d, 40), .gemv_blocks = 96 };
+    const code: u32 = 11 | (1000 << 5) | (1000 << 18);
+    var outs: [3]cuda.qlinear.Affine4Kernels.Out = undefined;
+    for (&outs, [_]usize{ 12288, 1024, 1024 }, 0..) |*o, n, i| {
+        o.* = .{ .q = .{ .w = 10 + i, .stream_w = 100 + i, .s = 20 + i, .b = 30 + i,
+            .sb = 200 + i, .tab = 300 + i, .code = code, .n = n, .npad = n, .k = 5120 }, .out = 1000 + i };
+    }
+    outs[1].q.code = 0;
+    try e.affine.decodeAttentionMixed(e.stream, 2000, 3000, &outs, 16);
+    try t.expectEqual(@as(usize, 32), OutputStreamTrace.id);
+    try t.expectEqual(@as(u32, 56), OutputStreamTrace.grid);
+    try t.expect(!OutputStreamTrace.cluster);
+    for (OutputStreamTrace.parts.p[0..3], [_]c_int{ 1, 8, 8 }, [_]c_int{ 0, 48, 52 }, 0..) |part, sk, first, i| {
+        try t.expectEqual(sk, part.sk);
+        try t.expectEqual(first, part.first);
+        try t.expectEqual(@as(u64, 100 + i), part.w);
+        try t.expectEqual(@as(u64, if (i == 1) 20 + i else 200 + i), part.scales);
+        try t.expectEqual(@as(u64, if (i == 1) 30 + i else 300 + i), part.biases);
+        try t.expectEqual(@as(c_int, if (i == 1) 0 else @intCast(outs[i].q.npad)), part.tiles);
+        try t.expectEqual(@as(c_int, if (i == 1) @intCast(outs[i].q.npad) else @bitCast(code)), part.npad);
+    }
+    e.affine.dict = null;
+    try e.affine.decodeAttentionMixed(e.stream, 2000, 3000, &outs, 16);
+    try t.expectEqual(@as(usize, 31), OutputStreamTrace.id);
+    for (OutputStreamTrace.parts.p[0..3], outs) |part, o| try t.expectEqual(o.q.s, part.scales);
+}
+
+test "terminal prompt: dedicated FFN retains original metadata and canonical fallback" {
+    var d: cuda.Driver = undefined;
+    d.api.cuLaunchKernel = PromptPersistentTrace.launch;
+    const stream: cuda.Stream = .{ .d = &d, .handle = null };
+    var k: cuda.prompt_many.Kernels = .{ .many_fn = function(&d, 14), .mlp_fn = function(&d, 4), .split_fn = function(&d, 15), .slots = 96,
+        .terminal_many_fn = function(&d, 51), .terminal_mlp_fn = function(&d, 52) };
+    var gate = PromptPersistentTrace.matrix(17408, 5120);
+    gate.sb = 9000; gate.tab = 10000; gate.code = 11 | (1000 << 5) | (1000 << 18);
+    const up = gate;
+    const down = PromptPersistentTrace.matrix(5120, 17408);
+    try k.mlpTerminal(stream, 1000, gate, up, down, 2000, 3000);
+    try t.expectEqual(@as(usize, 51), PromptPersistentTrace.id);
+    try t.expectEqual(@as(u32, 40), PromptPersistentTrace.grid);
+    try t.expectEqual(gate.s, PromptPersistentTrace.terminal_parts.p[0].scales);
+    try t.expectEqual(gate.b, PromptPersistentTrace.terminal_parts.p[0].biases);
+    try t.expectEqual(@as(c_int, 17408), PromptPersistentTrace.terminal_parts.p[0].npad);
+    try t.expectEqual(@as(u64, 2000), PromptPersistentTrace.terminal_act);
+    try t.expectEqual(@as(c_int, 1), PromptPersistentTrace.terminal_rows);
+    try t.expectEqual(down.s, PromptPersistentTrace.parts.p[0].scales);
+    try t.expectEqual(@as(c_int, 1), PromptPersistentTrace.scalar[0]);
+    k.terminal_many_fn = null; k.terminal_mlp_fn = null;
+    try k.mlpTerminal(stream, 1000, gate, up, down, 2000, 3000);
+    try t.expectEqual(@as(usize, 14), PromptPersistentTrace.id);
+    try t.expectEqual(down.s, PromptPersistentTrace.parts.p[0].scales);
+    try t.expectEqual(@as(c_int, 1), PromptPersistentTrace.scalar[0]);
 }

@@ -74,9 +74,9 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
             // the CTA's tiles' index windows: tile n0 / 64 + c / 16, chunk c % 16, from each group's 64-byte line
             const int step = qmm_dict::dict_step(P.npad);
             const size_t window = static_cast<size_t>(g) * step & ~static_cast<size_t>(63);
-            for (int c = tid; c < BN / 4; c += T::THREADS)
-                cp16(p + T::X + T::W + c * 16, reinterpret_cast<const unsigned char*>(P.scales) +
-                     static_cast<size_t>(n0 / 64 + c / 16) * KG * step + window + (c % 16) * 16);
+            if (tid < BN / 4)
+                cp16(p + T::X + T::W + tid * 16, reinterpret_cast<const unsigned char*>(P.scales) +
+                     static_cast<size_t>(n0 / 64 + tid / 16) * KG * step + window + (tid % 16) * 16);
         } else {
 #pragma unroll
         for (int j = 0; j < SC; ++j)
@@ -85,6 +85,8 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
     };
     unsigned char* dec = buf + T::SMEM;  // DICT: BN decoded scales, BN biases, then the part's table
     unsigned char* table = dec + 4 * BN;
+    // a pair table of up to GDN_PAIR_SMEM bytes in shared memory (the twin's two-CTAs-an-SM room, qlinear.zig
+    // gdn_pair_tab_max), else read through L2
     constexpr int GDN_PAIR_SMEM = 26496;
     [[maybe_unused]] const int pair_bytes = (qmm_dict::dict_np(P.npad) * 4 + 15) / 16 * 16;
     if constexpr (DICT) {
@@ -120,6 +122,7 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
     }
 #endif
     grid_wait();
+    qmm_dict::x_keep_l2(x, rows, K, ldx);
 #pragma unroll
     for (int s = 0; s < STAGES - 1; ++s) {
         if (s < items) load_x(s, s);
@@ -137,19 +140,43 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
         commit();
         const unsigned char* p = stage(it % STAGES);
         const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
+        // the lane's BN / 64 values of its warp's BN / 4 columns: value q is column q % (BN / 4)'s scale, then bias;
+        // fetched before the MMAs (a pair table read through L2 waits under them), stored into dec after them. A pair
+        // code (qmm_dict.cuh, FORMAT.md): the column's one index, the entry's scale or bias half
         [[maybe_unused]] uint32_t dv[BN / 64];
         if constexpr (DICT) {
             const int code = P.npad, bits = qmm_dict::dict_bits(code), step = qmm_dict::dict_step(code), g = map(it).x;
             const bool pair = qmm_dict::dict_pair(code);
             const uint32_t* gtab = pair && pair_bytes > GDN_PAIR_SMEM ? reinterpret_cast<const uint32_t*>(P.biases) : nullptr;
             const uint32_t mask_bits = (1u << bits) - 1u;
+            if constexpr (BN >= 128) {
+                if (pair) {
 #pragma unroll
-            for (int v = 0; v < BN / 64; ++v) {
-                const int q = lane + 32 * v, half = q / (BN / 4), col = wn * (BN / 4) + q % (BN / 4);
-                const uint32_t* pk = reinterpret_cast<const uint32_t*>(p + T::X + T::W + (col / 64) * 256);
-                const int off = (g * step & 63) * 8 + (pair ? col % 64 : half * 64 + col % 64) * bits;
+                    for (int pass = 0; pass < BN / 128; ++pass) {
+                        const int col = wn * (BN / 4) + pass * 32 + lane;
+                        const uint32_t* pk = reinterpret_cast<const uint32_t*>(p + T::X + T::W + (col / 64) * 256);
+                        const int off = (g * step & 63) * 8 + (col % 64) * bits;
+                        const uint32_t idx = __funnelshift_r(pk[off >> 5], pk[(off >> 5) + 1], off & 31) & mask_bits;
+                        const uint32_t entry = qmm_dict::dict_pair_entry(table, gtab, idx);
+                        dv[pass] = entry & 0xFFFFu;
+                        dv[BN / 128 + pass] = entry >> 16;
+                    }
+                } else {
+#pragma unroll
+                    for (int v = 0; v < BN / 64; ++v) {
+                        const int q = lane + 32 * v, half = q / (BN / 4), col = wn * (BN / 4) + q % (BN / 4);
+                        const uint32_t* pk = reinterpret_cast<const uint32_t*>(p + T::X + T::W + (col / 64) * 256);
+                        const int off = (g * step & 63) * 8 + (half * 64 + col % 64) * bits;
+                        const uint32_t idx = __funnelshift_r(pk[off >> 5], pk[(off >> 5) + 1], off & 31) & mask_bits;
+                        dv[v] = reinterpret_cast<const unsigned short*>(table)[(half ? qmm_dict::dict_ns(code) : 0) + idx];
+                    }
+                }
+            } else {
+                const int q = lane, half = q / 16, col = wn * 16 + (q & 15);
+                const uint32_t* pk = reinterpret_cast<const uint32_t*>(p + T::X + T::W);
+                const int off = (g * step & 63) * 8 + (pair ? col : half * 64 + col) * bits;
                 const uint32_t idx = __funnelshift_r(pk[off >> 5], pk[(off >> 5) + 1], off & 31) & mask_bits;
-                dv[v] = pair ? qmm_dict::dict_pair_half(qmm_dict::dict_pair_entry(table, gtab, idx), half * 16)
+                dv[0] = pair ? qmm_dict::dict_pair_half(qmm_dict::dict_pair_entry(table, gtab, idx), half * 16)
                              : reinterpret_cast<const unsigned short*>(table)[(half ? qmm_dict::dict_ns(code) : 0) + idx];
             }
         }
@@ -174,23 +201,37 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
                 else mma(d[j], a, b0, b1);
             }
         }
-        if constexpr (DICT) {
-#pragma unroll
-            for (int v = 0; v < BN / 64; ++v) {
-                const int q = lane + 32 * v, half = q / (BN / 4), col = wn * (BN / 4) + q % (BN / 4);
-                reinterpret_cast<unsigned short*>(dec)[half * BN + col] = static_cast<unsigned short>(dv[v]);
-            }
-            __syncwarp();
-        }
         const int row = lane >> 2;
         const float xv[2] = {px[row], px[row + 8]};
 #pragma unroll
         for (int j = 0; j < NT; ++j) {
-            const int col = wn * (BN / 4) + j * 8 + (lane & 3) * 2;
-            const __nv_bfloat162 s2 = *reinterpret_cast<const __nv_bfloat162*>(ps + col);
-            const __nv_bfloat162 b2 = *reinterpret_cast<const __nv_bfloat162*>(ps + BN + col);
-            const float sv[2] = {__low2float(s2), __high2float(s2)};
-            const float bv[2] = {__low2float(b2), __high2float(b2)};
+            float sv[2], bv[2];
+            if constexpr (DICT) {
+                if constexpr (BN >= 128) {
+                    const int pass = j / 4, jj = j % 4, c0 = jj * 8 + (lane & 3) * 2;
+                    const float sf = __bfloat162float(__ushort_as_bfloat16(static_cast<unsigned short>(dv[pass])));
+                    const float bf = __bfloat162float(__ushort_as_bfloat16(static_cast<unsigned short>(dv[BN / 128 + pass])));
+                    sv[0] = __shfl_sync(0xffffffffu, sf, c0);
+                    sv[1] = __shfl_sync(0xffffffffu, sf, c0 + 1);
+                    bv[0] = __shfl_sync(0xffffffffu, bf, c0);
+                    bv[1] = __shfl_sync(0xffffffffu, bf, c0 + 1);
+                } else {
+                    const int c0 = j * 8 + (lane & 3) * 2;
+                    const float dval = __bfloat162float(__ushort_as_bfloat16(static_cast<unsigned short>(dv[0])));
+                    sv[0] = __shfl_sync(0xffffffffu, dval, c0);
+                    sv[1] = __shfl_sync(0xffffffffu, dval, c0 + 1);
+                    bv[0] = __shfl_sync(0xffffffffu, dval, 16 + c0);
+                    bv[1] = __shfl_sync(0xffffffffu, dval, 16 + c0 + 1);
+                }
+            } else {
+                const int col = wn * (BN / 4) + j * 8 + (lane & 3) * 2;
+                const __nv_bfloat162 s2 = *reinterpret_cast<const __nv_bfloat162*>(ps + col);
+                const __nv_bfloat162 b2 = *reinterpret_cast<const __nv_bfloat162*>(ps + BN + col);
+                sv[0] = __low2float(s2);
+                sv[1] = __high2float(s2);
+                bv[0] = __low2float(b2);
+                bv[1] = __high2float(b2);
+            }
 #pragma unroll
             for (int e = 0; e < 4; ++e)
                 acc[j][e] = __fmaf_rn(xv[e >> 1], bv[e & 1], __fmaf_rn(d[j][e], sv[e & 1], acc[j][e]));
@@ -262,4 +303,26 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_gdn_stream16(const __nv
 // tf_qmm_gdn_stream16 with its dictionary-coded parts' index windows: the same loads, MMA chains, fmas and sums.
 extern "C" __global__ void __launch_bounds__(128) tf_qmm_gdn_stream16_dict(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
     tf_qmm_gdn_stream::body_dict(x,xs,parts,M,K,ldx);
+}
+
+// Three native attention matrices retain each matrix's original K partitions.
+template<bool DICT>
+__device__ __forceinline__ void tf_attention_input_stream(const __nv_bfloat16* x,const float* xs,
+        const tf_qmm_group::Parts& parts,int M,int K,int ldx){
+    int which=0;
+#pragma unroll
+    for(int i=1;i<4;++i)if(i<parts.count&&int(blockIdx.x)>=parts.p[i].first)which=i;
+    const auto p=parts.p[which];const int tile=int(blockIdx.x)-p.first;
+    if constexpr(DICT){
+        if(p.tiles>0)tf_qmm_gdn_stream::tile<256,0,true>(x,xs,p,tile,M,K,ldx);
+        else tf_qmm_gdn_stream::tile<256,0>(x,xs,p,tile,M,K,ldx);
+    }else tf_qmm_gdn_stream::tile<256,0>(x,xs,p,tile,M,K,ldx);
+}
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_attention_stream16(const __nv_bfloat16* x,const float* xs,
+        const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
+    tf_attention_input_stream<false>(x,xs,parts,M,K,ldx);
+}
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_attention_stream16_dict(const __nv_bfloat16* x,const float* xs,
+        const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
+    tf_attention_input_stream<true>(x,xs,parts,M,K,ldx);
 }
