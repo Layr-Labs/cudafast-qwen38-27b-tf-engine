@@ -59,8 +59,11 @@ fn launch(d: anytype, f: cuda.Function, comptime s: sig.Sig, grid: [3]usize, blo
 fn conv(d: anytype, x: u64, base: u64, res: u64, out: u64, rows: usize, branch: c_int) !void {
     try d.e.run(d.fns.dyn_conv_batch, .{ rows, (d.c.hidden + 255) / 256, 1 }, .{ 256, 1, 1 }, .{ x, d.dyn, base, res, out, @as(c_int, @intCast(d.c.hidden)), @as(c_int, @intCast(d.c.group)), branch, @as(c_int, @intCast(d.c.block)) });
 }
-fn rope(d: anytype, x: u64, w: u64, out: u64, rows: usize, heads: usize) !void {
-    try d.e.run(d.fns.norm_rope_batch, .{ rows * heads, 1, 1 }, .{ 32, 1, 1 }, .{ x, w, out, @as(c_int, @intCast(heads)), @as(c_int, @intCast(heads * 128)), d.segments, @as(c_int, @intCast(d.c.block)), d.c.eps, d.c.theta });
+/// The q and k norms-plus-rope in one launch: a block a (row, head), the q heads first, each head's arithmetic
+/// exactly tf_q35d_norm_rope_batch's per-head body (GQA keeps separate weights, head counts and strides).
+fn ropeQk(d: anytype, xq: u64, wq: u64, outq: u64, xk: u64, wk: u64, outk: u64, rows: usize) !void {
+    const c = d.c;
+    try d.e.run(d.fns.norm_rope_qk_batch, .{ rows * (c.heads + c.kv_heads), 1, 1 }, .{ 32, 1, 1 }, .{ xq, wq, outq, @as(c_int, @intCast(c.heads)), xk, wk, outk, @as(c_int, @intCast(c.kv_heads)), @as(c_int, @intCast(rows)), d.segments, @as(c_int, @intCast(c.block)), c.eps, c.theta });
 }
 pub fn attention(d: anytype, rows: usize, layer: usize) !void {
     const c = d.c;
@@ -110,8 +113,7 @@ fn body(d: anytype, n: usize, narrow_: bool) !?u64 {
         try d.projAgain(l.attn_conv, d.x, d.dyn, B);
         try conv(d, d.x, l.attn_base, 0, d.xin, B, 0);
         try d.projMany(&.{ l.q, l.k, l.v }, d.xin, &.{ d.qraw, d.kraw, d.vb }, B);
-        try rope(d, d.qraw, l.q_norm, d.q, B, c.heads);
-        try rope(d, d.kraw, l.k_norm, d.kb, B, c.kv_heads);
+        try ropeQk(d, d.qraw, l.q_norm, d.q, d.kraw, l.k_norm, d.kb, B);
         try attention(d, B, i);
         try d.proj(l.o, d.att, d.o, B);
         try conv(d, d.o, l.attn_base, d.h, d.h2, B, 1);
