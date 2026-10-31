@@ -38,10 +38,11 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     const heads: usize = if (record) total else 1;
     // Independent prompt rows share a block; decode keeps one warp per row. A 16..64-row window's gdn_pre rows share
     // blocks too (four row warps a block: its warps are independent, the same bits); TF_GDN_ROWS4=0 keeps one warp a
-    // block there. gdn_post keeps a warp a block in windows (four a block measured slower).
+    // block there. A verify round's 2..7-row window pairs its rows, two warps a block: half the blocks of a one-warp
+    // launch, no idle warp. gdn_post keeps a warp a block in windows (four a block measured slower).
     const gdn_rows: usize = if (prompt and total > 16) 4 else 1;
     const gdn_blocks = (total + gdn_rows - 1) / gdn_rows;
-    const pre_rows: usize = if ((prompt and total > 16) or (total >= 16 and rows4On())) 4 else 1;
+    const pre_rows: usize = if ((prompt and total > 16) or (total >= 8 and rows4On())) 4 else if (total >= 2 and rows4On()) 2 else 1;
     const pre_blocks = (total + pre_rows - 1) / pre_rows;
     const t_ids = e.tables.ptr + ids_at;
     const t_segs = e.tables.ptr + segs_at;
