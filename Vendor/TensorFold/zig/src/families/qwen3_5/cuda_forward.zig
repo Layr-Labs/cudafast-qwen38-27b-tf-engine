@@ -51,6 +51,8 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     // an image chunk's rows take the tower's features, and rotate at their staged t, h, w positions
     const mpos: u64 = if (e.features != 0) e.tables.ptr + mpos_at else 0;
     if (e.features != 0) try e.run(e.fns.splice, .{ total, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, e.features, e.tables.ptr + src_at, @as(c_int, @intCast(g.hidden)), t_params });
+    // a prompt chunk keeps its last row: past its keys and values, the last layer runs that row alone
+    const tail = prompt and @import("cuda_prompt_tail.zig").fits(e, total, nseg, shape.hidden, shape.paged);
     var di: usize = 0;
     var ai: c_int = 0;
     for (e.layers, 0..) |l, i| {
@@ -80,6 +82,10 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 } else {
                     // both head norms and the rope in one launch: a block a (row, head), each normed head rotated in place
                     try launchAfter(e, e.fns.norm_rope, sig.norm_rope, .{ total, g.q_heads + g.kv_heads, 1 }, .{ head_dim, 1, 1 }, .{ geo, e.qraw, e.kraw, m.q_norm, m.k_norm, e.qn, e.vraw, t_segs, t_rows, t_anc, @as(c_int, ai), t_params, mpos, g.eps });
+                }
+                if (tail and i == e.layers.len - 1) {
+                    try @import("cuda_prompt_tail.zig").run(e, @intCast(ai), total);
+                    return;
                 }
                 if (shape.paged) {
                     try @import("cuda_attention.zig").partial(e, shape, ai);
