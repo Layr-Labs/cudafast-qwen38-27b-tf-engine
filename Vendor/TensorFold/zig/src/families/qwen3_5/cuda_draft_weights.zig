@@ -141,7 +141,7 @@ fn leastSquares(row: []align(1) const u16, start: [2]f32) [2]f32 {
     var best = start;
     var best_err = groupError(row, start);
     var cur = start;
-    for (0..3) |_| {
+    for (0..5) |_| {
         const s = cur[0];
         if (s <= 0) break;
         var sq: f64 = 0;
