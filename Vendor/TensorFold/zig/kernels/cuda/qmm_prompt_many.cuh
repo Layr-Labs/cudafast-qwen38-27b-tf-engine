@@ -17,6 +17,7 @@ struct ManyPart {
     const __nv_bfloat16* biases;
     void* out;
     int n, npad, first;  // first: the part's first CTA in the launch
+    int add;             // the persistent rows2 output tiles: out is the residual h, and h += bf16(this output)
 };
 
 struct ManyParts {

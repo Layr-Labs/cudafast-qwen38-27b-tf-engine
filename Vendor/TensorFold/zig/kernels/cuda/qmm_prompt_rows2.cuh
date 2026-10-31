@@ -7,7 +7,7 @@ template <int GS, int BM, int BN, int WM, int WN, int STAGES>
 __device__ __forceinline__ void prompt_tile(
         const __nv_bfloat16* __restrict__ x, const uint32_t* __restrict__ w, const __nv_bfloat16* __restrict__ scales,
         const __nv_bfloat16* __restrict__ biases, void* __restrict__ out, int N, int npad, int M, int K, int ldx, int m0,
-        int n0) {
+        int n0, bool add = false) {
     using T = Tile<GS, BM, BN, WM, WN, STAGES>;
     extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -115,7 +115,17 @@ __device__ __forceinline__ void prompt_tile(
                 if (row >= M) continue;
                 const float v0 = acc[i][j][2 * h], v1 = acc[i][j][2 * h + 1];
                 __nv_bfloat16* dst = reinterpret_cast<__nv_bfloat16*>(out) + static_cast<size_t>(row) * N + col;
-                if (col + 1 < N && (N & 1) == 0)
+                if (add) {
+                    // out is the residual h: h = bf16(h + bf16(v)), the norm's residual sum of this output's bf16 rows
+                    if (col + 1 < N && (N & 1) == 0) {
+                        const __nv_bfloat162 hv = *reinterpret_cast<const __nv_bfloat162*>(dst);
+                        const __nv_bfloat162 rv = __floats2bfloat162_rn(v0, v1);
+                        *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(__low2float(hv) + __low2float(rv), __high2float(hv) + __high2float(rv));
+                    } else {
+                        if (col < N) dst[0] = __float2bfloat16_rn(__bfloat162float(dst[0]) + __bfloat162float(__float2bfloat16_rn(v0)));
+                        if (col + 1 < N) dst[1] = __float2bfloat16_rn(__bfloat162float(dst[1]) + __bfloat162float(__float2bfloat16_rn(v1)));
+                    }
+                } else if (col + 1 < N && (N & 1) == 0)
                     *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(v0, v1);
                 else {
                     if (col < N) dst[0] = __float2bfloat16_rn(v0);

@@ -39,10 +39,11 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     // Independent prompt rows share a block; decode keeps one warp per row. A 16..64-row window's gdn_pre rows share
     // blocks too (four row warps a block: its warps are independent, the same bits); TF_GDN_ROWS4=0 keeps one warp a
     // block there. gdn_post keeps a warp a block in windows (four a block measured slower).
-    const gdn_rows: usize = if (prompt and total > 16) 4 else 1;
-    const gdn_blocks = (total + gdn_rows - 1) / gdn_rows;
-    const pre_rows: usize = if ((prompt and total > 16) or (total >= 16 and rows4On())) 4 else 1;
+    const pre_rows: usize = if ((prompt and total > 16) or (total >= 8 and rows4On())) 4 else if (total >= 2 and rows4On()) 2 else 1;
     const pre_blocks = (total + pre_rows - 1) / pre_rows;
+    // gdn_post's decode windows: two independent row warps a block from 2 rows, as gdn_pre's (TF_POST_ROWS2=0: one)
+    const post_rows: usize = if (prompt and total > 16) 4 else if (total >= 2 and postRows2On()) 2 else 1;
+    const post_blocks = (total + post_rows - 1) / post_rows;
     const t_ids = e.tables.ptr + ids_at;
     const t_segs = e.tables.ptr + segs_at;
     const t_rows = e.tables.ptr + rowseg_at;
@@ -52,6 +53,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     const geo = e.geo;
     const group = g.q_heads / g.kv_heads;
 
+    e.h_added = false;
     try e.embed(t_ids, e.h, total, t_params);
     // the producers of the out, o and down inputs write their group sums; a prompt GEMM past 16 rows needs none
     const sums: u64 = if (prompt and total > 16) 0 else e.xs;
@@ -63,7 +65,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     var di: usize = 0;
     var ai: c_int = 0;
     for (e.layers, 0..) |l, i| {
-        try e.normInput(i != 0, l.input_norm, total, prompt);
+        try e.normInput(i != 0 and !taken(e), l.input_norm, total, prompt);
         if (e.learning) |k| try k.input(i, e.h, total);
         switch (l.mixer) {
             .delta => |m| {
@@ -74,8 +76,8 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 // one recorded window of 2+ rows: gdn_pre logged its tails, conv_commit would only return
                 if (!(record and nseg == 1 and total > 1)) try e.runAfter(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
                 if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else try e.deltaScan(record, shape.slots, nseg, layer);
-                try e.runAfter(e.fns.gdn_post, .{ 1, g.v_heads, gdn_blocks }, .{ 32, gdn_rows, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums });
-                try e.projAgain(m.out, e.mix, e.r, total, prompt);
+                try e.runAfter(e.fns.gdn_post, .{ 1, g.v_heads, post_blocks }, .{ 32, post_rows, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums });
+                try residual(e, m.out, e.mix, total, prompt, true);
                 di += 1;
             },
             .attention => |m| {
@@ -116,8 +118,8 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     } else {
                         // a 2..64-row window: row pairs share each chunk's stream-key tiles (attn_pair, the same bits);
                         // TF_ATTN_PAIR=0 keeps attn_partial's block a row
-                        if (record and total >= 2 and total % 2 == 0 and 2 * group <= 16 and pairOn())
-                            try sharedSized(e, e.fns.attn_pair, sig.attn_pair, .{ total / 2, partial_chunks, g.kv_heads }, 128, attn_tile, args)
+                        if (record and total >= 2 and 2 * group <= 16 and pairOn())
+                            try sharedSized(e, e.fns.attn_pair, sig.attn_pair, .{ (total + 1) / 2, partial_chunks, g.kv_heads }, 128, attn_tile, args)
                         else
                             try sharedSized(e, e.fns.attn_partial, sig.attn_partial, .{ total, partial_chunks, g.kv_heads }, 128, attn_tile, args);
                         // streams of caches no longer than GROUP_LEN have no row for attn_rows (its blocks would only return)
@@ -128,11 +130,11 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 }
                 if (prompt and nseg == 1 and (g.q_heads / g.kv_heads) % 2 == 0) try launchAfter(e, e.fns.attn_gate, sig.attn_gate, .{ (total * aw + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.y, e.qraw, e.mix, @as(c_int, @intCast(total)), t_params, sums });
                 if (e.learning) |k| try k.gated(i, e.mix, total);
-                try e.projAgain(m.o, e.mix, e.r, total, prompt);
+                try residual(e, m.o, e.mix, total, prompt, true);
                 ai += 1;
             },
         }
-        try e.normInput(true, l.post_norm, total, prompt);
+        try e.normInput(!taken(e), l.post_norm, total, prompt);
         if (e.learning) |k| try k.post(i, e.h, e.x, total);
         switch (l.mlp) {
             .dense => |m| {
@@ -141,7 +143,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     cuda.prompt_many.Kernels.mlpFits(m.gate.a4, m.up.a4) and m.gate.a4.n == g.intermediate;
                 if (fused) {
                     try e.prompt_many.mlp(e.stream, e.x, m.gate.a4, m.up.a4, e.act, total);
-                    try e.projAgain(m.down, e.act, e.r, total, prompt);
+                    try residual(e, m.down, e.act, total, prompt, e.mlp == null and e.pockets.of(i) == null);
                 } else if (!prompt and total <= E.most_verify and e.learning == null and e.mlp == null and e.affine.split == null and
                     m.gate == .a4 and m.up == .a4 and cuda.mlp_pair.Kernels.fits(m.gate.a4, m.up.a4) and m.gate.a4.n == g.intermediate)
                 {
@@ -163,15 +165,20 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
             .moe => |m| try e.routedRows(m.router, m.experts, e.x, e.r, total, promptMoe(prompt, total), t_params),
         }
         if (shape.taps) for (e.taps[0..e.n_taps], 0..) |t, ti| if (t == i) {
-            try e.runAfter(e.fns.tap, .{ total, (g.hidden + 2047) / 2048, 1 }, .{ 256, 1, 1 }, .{ e.h, e.r, t_segs, t_rows, @as(c_int, @intCast(ti)), @as(c_int, @intCast(g.hidden)), t_params });
+            try e.runAfter(e.fns.tap, .{ total, (g.hidden + 2047) / 2048, 1 }, .{ 256, 1, 1 }, .{ e.h, if (e.h_added) @as(u64, 0) else e.r, t_segs, t_rows, @as(c_int, @intCast(ti)), @as(c_int, @intCast(g.hidden)), t_params });
         };
         // a captured forward's first layer is a graph of its own (cuda_engine.zig's cutCapture)
         if (i == 0) try e.cutCapture();
     }
-    try finish(e, total, heads, shape.hidden);
+    try finish(e, total, heads, shape.hidden, if (@hasField(@TypeOf(shape), "amax")) shape.amax else false);
 }
 
 /// TF_GDN_ROWS4=0: 16..64-row windows keep one row warp a block in tf_q35_gdn_pre.
+fn postRows2On() bool {
+    const v = @import("sys").c.getenv("TF_POST_ROWS2") orelse return true;
+    return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
+}
+
 fn rows4On() bool {
     const v = @import("sys").c.getenv("TF_GDN_ROWS4") orelse return true;
     return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
@@ -181,6 +188,23 @@ fn rows4On() bool {
 fn pairOn() bool {
     const v = @import("sys").c.getenv("TF_ATTN_PAIR") orelse return true;
     return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
+}
+
+/// out, o or down into the residual: a prompt's rows2 output tiles add their rows into h itself (the next norm then
+/// reads h alone, its bits unchanged); everything else writes r for the norm to add. `can`: no hook reads r.
+fn residual(e: *E.Engine, l: E.Proj, x: u64, total: usize, prompt: bool, can: bool) !void {
+    if (can and e.fuse_residual and prompt and total > 16 and e.learning == null and !e.int8.on and l == .a4 and e.prompt_many.addsResidual(l.a4, total)) {
+        try e.prompt_many.prompt(e.stream, x, &.{.{ .q = l.a4, .out = e.h, .add = true }}, total);
+        e.h_added = true;
+        return;
+    }
+    try e.projAgain(l, x, e.r, total, prompt);
+}
+
+/// Whether the last residual producer added into h; the norm that consumes it clears it.
+fn taken(e: anytype) bool {
+    defer e.h_added = false;
+    return e.h_added;
 }
 
 /// A launch whose arguments are checked against the kernel's .cu signature: a wrong count or kind does not build.
@@ -210,16 +234,23 @@ fn sharedSized(e: *E.Engine, f: cuda.Function, comptime s: sig.Sig, grid: [3]usi
 }
 
 /// Layer inputs are already kept; hidden reads need neither the final norm nor the vocabulary head.
-pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool) !void {
+pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool, amax: bool) !void {
     if (hidden) return;
     const g = e.g;
+    const added = if (@hasField(@TypeOf(e.*), "h_added")) taken(e) else false;
     if (e.learning == null and heads < total) {
-        try e.normTail(e.final_norm, total, heads);
+        try @import("cuda_norm.zig").normTailRows(e, !added, e.final_norm, total, heads);
         if (e.learning) |k| try k.final(e.h, total);
         try e.proj(e.head, e.x + (total - heads) * g.hidden * 2, e.logits, heads, false);
     } else {
-        try e.norm(true, e.final_norm, total);
+        try e.norm(!added, e.final_norm, total);
         if (e.learning) |k| try k.final(e.h, total);
+        if (@hasField(@TypeOf(e.*), "head_amax")) if (amax) {
+            // a greedy verify: the norm wrote the rows' group sums (projAgain's input); the head's tile writes each
+            // row's best a tile and the merge each row's token (cuda_engine.zig forward then skips its argmax)
+            const x = e.x + (total - heads) * g.hidden * 2;
+            return e.affine.headArgmax(e.stream, x, e.xs, e.head.a4, e.head_amax, heads, e.tables.ptr + @import("cuda_round.zig").tokens_at);
+        };
         if (@hasDecl(@TypeOf(e.*), "projAgain"))
             try e.projAgain(e.head, e.x + (total - heads) * g.hidden * 2, e.logits, heads, false)
         else

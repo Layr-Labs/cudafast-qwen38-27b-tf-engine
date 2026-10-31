@@ -24,7 +24,7 @@ pub const threads = 128;
 pub const smem: u32 = 2 * (128 * 128 + 128 * 32 + 2 * 128 * 2);
 
 /// qmm_prompt_many.cuh's ManyPart and ManyParts, passed by value.
-pub const Part = extern struct { w: u64, scales: u64, biases: u64, out: u64, n: c_int, npad: c_int, first: c_int };
+pub const Part = extern struct { w: u64, scales: u64, biases: u64, out: u64, n: c_int, npad: c_int, first: c_int, add: c_int = 0 };
 pub const Parts = extern struct { p: [parts_max]Part, count: c_int };
 
 comptime {
@@ -33,7 +33,8 @@ comptime {
 }
 
 /// One projection of the shared input and its output rows.
-pub const Out = struct { q: Affine4, out: u64 };
+/// add: out is the residual h and h += bf16(the projection), on the rows2 output tiles only (addsResidual).
+pub const Out = struct { q: Affine4, out: u64, add: bool = false };
 
 pub const Kernels = struct {
     many_fn: Function,
@@ -106,6 +107,15 @@ pub const Kernels = struct {
     }
 
     /// Whether `mlp` takes this gate and up: one shape, whole 64-column tiles.
+    /// True when `prompt` of q alone over `rows` runs the persistent rows2 output tiles, which can add into h.
+    pub fn addsResidual(kk: *const Kernels, q: Affine4, rows: usize) bool {
+        const outs = [_]Out{.{ .q = q, .out = 0 }};
+        if (!kk.persistentRows(rows) or !outputRole(&outs)) return false;
+        if (kk.splitCols(q.n, rows)) |_| return kk.persistent_fns[2] != null;
+        const blocks = (rows + tile_m - 1) / tile_m * ((q.n + tile_n - 1) / tile_n);
+        return blocks > kk.slots and kk.persistent_fns[1] != null;
+    }
+
     pub fn mlpFits(gate: Affine4, up: Affine4) bool {
         return gate.n == up.n and gate.k == up.k and gate.npad == up.npad and gate.n % 64 == 0 and gate.k % 64 == 0;
     }
@@ -136,6 +146,7 @@ pub const Kernels = struct {
     /// out_i (rows, n_i) = x (rows, k) through each of `outs`, every one with prefill_kernel's bits.
     pub fn prompt(kk: *const Kernels, s: Stream, x: u64, outs: []const Out, rows: usize) !void {
         if (outs.len == 0 or outs.len > parts_max or rows == 0) return error.TooManyParts;
+        for (outs) |o| if (o.add and (outs.len != 1 or !kk.addsResidual(o.q, rows))) return error.InputMismatch;
         const k = outs[0].q.k;
         const rows_t = (rows + tile_m - 1) / tile_m;
         // prefill_kernel's row band: the row tiles of a column panel that share it from L2
@@ -143,7 +154,7 @@ pub const Kernels = struct {
         const group = @max(1, @min(rows_t, band));
         if (outs.len == 1) if (kk.splitCols(outs[0].q.n, rows)) |full_cols| {
             const o = outs[0];
-            const part: Part = .{ .w = o.q.w, .scales = o.q.s, .biases = o.q.b, .out = o.out, .n = @intCast(o.q.n), .npad = @intCast(o.q.npad), .first = 0 };
+            const part: Part = .{ .w = o.q.w, .scales = o.q.s, .biases = o.q.b, .out = o.out, .n = @intCast(o.q.n), .npad = @intCast(o.q.npad), .first = 0, .add = @intFromBool(o.add) };
             var g: launch_.Args = .{};
             g.add(x);
             g.add(part);
@@ -161,7 +172,7 @@ pub const Kernels = struct {
         var blocks: usize = 0;
         for (outs, 0..) |o, i| {
             if (o.q.k != k) return error.InputMismatch;
-            parts.p[i] = .{ .w = o.q.w, .scales = o.q.s, .biases = o.q.b, .out = o.out, .n = @intCast(o.q.n), .npad = @intCast(o.q.npad), .first = @intCast(blocks) };
+            parts.p[i] = .{ .w = o.q.w, .scales = o.q.s, .biases = o.q.b, .out = o.out, .n = @intCast(o.q.n), .npad = @intCast(o.q.npad), .first = @intCast(blocks), .add = @intFromBool(o.add) };
             blocks += rows_t * ((o.q.n + tile_n - 1) / tile_n);
         }
         parts.count = @intCast(outs.len);
