@@ -47,6 +47,5 @@ pub fn projectMany(e: *Engine, ls: []const Proj, x: u64, xs: u64, outs: []const 
 }
 
 fn mixedAttention() bool {
-    const value = @import("sys").c.getenv("TF_ATTENTION_MIXED") orelse return true;
-    return !std.mem.eql(u8, std.mem.span(value), "0");
+    return true;
 }
