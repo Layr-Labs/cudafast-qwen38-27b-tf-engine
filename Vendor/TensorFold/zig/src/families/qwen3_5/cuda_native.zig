@@ -412,10 +412,13 @@ const Lanes = struct {
     }
 
     fn closeDrafts(self: *Lanes) u64 {
-        if (self.draft) |draft| while (draft.pool.pop()) |ctx| {
-            if (ctx.ring.borrowed) ctx.ring.free() else cache_mod.giveBlock(&ctx.ring); // the next phase's ring, zeroed then
-            draft.gpa.destroy(ctx);
-        };
+        if (self.draft) |draft| {
+            draft.landing = .{};
+            while (draft.pool.pop()) |ctx| {
+                if (ctx.ring.borrowed) ctx.ring.free() else cache_mod.giveBlock(&ctx.ring);
+                draft.gpa.destroy(ctx);
+            }
+        }
         var bytes: u64 = 0;
         if (self.draft) |draft| {
             var streams = draft.streams.valueIterator();
@@ -436,6 +439,9 @@ const Lanes = struct {
             return;
         };
         stream.cache_len = closePhaseCaches(self);
+        cache_mod.clearBlocks(self.e) catch {
+            stream.cache_len = std.math.maxInt(u64);
+        };
     }
 
     /// Each width timed on a reset cache after its captured launch shape is warm.
@@ -638,6 +644,7 @@ test "Qwen stepped prefill: cancel between host iterations retains only the last
 
 test "Qwen stepped prefill: phase close drains real CUDA page and upload pools" {
     try @import("cuda_native_phase_test.zig").drains(closePhaseCaches, closeUploadSpares);
+    try @import("cuda_native_phase_test.zig").recycled(cache_mod.clearBlocks);
 }
 
 test "Qwen stepped prefill: failed first-window recreation releases its claim" {

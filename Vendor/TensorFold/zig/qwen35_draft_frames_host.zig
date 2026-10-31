@@ -8,6 +8,39 @@ const plan = @import("tests/cuda/qwen_draft_frames_plan.zig");
 const control = @import("tests/cuda/qwen_draft_frames_control.zig");
 const t = std.testing;
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "Draft frames: the configured tree budget reaches both facts and frame admission" {
+    _ = unsetenv("TF_DRAFT_NODES");
+    _ = unsetenv("TF_NO_TREES");
+    defer _ = unsetenv("TF_DRAFT_NODES");
+    var c: q.draft.Config = .{ .default_tree_nodes = 31, .hidden = 256, .intermediate = 256, .layers = 1, .vocab = 256, .heads = 2, .kv_heads = 1, .head_dim = 128, .block = 16, .mask = 255, .window = 2048, .group = 16, .rank = 2, .topk = 2, .eps = 1e-6, .theta = 10000000, .taps = @splat(0), .n_taps = 1 };
+    var d: q.draft.Draft = undefined;
+    d.projection_role = .proposal;
+    d.frame_streams = 1;
+    d.scratch_one = 0;
+    d.target_taps = 0;
+    d.step_ms = 1;
+    d.n_costs = 0;
+    d.c = c;
+    try t.expectEqual(@as(u32, 31), d.drafter().facts().tree_nodes);
+    const F = q.draft.frame;
+    var storage: [F.stagedLen(2)]u8 align(8) = undefined;
+    var ctx: q.draft.Ctx = .{ .ring = .{ .d = undefined, .ptr = 0x1000, .len = 1 }, .begin = 0, .end = 100 };
+    var refs = [_]*q.draft.Ctx{&ctx};
+    const items = [_]lanes.drafter.Hold{.{ .stream = @ptrFromInt(0x1000), .pending = 1, .position = 101, .depth = 31 }};
+    try F.stage(c, &items, &refs, &storage);
+    _ = setenv("TF_DRAFT_NODES", "7", 1);
+    try t.expectEqual(@as(u32, 7), d.drafter().facts().tree_nodes);
+    try t.expectError(error.BadDraftFrame, F.stage(c, &items, &refs, &storage));
+    _ = unsetenv("TF_DRAFT_NODES");
+    c.default_tree_nodes = 15;
+    d.c = c;
+    try t.expectEqual(@as(u32, 15), d.drafter().facts().tree_nodes);
+    try t.expectError(error.BadDraftFrame, F.stage(c, &items, &refs, &storage));
+}
+
 fn fill(c: *plan.Capture, partition: plan.Partition) !void {
     const Fake = struct {
         capture: *plan.Capture,

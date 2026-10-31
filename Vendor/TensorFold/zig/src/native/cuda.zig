@@ -105,6 +105,7 @@ pub const Host = struct {
     fn initThread(ctx: *anyopaque) !void {
         const h: *Host = @ptrCast(@alignCast(ctx));
         if (h.gpu) |g| {
+            @import("cuda_affinity.zig").preferPerformanceCores();
             try g.ctx.makeCurrent();
             bound = &g.ctx;
         }
@@ -252,6 +253,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         problem.* = try std.fmt.allocPrint(a, "{s}{d}: this machine has {d} CUDA device{s} (0 to {d})", .{ named, device, count, if (count == 1) "" else "s", @max(count, 1) - 1 });
         return null;
     }
+    // Decode consumes small host readbacks between GPU rounds; avoid scheduler wake-up latency at those waits.
+    try cuda.Context.setSchedule(&g.driver, @intCast(device), .spin);
     g.ctx = try cuda.Context.init(&g.driver, @intCast(device));
     defer if (!opened) g.ctx.deinit();
     bound = &g.ctx;

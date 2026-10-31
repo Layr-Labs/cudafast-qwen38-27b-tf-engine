@@ -52,10 +52,12 @@ const Capture = struct {
     var id: usize = 0;
     var input: u64 = 0;
     var threads: u32 = 0;
+    var grid_y: u32 = 0;
     var kept: q.round.Path = undefined;
-    fn launch(f: cuda.abi.Function, _: c_uint, _: c_uint, _: c_uint, x: c_uint, y: c_uint, z: c_uint, _: c_uint, _: cuda.abi.Stream, args: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+    fn launch(f: cuda.abi.Function, _: c_uint, gy: c_uint, _: c_uint, x: c_uint, y: c_uint, z: c_uint, _: c_uint, _: cuda.abi.Stream, args: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
         id = @intFromPtr(f);
         threads = x * y * z;
+        grid_y = gy;
         if (id >= 10) input = @as(*const u64, @ptrCast(@alignCast(args.?[7].?))).*;
         if (id == 1 or id == 3) kept = @as(*const q.round.Path, @ptrCast(@alignCast(args.?[2].?))).*;
         return cuda.abi.success;
@@ -87,6 +89,7 @@ test "Verify width calibration: actual DeltaNet dispatch selects its register va
     e.fns.gdn_slots_4 = function(&d, 24);
     e.fns.gdn_slots_8 = function(&d, 28);
     e.fns.gdn_slots_16 = function(&d, 36);
+    e.fns.gdn_slots16_3 = function(&d, 35);
     for ([_]u8{ 1, 2, 4, 8, 16 }) |slots| {
         try e.deltaScan(true, slots, 1, 0);
         try std.testing.expectEqual(@as(usize, 20 + slots), Capture.id);
@@ -97,6 +100,23 @@ test "Verify width calibration: actual DeltaNet dispatch selects its register va
     try std.testing.expectEqual(@as(usize, 11), Capture.id);
     try std.testing.expectEqual(e.tables.ptr + q.round.rowpar_at, Capture.input);
     try std.testing.expectError(error.InvalidGdnSlots, e.deltaScan(true, 3, 1, 0));
+    try e.deltaScan(true, 35, 1, 0);
+    try std.testing.expectEqual(@as(usize, 35), Capture.id);
+    try std.testing.expectEqual(@as(u32, 8), Capture.grid_y);
+    try std.testing.expectEqual(e.tables.ptr + q.round.steps_at, Capture.input);
+}
+
+test "Verify width calibration: narrow slot specialization has a proven plan and distinct graph" {
+    for (1..65) |rows| for (1..17) |peak| for ([_]bool{ false, true }) |enabled| {
+        const selected = q.round.narrowVariant(rows, peak, enabled);
+        const eligible = enabled and rows > 1 and rows <= 16 and peak == 3;
+        try std.testing.expectEqual(if (eligible) @as(usize, 35) else q.round.variant(peak), selected);
+        if (eligible) {
+            const native_shape = q.engine.Engine.Shape.init(rows, 1, true, false, 4);
+            const narrow_shape = q.engine.Engine.Shape.init(rows, 1, true, false, 35);
+            try std.testing.expect(native_shape.key() != narrow_shape.key());
+        }
+    };
 }
 
 test "Verify width calibration: actual keep launches carry the complete 64-row path" {

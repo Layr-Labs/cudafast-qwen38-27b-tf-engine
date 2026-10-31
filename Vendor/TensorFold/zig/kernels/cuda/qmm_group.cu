@@ -370,11 +370,11 @@ __device__ __forceinline__ float act_group_sum(const __nv_bfloat16* x) {   // qw
     return s;
 }
 
-template <int STAGES>
+template <int STAGES, int BM = 16, int BN = 64, bool KMAJOR = false>
 __device__ __forceinline__ void mlp_pair_body(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
                                               const Parts& parts, __nv_bfloat16* __restrict__ act,
                                               float* __restrict__ as, int M, int K, int ldx, int rows_t) {
-    constexpr int GS = 64, BM = 16, BN = 64, WM = 1, WN = 4;
+    constexpr int GS = 64, WM = 1, WN = 4;
     using T = LaneTile<GS, BM, BN, WM, WN, STAGES>;
     constexpr int I = T::MT, J = T::NT;
     extern __shared__ __align__(128) unsigned char buf[];
@@ -406,7 +406,7 @@ __device__ __forceinline__ void mlp_pair_body(const __nv_bfloat16* __restrict__ 
     for (int j = 0; j < WC; ++j) {
         const int c = tid + j * T::THREADS, t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
         wok[j] = c < T::W / 16;
-        wsrc[j] = reinterpret_cast<const unsigned char*>(P.w) + static_cast<size_t>(n0 / 64 + t) * KG * TILE_BYTES +
+        wsrc[j] = reinterpret_cast<const unsigned char*>(P.w) + static_cast<size_t>(n0 / 64 + t) * (KMAJOR ? 1 : KG) * TILE_BYTES +
                   off * 16;
         wdst[j] = T::X + c * 16;
     }
@@ -430,7 +430,7 @@ __device__ __forceinline__ void mlp_pair_body(const __nv_bfloat16* __restrict__ 
         unsigned char* p = stage(s);
 #pragma unroll
         for (int j = 0; j < WC; ++j)
-            if (wok[j]) cp16(p + wdst[j], wsrc[j] + static_cast<size_t>(g) * TILE_BYTES);
+            if (wok[j]) cp16(p + wdst[j], wsrc[j] + static_cast<size_t>(g) * (KMAJOR ? P.npad / 64 : 1) * TILE_BYTES);
 #pragma unroll
         for (int j = 0; j < SC; ++j)
             if (sok[j]) cp16(p + sdst[j], ssrc[j] + static_cast<size_t>(g) * P.npad);
@@ -560,7 +560,10 @@ __device__ __forceinline__ void mlp_pair_body(const __nv_bfloat16* __restrict__ 
                     if (m0 + r < M) *reinterpret_cast<__nv_bfloat162*>(act + static_cast<size_t>(m0 + r) * N + n0 + c) = o2;
                 }
         __syncthreads();                         // the CTA's act tile complete
-        if (tid < rows) as[static_cast<size_t>(m0 + tid) * (N / 64) + n0 / 64] = act_group_sum(own + tid * BN);
+        if (tid < rows * (BN / 64)) {
+            const int r = tid / (BN / 64), col = tid % (BN / 64);
+            as[static_cast<size_t>(m0 + r) * (N / 64) + n0 / 64 + col] = act_group_sum(own + r * BN + col * 64);
+        }
     }
 #else
     __trap();
@@ -574,3 +577,8 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_pair(const __nv_bfl
         float* __restrict__ as, int M, int K, int ldx, int rows_t) {
     tf_qmm_group::mlp_pair_body<8>(x, xs, parts, act, as, M, K, ldx, rows_t);
 }
+
+#include "qmm_wide_kmajor.cuh"
+#include "qmm_mlp_layout.cuh"
+
+#include "qmm_mlp_single.cuh"

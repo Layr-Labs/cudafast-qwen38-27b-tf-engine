@@ -102,6 +102,10 @@ pub const Drafted = struct {
         m.plain_guard = d.plain_guard;
         m.draft_streams = d.batched;
         m.lone_cost_min_rows = d.cost_probe_min_rows;
+        m.fixed_tree = d.fixed_tree;
+        if (d.fixed_tree) m.copy_drafts = false;
+        m.fixed_tree_budget = d.fixed_tree_budget;
+        if (d.fixed_tree_budget) m.lone_cost_tile = 0; // controller rounds never run extra calibration trials
         m.draft_probabilities = false;
         m.head_trees = d.trees;
         if (d.tree_nodes > 0) {

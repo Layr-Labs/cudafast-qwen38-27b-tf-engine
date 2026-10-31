@@ -315,7 +315,7 @@ __device__ __forceinline__ void attn_one(TileStore store, Geo geo, const __nv_bf
 }
 
 // RB rows a block (MT m16 tiles of query heads); a stream's rows of one chunk width read each key tile once.
-template <int MT, class Tiles>
+template <int MT, class Tiles, bool SHORT = false>
 __device__ __forceinline__ void attn_rows(TileStore store, Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
                                                                       const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
                                                                       const int* __restrict__ P, float scale, int total,
@@ -333,7 +333,7 @@ __device__ __forceinline__ void attn_rows(TileStore store, Geo geo, const __nv_b
     if (tid < RB) {
         const int m = m0 + tid;
         r_seg[tid] = -1;
-        if (m < total && !past_rows(P, m) && segs[rowseg[m]].len >= GROUP_LEN) {
+        if (m < total && !past_rows(P, m) && (SHORT || segs[rowseg[m]].len >= GROUP_LEN)) {
             const Seg sg = segs[rowseg[m]];
             const Ancestor anc = rowanc[m];
             const int keys = sg.len + rows_seen(anc), ck = chunk_keys(keys);
@@ -425,7 +425,7 @@ __device__ __forceinline__ void attn_rows(TileStore store, Geo geo, const __nv_b
                 __syncthreads();
                 tiles.put(true);
                 __syncthreads();
-                if (t0 + 2 * TK <= sg.len && t0 + TK < kend) fetch(t0 + TK, -1);
+                if (!one_buffer<Tiles>::value && t0 + 2 * TK <= sg.len && t0 + TK < kend) fetch(t0 + TK, -1);
                 scores(s);
             } else {
                 // a tile holding window keys: each row of the class over its own keys, its lines kept
@@ -567,7 +567,10 @@ __device__ __forceinline__ void attn_rows(TileStore store, Geo geo, const __nv_b
                     __syncthreads();
                     values(j);
                 }
-            if (!shared && t0 + TK < kend && t0 + 2 * TK <= sg.len) fetch(t0 + TK, -1);
+            if ((!shared || one_buffer<Tiles>::value) && t0 + TK < kend && t0 + 2 * TK <= sg.len) {
+                __syncthreads();
+                fetch(t0 + TK, -1);
+            }
         }
         // the class's partials (a row whose chunk is past its keys: empty), stats from the first key half
         if (half == 0 && qd == 0) {

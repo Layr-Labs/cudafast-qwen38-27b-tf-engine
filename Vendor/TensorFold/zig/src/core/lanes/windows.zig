@@ -238,6 +238,17 @@ pub fn anySampled(plans: []const Plan) bool {
 /// Trim draft prefixes by landing probability to the shared width with the most expected tokens a ms.
 pub fn allocate(e: *Engine, plans: []Plan) !void {
     if (e.trim) |t| return trimmed(e, plans, t);
+    // A stream-local controller selected this whole ancestry-closed own-node prefix.
+    // Mixed copies, grammar and sampled streams retain the ordinary allocator.
+    if (e.cfg.fixed_tree_budget and e.alone and plans.len == 1 and e.cfg.draft_confidence == null) {
+        const p = &plans[0];
+        if (p.kind == .head and p.branch_from == 0 and p.grammar_from == 0 and
+            p.stream.sampling == null and (p.count() == 15 or p.count() == 31))
+        {
+            p.stream.granted = @intCast(p.count());
+            return;
+        }
+    }
     const a = e.arena.allocator();
     const fixed = try a.alloc(u32, plans.len);
     const probs = try a.alloc([]const f64, plans.len);
@@ -269,7 +280,9 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
     const costs = if (explicit) &untimed else if (live) &own else &e.cfg.shared_costs;
     const overhead = if (explicit or live) 0 else e.rule.overheadMs(plans.len, anySampled(plans));
     const counts = try alloc.allocate(a, fixed, probs, costs, overhead, @max(plans.len, e.cfg.batch_rows));
-    const trial = if (live) lone_costs.probe(e, plans[0]) else null;
+    const fixed_tree = e.cfg.fixed_tree and e.alone and plans.len == 1 and plans[0].kind == .head;
+    if (fixed_tree) counts[0] = @intCast(@min(probs[0].len, e.cfg.batch_rows - 1));
+    const trial = if (live and !fixed_tree) lone_costs.probe(e, plans[0]) else null;
     if (trial) |count| {
         counts[0] = count;
         plans[0].cost_probe_rows = count + 1;
@@ -513,4 +526,26 @@ pub fn tokens(e: *Engine, w: be.Window, o: be.Verified) ![]u32 {
     @memcpy(out[1 .. 1 + w.held], o.drafts[0..w.held]);
     @memcpy(out[1 + w.held ..], w.tokens);
     return out;
+}
+
+test "DFlash width budget: a controller-owned tree reaches verification without a second probability trim" {
+    var e: Engine = undefined;
+    e.trim = null;
+    e.alone = true;
+    var cfg: @import("config.zig").Config = undefined;
+    cfg.fixed_tree_budget = true;
+    cfg.draft_confidence = null;
+    e.cfg = &cfg;
+    var stream: Stream = undefined;
+    stream.sampling = null;
+    var parents: [31]i32 = @splat(-1);
+    var offered_tokens: [31]u32 = @splat(7);
+    for ([_]usize{15,31}) |n| for ([_]bool{false,true}) |held| for ([_]bool{false,true}) |tree| {
+        stream.granted = 0;
+        var plans = [_]Plan{.{ .stream = &stream, .position = 0, .kind = .head,
+            .held = if (held) @intCast(n) else 0, .tokens = if (held) &.{} else offered_tokens[0..n], .parents = if (tree) parents[0..n] else null }};
+        try allocate(&e, &plans);
+        try std.testing.expectEqual(@as(u32, @intCast(n)), stream.granted);
+        try std.testing.expectEqual(n, plans[0].count());
+    };
 }

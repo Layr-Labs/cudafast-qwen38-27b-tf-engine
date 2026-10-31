@@ -98,3 +98,44 @@ pub fn firstWindow(comptime takeFirstWindow: anytype, comptime FirstWindow: type
     window.release();
     t.allocator.destroy(byte);
 }
+
+pub fn recycled(comptime clearBlocks: anytype) !void {
+    const Buffer = struct {
+        var fills: usize = 0;
+        var fail_fill = false;
+        var fail_sync = false;
+        bytes: *[4]u8,
+        pub fn fill8(b: @This(), value: u8, _: usize) !void {
+            if (fail_fill) return error.NotReady;
+            fills += 1;
+            @memset(b.bytes, value);
+        }
+    };
+    const Block = struct { buffer: Buffer, zeroed: bool = false };
+    var first: [4]u8 = @splat(71);
+    var second: [4]u8 = @splat(93);
+    var blocks = [_]Block{ .{ .buffer = .{ .bytes = &first } }, .{ .buffer = .{ .bytes = &second } } };
+    const Stream = struct {
+        handle: usize = 0,
+        pub fn synchronize(_: @This()) !void {
+            if (Buffer.fail_sync) return error.NotReady;
+        }
+    };
+    var e = .{ .blocks = .{ .items = blocks[0..] }, .stream = Stream{} };
+    Buffer.fills = 0;
+    Buffer.fail_fill = true;
+    try t.expectError(error.NotReady, clearBlocks(&e));
+    try t.expect(!blocks[0].zeroed and !blocks[1].zeroed);
+    Buffer.fail_fill = false;
+    Buffer.fail_sync = true;
+    try t.expectError(error.NotReady, clearBlocks(&e));
+    try t.expect(!blocks[0].zeroed and !blocks[1].zeroed);
+    Buffer.fail_sync = false;
+    try clearBlocks(&e);
+    try t.expect(blocks[0].zeroed and blocks[1].zeroed);
+    try t.expectEqualSlices(u8, &@as([4]u8, @splat(0)), &first);
+    try t.expectEqualSlices(u8, &@as([4]u8, @splat(0)), &second);
+    const fills = Buffer.fills;
+    try clearBlocks(&e);
+    try t.expectEqual(fills, Buffer.fills);
+}

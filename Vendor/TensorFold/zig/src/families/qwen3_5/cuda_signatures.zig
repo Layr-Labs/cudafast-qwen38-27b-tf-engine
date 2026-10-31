@@ -24,6 +24,7 @@ pub const attn_partial8 = Sig{ .name = "attn_partial8", .handle = "e.fp8.attn_pa
 
 /// The bf16 decode attention over a long stream's rows: a block a group of rows.
 pub const attn_rows = Sig{ .name = "attn_rows", .handle = "e.fns.attn_rows", .symbol = "tf_q35_attn_rows", .params = &.{ .geo, .ptr, .ptr, .ptr, .ptr, .i32, .ptr, .f32, .i32, .ptr, .ptr, .ptr } };
+pub const attn_wide = Sig{ .name = "attn_wide", .handle = "e.fns.attn_wide", .symbol = "tf_q35_attn_wide", .params = &.{ .geo, .ptr, .ptr, .ptr, .ptr, .i32, .ptr, .f32, .i32, .ptr, .ptr, .ptr } };
 
 /// The e4m3 decode attention over a long stream's rows.
 pub const attn_rows8 = Sig{ .name = "attn_rows8", .handle = "e.fp8.attn_rows", .symbol = "tf_q35_attn_rows8", .params = &.{ .geo, .ptr, .ptr, .ptr, .ptr, .i32, .ptr, .f32, .i32, .ptr, .ptr, .ptr } };
@@ -56,7 +57,7 @@ pub const draft_partial_rows = Sig{ .name = "draft_partial_rows", .handle = "d.f
 pub const draft_merge = Sig{ .name = "draft_merge", .handle = "d.fns.attn_merge", .symbol = "tf_q35d_attn_merge", .params = &.{ .ptr, .ptr, .ptr, .i32, .ptr } };
 
 /// Every q35 attention kernel's list: the decode partials, the rows, the merge, the gate, the rope and the draft pair.
-pub const all = [_]Sig{ attn_partial, attn_partial8, attn_rows, attn_rows8, attn_merge, attn_gate, attn_merge_gate, norm_rope, rope, rope8, draft_partial, draft_partial_rows, draft_merge };
+pub const all = [_]Sig{ attn_partial, attn_partial8, attn_rows, attn_wide, attn_rows8, attn_merge, attn_gate, attn_merge_gate, norm_rope, rope, rope8, draft_partial, draft_partial_rows, draft_merge };
 
 /// The list a launch site's handle names, if the table holds one.
 pub fn byHandle(handle: []const u8) ?Sig {
