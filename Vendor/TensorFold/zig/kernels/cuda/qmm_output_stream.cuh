@@ -9,6 +9,7 @@ constexpr int Stage=4416, SliceBytes=Stage*2, Bytes=SliceBytes*4;
 // A dictionary-coded part (qmm_dict.cuh): a stage's 256 bytes at 4096 hold the group's index window in place of its
 // scales and biases; each slice decodes its group into its own 256 bytes past Bytes, from the one table after them.
 // The part's npad holds the code, so the word stream's tile count is the grid's (one CTA a 64-column tile).
+// (pair codes too: qmm_dict::dict_fetch reads the column's pair entry, from the table here or through L2)
 __device__ __forceinline__ void dict_decode_at(const qmm_dict::DictLanes& D,const unsigned char* packed,unsigned char* dec,
         const unsigned char* table,int g){
     qmm_dict::dict_put(D,dec,qmm_dict::dict_fetch(D,packed,table,g));
@@ -17,7 +18,7 @@ __device__ __forceinline__ void dict_decode_at(const qmm_dict::DictLanes& D,cons
 template<int FutureGroups,int Slices=4,int Rolling=0,bool DICT=false>
 __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const float* __restrict__ xs,
         const tf_qmm_group::Parts& parts,int M,int K,int ldx) {
-    static_assert(!DICT||(FutureGroups==0&&Rolling==0),"a coded part's L2 prefetch would target its index windows");
+    static_assert(!DICT||Rolling==0,"a coded part's rolling prefetch would target its index windows");
     extern __shared__ __align__(128) unsigned char buf[];
     const auto p=parts.p[0];
     const int slice=threadIdx.x/128,tid=threadIdx.x%128,lane=tid&31,wn=tid>>5;
@@ -47,10 +48,13 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
     if(tid==0) {
 #pragma unroll
         for(int g=1;g<=FutureGroups;++g)if(g<per){
-            const auto* w=weight(g0+g);const auto* s=p.scales+size_t(g0+g)*p.npad+n0;const auto* b=p.biases+size_t(g0+g)*p.npad+n0;
+            const auto* w=weight(g0+g);
             asm volatile("cp.async.bulk.prefetch.L2.global [%0], 2048;" :: "l"(w) : "memory");
-            asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(s) : "memory");
-            asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(b) : "memory");
+            if constexpr(!DICT){
+                const auto* s=p.scales+size_t(g0+g)*p.npad+n0;const auto* b=p.biases+size_t(g0+g)*p.npad+n0;
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(s) : "memory");
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(b) : "memory");
+            }
         }
     }
 #endif
@@ -70,6 +74,7 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
         wait<0>();__syncthreads();
         if(it+1<per){load_w(it+1);load_x(it+1);}commit();
         const auto* at=stage(it);const auto* wp=reinterpret_cast<const uint32_t*>(at+2048);
+        // the lane's scale or bias, fetched now and stored after the MMAs (a global pair table's latency)
         uint32_t dv=0;if constexpr(DICT)dv=qmm_dict::dict_fetch(D,at+4096,table,g0+it);
         const auto* sp=reinterpret_cast<const __nv_bfloat16*>(DICT?dec:at+4096);const auto* sums=reinterpret_cast<const float*>(at+4352);
         uint32_t words[2][2];
@@ -126,7 +131,11 @@ extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_stream16(const _
 }
 // tf_qmm_output_stream16 on a dictionary-coded part: the same loads, MMA chains, fmas and slice-ordered sum.
 extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_stream16_dict(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
-    tf_qmm_output_stream::body<0,4,0,true>(x,xs,parts,M,K,ldx);
+    if (K == 6144) {
+        tf_qmm_output_stream::body<4,4,0,true>(x,xs,parts,M,K,ldx);
+    } else {
+        tf_qmm_output_stream::body<0,4,0,true>(x,xs,parts,M,K,ldx);
+    }
 }
 extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_prefetch16(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
     tf_qmm_output_stream::body<4>(x,xs,parts,M,K,ldx);

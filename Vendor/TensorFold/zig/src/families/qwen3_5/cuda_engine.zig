@@ -515,11 +515,7 @@ pub const Engine = struct {
     /// Logits rows first..first + n's greedy tokens into toks: the highest logit, ties to the lower id.
     fn argmax(e: *Engine, first: usize, n: usize, toks: u64) !void {
         if (n == 0) return;
-        const slices = argmaxSlices(e.g.vocab);
-        const pv = e.amax;
-        const pi = e.amax + n * slices * 4;
-        try e.run(e.fns.argmax_slices, .{ slices, n, 1 }, .{ 256, 1, 1 }, .{ e.logits + first * e.g.vocab * 2, @as(c_int, @intCast(e.g.vocab)), pv, pi });
-        try e.run(e.fns.argmax_merge, .{ n, 1, 1 }, .{ 32, 1, 1 }, .{ pv, pi, @as(c_int, @intCast(slices)), toks + first * 4 });
+        try e.run(e.fns.argmax, .{ n, 1, 1 }, .{ 1024, 1, 1 }, .{ e.logits + first * e.g.vocab * 2, @as(c_int, @intCast(e.g.vocab)), toks + first * 4 });
     }
 
     pub const norm = @import("cuda_norm.zig").norm;
@@ -610,8 +606,8 @@ pub const Engine = struct {
             Round.stageImageTables(st, im, p0, total);
         }
         try e.tables.uploadAsync(0, st[0..if (images != null) tables_len else src_at], e.stream.handle); // text: as before
-        const slot_variant = if (total > 16 and total <= 32 and slot_peak == 3 and e.affine.pdl and !envOff("TF_WIDE_SLOTS")) 3 else
-            Round.narrowVariant(total, slot_peak, record and e.affine.pdl and !envOff("TF_GDN16"));
+        const slot_variant = if (total > 16 and total <= 32 and slot_peak == 3 and e.affine.pdl) 3 else
+            Round.narrowVariant(total, slot_peak, record and e.affine.pdl);
         var shape = Shape.init(total, parts.len, record, e.n_taps > 0, @intCast(slot_variant));
         if (record and @import("cuda_round_timing.zig").Trace.enabled())
             std.debug.print("[timing] verify_slots peak={d} variant={d}\n", .{ slot_peak, shape.slots });

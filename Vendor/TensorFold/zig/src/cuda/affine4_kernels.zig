@@ -468,7 +468,9 @@ pub const Affine4Kernels = struct {
         // clusters of four, each CTA chaining the tile's slices in order (the same bits); the down projection's long
         // slices (68 groups) stay on the cluster tile, and so does a short K (the drafter's K = 4096, 64 groups a
         // lane CTA: its 80 CTAs keep too few bytes in flight)
-        if (sk > 1 and a.cluster_decode and !(a.short_lane and q.k / 64 / sk < lane_min and q.k / 64 >= lane_groups)) return a.cluster(s, x, xs, q, out, rows, sk);
+        const stream_fn = if (q.stream_w == 0) null else a.stream16_fns[@as(usize, if (q.k == 6144) 1 else 0)];
+        const streamed = rows == 16 and sk == 4 and q.n == 5120 and (q.k == 6144 or q.k == 17408) and q.stream_w != 0 and stream_fn != null;
+        if (sk > 1 and a.cluster_decode and (streamed or !(a.short_lane and q.k / 64 / sk < lane_min and q.k / 64 >= lane_groups))) return a.cluster(s, x, xs, q, out, rows, sk);
         return if (sk > 1) a.gemv(s, x, xs, q, out, rows, sk) else a.cluster(s, x, xs, q, out, rows, sk);
     }
 
@@ -784,7 +786,7 @@ pub const Affine4Kernels = struct {
         const stream_fn = if (q.stream_w == 0) null else a.stream16_fns[@as(usize, if (q.k == 6144) 1 else 0)];
         if (rows == 16 and sk == 4 and q.n == 5120 and (q.k == 6144 or q.k == 17408) and q.stream_w != 0 and stream_fn != null) {
             // a coded down projection streams its index windows in place of its scales and biases (the same bits)
-            const dict = q.k == 17408 and q.npad == 5120 and a.coded(q) and a.stream16_dict_fn != null;
+            const dict = (q.k == 17408 or q.k == 6144) and q.npad == 5120 and a.coded(q) and a.stream16_dict_fn != null;
             var parts: Parts = std.mem.zeroes(Parts);
             parts.count = 1;
             parts.p[0] = .{ .w = q.stream_w, .scales = if (dict) q.sb else q.s, .biases = if (dict) q.tab else q.b, .out = out, .n = int(q.n), .npad = if (dict) @bitCast(q.code) else int(q.npad), .sk = 4, .tiles = 80, .first = 0 };
