@@ -14,8 +14,8 @@ const linux = std.os.linux;
 /// Free blocks smaller than this are what the buffer takes.
 const below: usize = 32 << 20;
 /// Memory left free beyond the engine's own buffers; the buffer never takes more than `most`.
-const margin: usize = 24 << 30;
-const most: usize = 40 << 30;
+const margin: usize = 34 << 30;
+const most: usize = 60 << 30;
 const least: usize = 1 << 30;
 const granule: usize = 2 << 20;
 
@@ -31,16 +31,21 @@ pub const Sponge = struct {
 };
 
 /// Commits a buffer over the free memory in blocks below `below`, keeping `need` bytes and `margin` free; an
-/// empty Sponge when the kernel's pages are small (4 KiB pages: its largest block is 4 MiB), the counts are
-/// unreadable, memory is short, or a driver call fails. Never fails the load.
+/// empty Sponge when the counts are unreadable, memory is short, or a driver call fails. Never fails the load.
+/// The page size is no reason to decline: GB10's 4 KiB-page kernel has buddy orders up to 13, so blocks up to 32 MiB.
+/// TF_SPONGE=<GiB> caps the buffer below `most`, TF_SPONGE=0 turns it off.
 pub fn take(d: *const cuda.Driver, need: usize) Sponge {
     if (comptime builtin.os.tag != .linux) return .{};
     const page = std.heap.pageSize();
-    if (page < 64 << 10) return .{};
+    const c = @import("sys").c;
+    const cap: usize = if (c.getenv("TF_SPONGE")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch most >> 30) << 30 else most;
+    if (cap == 0) return .{};
     var buf: [16384]u8 = undefined;
     const small = smallFree(read("/proc/buddyinfo", &buf) orelse return .{}, page);
     const avail = memAvailable(read("/proc/meminfo", &buf) orelse return .{}) orelse return .{};
-    const len = size(small, avail, need);
+    const len = @min(size(small, avail, need), cap);
+    if (c.getenv("TF_TIMING") != null)
+        std.debug.print("info: sponge: small {d} MiB, available {d} MiB, need {d} MiB, cap {d} MiB, taking {d} MiB\n", .{ small >> 20, avail >> 20, need >> 20, cap >> 20, len >> 20 });
     if (len == 0) return .{};
     var p: cuda.abi.DevicePtr = 0;
     if (d.api.cuMemAlloc_v2(&p, len) != cuda.abi.success) return .{};
@@ -105,6 +110,11 @@ fn memAvailable(text: []const u8) ?usize {
     return null;
 }
 
+test "sponge: 4 KiB pages, orders 0-12 are below 32 MiB and order 13 is not" {
+    const info = "Node 0, zone   Normal      3      0      0      0      0      0      0      0      0      1      0      0      1      2\n";
+    try std.testing.expectEqual(@as(usize, 3 * 4096 + (2 << 20) + (16 << 20)), smallFree(info, 4096));
+}
+
 test "sponge: small blocks counted by order, sized within the memory kept free" {
     const t = std.testing;
     const info =
@@ -119,8 +129,8 @@ test "sponge: small blocks counted by order, sized within the memory kept free" 
     try t.expectEqual(@as(?usize, null), memAvailable("MemTotal: 1 kB\n"));
     const g: usize = 1 << 30;
     try t.expectEqual(@as(usize, 20 * g), size(20 * g, 100 * g, 30 * g));
-    try t.expectEqual(@as(usize, 40 * g), size(90 * g, 200 * g, 30 * g)); // at most `most`
-    try t.expectEqual(@as(usize, 6 * g), size(20 * g, 60 * g, 30 * g)); // the kept memory first
-    try t.expectEqual(@as(usize, 0), size(20 * g, 50 * g, 30 * g));
+    try t.expectEqual(@as(usize, 60 * g), size(90 * g, 200 * g, 30 * g)); // at most `most`
+    try t.expectEqual(@as(usize, 6 * g), size(20 * g, 70 * g, 30 * g)); // the kept memory first
+    try t.expectEqual(@as(usize, 0), size(20 * g, 60 * g, 30 * g));
     try t.expectEqual(@as(usize, 0), size(g / 2, 100 * g, 30 * g));
 }
