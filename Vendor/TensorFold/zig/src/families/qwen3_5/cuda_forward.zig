@@ -51,6 +51,8 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     // an image chunk's rows take the tower's features, and rotate at their staged t, h, w positions
     const mpos: u64 = if (e.features != 0) e.tables.ptr + mpos_at else 0;
     if (e.features != 0) try e.run(e.fns.splice, .{ total, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, e.features, e.tables.ptr + src_at, @as(c_int, @intCast(g.hidden)), t_params });
+    // a prompt chunk keeps its last row: past its keys and values, the last layer runs that row alone
+    const tail = prompt and @import("cuda_prompt_tail.zig").fits(e, total, nseg, shape.hidden, shape.paged);
     var di: usize = 0;
     var ai: c_int = 0;
     for (e.layers, 0..) |l, i| {
@@ -60,6 +62,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
             .delta => |m| {
                 const layer: c_int = @intCast(di);
                 try e.projMany(&.{ m.qkv, m.z, m.a, m.b }, e.x, &.{ e.qkv, e.z, e.a, e.b }, total, prompt);
+                if (!prompt) try warm(e, m.out); // the out projection's first groups, during the delta rule's kernels
                 if (e.learning) |k| try k.delta(i, e.qkv, e.z, e.b, e.a, total);
                 try e.runAfter(e.fns.gdn_pre, .{ 1, 2 * g.k_heads + g.v_heads, total }, .{ 32, 1, 1 }, .{ geo, e.qkv, t_segs, t_rows, t_par, layer, m.conv, e.a, e.b, m.a_log, m.dt_bias, e.q, e.k, e.v, e.g_, e.beta, t_params });
                 // one recorded window of 2+ rows: gdn_pre logged its tails, conv_commit would only return
@@ -72,6 +75,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
             .attention => |m| {
                 const aw = g.attnWidth();
                 try e.projMany(&.{ m.q, m.k, m.v }, e.x, &.{ e.qraw, e.kraw, e.vraw }, total, prompt);
+                if (!prompt) try warm(e, m.o); // the o projection's first groups, during the attention kernels
                 if (e.learning) |k| try k.attention(i, e.qraw, e.kraw, e.vraw, total);
                 if (e.kv8) {
                     try e.runAfter(e.fns.head_norm, .{ total * g.q_heads, 1, 1 }, .{ 64, 1, 1 }, .{ e.qraw, m.q_norm, e.qn, @as(c_int, @intCast(g.q_heads)), @as(c_int, @intCast(2 * aw)), @as(c_int, 2 * head_dim), g.eps, t_params });
@@ -80,6 +84,10 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 } else {
                     // both head norms and the rope in one launch: a block a (row, head), each normed head rotated in place
                     try launchAfter(e, e.fns.norm_rope, sig.norm_rope, .{ total, g.q_heads + g.kv_heads, 1 }, .{ head_dim, 1, 1 }, .{ geo, e.qraw, e.kraw, m.q_norm, m.k_norm, e.qn, e.vraw, t_segs, t_rows, t_anc, @as(c_int, ai), t_params, mpos, g.eps });
+                }
+                if (tail and i == e.layers.len - 1) {
+                    try @import("cuda_prompt_tail.zig").run(e, @intCast(ai), total);
+                    return;
                 }
                 if (shape.paged) {
                     try @import("cuda_attention.zig").partial(e, shape, ai);
@@ -144,6 +152,25 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     }
     try finish(e, total, heads, shape.hidden);
 }
+
+/// GB10 decode and verify windows: L2 hints (tf_q35_l2_warm) for the head of each of `l`'s (tile, K slice) runs, about
+/// 8 MB, issued once the input projections before have finished, so they stream in while the mixer's latency-bound
+/// kernels (gdn_pre, conv_commit, the slot scan, gdn_post; or the attention kernels) leave DRAM idle.
+fn warm(e: *E.Engine, l: E.Proj) !void {
+    if (!e.affine.pdl or !warm_on or l != .a4) return;
+    const q = l.a4;
+    const tiles = (q.n + 63) / 64;
+    const kg = q.k / 64;
+    const sk = cuda.qlinear.splitK(q.n, q.k);
+    const groups = @max(1, @min(kg / sk, warm_bytes / (tiles * sk * 2048)));
+    const threads = tiles * sk + 2 * sk;
+    try e.runAfter(e.fns.l2_warm, .{ (threads + 127) / 128, 1, 1 }, .{ 128, 1, 1 }, .{ q.w, q.s, q.b, @as(c_int, @intCast(tiles)), @as(c_int, @intCast(kg)), @as(c_int, @intCast(sk)), @as(c_int, @intCast(groups)), @as(c_int, @intCast(q.npad)) });
+}
+
+/// The out/o projection bytes each warm hints (about half of the 27B's 6144 x 5120 projections' words).
+const warm_bytes: usize = 8 << 20;
+/// Compile-time switch for A/B: false launches no warm kernels (every value is the same either way).
+pub const warm_on = true;
 
 /// A launch whose arguments are checked against the kernel's .cu signature: a wrong count or kind does not build.
 fn launch(e: *E.Engine, f: cuda.Function, comptime s: sig.Sig, grid: [3]usize, block: [3]usize, args: anytype) !void {

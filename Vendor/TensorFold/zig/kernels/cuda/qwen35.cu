@@ -641,6 +641,33 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm_rope(Geo geo, cons
 }
 
 #include "qwen35_rows.cuh"
+// L2 hints for the head of each (64-column tile, K slice) run of a decode projection's stored words (tile t, group g at
+// (t * kg + g) * 2048 bytes) and of its scale and bias rows ((kg, npad) bf16). Launched after a layer's input
+// projections, it streams the out (o) projection's first groups into L2 while the mixer's latency-bound kernels leave
+// DRAM idle, so that projection's CTAs start from L2. A hint only: nothing is written and no value changes.
+extern "C" __global__ void __launch_bounds__(128) tf_q35_l2_warm(const unsigned char* __restrict__ W, const unsigned char* __restrict__ S,
+                                                                   const unsigned char* __restrict__ B, int tiles, int kg, int sk, int groups,
+                                                                   int npad) {
+    release_next();
+    await_prior();
+#if __CUDA_ARCH__ >= 900
+    const int per = kg / sk, runs = tiles * sk;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < runs + 2 * sk; i += gridDim.x * blockDim.x) {
+        const unsigned char* p;
+        unsigned bytes;
+        if (i < runs) {
+            p = W + ((size_t)(i / sk) * kg + (size_t)(i % sk) * per) * 2048;
+            bytes = (unsigned)groups * 2048u;
+        } else {
+            const int j = i - runs;
+            p = (j < sk ? S : B) + (size_t)(j % sk) * per * npad * 2;
+            bytes = (unsigned)groups * (unsigned)npad * 2u;
+        }
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(p), "r"(bytes) : "memory");
+    }
+#endif
+}
+
 #include "qwen35_slots.cuh"
 #include "qwen35_argmax.cuh"
 

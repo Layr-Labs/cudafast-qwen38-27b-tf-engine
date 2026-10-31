@@ -13,6 +13,8 @@ const noise_weight = 0.7;
 const default_nodes = 15;
 const lp_top = 20;
 const lp_words = 3 + 2 * lp_top;
+/// Selector ranks whose pred x selector products chancesAfter keeps on the stack (larger ranks: the plain loop).
+const max_rank = 1024;
 
 /// A hold's rows: each row's logprob words (ids, then logits at lp_top), its selector projection, the codebooks.
 pub const Candidates = struct {
@@ -129,10 +131,20 @@ fn ids(c: Candidates, r: usize) []align(1) const u32 {
 fn chancesAfter(c: Candidates, r: usize, pred: u32, out: *[lp_top]f64) void {
     const w = ids(c, r);
     const hp = std.mem.bytesAsSlice(u16, c.projected[r * c.rank * 2 ..][0 .. c.rank * 2]);
+    // pred x selector once a row (each product as the candidates' loop formed it: (pred * hp) * successor), so the
+    // host's tree build between the drafter frame and the verify does rank multiplies a candidate, not 2 x rank
+    var ph_buf: [max_rank]f64 = undefined;
+    const ph = ph_buf[0..@min(c.rank, max_rank)];
+    if (c.rank <= max_rank) for (ph, 0..) |*v, k| {
+        v.* = bf16(c.predecessor[pred * c.rank + k]) * bf16(hp[k]);
+    };
     var most: f64 = -std.math.inf(f64);
     for (0..c.topk) |j| {
         var edge: f64 = 0;
-        for (0..c.rank) |k| edge += bf16(c.predecessor[pred * c.rank + k]) * bf16(hp[k]) * bf16(c.successor[w[2 + j] * c.rank + k]);
+        const succ = c.successor[w[2 + j] * c.rank ..][0..c.rank];
+        if (c.rank <= max_rank) {
+            for (ph, succ) |v, x| edge += v * bf16(x);
+        } else for (0..c.rank) |k| edge += bf16(c.predecessor[pred * c.rank + k]) * bf16(hp[k]) * bf16(succ[k]);
         out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edge_weight * edge) / scale;
         most = @max(most, out[j]);
     }
@@ -232,4 +244,44 @@ test "best first: a node's children follow it, the cheapest open node first, cha
     try std.testing.expectEqual(@as(i32, -1), parents[0]);
     for (parents[0..n], 0..) |p, i| try std.testing.expect(p < @as(i32, @intCast(i)));
     for (tokens[0..n], parents[0..n]) |t, p| try std.testing.expectEqual(p >= 0, t >= 10); // row 1's ids under row 0's
+}
+
+test "hoisted selector: chancesAfter keeps the per-candidate formula's bits" {
+    // five rows of six candidates over a 64-token vocabulary, rank-4 codebooks: every edge term non-zero
+    const rank = 4;
+    const rows = 5;
+    const topk = 6;
+    var words: [rows * lp_words * 4]u8 = @splat(0);
+    const w = std.mem.bytesAsSlice(u32, &words);
+    var prng = std.Random.DefaultPrng.init(7);
+    const rnd = prng.random();
+    for (0..rows) |r| for (0..topk) |j| {
+        w[r * lp_words + 2 + j] = @intCast((r * 11 + j * 7) % 64);
+        w[r * lp_words + 2 + lp_top + j] = @bitCast(@as(f32, 3.0 - @as(f32, @floatFromInt(j)) * 0.5 + rnd.float(f32)));
+    };
+    var book: [2][64 * rank]u16 = undefined;
+    for (&book) |*b| for (b) |*x| {
+        x.* = @truncate(@as(u32, @bitCast(rnd.float(f32) * 2 - 1)) >> 16);
+    };
+    var hp: [rows * rank]u16 = undefined;
+    for (&hp) |*x| x.* = @truncate(@as(u32, @bitCast(rnd.float(f32) * 2 - 1)) >> 16);
+    const c: Candidates = .{ .words = &words, .projected = std.mem.sliceAsBytes(&hp), .topk = topk, .rank = rank, .predecessor = &book[0], .successor = &book[1] };
+    for (0..rows) |r| for ([_]u32{ 0, 3, 17, 63 }) |pred| {
+        var got: [lp_top]f64 = undefined;
+        chancesAfter(c, r, pred, &got);
+        // the original loop, verbatim
+        const wr = ids(c, r);
+        var want: [lp_top]f64 = undefined;
+        var most: f64 = -std.math.inf(f64);
+        for (0..topk) |j| {
+            var edge: f64 = 0;
+            for (0..rank) |k| edge += bf16(c.predecessor[pred * rank + k]) * bf16(hp[r * rank + k]) * bf16(c.successor[wr[2 + j] * rank + k]);
+            want[j] = drawn(c, r, wr[2 + j], @as(f64, @as(f32, @bitCast(wr[2 + lp_top + j]))) + edge_weight * edge) / scale;
+            most = @max(most, want[j]);
+        }
+        var total: f64 = 0;
+        for (want[0..topk]) |v| total += @exp(v - most);
+        const log_total = most + @log(total);
+        for (want[0..topk], got[0..topk]) |a, b| try std.testing.expectEqual(@as(u64, @bitCast(a - log_total)), @as(u64, @bitCast(b)));
+    };
 }
