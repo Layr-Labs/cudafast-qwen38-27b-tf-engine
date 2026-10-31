@@ -172,6 +172,8 @@ fn actualFrame(block: usize) !void {
     d.streams = .empty;
     defer d.streams.deinit(a);
     d.selection_base = 0;
+    d.replay = null;
+    d.replay_ctx = null;
     inline for (@typeInfo(@TypeOf(d.fns)).@"struct".field_names) |name| @field(d.fns, name) = function(&driver, 10);
     d.fns.dyn_conv_batch = function(&driver, 2);
     d.fns.norm_rope_batch = function(&driver, 3);
