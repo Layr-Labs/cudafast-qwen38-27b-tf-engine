@@ -85,12 +85,34 @@ const Record = struct {
     var waits: usize = 0;
     var fail: bool = false;
     var last_norm_input: u64 = 0;
+    /// The fused q/k norm-rope launch's 13 arguments, widened per slot: pointers as u64, i32 sign-extended, f32 bits.
+    var qk_args: [13]u64 = @splat(0);
+    var qk_grid: u32 = 0;
+    var qk_threads: u32 = 0;
     var block: usize = 8;
     fn launch(f: cuda.abi.Function, x: c_uint, _: c_uint, z: c_uint, threads: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, args: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
         const id = @intFromPtr(f);
         if (id < counts.len) counts[id] += 1;
         if (id == 13) last_norm_input = @as(*const u64, @ptrCast(@alignCast(args.?[0].?))).*;
         if (id == 1) max_rows = @max(max_rows, x);
+        if (id == 7) {
+            const A = args.?;
+            qk_grid = x;
+            qk_threads = threads;
+            qk_args[0] = @as(*const u64, @ptrCast(@alignCast(A[0].?))).*;
+            qk_args[1] = @as(*const u64, @ptrCast(@alignCast(A[1].?))).*;
+            qk_args[2] = @as(*const u64, @ptrCast(@alignCast(A[2].?))).*;
+            qk_args[3] = @bitCast(@as(i64, @as(*const i32, @ptrCast(@alignCast(A[3].?))).*));
+            qk_args[4] = @as(*const u64, @ptrCast(@alignCast(A[4].?))).*;
+            qk_args[5] = @as(*const u64, @ptrCast(@alignCast(A[5].?))).*;
+            qk_args[6] = @as(*const u64, @ptrCast(@alignCast(A[6].?))).*;
+            qk_args[7] = @bitCast(@as(i64, @as(*const i32, @ptrCast(@alignCast(A[7].?))).*));
+            qk_args[8] = @bitCast(@as(i64, @as(*const i32, @ptrCast(@alignCast(A[8].?))).*));
+            qk_args[9] = @as(*const u64, @ptrCast(@alignCast(A[9].?))).*;
+            qk_args[10] = @bitCast(@as(i64, @as(*const i32, @ptrCast(@alignCast(A[10].?))).*));
+            qk_args[11] = @as(u64, @as(u32, @bitCast(@as(*const f32, @ptrCast(@alignCast(A[11].?))).*)));
+            qk_args[12] = @as(u64, @as(u32, @bitCast(@as(*const f32, @ptrCast(@alignCast(A[12].?))).*)));
+        }
         if (id == 5) {
             std.debug.assert(z == 9 and threads == 128);
             if (fail) return cuda.abi.error_not_ready;
@@ -182,6 +204,7 @@ fn actualFrame(block: usize) !void {
     inline for (@typeInfo(@TypeOf(d.fns)).@"struct".field_names) |name| @field(d.fns, name) = function(&driver, 10);
     d.fns.dyn_conv_batch = function(&driver, 2);
     d.fns.norm_rope_batch = function(&driver, 3);
+    d.fns.norm_rope_qk_batch = function(&driver, 7);
     d.fns.mask_rows = function(&driver, 4);
     d.fns.attn_partial = function(&driver, 5);
     d.fns.attn_merge = function(&driver, 6);
@@ -194,6 +217,7 @@ fn actualFrame(block: usize) !void {
     layer.mlp_conv.n = 64;
     layer.k.n = 128;
     layer.v.n = 128;
+    layer.k_norm = 2; // distinct from q_norm's 1: the fused launch must pass each side its own weight
     d.w.selector = weight();
     d.w.selector.n = 2;
     d.w.selector.npad = 64;
@@ -230,7 +254,17 @@ fn actualFrame(block: usize) !void {
         try std.testing.expectEqual(@as(usize, if (count == 1) 0 else 1), Record.counts[4]);
         try std.testing.expectEqual(if (count == 1) d.h + d.c.hidden * 2 else d.h2, Record.last_norm_input);
         try std.testing.expectEqual(@as(usize, 4), Record.counts[2]);
-        try std.testing.expectEqual(@as(usize, 2), Record.counts[3]);
+        try std.testing.expectEqual(@as(usize, 0), Record.counts[3]); // the split launches are gone
+        try std.testing.expectEqual(@as(usize, 1), Record.counts[7]); // one fused q/k norm-rope launch
+        try std.testing.expectEqual(@as(u32, @intCast(count * block * (d.c.heads + d.c.kv_heads))), Record.qk_grid);
+        try std.testing.expectEqual(@as(u32, 32), Record.qk_threads);
+        try std.testing.expectEqual(@as(u64, @intCast(d.c.heads)), Record.qk_args[3]);
+        try std.testing.expectEqual(@as(u64, @intCast(d.c.kv_heads)), Record.qk_args[7]);
+        try std.testing.expectEqual(@as(u64, @intCast(count * block)), Record.qk_args[8]);
+        try std.testing.expectEqual(@as(u64, @intCast(block)), Record.qk_args[10]);
+        try std.testing.expect(Record.qk_args[0] != Record.qk_args[4]); // q and k inputs are distinct buffers
+        try std.testing.expect(Record.qk_args[1] != Record.qk_args[5]); // each side its own norm weight
+        try std.testing.expect(Record.qk_args[2] != Record.qk_args[6]); // q and k outputs are distinct buffers
         try std.testing.expectEqual(@as(usize, 2), Record.uploads);
         try std.testing.expectEqual(@as(usize, 2), Record.downloads);
         try std.testing.expectEqual(@as(usize, 1), Record.waits);
