@@ -70,10 +70,23 @@ __device__ __forceinline__ void await_prior() {
 #endif
 }
 
+template <typename T>
+__device__ __forceinline__ T* after_wait(T* p) {
+    asm volatile("" : "+l"(p)::"memory");
+    return p;
+}
+
+template <typename T>
+__device__ __forceinline__ T* plain(T* p) {
+    asm volatile("" : "+l"(p));
+    return p;
+}
+__device__ __forceinline__ void keep4(const uint4& v) { asm volatile("" ::"r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)); }
+
 // h = bf16(h + r) (r may be null), x = bf16(w * (h * inv)), XS (may be null) x's group sums; D 256k up to 8192.
-extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __restrict__ H, const __nv_bfloat16* __restrict__ R,
-                                                               const __nv_bfloat16* __restrict__ W, __nv_bfloat16* __restrict__ X, float eps, int D,
-                                                               const int* __restrict__ P, float* __restrict__ XS) {
+extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __restrict__ H0, const __nv_bfloat16* __restrict__ R0,
+                                                               const __nv_bfloat16* __restrict__ W, __nv_bfloat16* __restrict__ X0, float eps, int D,
+                                                               const int* __restrict__ P, float* __restrict__ XS0) {
     constexpr int MAXE = 32;
     __shared__ float red[8];
     __shared__ __align__(16) __nv_bfloat16 xrow[8192];
@@ -86,9 +99,15 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __r
     uint4 wv[4];
     if ((E & 3) == 0) {
 #pragma unroll
-        for (int j = 0; j < 4; j++) wv[j] = *reinterpret_cast<const uint4*>(W + min((t + 256 * j) * 8, D - 8));
+        for (int j = 0; j < 4; j++) wv[j] = *reinterpret_cast<const uint4*>(plain(W) + min((t + 256 * j) * 8, D - 8));
+#pragma unroll
+        for (int j = 0; j < 4; j++) keep4(wv[j]);
     }
     await_prior();
+    __nv_bfloat16* H = after_wait(H0);
+    const __nv_bfloat16* R = after_wait(R0);
+    __nv_bfloat16* X = after_wait(X0);
+    float* XS = after_wait(XS0);
     if ((E & 3) == 0) {
         const size_t row = blockIdx.x;
         uint4 hw[4], rw[4];
@@ -197,16 +216,24 @@ extern "C" __global__ void __launch_bounds__(64) tf_q35_sums(const __nv_bfloat16
 }
 
 // Conv, silu, q/k norms, decay and write: blockDim.y independent row warps per head, taps from the parents.
-extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_pre(Geo geo, const __nv_bfloat16* __restrict__ QKV, const Seg* __restrict__ segs,
+extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_pre(Geo geo, const __nv_bfloat16* __restrict__ QKV0, const Seg* __restrict__ segs,
                                                                   const int* __restrict__ rowseg, const int* __restrict__ rowpar, int layer,
                                                                   const __nv_bfloat16* __restrict__ CW,
-                                                                  const __nv_bfloat16* __restrict__ Ain, const __nv_bfloat16* __restrict__ Bin,
+                                                                  const __nv_bfloat16* __restrict__ Ain0, const __nv_bfloat16* __restrict__ Bin0,
                                                                   const float* __restrict__ ALOG, const __nv_bfloat16* __restrict__ DT,
-                                                                  __nv_bfloat16* __restrict__ Q, __nv_bfloat16* __restrict__ K,
-                                                                  __nv_bfloat16* __restrict__ V, float* __restrict__ G, __nv_bfloat16* __restrict__ BETA,
+                                                                  __nv_bfloat16* __restrict__ Q0, __nv_bfloat16* __restrict__ K0,
+                                                                  __nv_bfloat16* __restrict__ V0, float* __restrict__ G0, __nv_bfloat16* __restrict__ BETA0,
                                                                   const int* __restrict__ P) {
     release_next();
     await_prior();
+    const __nv_bfloat16* QKV = after_wait(QKV0);
+    const __nv_bfloat16* Ain = after_wait(Ain0);
+    const __nv_bfloat16* Bin = after_wait(Bin0);
+    __nv_bfloat16* Q = after_wait(Q0);
+    __nv_bfloat16* K = after_wait(K0);
+    __nv_bfloat16* V = after_wait(V0);
+    float* G = after_wait(G0);
+    __nv_bfloat16* BETA = after_wait(BETA0);
     const int lane = threadIdx.x;
     const int head = blockIdx.y;
     const int w = blockIdx.z * blockDim.y + threadIdx.y;
@@ -274,10 +301,11 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_pre(Geo geo, const 
 }
 
 // A segment's conv tail: a recorded window leaves the stream's (gdn_pre logged its rows'); others update it in place.
-extern "C" __global__ void tf_q35_conv_commit(Geo geo, const __nv_bfloat16* __restrict__ QKV, const Seg* __restrict__ segs,
+extern "C" __global__ void tf_q35_conv_commit(Geo geo, const __nv_bfloat16* __restrict__ QKV0, const Seg* __restrict__ segs,
                                                 const int* __restrict__ rowpar, int layer, const int* __restrict__ P) {
     release_next();
     await_prior();
+    const __nv_bfloat16* QKV = after_wait(QKV0);
     const int C = geo.conv();
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C || past_windows(P, blockIdx.y)) return;
@@ -298,13 +326,19 @@ extern "C" __global__ void tf_q35_conv_commit(Geo geo, const __nv_bfloat16* __re
 
 // Gated delta rule, each row's state its parent's: a chain keeps it in registers, a branch rebuilds it from the log.
 constexpr bool chain_root_state = true;
-extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_chain(Geo geo, const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
-                                                                     const __nv_bfloat16* __restrict__ v, const float* __restrict__ g,
-                                                                     const __nv_bfloat16* __restrict__ beta, const Seg* __restrict__ segs,
-                                                                     const int* __restrict__ rowpar, int layer, __nv_bfloat16* __restrict__ y,
+extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_chain(Geo geo, const __nv_bfloat16* __restrict__ q0, const __nv_bfloat16* __restrict__ k0,
+                                                                     const __nv_bfloat16* __restrict__ v0, const float* __restrict__ g0,
+                                                                     const __nv_bfloat16* __restrict__ beta0, const Seg* __restrict__ segs,
+                                                                     const int* __restrict__ rowpar, int layer, __nv_bfloat16* __restrict__ y0,
                                                                      const int* __restrict__ P) {
     release_next();
     await_prior();
+    const __nv_bfloat16* q = after_wait(q0);
+    const __nv_bfloat16* k = after_wait(k0);
+    const __nv_bfloat16* v = after_wait(v0);
+    const float* g = after_wait(g0);
+    const __nv_bfloat16* beta = after_wait(beta0);
+    __nv_bfloat16* y = after_wait(y0);
     const int NK = geo.nk, NV = geo.nv;
     if (past_windows(P, blockIdx.z / NV)) return;
     const int hv = blockIdx.z % NV;
@@ -406,14 +440,18 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_chain(Geo geo, cons
 }
 
 // out = bf16(silu(z) * bf16(w * rmsnorm(y))) per value head; blockDim.y independent row warps, at most four.
-extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post(Geo geo, const __nv_bfloat16* __restrict__ Y, const __nv_bfloat16* __restrict__ Z,
-                                                                   const __nv_bfloat16* __restrict__ NW, float eps, __nv_bfloat16* __restrict__ OUT,
-                                                                   const int* __restrict__ P, float* __restrict__ XS) {
+extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post(Geo geo, const __nv_bfloat16* __restrict__ Y0, const __nv_bfloat16* __restrict__ Z0,
+                                                                   const __nv_bfloat16* __restrict__ NW, float eps, __nv_bfloat16* __restrict__ OUT0,
+                                                                   const int* __restrict__ P, float* __restrict__ XS0) {
     __shared__ __align__(16) __nv_bfloat16 row_done[4][DK];
     __nv_bfloat16* done = row_done[threadIdx.y];
     const int lane = threadIdx.x, hv = blockIdx.y;
     release_next();
     await_prior();
+    const __nv_bfloat16* Y = after_wait(Y0);
+    const __nv_bfloat16* Z = after_wait(Z0);
+    __nv_bfloat16* OUT = after_wait(OUT0);
+    float* XS = after_wait(XS0);
     const size_t m = blockIdx.z * blockDim.y + threadIdx.y;
     if (past_rows(P, m)) return;
     const size_t W = (size_t)geo.nv * DK;
@@ -458,19 +496,23 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_rope(Geo geo, __nv_bflo
                                                                 const int* __restrict__ P, const int* __restrict__ M) {
     release_next();
     await_prior();
-    rope_rows(geo, Qn, Kn, Vr, segs, rowseg, rowanc, P, M, StoreBf16{layer, geo.kvh});
+    rope_rows(geo, after_wait(Qn), after_wait(Kn), after_wait(Vr), segs, rowseg, rowanc, P, M, StoreBf16{layer, geo.kvh});
 }
 
 // Causal attention in chunks of chunk_keys(the row's keys), a warp a query head; partials by (row, head, chunk).
 #include "qwen35_attn.cuh"
 
 // A row's chunks' partials into each (row, query head)'s output, rows qh * HD wide. Grid (qh, rows), a warp each.
-extern "C" __global__ void __launch_bounds__(32) tf_q35_attn_merge(Geo geo, const float* __restrict__ PM, const float* __restrict__ PL,
-                                                                     const float* __restrict__ PO, const Seg* __restrict__ segs,
+extern "C" __global__ void __launch_bounds__(32) tf_q35_attn_merge(Geo geo, const float* __restrict__ PM0, const float* __restrict__ PL0,
+                                                                     const float* __restrict__ PO0, const Seg* __restrict__ segs,
                                                                      const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc,
-                                                                     const int* __restrict__ P, __nv_bfloat16* __restrict__ OUT) {
+                                                                     const int* __restrict__ P, __nv_bfloat16* __restrict__ OUT0) {
     release_next();
     await_prior();
+    const float* PM = after_wait(PM0);
+    const float* PL = after_wait(PL0);
+    const float* PO = after_wait(PO0);
+    __nv_bfloat16* OUT = after_wait(OUT0);
     constexpr int DPL = HD / 32;
     const int QH = geo.qh;
     const int lane = threadIdx.x, qh = blockIdx.x;
@@ -505,11 +547,15 @@ __device__ __forceinline__ void block_sums(__nv_bfloat16* done, size_t total, fl
 }
 
 // out = bf16(y * bf16(sigmoid(gate))), the gate the second half of each query head's q_proj rows; rows qh * HD wide.
-extern "C" __global__ void tf_q35_attn_gate(Geo geo, const __nv_bfloat16* __restrict__ Y, const __nv_bfloat16* __restrict__ QRAW,
-                                              __nv_bfloat16* __restrict__ OUT, int rows, const int* __restrict__ P, float* __restrict__ XS) {
+extern "C" __global__ void tf_q35_attn_gate(Geo geo, const __nv_bfloat16* __restrict__ Y0, const __nv_bfloat16* __restrict__ QRAW0,
+                                              __nv_bfloat16* __restrict__ OUT0, int rows, const int* __restrict__ P, float* __restrict__ XS0) {
     __shared__ __align__(16) __nv_bfloat16 done[256];
     release_next();
     await_prior();
+    const __nv_bfloat16* Y = after_wait(Y0);
+    const __nv_bfloat16* QRAW = after_wait(QRAW0);
+    __nv_bfloat16* OUT = after_wait(OUT0);
+    float* XS = after_wait(XS0);
     const size_t W = (size_t)geo.qh * HD;
     if (P != nullptr) rows = P[2];
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -525,14 +571,20 @@ extern "C" __global__ void tf_q35_attn_gate(Geo geo, const __nv_bfloat16* __rest
 
 // tf_q35_attn_merge then tf_q35_attn_gate in one warp a (row, query head): the merge's bf16 output gated as attn_gate
 // does, and the head's four 64-entry group sums of the gated row, each as block_sums adds them (null XS: none).
-extern "C" __global__ void __launch_bounds__(32) tf_q35_attn_merge_gate(Geo geo, const float* __restrict__ PM, const float* __restrict__ PL,
-                                                                          const float* __restrict__ PO, const Seg* __restrict__ segs,
+extern "C" __global__ void __launch_bounds__(32) tf_q35_attn_merge_gate(Geo geo, const float* __restrict__ PM0, const float* __restrict__ PL0,
+                                                                          const float* __restrict__ PO0, const Seg* __restrict__ segs,
                                                                           const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc,
-                                                                          const int* __restrict__ P, const __nv_bfloat16* __restrict__ QRAW,
-                                                                          __nv_bfloat16* __restrict__ OUT, float* __restrict__ XS) {
+                                                                          const int* __restrict__ P, const __nv_bfloat16* __restrict__ QRAW0,
+                                                                          __nv_bfloat16* __restrict__ OUT0, float* __restrict__ XS0) {
     __shared__ __align__(16) __nv_bfloat16 done[HD];
     release_next();
     await_prior();
+    const float* PM = after_wait(PM0);
+    const float* PL = after_wait(PL0);
+    const float* PO = after_wait(PO0);
+    const __nv_bfloat16* QRAW = after_wait(QRAW0);
+    __nv_bfloat16* OUT = after_wait(OUT0);
+    float* XS = after_wait(XS0);
     constexpr int DPL = HD / 32;
     const int QH = geo.qh;
     const int lane = threadIdx.x, qh = blockIdx.x;
@@ -622,7 +674,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm_rope(Geo geo, cons
                                                                      const int* __restrict__ M, float eps) {
     release_next();
     await_prior();
-    norm_rope_rows(geo, QRAW, KRAW, WQ, WK, Qn, Vr, segs, rowseg, rowanc, P, M, eps, StoreBf16{layer, geo.kvh});
+    norm_rope_rows(geo, after_wait(QRAW), after_wait(KRAW), WQ, WK, after_wait(Qn), after_wait(Vr), segs, rowseg, rowanc, P, M, eps, StoreBf16{layer, geo.kvh});
 }
 
 #include "qwen35_rows.cuh"
@@ -631,12 +683,16 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm_rope(Geo geo, cons
 #include "qwen35_argmax.cuh"
 
 
-extern "C" __global__ void __launch_bounds__(128) tf_q35_attn_partial(Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
+extern "C" __global__ void __launch_bounds__(128) tf_q35_attn_partial(Geo geo, const __nv_bfloat16* __restrict__ Q0, const Seg* __restrict__ segs,
                                                                         const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
                                                                         const int* __restrict__ P, float scale,
-                                                                        float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
+                                                                        float* __restrict__ PM0, float* __restrict__ PL0, float* __restrict__ PO0) {
     release_next();
     await_prior();
+    const __nv_bfloat16* Q = after_wait(Q0);
+    float* PM = after_wait(PM0);
+    float* PL = after_wait(PL0);
+    float* PO = after_wait(PO0);
     extern __shared__ __align__(16) uint4 attn_tiles[];
     // A block takes every gridDim.y-th chunk, each chunk's arithmetic as its own block's: a short stream's rows need few
     // of the MAXCH chunks, and a block of these tiles holds its SM alone, so an idle chunk's block cost a dispatch.
@@ -662,12 +718,16 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_attn_partial(Geo geo, c
     }
 }
 
-extern "C" __global__ void __launch_bounds__(256) tf_q35_attn_rows(Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
+extern "C" __global__ void __launch_bounds__(256) tf_q35_attn_rows(Geo geo, const __nv_bfloat16* __restrict__ Q0, const Seg* __restrict__ segs,
                                                                      const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
                                                                      const int* __restrict__ P, float scale, int total,
-                                                                     float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
+                                                                     float* __restrict__ PM0, float* __restrict__ PL0, float* __restrict__ PO0) {
     release_next();
     await_prior();
+    const __nv_bfloat16* Q = after_wait(Q0);
+    float* PM = after_wait(PM0);
+    float* PL = after_wait(PL0);
+    float* PO = after_wait(PO0);
     extern __shared__ __align__(16) uint4 attn_tiles[];
     // every gridDim.y-th chunk, as tf_q35_attn_partial's; a group without a long stream's row has nothing at any chunk
     __shared__ int long_rows;

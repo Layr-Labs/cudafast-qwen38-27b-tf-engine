@@ -1,13 +1,17 @@
 // One warp retains the two original head-normalization sums, followed by register-only rotary exchange.
 extern "C" __global__ void __launch_bounds__(256) tf_q35_head_rope_warp(
-        Geo geo, const __nv_bfloat16* __restrict__ Qraw, const __nv_bfloat16* __restrict__ Kraw,
-        const __nv_bfloat16* __restrict__ Vraw, const __nv_bfloat16* __restrict__ Qweight,
-        const __nv_bfloat16* __restrict__ Kweight, __nv_bfloat16* __restrict__ Qn,
+        Geo geo, const __nv_bfloat16* __restrict__ Qraw0, const __nv_bfloat16* __restrict__ Kraw0,
+        const __nv_bfloat16* __restrict__ Vraw0, const __nv_bfloat16* __restrict__ Qweight,
+        const __nv_bfloat16* __restrict__ Kweight, __nv_bfloat16* __restrict__ Qn0,
         const Seg* __restrict__ segs, const int* __restrict__ rowseg,
         const Ancestor* __restrict__ rowanc, int layer, float eps,
         const int* __restrict__ P, const int* __restrict__ M) {
     release_next();
     await_prior();
+    const __nv_bfloat16* Qraw = after_wait(Qraw0);
+    const __nv_bfloat16* Kraw = after_wait(Kraw0);
+    const __nv_bfloat16* Vraw = after_wait(Vraw0);
+    __nv_bfloat16* Qn = after_wait(Qn0);
     const int heads = geo.qh + geo.kvh, lane = threadIdx.x;
     const size_t row_head = blockIdx.x * blockDim.y + threadIdx.y, row = row_head / heads;
     if (past_rows(P, row)) return; // Every lane of this independent warp has the same row.

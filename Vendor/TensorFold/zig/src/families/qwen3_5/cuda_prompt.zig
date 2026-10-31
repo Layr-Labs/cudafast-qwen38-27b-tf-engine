@@ -30,8 +30,17 @@ pub fn resolve(attention: cuda.Module, gdn: cuda.Module) !Fns {
 
 /// Attention layer `layer` into e.y: a chunk's queries (e.qn) over cache positions 0 .. len + row (rope wrote its own).
 pub fn run(e: *E.Engine, layer: usize, rows: usize) !void {
+    return runFrom(e, layer, 0, rows);
+}
+
+/// `run` for the chunk's rows from `first` on: each row's queries over its own keys, the same arithmetic a row
+/// (a tile past a row's position is wholly masked and leaves its maximum, sum and output as they were).
+pub fn runFrom(e: *E.Engine, layer: usize, first: usize, end: usize) !void {
     const g = e.g;
-    const sg = std.mem.bytesToValue(Seg, e.staged.bytes[E.Engine.segs_at..][0..@sizeOf(Seg)]);
+    const rows = end - first;
+    const at: u64 = first * g.q_heads * head_dim * 2;
+    var sg = std.mem.bytesToValue(Seg, e.staged.bytes[E.Engine.segs_at..][0..@sizeOf(Seg)]);
+    sg.len += @intCast(first);
     const kvh: u64 = g.kv_heads;
     const cap: u64 = @intCast(sg.cap);
     const heads = kvh * cap; // rows of one layer's keys (or values)
@@ -42,10 +51,10 @@ pub fn run(e: *E.Engine, layer: usize, rows: usize) !void {
         const keys = base;
         const values = keys + heads * head_dim;
         const kscale = values + heads * head_dim;
-        for ([_]u64{ e.qn, keys, values, kscale, kscale + heads * 4, e.y }) |v| a.add(v);
+        for ([_]u64{ e.qn + at, keys, values, kscale, kscale + heads * 4, e.y + at }) |v| a.add(v);
     } else {
         const base = sg.kv + layer * 2 * heads * head_dim * 2;
-        for ([_]u64{ e.qn, base, base + heads * head_dim * 2, e.y }) |v| a.add(v);
+        for ([_]u64{ e.qn + at, base, base + heads * head_dim * 2, e.y + at }) |v| a.add(v);
     }
     for ([_]usize{ @intCast(sg.len), rows, g.q_heads, g.kv_heads, group }) |v| a.add(@as(c_int, @intCast(v)));
     a.add(@as(f32, 1.0 / 16.0));

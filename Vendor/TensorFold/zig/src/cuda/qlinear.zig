@@ -28,6 +28,17 @@ pub const Affine4 = struct {
     n: usize,
     k: usize,
     npad: usize,
+    /// The decode kernels' dictionary-coded scales and biases (qmm_dict.cuh), built at load from s and b (0: none):
+    /// index words [npad / 64][k / 64][16 * bits] bytes, the table (ns scale values, then nb bias values), and
+    /// bits | ns << 5 | nb << 18. s and b stay for the prompt kernels and every launch without a dictionary twin.
+    sb: u64 = 0,
+    tab: u64 = 0,
+    code: u32 = 0,
+
+    /// The table's bytes (16-byte padded) when coded.
+    pub fn tabBytes(q: Affine4) u32 {
+        return ((q.code >> 5 & 0x1FFF) + (q.code >> 18 & 0x1FFF) + 7) / 8 * 16;
+    }
 
     /// The tiled sizes for n outputs from k inputs: rows padded to 128, then the words', scales' and biases' bytes.
     pub fn layout(n: usize, k: usize) struct { npad: usize, words: usize, scales: usize } {
@@ -246,6 +257,14 @@ pub const symbols = struct {
     pub const prefill_n64 = "tf_qmm_prefill_n64";
     pub const pack_words = "tf_pack_dense";
     pub const pack_scales = "tf_transpose_pad16";
+    // dictionary-coded twins (qmm_dict.cuh) and the load-time encoder (affine4_pack.cu)
+    pub const group_dict = "_ZN12tf_qmm_group17group_kernel_dictILi64ELi16ELi64ELi1ELi4ELi8ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
+    pub const gemv_dict = "tf_lane_gemv_dict";
+    pub const gemv_many_dict = "tf_lane_gemv_many_dict";
+    pub const dict_mark = "tf_dict_mark";
+    pub const dict_rank = "tf_dict_rank";
+    pub const dict_table = "tf_dict_table";
+    pub const dict_pack = "tf_dict_pack";
 };
 
 /// qmm_group.cu's Part and Parts, passed by value: four projections at most, one used here.
@@ -280,6 +299,13 @@ pub const split_smem: u32 = 17664; // LaneTile<64, 16, 64, 1, 4, 4>::SMEM: four 
 pub const prefill_smem: u32 = 62976; // Tile<64, 128, 128, 2, 4, 3>::SMEM
 pub const prefill_n64_smem: u32 = 56064; // Tile<64, 128, 64, 2, 4, 3>::SMEM
 pub const prefill22_smem: u32 = 41984; // Tile<64, 128, 128, 2, 2, 2>::SMEM
+/// A dictionary twin's shared memory past its stages: one group's decoded scales and biases, then the part's table.
+pub const dict_dec: u32 = 256; // qmm_dict.cuh DICT_DEC
+pub const dict_tab_max: u32 = 10240; // tables past this stay uncoded: each twin keeps its original's CTAs an SM on GB10
+pub const dict_bits_max: u32 = 12;
+/// A code's layout bit: its indices lie group-major ([k / 64][npad / 64][16 * bits]) for tf_qmm_mlp_single16's K-major
+/// panels, which only that kernel's twin reads; every other twin reads tile-major codes.
+pub const dict_kmajor: u32 = 1 << 31;
 
 /// Split-K lane_gemv's fp32 slice partials and per-tile tickets: splitK keeps tiles * sk under 384 and tiles under 192.
 pub const Split = struct {
@@ -327,6 +353,7 @@ fn u(x: usize) u32 {
 }
 
 pub const Affine4Kernels = @import("affine4_kernels.zig").Affine4Kernels;
+pub const DictStore = @import("affine4_kernels.zig").DictStore;
 
 /// affine8.cu's shared bytes a width: Tile<64, 64, 6, bits>::SMEM for gemv, Tile<64, 64, 4, bits>::SMEM for split.
 pub fn gemvSmem(bits: u8) u32 {
