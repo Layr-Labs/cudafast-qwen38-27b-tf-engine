@@ -41,7 +41,9 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     // block there. gdn_post keeps a warp a block in windows (four a block measured slower).
     const gdn_rows: usize = if (prompt and total > 16) 4 else 1;
     const gdn_blocks = (total + gdn_rows - 1) / gdn_rows;
-    const pre_rows: usize = if ((prompt and total > 16) or (total >= 16 and rows4On())) 4 else 1;
+    // A recorded two-row verify window pairs its two rows in one block as well: one pre block a (k, v) head column
+    // reads the conv, a, b, a_log and dt vectors once for both rows, where two one-row blocks read them twice.
+    const pre_rows: usize = if (prompt and total > 16) 4 else if (total >= 8 and rows4On()) 4 else if (record and total == 2 and rows4On()) 2 else 1;
     const pre_blocks = (total + pre_rows - 1) / pre_rows;
     const t_ids = e.tables.ptr + ids_at;
     const t_segs = e.tables.ptr + segs_at;
