@@ -14,7 +14,8 @@ __device__ __forceinline__ void dict_decode_at(const qmm_dict::DictLanes& D,cons
     const uint32_t* pk=reinterpret_cast<const uint32_t*>(packed);
     const int off=(g*D.step&63)*8+D.bit0;
     const uint32_t idx=__funnelshift_r(pk[off>>5],pk[(off>>5)+1],off&31)&D.mask;
-    reinterpret_cast<unsigned short*>(dec)[D.pos]=reinterpret_cast<const unsigned short*>(table)[D.base+idx];
+    const auto* tab=reinterpret_cast<const unsigned short*>(table);
+    reinterpret_cast<unsigned short*>(dec)[D.pos]=D.c3?qmm_dict::c3_bits(idx,tab[0],D.pos>>6):tab[D.base+idx];
 }
 
 template<int FutureGroups,int Slices=4,int Rolling=0,bool DICT=false>

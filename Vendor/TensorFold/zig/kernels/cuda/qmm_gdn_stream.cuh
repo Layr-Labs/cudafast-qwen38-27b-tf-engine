@@ -132,15 +132,17 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
         if constexpr (DICT) {
             // the lane's BN / 64 values of its warp's BN / 4 columns: value q is column q % (BN / 4)'s scale, then bias
             const int code = P.npad, bits = qmm_dict::dict_bits(code), step = 16 * bits, g = map(it).x;
-            const uint32_t mask_bits = (1u << bits) - 1u;
+            const bool c3 = qmm_dict::dict_c3(code);   // packed words: column col's word at bit (col % 64) * 16
+            const uint32_t mask_bits = c3 ? 0xFFFFu : (1u << bits) - 1u;
 #pragma unroll
             for (int v = 0; v < BN / 64; ++v) {
                 const int q = lane + 32 * v, half = q / (BN / 4), col = wn * (BN / 4) + q % (BN / 4);
                 const uint32_t* pk = reinterpret_cast<const uint32_t*>(p + T::X + T::W + (col / 64) * 256);
-                const int off = (g * step & 63) * 8 + (half * 64 + col % 64) * bits;
+                const int off = (g * step & 63) * 8 + (c3 ? (col % 64) * 16 : (half * 64 + col % 64) * bits);
                 const uint32_t idx = __funnelshift_r(pk[off >> 5], pk[(off >> 5) + 1], off & 31) & mask_bits;
+                const unsigned short* tab = reinterpret_cast<const unsigned short*>(table);
                 reinterpret_cast<unsigned short*>(dec)[half * BN + col] =
-                    reinterpret_cast<const unsigned short*>(table)[(half ? qmm_dict::dict_ns(code) : 0) + idx];
+                    c3 ? qmm_dict::c3_bits(idx, tab[0], half) : tab[(half ? qmm_dict::dict_ns(code) : 0) + idx];
             }
             __syncwarp();
         }

@@ -22,8 +22,8 @@ test "dense serving: owned CUDA images retain their reviewed lane and decode byt
     const group = @embedFile("kernels/cuda/qmm_group.cu");
     try std.testing.expectEqualStrings("3b27b8e964f6e7453e962cd7a259253ae7e1940297439b4b518f05da04dd1041", &hash(group[0..16132]));
     try std.testing.expectEqualStrings("6f8ef4eed5368f309d3eb4080f656c99d8e302f5e23d5c2b33b095d23b8ca798", &hash(group));
-    try std.testing.expectEqualStrings("c824b95480a53c4c88abbaf80444f990309068e4414e34458cca255c01bea35a", &hash(@embedFile("kernels/cuda/qmm_output_stream.cuh")));
-    try std.testing.expectEqualStrings("ac152a74edbdde6190b4b268e885d93588c09e22929dcf4aa610e7c64794ca5e", &hash(@embedFile("kernels/cuda/qmm_gdn_stream.cuh")));
+    try std.testing.expectEqualStrings("ed5e9da7cf68887dc158747df8154c5dd3ca3606337a89e447a14d308b150431", &hash(@embedFile("kernels/cuda/qmm_output_stream.cuh")));
+    try std.testing.expectEqualStrings("9b8c1d2ce9420163b72ca747ea208659e14e7c9913e7d6ab2fe5f2d8b1c25852", &hash(@embedFile("kernels/cuda/qmm_gdn_stream.cuh")));
     try std.testing.expectEqualStrings("fb1101f0b75e07be8452e79da886930f44c27774f5f431d906edbd933c6dd9bd", &hash(@embedFile("kernels/cuda/qmm_wide_kmajor.cuh")));
     try std.testing.expectEqualStrings("f5d4386f2fc954c813d9f0536432f36cebe6c6ebd05c074f10776d2aa3b545ee", &hash(@embedFile("kernels/cuda/qmm_prefill.cu")));
     try std.testing.expectEqualStrings("98d7a19a2a005f4d7767c6d12ae13ee29bf525b307449b07d6c95c3ec5be27db", &hash(@embedFile("kernels/cuda/qmm_prompt_rows2.cuh")));

@@ -51,6 +51,7 @@ pub const DictStore = struct {
     bytes: usize = 0, // taken so far (reporting)
     coded: usize = 0, // projections coded
     kept: usize = 0, // projections left on their arrays (too many values)
+    words: usize = 0, // of the coded, those on packed words (qmm_dict.cuh C3_CODE)
 
     const chunk = 256 << 20;
     pub const scratch_bytes = 4 * 2048 * 4 + 16;
@@ -89,6 +90,8 @@ pub const DictKernels = struct {
     rank: Function,
     table: Function,
     pack: Function,
+    c3_range: Function, // tf_c3_range: a projection's ebase and nbase for its packed words
+    c3_pack: Function, // tf_c3_pack: the packed words (qmm_dict.cuh C3_CODE), each checked through c3_bits
     gemv_blocks: usize, // resident twin lane CTAs at the largest table kept (GB10: gemv_blocks)
 };
 
@@ -182,6 +185,8 @@ pub const Affine4Kernels = struct {
             t.rank = try pack_mod.function(symbols.dict_rank);
             t.table = try pack_mod.function(symbols.dict_table);
             t.pack = try pack_mod.function(symbols.dict_pack);
+            t.c3_range = try pack_mod.function(symbols.c3_range);
+            t.c3_pack = try pack_mod.function(symbols.c3_pack);
             const room = linear.dict_dec + linear.dict_tab_max;
             try t.group.allowDynamicShared(group_smem + room);
             try t.gemv.allowDynamicShared(group_smem + room);
@@ -206,6 +211,7 @@ pub const Affine4Kernels = struct {
         if (q.k % 256 != 0 or q.npad % 64 != 0) return; // kg a multiple of 4: every tile's indices start on a 64-byte line
         const kg = q.k / 64;
         const cells: c_longlong = @intCast(kg * q.npad);
+        if (try a.encodeWords(s, q, store, kmajor)) return;
         const bitmap = store.scratch.ptr;
         const rank = bitmap + 2 * 2048 * 4;
         const count = rank + 2 * 2048 * 4;
@@ -265,6 +271,69 @@ pub const Affine4Kernels = struct {
         q.tab = tab;
         q.code = bits | ns << 5 | nb << 18 | (if (kmajor) linear.dict_kmajor else 0);
         store.coded += 1;
+    }
+
+    /// q's scales and biases as packed words (qmm_dict.cuh C3_CODE, 128 bytes a group: the 8-bit dictionary's windows)
+    /// when every column of every group has a word that c3_bits turns back into its scale and bias bits; false (and q
+    /// untouched) otherwise. The 16-byte table holds ebase | nbase << 8 as its first value.
+    fn encodeWords(a: *const Affine4Kernels, s: Stream, q: *Affine4, store: *DictStore, kmajor: bool) !bool {
+        const t = a.dict orelse return false;
+        const kg = q.k / 64;
+        const count: u64 = @as(u64, kg) * q.npad;
+        const range = store.scratch.ptr; // ebase, nbase, then the miss count
+        try s.d.check(s.d.api.cuMemsetD32Async(range, 0xffffffff, 2, s.handle), "cuMemsetD32Async");
+        try s.d.check(s.d.api.cuMemsetD32Async(range + 8, 0, 1, s.handle), "cuMemsetD32Async");
+        {
+            var g: launch_.Args = .{};
+            g.add(q.s);
+            g.add(q.b);
+            g.add(@as(c_longlong, @intCast(count)));
+            g.add(range);
+            try launch_.launch(t.c3_range, .{ .grid = .{ .x = @intCast(@min((count + 255) / 256, 4096)) }, .block = .{ .x = 256 } }, s, &g);
+        }
+        try s.synchronize();
+        var got: [2]u32 = .{ 0, 0 };
+        try store.scratch.download(0, std.mem.asBytes(&got));
+        if (got[0] > 255 or got[1] > 31) return false;
+        const eb: u32 = got[0] | got[1] << 8;
+        const total: u64 = @as(u64, q.npad / 64) * kg * 32;
+        const room_at = store.at;
+        const room_n = store.n;
+        const room_bytes = store.bytes;
+        const sb = try store.alloc(total * 4 + 256); // + the last window's reach past the last group
+        {
+            var g: launch_.Args = .{};
+            g.add(q.s);
+            g.add(q.b);
+            for ([_]usize{ kg, q.npad }) |v| g.add(int(v));
+            g.add(eb);
+            g.add(sb);
+            g.add(@as(c_longlong, @intCast(total)));
+            g.add(@as(c_int, @intFromBool(kmajor)));
+            g.add(range + 8);
+            try launch_.launch(t.c3_pack, .{ .grid = .{ .x = @intCast((total + 255) / 256) }, .block = .{ .x = 256 } }, s, &g);
+        }
+        try s.synchronize();
+        var missed: u32 = 0;
+        try store.scratch.download(8, std.mem.asBytes(&missed));
+        if (missed != 0) {
+            // give the words' room back when it came from the current chunk (the dictionary takes it next)
+            if (store.n == room_n) {
+                store.at = room_at;
+                store.bytes = room_bytes;
+            }
+            return false;
+        }
+        const tab = try store.alloc(16);
+        try s.d.check(s.d.api.cuMemsetD32Async(tab, eb, 1, s.handle), "cuMemsetD32Async");
+        try s.d.check(s.d.api.cuMemsetD32Async(tab + 4, 0, 3, s.handle), "cuMemsetD32Async");
+        try s.synchronize();
+        q.sb = sb;
+        q.tab = tab;
+        q.code = linear.dict_c3 | (if (kmajor) linear.dict_kmajor else 0);
+        store.coded += 1;
+        store.words += 1;
+        return true;
     }
 
     pub fn deinit(a: *Affine4Kernels) void {

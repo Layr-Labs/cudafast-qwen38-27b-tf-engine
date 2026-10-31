@@ -21,11 +21,32 @@ using qmm_frag::cp16;
 // fetched whole once and the next group's indices in it come from L2.
 constexpr int DICT_DEC = 256;                    // shared bytes of one group's decoded scales and biases (bf16, 2 x 64)
 
+// Packed words: a coded view whose code is C3_CODE (the kmajor bit aside) holds, a group, its 64 columns' 16-bit words
+// in column order (128 bytes: the 8-bit dictionary's window, so every load is the dictionary's), each word
+// sign | 7 mantissa bits | exponent - ebase (3 bits) | c (5 bits), c = (n - nbase) * 3 + d + 1, and its 16-byte table
+// starts with eb = ebase | nbase << 8. c3_bits gives a word's scale bits (half 0) or bias bits (half 1): the scale's,
+// and the bf16 bits of -n * scale (fp32, rounded to nearest even) moved by d ulps. affine4_pack.cu's tf_c3_pack keeps
+// a projection's word view only when c3_bits gives every stored scale and bias bit for bit.
+constexpr int C3_CODE = 8 | 1 << 5 | 1 << 18;
+
+__device__ __forceinline__ bool dict_c3(int code) { return (code & 0x7FFFFFFF) == C3_CODE; }
+
+__device__ __forceinline__ unsigned short c3_bits(unsigned u, unsigned eb, int half) {
+    const unsigned sbits = (u & 0x8000u) | ((eb & 0xffu) + ((u >> 5) & 7u)) << 7 | ((u >> 8) & 0x7fu);
+    if (!half) return static_cast<unsigned short>(sbits);
+    const float sv = __uint_as_float(sbits << 16);
+    const unsigned c = u & 31u, q = (c * 11u) >> 5;   // c / 3 for c < 32
+    const unsigned code = ((eb >> 8) & 0xffu) + q | (c - 3u * q) << 5;
+    const unsigned short r = __bfloat16_as_ushort(__float2bfloat16_rn(static_cast<float>(-static_cast<int>(code & 31u)) * sv));
+    return static_cast<unsigned short>(r + (code >> 5) - 1u);
+}
+
 struct DictLanes {
     const unsigned char* src;                    // this thread's 16-byte chunk at the tile's first index group
     int step, bit0, base, pos;                   // bytes a group; the lane's index's bit in its group; table half
     uint32_t mask;
     bool ok;
+    bool c3;                                     // packed words (C3_CODE): the lane's column word at bit (pos % 64) * 16
 };
 
 // The group's 256-byte window: from the 64-byte line its indices start in.
@@ -49,6 +70,11 @@ __device__ __forceinline__ DictLanes dict_lanes(const PartT& P, int n0, int KG, 
     D.bit0 = D.pos * bits;
     D.base = (lane >> 4) ? dict_ns(code) : 0;
     D.mask = (1u << bits) - 1u;
+    D.c3 = dict_c3(code);
+    if (D.c3) {
+        D.bit0 = (D.pos & 63) * 16;
+        D.mask = 0xFFFFu;
+    }
     return D;
 }
 
@@ -66,7 +92,7 @@ __device__ __forceinline__ void dict_decode(const DictLanes& D, const unsigned c
     const int off = (g * D.step & 63) * 8 + D.bit0;
     const uint32_t idx = __funnelshift_r(pk[off >> 5], pk[(off >> 5) + 1], off & 31) & D.mask;
     const unsigned short* tab = reinterpret_cast<const unsigned short*>(dec + DICT_DEC);
-    reinterpret_cast<unsigned short*>(dec)[D.pos] = tab[D.base + idx];
+    reinterpret_cast<unsigned short*>(dec)[D.pos] = D.c3 ? c3_bits(idx, tab[0], D.pos >> 6) : tab[D.base + idx];
 }
 
 } // namespace qmm_dict

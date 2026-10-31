@@ -265,6 +265,8 @@ pub const symbols = struct {
     pub const dict_rank = "tf_dict_rank";
     pub const dict_table = "tf_dict_table";
     pub const dict_pack = "tf_dict_pack";
+    pub const c3_range = "tf_c3_range";
+    pub const c3_pack = "tf_c3_pack";
 };
 
 /// qmm_group.cu's Part and Parts, passed by value: four projections at most, one used here.
@@ -306,6 +308,7 @@ pub const dict_bits_max: u32 = 12;
 /// A code's layout bit: its indices lie group-major ([k / 64][npad / 64][16 * bits]) for tf_qmm_mlp_single16's K-major
 /// panels, which only that kernel's twin reads; every other twin reads tile-major codes.
 pub const dict_kmajor: u32 = 1 << 31;
+pub const dict_c3: u32 = 8 | 1 << 5 | 1 << 18; // qmm_dict.cuh C3_CODE: packed words in place of the indices
 
 /// Split-K lane_gemv's fp32 slice partials and per-tile tickets: splitK keeps tiles * sk under 384 and tiles under 192.
 pub const Split = struct {

@@ -74,7 +74,8 @@ __device__ __forceinline__ void mlp_single_dict_body(const __nv_bfloat16* __rest
     const int ddst = T::X + T::W + (dpart ? 64 * bits0 : 0) + dchunk * 16;
     // the lane's two values a pass: projection wn / 2's column (wn % 2) * 128 + pass * 32 + lane, scale and bias
     const int mpart = wn / 2, mbits = mpart ? bits1 : bits0, mns = dict_ns(mpart ? code1 : code0);
-    const uint32_t mmask = (1u << mbits) - 1u;
+    const bool mc3 = dict_c3(mpart ? code1 : code0);   // packed words: tile tt's column ct word at bit tt * 1024 + ct * 16
+    const uint32_t mmask = mc3 ? 0xFFFFu : (1u << mbits) - 1u;
     const int mrun = mpart ? 64 * bits0 : 0;
     const unsigned short* const mtab = tabs + (mpart ? tab0 / 2 : 0);
     const bool xsok = tid < rows;
@@ -175,9 +176,9 @@ __device__ __forceinline__ void mlp_single_dict_body(const __nv_bfloat16* __rest
                 const int c = (wn % 2) * 128 + pass * 32 + lane, tt = c / 64, ct = c % 64;
 #pragma unroll
                 for (int which = 0; which < 2; ++which) {
-                    const int off = (tt * 128 + which * 64 + ct) * mbits;
+                    const int off = mc3 ? tt * 1024 + ct * 16 : (tt * 128 + which * 64 + ct) * mbits;
                     const uint32_t idx = __funnelshift_r(pk[off >> 5], pk[(off >> 5) + 1], off & 31) & mmask;
-                    reinterpret_cast<unsigned short*>(dw)[which * 32 + lane] = mtab[(which ? mns : 0) + idx];
+                    reinterpret_cast<unsigned short*>(dw)[which * 32 + lane] = mc3 ? c3_bits(idx, mtab[0], which) : mtab[(which ? mns : 0) + idx];
                 }
             }
             __syncwarp();

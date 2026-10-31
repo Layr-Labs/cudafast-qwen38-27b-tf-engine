@@ -1,5 +1,6 @@
 // The MLX affine-4 repack into the lane matmul's tiles (cuda/qlinear.zig), moved verbatim from nemotron_ops.cu.
 
+#include "qmm_dict.cuh"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -126,4 +127,66 @@ extern "C" __global__ void tf_dict_pack(const uint16_t* __restrict__ s, const ui
         word |= start >= 0 ? idx << start : idx >> -start;
     }
     out[i] = word;
+}
+
+// Packed words (qmm_dict.cuh C3_CODE) in place of a projection's dictionary indices. A bias's code next to its scale:
+// n with bias = bf16(-n * scale) moved by d ulps (d in -1..1), the code n | (d + 1) << 5, or 0x100 when none gives
+// the bias bits (c3_bits' arithmetic).
+__device__ __forceinline__ unsigned c3_bias_code(uint16_t s, uint16_t b) {
+    const float sv = __uint_as_float(static_cast<unsigned>(s) << 16), bv = __uint_as_float(static_cast<unsigned>(b) << 16);
+    const float q = rintf(bv / sv);
+    const int n = q <= -1.0f && q >= -31.0f ? -static_cast<int>(q) : 0;
+    const unsigned short r = __bfloat16_as_ushort(__float2bfloat16_rn(static_cast<float>(-n) * sv));
+    const int d = static_cast<int>(b) - static_cast<int>(r);
+    if (d < -1 || d > 1) return 0x100u;
+    return static_cast<unsigned>(n) | static_cast<unsigned>(d + 1) << 5;
+}
+
+// tf_c3_range: a projection's smallest scale exponent (range[0]) and smallest bias n over biases with a code
+// (range[1]), both set to ~0 before: the word view's ebase and nbase.
+extern "C" __global__ void tf_c3_range(const uint16_t* __restrict__ scales, const uint16_t* __restrict__ biases,
+                                       long long count, unsigned* __restrict__ range) {
+    unsigned e = 0xffffffffu, n = 0xffffffffu;
+    for (long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        e = min(e, (static_cast<unsigned>(scales[i]) >> 7) & 0xffu);
+        const unsigned code = c3_bias_code(scales[i], biases[i]);
+        if (code < 0x100u) n = min(n, code & 31u);
+    }
+    e = __reduce_min_sync(0xffffffffu, e);
+    n = __reduce_min_sync(0xffffffffu, n);
+    if ((threadIdx.x & 31) == 0) {
+        atomicMin(range, e);
+        atomicMin(range + 1, n);
+    }
+}
+
+// One column's word for scale s and bias b, or 0x10000 when none gives both bit for bit through c3_bits.
+__device__ __forceinline__ unsigned c3_word(uint16_t s, uint16_t b, unsigned eb) {
+    const unsigned code = c3_bias_code(s, b);
+    if (code >= 0x100u) return 0x10000u;
+    const int eoff = static_cast<int>((s >> 7) & 0xffu) - static_cast<int>(eb & 0xffu);
+    const int c = (static_cast<int>(code & 31u) - static_cast<int>((eb >> 8) & 0xffu)) * 3 + static_cast<int>(code >> 5);
+    if (eoff < 0 || eoff > 7 || c < 0 || c > 31) return 0x10000u;
+    const unsigned u = (s & 0x8000u) | (s & 0x7fu) << 8 | static_cast<unsigned>(eoff) << 5 | static_cast<unsigned>(c);
+    return qmm_dict::c3_bits(u, eb, 0) == s && qmm_dict::c3_bits(u, eb, 1) == b ? u : 0x10000u;
+}
+
+// tf_c3_pack: the (kg, npad) scales s and biases b as words, two columns a 32-bit word: out [npad / 64][kg][32 words]
+// (each group's 64 columns in order), or group-major [kg][npad / 64][32] (`kmajor`, tf_dict_pack's layouts at 8 bits).
+// Every column whose word does not give its scale and bias bits counts in *bad.
+extern "C" __global__ void tf_c3_pack(const uint16_t* __restrict__ s, const uint16_t* __restrict__ b, int kg, int npad,
+                                      unsigned eb, uint32_t* __restrict__ out, long long total, int kmajor,
+                                      unsigned* __restrict__ bad) {
+    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int lw = static_cast<int>(i % 32);
+    const long long tg = i / 32;
+    const int tiles = npad / 64;
+    const int g = static_cast<int>(kmajor ? tg / tiles : tg % kg), t = static_cast<int>(kmajor ? tg % tiles : tg / kg);
+    const long long at = static_cast<long long>(g) * npad + t * 64 + lw * 2;
+    const unsigned w0 = c3_word(s[at], b[at], eb), w1 = c3_word(s[at + 1], b[at + 1], eb);
+    out[i] = (w0 & 0xffffu) | (w1 & 0xffffu) << 16;
+    const unsigned miss = (w0 >> 16) + (w1 >> 16);
+    if (miss) atomicAdd(bad, miss);
 }
