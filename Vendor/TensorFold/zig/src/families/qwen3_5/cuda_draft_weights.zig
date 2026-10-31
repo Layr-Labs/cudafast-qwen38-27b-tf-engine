@@ -95,7 +95,9 @@ fn toBf16(x: f32) u16 {
 }
 
 /// MLX affine-4, group 64: minimize weight error with a bf16 scale and bias; pack low nibbles first.
-fn quantize(gpa: std.mem.Allocator, w: []align(1) const u16, n: usize, k: usize) !struct { words: []u32, scales: []u16, biases: []u16 } {
+/// `imp` (null: every input alike): each input's weight in the fit's squared error, k long (the square of the RMSNorm
+/// weight that scales that input channel, for a projection of normed inputs).
+fn quantize(gpa: std.mem.Allocator, w: []align(1) const u16, n: usize, k: usize, imp: ?[]const f32) !struct { words: []u32, scales: []u16, biases: []u16 } {
     const groups = k / 64;
     const words = try gpa.alloc(u32, n * k / 8);
     errdefer gpa.free(words);
@@ -114,7 +116,7 @@ fn quantize(gpa: std.mem.Allocator, w: []align(1) const u16, n: usize, k: usize)
                 hi = @max(hi, x);
             }
             var fit = [2]f32{ (hi - lo) / 15.0, lo };
-            fit = leastSquares(row, fit);
+            fit = leastSquares(row, fit, if (imp) |m| m[g * 64 ..][0..64] else null);
             const scale = toBf16(fit[0]);
             const bias = toBf16(fit[1]);
             scales[r * groups + g] = scale;
@@ -137,32 +139,36 @@ fn quantize(gpa: std.mem.Allocator, w: []align(1) const u16, n: usize, k: usize)
 
 /// A group's (scale, bias) improved by alternating code assignment and a least-squares line fit; kept only where the
 /// squared error with bf16-rounded scale and bias drops.
-fn leastSquares(row: []align(1) const u16, start: [2]f32) [2]f32 {
+fn leastSquares(row: []align(1) const u16, start: [2]f32, wts: ?[]const f32) [2]f32 {
     var best = start;
-    var best_err = groupError(row, start);
+    var best_err = groupError(row, start, wts);
     var cur = start;
     for (0..8) |_| {
         const s = cur[0];
         if (s <= 0) break;
+        // the (weighted) least-squares line of the inputs on their codes
+        var s1: f64 = 0;
         var sq: f64 = 0;
         var sqq: f64 = 0;
         var sw: f64 = 0;
         var sqw: f64 = 0;
-        for (row) |h| {
+        for (row, 0..) |h, i| {
+            const a: f64 = if (wts) |m| m[i] else 1;
             const x: f64 = bf16(h);
             const q: f64 = std.math.clamp(@round((x - cur[1]) / s), 0.0, 15.0);
-            sq += q;
-            sqq += q * q;
-            sw += x;
-            sqw += q * x;
+            s1 += a;
+            sq += a * q;
+            sqq += a * q * q;
+            sw += a * x;
+            sqw += a * q * x;
         }
-        const det = 64 * sqq - sq * sq;
+        const det = s1 * sqq - sq * sq;
         if (det <= 0) break;
-        const ns = (64 * sqw - sq * sw) / det;
-        const nb = (sw - ns * sq) / 64;
+        const ns = (s1 * sqw - sq * sw) / det;
+        const nb = (sw - ns * sq) / s1;
         if (!(ns > 0)) break;
         cur = .{ @floatCast(ns), @floatCast(nb) };
-        const err = groupError(row, cur);
+        const err = groupError(row, cur, wts);
         if (err < best_err) {
             best_err = err;
             best = cur;
@@ -179,7 +185,7 @@ fn leastSquares(row: []align(1) const u16, start: [2]f32) [2]f32 {
             if (su < 0 or su > 65535 or bu < 0 or bu > 65535) continue;
             const candidate = [2]f32{ bf16(@intCast(su)), bf16(@intCast(bu)) };
             if (!(candidate[0] > 0) or !std.math.isFinite(candidate[0]) or !std.math.isFinite(candidate[1])) continue;
-            const err = groupError(row, candidate);
+            const err = groupError(row, candidate, wts);
             if (err < best_err) {
                 best_err = err;
                 best = candidate;
@@ -190,24 +196,29 @@ fn leastSquares(row: []align(1) const u16, start: [2]f32) [2]f32 {
 }
 
 /// The group's squared error under bf16-rounded scale and bias, as quantize then stores and the kernels read it.
-fn groupError(row: []align(1) const u16, fit: [2]f32) f64 {
+fn groupError(row: []align(1) const u16, fit: [2]f32, wts: ?[]const f32) f64 {
     const s = bf16(toBf16(fit[0]));
     const b = bf16(toBf16(fit[1]));
     const inv = if (s == 0) 0.0 else 1.0 / s;
     var err: f64 = 0;
-    for (row) |h| {
+    for (row, 0..) |h, i| {
         const x = bf16(h);
         const q = std.math.clamp(@round((x - b) * inv), 0.0, 15.0);
         const d: f64 = x - (q * s + b);
-        err += d * d;
+        err += (if (wts) |m| m[i] else 1) * d * d;
     }
     return err;
 }
 
 /// A bf16 (n, k) tensor quantized and packed through `stage` into the drafter's arena.
 fn linear(gpa: std.mem.Allocator, e: *Engine, stage: *DeviceBuffer, w: *Weights, ck: *core.Checkpoint, name: []const u8, n: usize, k: usize) !Affine4 {
+    return linearOf(gpa, e, stage, w, ck, name, n, k, null);
+}
+
+/// `linear` with each input's weight in the refit's error (quantize's `imp`).
+fn linearOf(gpa: std.mem.Allocator, e: *Engine, stage: *DeviceBuffer, w: *Weights, ck: *core.Checkpoint, name: []const u8, n: usize, k: usize, imp: ?[]const f32) !Affine4 {
     const t = try ck.expect(name, .bf16, &.{ n, k });
-    const q = try quantize(gpa, std.mem.bytesAsSlice(u16, t.bytes), n, k);
+    const q = try quantize(gpa, std.mem.bytesAsSlice(u16, t.bytes), n, k, imp);
     defer {
         gpa.free(q.words);
         gpa.free(q.scales);
@@ -253,6 +264,22 @@ fn vector(w: *Weights, ck: *core.Checkpoint, name: []const u8, shape: []const us
     return p;
 }
 
+/// An RMSNorm weight's squares, `n` long: each input's weight in the refit of a projection of that norm's outputs.
+fn normImportance(gpa: std.mem.Allocator, ck: *core.Checkpoint, name: []const u8, n: usize) ![]f32 {
+    const t = try ck.expect(name, .bf16, &.{n});
+    const out = try gpa.alloc(f32, n);
+    for (out, std.mem.bytesAsSlice(u16, t.bytes)) |*o, h| {
+        const g = bf16(h);
+        o.* = g * g + 1e-12; // a zero weight keeps a tiny pull, so a group of zero norm weights still fits
+    }
+    return out;
+}
+
+fn refitPlain() bool {
+    const v = @import("sys").c.getenv("TF_DRAFT_REFIT_PLAIN") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}
+
 fn hostBf16(gpa: std.mem.Allocator, ck: *core.Checkpoint, name: []const u8, shape: []const usize) ![]u16 {
     const t = try ck.expect(name, .bf16, shape);
     const out = try gpa.alloc(u16, t.bytes.len / 2);
@@ -275,7 +302,11 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: *Engine, dir: []const u8, s: 
     w.fc = try linear(gpa, e, &stage, &w, &ck, "fc.weight", s.hidden, s.taps * s.hidden);
     w.hidden_norm = try vector(&w, &ck, "hidden_norm.weight", &.{s.hidden});
     w.final_norm = try vector(&w, &ck, "norm.weight", &.{s.hidden});
-    w.selector = try linear(gpa, e, &stage, &w, &ck, "candidate_selector.hidden_projection.weight", s.rank, s.hidden);
+    // the refit weighs each input by the square of the RMSNorm weight that scales it (TF_DRAFT_REFIT_PLAIN=1: alike)
+    const weigh = !refitPlain();
+    const final_imp = try normImportance(gpa, &ck, "norm.weight", s.hidden);
+    defer gpa.free(final_imp);
+    w.selector = try linearOf(gpa, e, &stage, &w, &ck, "candidate_selector.hidden_projection.weight", s.rank, s.hidden, if (weigh) final_imp else null);
     w.predecessor = try hostBf16(gpa, &ck, "candidate_selector.predecessor_codebook", &.{ s.vocab, s.rank });
     errdefer gpa.free(w.predecessor);
     w.successor = try hostBf16(gpa, &ck, "candidate_selector.successor_codebook", &.{ s.vocab, s.rank });
@@ -290,21 +321,28 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: *Engine, dir: []const u8, s: 
             }
         };
         const nm: Name = .{ .buf = &buf, .i = i };
+        var nbuf: [96]u8 = undefined;
+        const in_imp = try normImportance(gpa, &ck, try std.fmt.bufPrint(&nbuf, "layers.{d}.input_layernorm.weight", .{i}), s.hidden);
+        defer gpa.free(in_imp);
+        const post_imp = try normImportance(gpa, &ck, try std.fmt.bufPrint(&nbuf, "layers.{d}.post_attention_layernorm.weight", .{i}), s.hidden);
+        defer gpa.free(post_imp);
+        const in_w: ?[]const f32 = if (weigh) in_imp else null;
+        const post_w: ?[]const f32 = if (weigh) post_imp else null;
         l.* = .{
             .input_norm = try vector(&w, &ck, try nm.of("input_layernorm.weight"), &.{s.hidden}),
             .post_norm = try vector(&w, &ck, try nm.of("post_attention_layernorm.weight"), &.{s.hidden}),
-            .q = try linear(gpa, e, &stage, &w, &ck, try nm.of("self_attn.q_proj.weight"), s.q_width, s.hidden),
-            .k = try linear(gpa, e, &stage, &w, &ck, try nm.of("self_attn.k_proj.weight"), s.kv_width, s.hidden),
-            .v = try linear(gpa, e, &stage, &w, &ck, try nm.of("self_attn.v_proj.weight"), s.kv_width, s.hidden),
+            .q = try linearOf(gpa, e, &stage, &w, &ck, try nm.of("self_attn.q_proj.weight"), s.q_width, s.hidden, in_w),
+            .k = try linearOf(gpa, e, &stage, &w, &ck, try nm.of("self_attn.k_proj.weight"), s.kv_width, s.hidden, in_w),
+            .v = try linearOf(gpa, e, &stage, &w, &ck, try nm.of("self_attn.v_proj.weight"), s.kv_width, s.hidden, in_w),
             .o = try linear(gpa, e, &stage, &w, &ck, try nm.of("self_attn.o_proj.weight"), s.hidden, s.q_width),
             .q_norm = try vector(&w, &ck, try nm.of("self_attn.q_norm.weight"), &.{s.head_dim}),
             .k_norm = try vector(&w, &ck, try nm.of("self_attn.k_norm.weight"), &.{s.head_dim}),
-            .gate = try linear(gpa, e, &stage, &w, &ck, try nm.of("mlp.gate_proj.weight"), s.intermediate, s.hidden),
-            .up = try linear(gpa, e, &stage, &w, &ck, try nm.of("mlp.up_proj.weight"), s.intermediate, s.hidden),
+            .gate = try linearOf(gpa, e, &stage, &w, &ck, try nm.of("mlp.gate_proj.weight"), s.intermediate, s.hidden, post_w),
+            .up = try linearOf(gpa, e, &stage, &w, &ck, try nm.of("mlp.up_proj.weight"), s.intermediate, s.hidden, post_w),
             .down = try linear(gpa, e, &stage, &w, &ck, try nm.of("mlp.down_proj.weight"), s.hidden, s.intermediate),
-            .attn_conv = try linear(gpa, e, &stage, &w, &ck, try nm.of("attention_conv.kernel_projection.weight"), s.dynamic, s.hidden),
+            .attn_conv = try linearOf(gpa, e, &stage, &w, &ck, try nm.of("attention_conv.kernel_projection.weight"), s.dynamic, s.hidden, in_w),
             .attn_base = try vector(&w, &ck, try nm.of("attention_conv.base_kernel"), &.{ 2, 2, s.hidden }),
-            .mlp_conv = try linear(gpa, e, &stage, &w, &ck, try nm.of("mlp_conv.kernel_projection.weight"), s.dynamic, s.hidden),
+            .mlp_conv = try linearOf(gpa, e, &stage, &w, &ck, try nm.of("mlp_conv.kernel_projection.weight"), s.dynamic, s.hidden, post_w),
             .mlp_base = try vector(&w, &ck, try nm.of("mlp_conv.base_kernel"), &.{ 2, 2, s.hidden }),
         };
     }
@@ -315,7 +353,7 @@ test "bf16 rounding of a quantized group's scale and bias" {
     try std.testing.expectEqual(@as(u16, 0x3f80), toBf16(1.0));
     try std.testing.expectEqual(@as(f32, 1.0), bf16(0x3f80));
     const w: [64]u16 = @splat(0x3f80); // a flat group: scale 0, bias 1, every nibble 0
-    const q = try quantize(std.testing.allocator, &w, 1, 64);
+    const q = try quantize(std.testing.allocator, &w, 1, 64, null);
     defer {
         std.testing.allocator.free(q.words);
         std.testing.allocator.free(q.scales);
@@ -329,12 +367,12 @@ test "bf16 rounding of a quantized group's scale and bias" {
 
 test "drafter refit preserves flat groups and improves a linear weight ramp" {
     const flat: [64]u16 = @splat(0x3f80);
-    const unchanged = leastSquares(&flat, .{ 0, 1 });
+    const unchanged = leastSquares(&flat, .{ 0, 1 }, null);
     try std.testing.expectEqual(@as(f32, 0), unchanged[0]);
     try std.testing.expectEqual(@as(f32, 1), unchanged[1]);
     var row: [64]u16 = undefined;
     for (&row, 0..) |*h, i| h.* = toBf16(@as(f32, @floatFromInt(i)) / 63.0 - 0.5);
     const initial = [2]f32{ 1.0 / 15.0, -0.5 };
-    const fitted = leastSquares(&row, initial);
-    try std.testing.expect(groupError(&row, fitted) < groupError(&row, initial));
+    const fitted = leastSquares(&row, initial, null);
+    try std.testing.expect(groupError(&row, fitted, null) < groupError(&row, initial, null));
 }
