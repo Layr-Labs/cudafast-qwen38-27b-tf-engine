@@ -356,6 +356,11 @@ namespace tf_qmm_group {
 
 using namespace qmm_dict;
 
+// group_kernel_dict's shared pair-table room (qlinear.zig group_pair_tab_max, group_pair_tab_one): two CTAs an SM past the
+// stages and dec[] in a cluster launch; any table (np <= 8191) in a launch of single CTAs
+constexpr int GROUP_PAIR_SMEM = 14592;
+constexpr int GROUP_PAIR_SMEM_ONE = 32768;
+
 // group_kernel with dictionary-coded scales and biases (dict_lanes): no swapped or spread tiles.
 template <int GS, int BM, int BN, int WM, int WN, int STAGES, bool F32, bool SKIP = false>
 __global__ void __launch_bounds__(WM * WN * 32) group_kernel_dict(
@@ -412,7 +417,11 @@ __global__ void __launch_bounds__(WM * WN * 32) group_kernel_dict(
         ssrc[j] = (which ? P.biases : P.scales) + n0 + off * 8;
         sdst[j] = T::X + T::W + which * T::S + off * 16;
     }
-    const DictLanes D = dict_lanes<BN, WN>(P, n0, KG, tid);
+    // the pair-table room: two CTAs an SM for a cluster launch (its CTAs co-scheduled a GPC at a time), a whole
+    // table for a launch of single CTAs (one an SM beats reading a large table through L2)
+    const int room = C > 1 ? GROUP_PAIR_SMEM : GROUP_PAIR_SMEM_ONE;
+    DictLanes D = dict_lanes<BN, WN>(P, n0, KG, tid);
+    dict_room(D, P, room);
     const bool xsok = tid < rows;
     const float* xssrc = xs + static_cast<size_t>(m0 + min(tid, rows - 1)) * KG;
     auto load_x = [&](int s, int g) {
@@ -446,7 +455,7 @@ __global__ void __launch_bounds__(WM * WN * 32) group_kernel_dict(
 #pragma unroll
                 for (int s = 0; s < STAGES; ++s)
                     *reinterpret_cast<uint4*>(stage(s) + c / T::CHUNKS * T::ROW + c % T::CHUNKS * 16) = uint4{};
-        dict_table<T::THREADS>(P, buf + T::SMEM + DICT_DEC, tid);
+        dict_table<T::THREADS>(P, buf + T::SMEM + DICT_DEC, tid, room);
 #pragma unroll
         for (int s = 0; s < STAGES - 1; ++s) {
             if (s < per) load_w(s, g0 + s);
@@ -472,7 +481,8 @@ __global__ void __launch_bounds__(WM * WN * 32) group_kernel_dict(
                 commit();
                 const unsigned char* p = stage(it % STAGES);
                 const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
-                dict_decode(D, p + T::X + T::W, buf + T::SMEM, g0 + it);
+                // the lane's scale or bias, fetched now and stored after the MMAs (a global pair table's latency)
+                const uint32_t dv = dict_fetch(D, p + T::X + T::W, buf + T::SMEM + DICT_DEC, g0 + it);
                 const __nv_bfloat16* ps = reinterpret_cast<const __nv_bfloat16*>(buf + T::SMEM);
                 const float* px = reinterpret_cast<const float*>(p + T::X + T::W + 2 * T::S);
                 uint32_t words[T::NT][GS / 32];
@@ -529,6 +539,7 @@ __global__ void __launch_bounds__(WM * WN * 32) group_kernel_dict(
                             }
                         }
                     }
+                    dict_put(D, buf + T::SMEM, dv);
                     __syncwarp();                 // the warp's decoded scales and biases
 #pragma unroll
                     for (int j = 0; j < T::NT; ++j) {
@@ -785,7 +796,9 @@ __device__ __forceinline__ void mlp_pair_body(const __nv_bfloat16* __restrict__ 
         commit();
         const unsigned char* p = stage(it % STAGES);
         const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
-        if constexpr (DICT) dict_decode(D, p + T::X + T::W, buf + T::SMEM + BM * BN * 2, g0 + it);
+        // the lane's scale or bias, fetched now and stored after the MMAs (a global pair table's latency)
+        uint32_t dv = 0;
+        if constexpr (DICT) dv = dict_fetch(D, p + T::X + T::W, buf + T::SMEM + BM * BN * 2 + DICT_DEC, g0 + it);
         const __nv_bfloat16* ps = DICT ? reinterpret_cast<const __nv_bfloat16*>(buf + T::SMEM + BM * BN * 2)
                                        : reinterpret_cast<const __nv_bfloat16*>(p + T::X + T::W);
         const float* px = reinterpret_cast<const float*>(p + T::X + T::W + 2 * T::S);
@@ -815,7 +828,10 @@ __device__ __forceinline__ void mlp_pair_body(const __nv_bfloat16* __restrict__ 
                 }
             }
         }
-        if constexpr (DICT) __syncwarp();        // the warp's decoded scales and biases
+        if constexpr (DICT) {
+            dict_put(D, buf + T::SMEM + BM * BN * 2, dv);
+            __syncwarp();                        // the warp's decoded scales and biases
+        }
 #pragma unroll
         for (int j = 0; j < T::NT; ++j) {
             const int col = wn * (BN / WN) + j * 8 + (lane & 3) * 2;

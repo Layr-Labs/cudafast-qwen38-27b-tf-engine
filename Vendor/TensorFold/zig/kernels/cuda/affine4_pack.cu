@@ -127,3 +127,124 @@ extern "C" __global__ void tf_dict_pack(const uint16_t* __restrict__ s, const ui
     }
     out[i] = word;
 }
+
+// Joint (scale, bias) pair dictionary: each (group, column) cell's pair keyed by its separate indices, si << 12 | bi
+// (both under 4096), marked in a 2^24-bit presence bitmap (524288 words), ranked, and indexed by its rank.
+// tf_dict_pair_mark: the (kg, npad) cells' pair keys, through the separate dictionaries' bitmaps and ranks.
+extern "C" __global__ void tf_dict_pair_mark(const uint16_t* __restrict__ s, const uint16_t* __restrict__ b, long long count,
+                                             const uint32_t* __restrict__ bitmap, const uint32_t* __restrict__ rank,
+                                             uint32_t* __restrict__ pairs) {
+    for (long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const uint32_t key = dict_index(bitmap, rank, s[i]) << 12 | dict_index(bitmap + 2048, rank + 2048, b[i]);
+        atomicOr(pairs + (key >> 5), 1u << (key & 31));
+    }
+}
+
+// tf_dict_pair_rank: 256 blocks of 1024 threads, two words a thread: each word's count of smaller present keys within
+// its block's 2048 words (rank), and each block's total (totals[block]).
+extern "C" __global__ void __launch_bounds__(1024) tf_dict_pair_rank(const uint32_t* __restrict__ pairs, uint32_t* __restrict__ rank,
+                                                                     uint32_t* __restrict__ totals) {
+    __shared__ uint32_t sums[1024];
+    const int t = threadIdx.x;
+    const size_t w0 = static_cast<size_t>(blockIdx.x) * 2048 + 2 * t;
+    const uint32_t a = __popc(pairs[w0]), c = __popc(pairs[w0 + 1]);
+    sums[t] = a + c;
+    __syncthreads();
+    for (int off = 1; off < 1024; off <<= 1) {
+        const uint32_t v = t >= off ? sums[t - off] : 0u;
+        __syncthreads();
+        sums[t] += v;
+        __syncthreads();
+    }
+    const uint32_t before = sums[t] - a - c;
+    rank[w0] = before;
+    rank[w0 + 1] = before + a;
+    if (t == 1023) totals[blockIdx.x] = sums[1023];
+}
+
+// tf_dict_pair_offsets: one block of 256 threads: the blocks' totals into their exclusive offsets (in place), and the
+// pair count np into totals[256].
+extern "C" __global__ void __launch_bounds__(256) tf_dict_pair_offsets(uint32_t* __restrict__ totals) {
+    __shared__ uint32_t sums[256];
+    const int t = threadIdx.x;
+    const uint32_t own = totals[t];
+    sums[t] = own;
+    __syncthreads();
+    for (int off = 1; off < 256; off <<= 1) {
+        const uint32_t v = t >= off ? sums[t - off] : 0u;
+        __syncthreads();
+        sums[t] += v;
+        __syncthreads();
+    }
+    totals[t] = sums[t] - own;
+    if (t == 255) totals[256] = sums[255];
+}
+
+// The pair index of key: its block's offset, its word's rank in the block, and the smaller keys in its word.
+__device__ __forceinline__ uint32_t dict_pair_index(const uint32_t* __restrict__ pairs, const uint32_t* __restrict__ rank,
+                                                    const uint32_t* __restrict__ offsets, uint32_t key) {
+    const uint32_t w = key >> 5;
+    return offsets[w >> 11] + rank[w] + __popc(pairs[w] & ((1u << (key & 31)) - 1u));
+}
+
+// tf_dict_pair_table: each present key's entry at its pair index, the scale's bf16 | the bias's bf16 << 16, from the
+// separate table (ns scale values, then the bias values); one thread a bitmap word.
+extern "C" __global__ void tf_dict_pair_table(const uint32_t* __restrict__ pairs, const uint32_t* __restrict__ rank,
+                                              const uint32_t* __restrict__ offsets, const uint16_t* __restrict__ stab, int ns,
+                                              uint32_t* __restrict__ table) {
+    const int w = blockIdx.x * blockDim.x + threadIdx.x;
+    if (w >= (1 << 19)) return;
+    uint32_t m = pairs[w];
+    uint32_t at = offsets[w >> 11] + rank[w];
+    while (m) {
+        const uint32_t key = static_cast<uint32_t>(w) * 32 + (__ffs(m) - 1);
+        table[at++] = static_cast<uint32_t>(stab[key >> 12]) | static_cast<uint32_t>(stab[ns + (key & 4095)]) << 16;
+        m &= m - 1;
+    }
+}
+
+// tf_dict_pair_pack: each 64-column tile's group of the (kg, npad) scales s and biases b as 64 pair indices of `pbits`
+// bits, packed little-endian into 2 * pbits words: out [npad / 64][kg][2 * pbits], or group-major
+// [kg][npad / 64][2 * pbits] (`kmajor`).
+extern "C" __global__ void tf_dict_pair_pack(const uint16_t* __restrict__ s, const uint16_t* __restrict__ b, int kg, int npad,
+                                             const uint32_t* __restrict__ bitmap, const uint32_t* __restrict__ rank,
+                                             const uint32_t* __restrict__ pairs, const uint32_t* __restrict__ prank,
+                                             const uint32_t* __restrict__ offsets, int pbits, uint32_t* __restrict__ out,
+                                             long long total, int kmajor) {
+    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int per = 2 * pbits, lw = static_cast<int>(i % per);
+    const long long tg = i / per;
+    const int tiles = npad / 64;
+    const int g = static_cast<int>(kmajor ? tg / tiles : tg % kg), t = static_cast<int>(kmajor ? tg % tiles : tg / kg);
+    const int lo = 32 * lw / pbits, hi = min(63, (32 * lw + 31) / pbits);
+    uint32_t word = 0;
+    for (int p = lo; p <= hi; ++p) {
+        const long long at = static_cast<long long>(g) * npad + t * 64 + p;
+        const uint32_t key = dict_index(bitmap, rank, s[at]) << 12 | dict_index(bitmap + 2048, rank + 2048, b[at]);
+        const uint32_t idx = dict_pair_index(pairs, prank, offsets, key);
+        const int start = p * pbits - 32 * lw;
+        word |= start >= 0 ? idx << start : idx >> -start;
+    }
+    out[i] = word;
+}
+
+// tf_dict_pair_check: every (kg, npad) cell's index read back from the stream (as a decode kernel reads it) through the
+// table must give the cell's own scale and bias; mismatches counted into bad[0].
+extern "C" __global__ void tf_dict_pair_check(const uint16_t* __restrict__ s, const uint16_t* __restrict__ b, int kg, int npad,
+                                              const uint32_t* __restrict__ stream, const uint32_t* __restrict__ table, int pbits,
+                                              int kmajor, unsigned long long* __restrict__ bad) {
+    const long long count = static_cast<long long>(kg) * npad;
+    const int tiles = npad / 64;
+    const uint32_t mask = (1u << pbits) - 1u;
+    for (long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+         i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const int g = static_cast<int>(i / npad), col = static_cast<int>(i % npad), t = col / 64, c = col % 64;
+        const long long tg = kmajor ? static_cast<long long>(g) * tiles + t : static_cast<long long>(t) * kg + g;
+        const long long bit = tg * 64 * pbits + static_cast<long long>(c) * pbits;
+        const uint32_t idx = __funnelshift_r(stream[bit >> 5], stream[(bit >> 5) + 1], static_cast<int>(bit & 31)) & mask;
+        const uint32_t e = table[idx];
+        if ((e & 0xFFFFu) != s[i] || (e >> 16) != b[i]) atomicAdd(bad, 1ull);
+    }
+}
