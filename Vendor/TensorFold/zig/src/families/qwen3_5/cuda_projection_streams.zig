@@ -45,13 +45,50 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     const down = try e.mods[0].function("tf_qmm_output_stream16");
     const out = try e.mods[0].function("tf_qmm_output_prefetch16");
     try down.allowDynamicShared(35328);
-    // its twin for a dictionary-coded down/out/o projection: the table past the stages
+    // its twin for a dictionary-coded down projection: four slices' decoded groups and the table past the stages
     const down_dict: ?cuda.Function = if (e.affine.dict == null) null else blk: {
         const f = try e.mods[0].function("tf_qmm_output_stream16_dict");
-        try f.allowDynamicShared(35328 + @as(u32, @max(cuda.qlinear.dict_tab_max, cuda.qlinear.out_pair_tab_max)));
+        try f.allowDynamicShared(35328 + 4 * cuda.qlinear.dict_dec + cuda.qlinear.dict_tab_max);
         break :blk f;
     };
     try out.allowDynamicShared(35328);
+    // the 32-row twins (qmm_stream32.cuh) for verify windows of 17 to 32 rows; TF_STREAM32=0 keeps those on cluster32
+    const wide = !envOff("TF_STREAM32");
+    var wide_fns: [2]?cuda.Function = @splat(null);
+    var wide_dict: ?cuda.Function = null;
+    var wide_gdn: ?cuda.Function = null;
+    var wide_gdn_dict: ?cuda.Function = null;
+    if (wide) {
+        if (output) {
+            const q = cuda.qlinear;
+            wide_fns = .{ try e.mods[0].function("tf_qmm_output_stream32"), try e.mods[0].function("tf_qmm_output_prefetch32") };
+            for (wide_fns) |f| try f.?.allowDynamicShared(q.out32_smem);
+            if (e.affine.dict != null) {
+                wide_dict = try e.mods[0].function("tf_qmm_output_stream32_dict");
+                try wide_dict.?.allowDynamicShared(q.out32_smem + 4 * q.dict_dec + q.dict_tab_max);
+            }
+            // GDN out / attention o in the lane form (TF_W32_OUT_STREAM=1: the four-slice stream twin instead)
+            if (!envOn("TF_W32_OUT_STREAM")) {
+                const l0 = try e.mods[0].function("tf_qmm_lane32");
+                try l0.allowDynamicShared(q.lane32_smem);
+                var l1: ?cuda.Function = null;
+                if (e.affine.dict != null) {
+                    l1 = try e.mods[0].function("tf_qmm_lane32_dict");
+                    try l1.?.allowDynamicShared(q.lane32_smem + 4 * 64 + @max(q.dict_tab_max, q.lane32_pair_tab_max));
+                }
+                e.affine.lane32_fns = .{ l0, l1 };
+                e.affine.down_lane32 = envOn("TF_W32_DOWN_LANE");
+            }
+        }
+        if (input) {
+            wide_gdn = try e.mods[0].function("tf_qmm_gdn_stream32");
+            try wide_gdn.?.allowDynamicShared(cuda.qlinear.gdn32_smem);
+            if (e.affine.dict != null) {
+                wide_gdn_dict = try e.mods[0].function("tf_qmm_gdn_stream32_dict");
+                try wide_gdn_dict.?.allowDynamicShared(cuda.qlinear.gdn32_smem + 4 * 256 + @max(cuda.qlinear.dict_tab_max, cuda.qlinear.gdn32_pair_tab_max));
+            }
+        }
+    }
     var buffer = try cuda.DeviceBuffer.alloc(e.d, bytes);
     errdefer buffer.free();
     try buffer.fill8(0, null);
@@ -80,20 +117,21 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     };
     if (output) e.affine.stream16_fns = .{ down, out };
     if (output) e.affine.stream16_dict_fn = down_dict;
-    if (input) {
-        e.affine.gdn_stream16_fn = grouped;
-        e.affine.gdn_stream16_dict_fn = grouped_dict;
-        const off32 = if (@import("sys").c.getenv("TF_GDN_STREAM32")) |v| @import("std").mem.eql(u8, @import("std").mem.span(v), "0") else false;
-        if (!off32) {
-            const g32 = try e.mods[0].function("tf_qmm_gdn_stream32");
-            try g32.allowDynamicShared(cuda.qlinear.Affine4Kernels.gdn_stream32_smem);
-            e.affine.gdn_stream32_fn = g32;
-            if (e.affine.dict != null) {
-                const gd32 = try e.mods[0].function("tf_qmm_gdn_stream32_dict");
-                try gd32.allowDynamicShared(cuda.qlinear.Affine4Kernels.gdn_stream32_smem + 4 * 128 + @as(u32, @max(cuda.qlinear.dict_tab_max, cuda.qlinear.gdn_pair_tab_max)));
-                e.affine.gdn_stream32_dict_fn = gd32;
-            }
-        }
-    }
+    if (input) e.affine.gdn_stream16_fn = grouped;
+    if (input) e.affine.gdn_stream16_dict_fn = grouped_dict;
+    if (output) e.affine.stream32_fns = wide_fns;
+    if (output) e.affine.stream32_dict_fn = wide_dict;
+    if (input) e.affine.gdn_stream32_fn = wide_gdn;
+    if (input) e.affine.gdn_stream32_dict_fn = wide_gdn_dict;
     return buffer;
+}
+
+fn envOn(name: [*:0]const u8) bool {
+    const v = @import("sys").c.getenv(name) orelse return false;
+    return @import("std").mem.eql(u8, @import("std").mem.span(v), "1");
+}
+
+fn envOff(name: [*:0]const u8) bool {
+    const v = @import("sys").c.getenv(name) orelse return false;
+    return @import("std").mem.eql(u8, @import("std").mem.span(v), "0");
 }

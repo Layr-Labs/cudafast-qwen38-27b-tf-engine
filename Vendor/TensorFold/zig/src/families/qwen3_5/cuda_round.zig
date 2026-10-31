@@ -110,7 +110,7 @@ fn plan(st: []u8, parts: []const @import("cuda_engine.zig").Part, record: bool, 
         }
         if (record) {
             if (chain) {
-                for (schedule[first..][0..p.rows], 0..) |*step, row| step.* = .{ .row = @intCast(first + row), .read_slot = if (row == 0) -1 else if (carry) slots.in_registers else 0, .write_slot = if (carry) -1 else 0 };
+                for (schedule[first..][0..p.rows], 0..) |*step, row| step.* = .{ .row = @intCast(first + row), .read_slot = if (row == 0) -1 else 0, .write_slot = 0 };
             } else {
                 sizes.reset();
                 peak = @max(peak, if (carry)

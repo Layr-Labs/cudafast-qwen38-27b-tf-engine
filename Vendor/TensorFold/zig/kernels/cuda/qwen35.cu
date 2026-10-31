@@ -215,12 +215,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __r
 }
 
 // 64-group sums of bf16 rows D wide (the decode projections' input sums). Grid (rows, groups / 64), a thread a group.
-extern "C" __global__ void __launch_bounds__(64) tf_q35_sums(const __nv_bfloat16* __restrict__ X0, float* __restrict__ XS0, int D, const int* __restrict__ P0) {
-    release_next();
-    await_prior();
-    const __nv_bfloat16* X = after_wait(X0);
-    float* XS = after_wait(XS0);
-    const int* P = after_wait(P0);
+extern "C" __global__ void __launch_bounds__(64) tf_q35_sums(const __nv_bfloat16* __restrict__ X, float* __restrict__ XS, int D, const int* __restrict__ P) {
     if (past_rows(P, blockIdx.x)) return;
     const size_t row = blockIdx.x;
     const int g = blockIdx.y * blockDim.x + threadIdx.x;
@@ -732,7 +727,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_attn_partial(Geo geo, c
 }
 
 // tf_q35_attn_partial for row pairs (attn_two): a block a (row pair, chunk, key head), each chunk's stream-key tiles
-// loaded once for both rows; a 2..64-row window's rows of short streams (cuda_forward.zig), bits as attn_partial's.
+// loaded once for both rows; a 17..64-row window's rows of short streams (cuda_forward.zig), bits as attn_partial's.
 extern "C" __global__ void __launch_bounds__(128) tf_q35_attn_pair(Geo geo, const __nv_bfloat16* __restrict__ Q0, const Seg* __restrict__ segs,
                                                                      const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
                                                                      const int* __restrict__ P, float scale,

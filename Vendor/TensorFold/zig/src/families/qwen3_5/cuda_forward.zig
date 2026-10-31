@@ -13,7 +13,7 @@ pub const attn_tiles = 4 * 32 * 512;
 /// tf_q35_attn_partial's one key and value tile (Bf16Tiles1), and the chunk blocks it launches a (row, key head):
 /// each takes every partial_chunks-th of the MAXCH chunks, so a short stream's rows dispatch no idle blocks.
 const attn_tile = attn_tiles / 2;
-const partial_chunks = 12;
+const partial_chunks = 8;
 /// qwen35_attn_tc.cuh's GROUP_LEN: a stream at least this long has its rows on tf_q35_attn_rows.
 pub const group_len = 8192;
 const ids_at = E.Engine.ids_at;
@@ -36,12 +36,12 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     const record = shape.record;
     const prompt = shape.prompt;
     const heads: usize = if (record) total else 1;
-    // Independent prompt rows share a block; decode keeps one warp per row. A 16..64-row window's gdn_pre rows share
+    // Independent prompt rows share a block; decode keeps one warp per row. A 17..64-row window's gdn_pre rows share
     // blocks too (four row warps a block: its warps are independent, the same bits); TF_GDN_ROWS4=0 keeps one warp a
     // block there. gdn_post keeps a warp a block in windows (four a block measured slower).
     const gdn_rows: usize = if (prompt and total > 16) 4 else 1;
     const gdn_blocks = (total + gdn_rows - 1) / gdn_rows;
-    const pre_rows: usize = if ((prompt and total > 16) or (total >= 16 and rows4On())) 4 else 1;
+    const pre_rows: usize = if (total >= 16 and (prompt or rows4On())) 4 else 1;
     const pre_blocks = (total + pre_rows - 1) / pre_rows;
     const t_ids = e.tables.ptr + ids_at;
     const t_segs = e.tables.ptr + segs_at;
@@ -80,10 +80,11 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
             },
             .attention => |m| {
                 const aw = g.attnWidth();
-                if (tail and i == e.layers.len - 1)
-                    try @import("cuda_prompt_tail.zig").query(e, m, total)
-                else
-                    try e.projMany(&.{ m.q, m.k, m.v }, e.x, &.{ e.qraw, e.kraw, e.vraw }, total, prompt);
+                if (tail and i == e.layers.len - 1) {
+                    // the tail's layer: keys and values for every row, queries (and gate) for the last row alone
+                    try e.projMany(&.{ m.k, m.v }, e.x, &.{ e.kraw, e.vraw }, total, prompt);
+                    try @import("cuda_prompt_tail.zig").query(e, m.q.a4, total);
+                } else try e.projMany(&.{ m.q, m.k, m.v }, e.x, &.{ e.qraw, e.kraw, e.vraw }, total, prompt);
                 if (e.learning) |k| try k.attention(i, e.qraw, e.kraw, e.vraw, total);
                 if (prompt and total > 16 and !e.kv8) {
                     // Preserve the original two head sums and bf16 boundary before rotary/cache stores.
@@ -100,9 +101,11 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     try @import("cuda_prompt_tail.zig").run(e, @intCast(ai), total);
                     return;
                 }
+                var merged = false;
                 if (shape.paged) {
                     try @import("cuda_attention.zig").partial(e, shape, ai);
-                    try launchAfter(e, e.fns.attn_merge_gate, sig.attn_merge_gate, .{ g.q_heads, total, 1 }, .{ 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.qraw, e.mix, sums });
+                    try launch(e, e.fns.attn_merge_gate, sig.attn_merge_gate, .{ g.q_heads, total, 1 }, .{ 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.qraw, e.mix, sums });
+                    merged = true;
                 } else if (prompt and nseg == 1 and (g.q_heads / g.kv_heads) % 2 == 0) {
                     // a prompt chunk's rows over its own cache: tensor-core tiles in place of the decode partials
                     try @import("cuda_prompt.zig").run(e, @intCast(ai), total);
@@ -114,7 +117,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                         try launch(e, e.fp8.attn_partial, sig.attn_partial8, .{ total, max_chunks, g.kv_heads }, .{ 128, 1, 1 }, args);
                         try launch(e, e.fp8.attn_rows, sig.attn_rows8, .{ groups, max_chunks, g.kv_heads }, .{ 256, 1, 1 }, rows_args);
                     } else {
-                        // a 2..64-row window: row pairs share each chunk's stream-key tiles (attn_pair, the same bits);
+                        // a 17..64-row window: row pairs share each chunk's stream-key tiles (attn_pair, the same bits);
                         // TF_ATTN_PAIR=0 keeps attn_partial's block a row
                         if (record and total >= 2 and total % 2 == 0 and 2 * group <= 16 and pairOn())
                             try sharedSized(e, e.fns.attn_pair, sig.attn_pair, .{ total / 2, partial_chunks, g.kv_heads }, 128, attn_tile, args)
@@ -125,8 +128,9 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     }
                     // the merge with the gate and the gated rows' group sums, attn_gate's bits
                     try launchAfter(e, e.fns.attn_merge_gate, sig.attn_merge_gate, .{ g.q_heads, total, 1 }, .{ 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.qraw, e.mix, sums });
+                    merged = true;
                 }
-                if (prompt and nseg == 1 and (g.q_heads / g.kv_heads) % 2 == 0) try launchAfter(e, e.fns.attn_gate, sig.attn_gate, .{ (total * aw + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.y, e.qraw, e.mix, @as(c_int, @intCast(total)), t_params, sums });
+                if (!merged and (shape.paged or (prompt and nseg == 1 and (g.q_heads / g.kv_heads) % 2 == 0))) try launchAfter(e, e.fns.attn_gate, sig.attn_gate, .{ (total * aw + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.y, e.qraw, e.mix, @as(c_int, @intCast(total)), t_params, sums });
                 if (e.learning) |k| try k.gated(i, e.mix, total);
                 try e.projAgain(m.o, e.mix, e.r, total, prompt);
                 ai += 1;
@@ -163,7 +167,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
             .moe => |m| try e.routedRows(m.router, m.experts, e.x, e.r, total, promptMoe(prompt, total), t_params),
         }
         if (shape.taps) for (e.taps[0..e.n_taps], 0..) |t, ti| if (t == i) {
-            try e.runAfter(e.fns.tap, .{ total, (g.hidden + 2047) / 2048, 1 }, .{ 256, 1, 1 }, .{ e.h, e.r, t_segs, t_rows, @as(c_int, @intCast(ti)), @as(c_int, @intCast(g.hidden)), t_params });
+            try e.run(e.fns.tap, .{ total, (g.hidden + 2047) / 2048, 1 }, .{ 256, 1, 1 }, .{ e.h, e.r, t_segs, t_rows, @as(c_int, @intCast(ti)), @as(c_int, @intCast(g.hidden)), t_params });
         };
         // a captured forward's first layer is a graph of its own (cuda_engine.zig's cutCapture)
         if (i == 0) try e.cutCapture();
@@ -171,13 +175,13 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     try finish(e, total, heads, shape.hidden);
 }
 
-/// TF_GDN_ROWS4=0: 16..64-row windows keep one row warp a block in tf_q35_gdn_pre.
+/// TF_GDN_ROWS4=0: 17..64-row windows keep one row warp a block in tf_q35_gdn_pre and tf_q35_gdn_post.
 fn rows4On() bool {
     const v = @import("sys").c.getenv("TF_GDN_ROWS4") orelse return true;
     return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
 }
 
-/// TF_ATTN_PAIR=0: 2..64-row windows keep tf_q35_attn_partial (a block a row).
+/// TF_ATTN_PAIR=0: 17..64-row windows keep tf_q35_attn_partial (a block a row).
 fn pairOn() bool {
     const v = @import("sys").c.getenv("TF_ATTN_PAIR") orelse return true;
     return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
@@ -213,18 +217,11 @@ fn sharedSized(e: *E.Engine, f: cuda.Function, comptime s: sig.Sig, grid: [3]usi
 pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool) !void {
     if (hidden) return;
     const g = e.g;
-    if (e.learning == null and heads < total) {
-        try e.normTail(e.final_norm, total, heads);
-        if (e.learning) |k| try k.final(e.h, total);
-        try e.proj(e.head, e.x + (total - heads) * g.hidden * 2, e.logits, heads, false);
-    } else {
+    if (e.learning == null and heads < total) try e.normTail(e.final_norm, total, heads) else
         try e.norm(true, e.final_norm, total);
-        if (e.learning) |k| try k.final(e.h, total);
-        if (@hasDecl(@TypeOf(e.*), "projAgain"))
-            try e.projAgain(e.head, e.x + (total - heads) * g.hidden * 2, e.logits, heads, false)
-        else
-            try e.proj(e.head, e.x + (total - heads) * g.hidden * 2, e.logits, heads, false);
-    }
+    if (e.learning) |k| try k.final(e.h, total);
+    // the head over the kept rows
+    try e.proj(e.head, e.x + (total - heads) * g.hidden * 2, e.logits, heads, false);
     if (e.learning) |k| try hooks.logits(k, e.logits, e.stream);
 }
 

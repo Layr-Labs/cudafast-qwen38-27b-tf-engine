@@ -572,7 +572,7 @@ pub const Engine = struct {
         @memcpy(std.mem.bytesAsSlice(u32, st[ids_at..][0 .. total * 4]), ids);
         @memset(st[ids_at + total * 4 .. ids_at + max_rows * 4], 0); // a bucket's padding rows read token 0
         const segs = std.mem.bytesAsSlice(Seg, st[segs_at..][0 .. parts.len * @sizeOf(Seg)]);
-        // past 1 row a window's scan carries each parent's state in the registers to its first child
+        // past 16 rows a branching window's scan carries each parent's state in the registers to its first child
         // (tree_slots.carried: one slot fewer, -2 steps); TF_CARRIED=0 restores build's plans
         const carry = record and total > 1 and !envOff("TF_CARRIED");
         const slot_peak = try Round.buildCarried(st, parts, record, carry);
@@ -613,12 +613,11 @@ pub const Engine = struct {
             Round.stageImageTables(st, im, p0, total);
         }
         try e.tables.uploadAsync(0, st[0..if (images != null) tables_len else src_at], e.stream.handle); // text: as before
-        // carried plans of 2..32 rows (at most 3 slots) scan four value rows a warp on qwen35_slots_lean.cuh (slots_3's
-        // arithmetic, its addressing hoisted; 2 slots where they suffice); TF_SLOTS_LEAN=0 keeps prior dispatch
-        const lean = record and total > 1 and total <= 32 and e.affine.pdl and !envOff("TF_SLOTS_LEAN");
+        // carried plans of 17..32 rows (at most 3 slots) scan four value rows a warp on qwen35_slots_lean.cuh (slots_3's
+        // arithmetic, its addressing hoisted; 2 slots where they suffice); TF_SLOTS_LEAN=0 keeps tf_q35_gdn_slots_3
         const wide = total > 16 and total <= 32 and e.affine.pdl and !envOff("TF_WIDE_SLOTS");
-        const slot_variant: usize = if (lean and carry and slot_peak <= 3)
-            (if (slot_peak <= 2) 37 else 38)
+        const slot_variant: usize = if (wide and carry and slot_peak <= 3)
+            (if (envOff("TF_SLOTS_LEAN")) 3 else if (slot_peak <= 2) 37 else 38)
         else if (wide and slot_peak == 3) 3 else Round.narrowVariant(total, slot_peak, record and e.affine.pdl and !envOff("TF_GDN16"));
         var shape = Shape.init(total, parts.len, record, e.n_taps > 0, @intCast(slot_variant));
         if (record and @import("cuda_round_timing.zig").Trace.enabled())
