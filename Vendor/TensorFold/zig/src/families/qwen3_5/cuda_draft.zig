@@ -40,9 +40,11 @@ pub const Ctx = struct {
     parents: [engine.most_window]i32 = undefined,
     own: [engine.most_window]f64 = undefined,
     grown: usize = 0,
-    // the stream's tokens draft_frame has read, and whether one lay outside its spans (then drafts take the whole head)
+    // the stream's tokens draft_frame has read, and whether more than 1 in 4 lay outside its spans (then drafts take
+    // the whole head)
     scanned: usize = 0,
     wide: bool = false,
+    outside: usize = 0, // the stream's tokens so far outside the draft spans (frame.scan)
 };
 
 pub const Draft = struct {

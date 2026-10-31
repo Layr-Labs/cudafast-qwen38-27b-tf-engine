@@ -34,6 +34,9 @@ pub const attn_merge = Sig{ .name = "attn_merge", .handle = "e.fns.attn_merge", 
 /// The gate: the attention's outputs through the second half of each query head's q_proj rows.
 pub const attn_gate = Sig{ .name = "attn_gate", .handle = "e.fns.attn_gate", .symbol = "tf_q35_attn_gate", .params = &.{ .geo, .ptr, .ptr, .ptr, .i32, .ptr, .ptr } };
 
+/// The merge then the gate in one launch: the gated rows (qh * HD wide) and their group sums.
+pub const merge_gate = Sig{ .name = "merge_gate", .handle = "e.fns.merge_gate", .symbol = "tf_q35_merge_gate", .params = &.{ .geo, .ptr, .ptr, .ptr, .ptr, .ptr, .ptr, .ptr, .ptr, .ptr, .ptr } };
+
 /// The rope: the queries rotated in place, the keys rotated and the values copied into the cache.
 pub const rope = Sig{ .name = "rope", .handle = "e.fns.rope", .symbol = "tf_q35_rope", .params = &.{ .geo, .ptr, .ptr, .ptr, .ptr, .ptr, .ptr, .i32, .ptr, .ptr } };
 
@@ -47,7 +50,7 @@ pub const draft_partial = Sig{ .name = "draft_partial", .handle = "d.fns.attn_pa
 pub const draft_merge = Sig{ .name = "draft_merge", .handle = "d.fns.attn_merge", .symbol = "tf_q35d_attn_merge", .params = &.{ .ptr, .ptr, .ptr, .i32, .ptr } };
 
 /// Every q35 attention kernel's list: the decode partials, the rows, the merge, the gate, the rope and the draft pair.
-pub const all = [_]Sig{ attn_partial, attn_partial8, attn_rows, attn_rows8, attn_merge, attn_gate, rope, rope8, draft_partial, draft_merge };
+pub const all = [_]Sig{ attn_partial, attn_partial8, attn_rows, attn_rows8, attn_merge, attn_gate, merge_gate, rope, rope8, draft_partial, draft_merge };
 
 /// The list a launch site's handle names, if the table holds one.
 pub fn byHandle(handle: []const u8) ?Sig {
