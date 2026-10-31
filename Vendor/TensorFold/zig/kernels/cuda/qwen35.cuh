@@ -39,6 +39,8 @@ struct Seg {
     int ptok;                 // positions a KV page holds
     int pn;
     unsigned long long plog;
+    int qn;
+    unsigned long long qlog;
 };
 
 // Seg.kv's element of layer a's key (s 0) or value (s 1) at pos, head h: cap rows a head, or pos's page's row.

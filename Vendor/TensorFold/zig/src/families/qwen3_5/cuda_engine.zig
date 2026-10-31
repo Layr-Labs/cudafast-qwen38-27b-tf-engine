@@ -326,7 +326,7 @@ pub const Engine = struct {
 
     /// A stream's device bytes at a `cap`-token window: recurrences, convolution tails, keys and values, taps, log.
     pub fn streamBytes(e: *const Engine, cap: usize) usize {
-        return 2 * e.g.stateBytes() + e.g.kvBytes(cap, e.kv8) + e.tapBytes() + 2 * e.g.logBytes(most_window);
+        return 2 * e.g.stateBytes() + e.g.kvBytes(cap, e.kv8) + e.tapBytes() + @import("cuda_cache.zig").log_parts * e.g.logBytes(most_window);
     }
 
     /// A stream's tap ring: tap_rows rows of the tapped layers' residuals.

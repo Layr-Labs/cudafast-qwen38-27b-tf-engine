@@ -4,7 +4,6 @@
 
 using namespace tf_q35;
 
-// Each linear layer's recurrence through the path's (decay, key, write), as the forward's chain would have left it.
 extern "C" __global__ void __launch_bounds__(128) tf_q35k_apply(Geo geo, Seg sg, Path path) {
     const int NK = geo.nk, NV = geo.nv;
     const int layer = blockIdx.z / NV, hv = blockIdx.z % NV;
@@ -17,8 +16,10 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35k_apply(Geo geo, Seg sg,
     float state[PT];
 #pragma unroll
     for (int i = 0; i < PT; i++) state[i] = st[i];
-    for (int j = 0; j < path.n; j++) {
-        const LogRow l = log_row(geo, sg, layer, path.rows[j]);
+    for (int j = 0; j < sg.qn + path.n; j++) {
+        Seg from = sg;
+        if (j < sg.qn) from.log = sg.qlog;
+        const LogRow l = log_row(geo, from, layer, j < sg.qn ? j : path.rows[j - sg.qn]);
         const float g = l.g[hv], d = l.delta[hv * DK + dv];
 #pragma unroll
         for (int i = 0; i < PT; i++) {

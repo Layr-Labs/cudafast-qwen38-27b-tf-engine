@@ -2,6 +2,7 @@
 const std = @import("std");
 const lanes = @import("lanes");
 const E = @import("cuda_engine.zig");
+const Round = @import("cuda_round.zig");
 pub const profile = @import("cuda_startup_profile.zig");
 
 pub const Seen = struct {
@@ -55,8 +56,47 @@ fn timed(io: std.Io, e: anytype, d: anytype, cache: anytype, warmed: *Seen, phas
     }
     try cache.reset(e);
     for (measured[0..e.window_rows]) |m| d.setCost(m.rows, m.ms);
+    const trees_start = profile.now(io);
+    try trees(e, cache, warmed);
+    warm_ns += profile.elapsed(io, trees_start);
     phases.warmups += warm_ns;
     phases.calibration += profile.elapsed(io, started) - warm_ns;
+}
+
+/// A drafting engine's tree windows: each 16-row bucket at every GDN slot variant a tree reaches, captured and run
+/// twice now (content-free: zero ids on a reset cache), as the chain widths are above. A tree's shape is otherwise
+/// captured, uploaded and its kernels loaded inside the first timed round that meets it.
+fn trees(e: anytype, cache: anytype, warmed: *Seen) !void {
+    if (e.n_taps == 0) return;
+    const ids: [E.most_window]u32 = @splat(0);
+    var picks: [E.most_window]E.Draw = undefined;
+    for (&picks) |*pk| pk.* = .{ .rule = null, .position = 1 };
+    const staging = try std.heap.page_allocator.alignedAlloc(u8, .@"16", Round.bytes);
+    defer std.heap.page_allocator.free(staging);
+    var parents: [E.most_window]i32 = undefined;
+    var bucket: usize = 16;
+    while (bucket <= e.window_rows) : (bucket += 16) {
+        // three families whose slot peaks cover every variant a drafted tree reaches: a root's k children with a chain
+        // under the last, k chains interleaved row by row (as a best-first tree's rows interleave its branches), and
+        // k-ary heaps
+        for (0..3) |family| for (2..bucket) |k| {
+            parents[0] = -1;
+            for (1..bucket) |r| parents[r] = switch (family) {
+                0 => if (r <= k) 0 else @intCast(r - 1),
+                1 => if (r <= k) 0 else @intCast(r - k),
+                else => @intCast((r - 1) / k),
+            };
+            const part: E.Part = .{ .cache = cache, .rows = bucket, .parents = parents[0..bucket] };
+            const peak = Round.build(staging, &.{part}, true) catch continue;
+            const shape = E.Engine.Shape.init(bucket, 1, true, true, @intCast(Round.variant(peak)));
+            while (warmed.passes(shape) < 2) {
+                try cache.reset(e);
+                try e.forward(&.{part}, ids[0..bucket], .{ .draws = picks[0..bucket] });
+                warmed.mark(shape);
+            }
+        };
+    }
+    try cache.reset(e);
 }
 
 /// One width's cost: the fastest of its timed runs, so one slow run cannot set the table.
@@ -120,7 +160,7 @@ fn run(io: std.Io, e: anytype, d: anytype, cache: anytype, warmed: *Seen, phases
             warmed.mark(shape);
         }
     }
-    try cache.reset(e);
+    try trees(e, cache, warmed);
     phases.warmups += profile.elapsed(io, started);
 }
 
