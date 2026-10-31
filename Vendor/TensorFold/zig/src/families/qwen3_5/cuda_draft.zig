@@ -99,6 +99,10 @@ pub const Draft = struct {
     pool: std.ArrayList(*Ctx) = .empty,
     /// Grown trees' nodes offered and landed, by own chance: the nodes' chances the round loop prices.
     landing: tree.Landing = .{},
+    /// One greedy stream's rounds replayed through each tree policy: allocated at load, given to the first stream to
+    /// open while it is free, and reset at that open (null storage: every tree takes the default policy).
+    replay: ?*tree.Replay = null,
+    replay_ctx: ?*Ctx = null,
     /// One level of a hold (a hold drafts every level at once; timed at load, over the block's levels).
     step_ms: f64 = 1.0,
     /// The target's window ms by rows (cuda_native.zig times them), for the round loop's prices.
@@ -137,6 +141,9 @@ pub const Draft = struct {
         _ = try d.layout(true);
         d.staged = try cuda.HostBuffer.alloc(e.d, try frame.stagedBytes(c.rank));
         errdefer d.staged.free();
+        d.replay = try gpa.create(tree.Replay);
+        errdefer gpa.destroy(d.replay.?);
+        d.replay.?.* = .{};
         // the first context, and a hold timed on it (the quickest of several: the first ones pay the driver's stalls)
         const ctx = try d.create();
         errdefer d.drop(ctx);
@@ -185,6 +192,7 @@ pub const Draft = struct {
         d.streams.deinit(d.gpa);
         for (d.pool.items) |ctx| d.drop(ctx);
         d.pool.deinit(d.gpa);
+        if (d.replay) |r| d.gpa.destroy(r);
         d.staged.free();
         d.scratch.free();
         d.w.deinit(d.gpa);
@@ -427,8 +435,18 @@ pub const Draft = struct {
         if (limit > 0) {
             // the whole budget whenever drafts are asked: the block's forward costs the same at any depth
             const n = if (it.depth == 0) 0 else limit;
-            ctx.grown = tree.grow(d.candidates(rows), it.pending, rows, n, &ctx.held, &ctx.parents, &ctx.own);
+            const cands = d.candidates(rows);
+            // a greedy stream's tree ranks by the policy its replay favors so far, and its candidates join the replay
+            const replay = if (it.sampling == null and n > 0 and tree.replaying()) d.replayFor(ctx) else null;
+            var pick: usize = 0;
+            if (replay) |r| {
+                const swept = d.policyMs(n);
+                pick = r.take(@intCast(std.Io.Clock.awake.now(d.io).toNanoseconds()), &swept);
+            }
+            const policy = tree.policies[pick];
+            ctx.grown = tree.grow(cands, it.pending, rows, @min(n, policy.nodes), policy, null, &ctx.held, &ctx.parents, &ctx.own);
             ctx.held_n = ctx.grown;
+            if (replay) |r| r.record(cands, it.pending, it.position, rows);
         } else {
             d.select(ctx, it.pending, rows);
             ctx.held_n = @min(it.depth, rows);
@@ -463,12 +481,54 @@ pub const Draft = struct {
             const ctx = try d.gpa.create(Ctx);
             errdefer d.gpa.destroy(ctx);
             ctx.* = .{ .ring = .{ .d = d.e.d, .ptr = ptr, .len = d.c.ringBytes(), .borrowed = true } };
-            return d.streams.put(d.gpa, s, ctx);
+            try d.streams.put(d.gpa, s, ctx);
+            return d.bindReplay(ctx);
         };
         const ctx = d.pool.pop() orelse try d.createCold();
         errdefer d.pool.append(d.gpa, ctx) catch d.drop(ctx);
         ctx.* = .{ .ring = ctx.ring };
         try d.streams.put(d.gpa, s, ctx);
+        d.bindReplay(ctx);
+    }
+
+    /// The replay, emptied, for a newly opened stream's context when no other stream holds it.
+    fn bindReplay(d: *Draft, ctx: *Ctx) void {
+        const r = d.replay orelse return;
+        if (d.replay_ctx != null) return;
+        r.reset();
+        d.replay_ctx = ctx;
+    }
+
+    /// The replay serving `ctx`'s stream, if it does.
+    fn replayFor(d: *Draft, ctx: *const Ctx) ?*tree.Replay {
+        return if (d.replay_ctx == ctx) d.replay else null;
+    }
+
+    /// Each policy's round in ms for trees of up to `budget` nodes: the target's window at the tree's rows, as
+    /// measured at load, and the drafter's frame. Without a measured table every tree of the default's size costs
+    /// alike and no other size is taken.
+    fn policyMs(d: *const Draft, budget: usize) [tree.policies.len]f64 {
+        const frame_ms = d.step_ms * @as(f64, @floatFromInt(d.c.block - 1));
+        const default_rows = 1 + @min(tree.policies[0].nodes, budget);
+        var out: [tree.policies.len]f64 = undefined;
+        for (tree.policies, &out) |p, *o| {
+            const rows = 1 + @min(p.nodes, budget);
+            o.* = std.math.inf(f64);
+            for (d.costs[0..d.n_costs]) |cost| {
+                if (cost.width == rows) o.* = cost.ms + frame_ms;
+            }
+            if (d.n_costs == 0 and rows == default_rows) o.* = 1;
+        }
+        return out;
+    }
+
+    /// The stream's rounds whose replies have landed in `tokens`, replayed through each policy's tree (the frame calls
+    /// this while its kernels run, before the readback).
+    pub fn replayLanded(d: *Draft, ctx: *const Ctx, tokens: []const u32) void {
+        const r = d.replayFor(ctx) orelse return;
+        if (d.c.block != 16) return;
+        const base: tree.Candidates = .{ .words = &.{}, .projected = &.{}, .topk = d.c.topk, .rank = d.c.rank, .predecessor = d.w.predecessor, .successor = d.w.successor };
+        r.replay(base, tokens, tree.nodes());
     }
 
     fn absorbFn(p: *anyopaque, items: []const dr.Absorb) anyerror!void {
@@ -538,6 +598,7 @@ pub const Draft = struct {
         const d = cast(p);
         if (d.streams.fetchRemove(s)) |kv| {
             if (d.streams.count() == 0) d.landing = .{};
+            if (d.replay_ctx == kv.value) d.replay_ctx = null;
             if (kv.value.ring.borrowed) return d.gpa.destroy(kv.value); // its lane's run goes back with the lane
             d.pool.append(d.gpa, kv.value) catch d.drop(kv.value);
         }

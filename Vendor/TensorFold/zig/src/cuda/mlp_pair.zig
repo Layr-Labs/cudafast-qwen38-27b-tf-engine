@@ -41,7 +41,10 @@ pub const Kernels = struct {
     pub fn pair(kk: *const Kernels, s: Stream, x: u64, xs: u64, gate: Affine4, up: Affine4, act: u64, as: u64, rows: usize) !void {
         if (!fits(gate, up) or rows == 0) return error.InputMismatch;
         const rows_t = (rows + 15) / 16;
-        const major = rows == 16 and gate.n == 17408 and gate.k == 5120 and
+        // the word-panel view for a full 16-row window, and the single-CTA one for 17 to 32 rows too (two row tiles
+        // reading each panel, every row's MMA chain as at 16)
+        const wide = kk.kmajor_single and rows > 16 and rows <= 32;
+        const major = (rows == 16 or wide) and gate.n == 17408 and gate.k == 5120 and
             gate.verify_w != 0 and up.verify_w != 0 and kk.kmajor_fn != null;
         const single = major and kk.kmajor_single;
         const tiles = gate.n / @as(usize, if (single) 256 else if (major) 128 else 64);

@@ -30,6 +30,45 @@ pub const Seen = struct {
     }
 };
 
+/// `parents` (a window's rows, row 0 the pending one) as a tree whose depth-first register-slot plan (core/tree_slots)
+/// peaks at `peak` live slots: a node whose light child is such a tree one slot shallower and whose heavy child is a
+/// chain as long, 2^peak - 1 rows in all; the rows past it extend the last chain.
+pub fn treeOfPeak(parents: []i32, peak: usize) void {
+    var at: usize = 0;
+    nest(parents, &at, -1, peak);
+    while (at < parents.len) : (at += 1) parents[at] = @intCast(at - 1);
+}
+
+fn nest(parents: []i32, at: *usize, parent: i32, peak: usize) void {
+    const node = at.*;
+    parents[node] = parent;
+    at.* += 1;
+    if (peak <= 1) return;
+    nest(parents, at, @intCast(node), peak - 1);
+    var prev: i32 = @intCast(node);
+    for (0..(@as(usize, 1) << @intCast(peak - 1)) - 1) |_| {
+        parents[at.*] = prev;
+        prev = @intCast(at.*);
+        at.* += 1;
+    }
+}
+
+/// Every register-slot variant a 16- and a 32-row tree window can take, captured once at load: a stream whose tree
+/// changes shape mid-reply (a 31-node tree after 15-node ones) meets no forward capture inside its timed decode.
+fn warmTrees(e: anytype, cache: anytype, ids: []const u32, picks: []const E.Draw) !void {
+    if (comptime !@hasDecl(@TypeOf(e.*), "deltaScan")) return; // a calibration fixture has no tree windows
+    for ([_]usize{ 16, 32 }) |rows| {
+        if (rows > e.window_rows) continue;
+        var peak: usize = 2;
+        while ((@as(usize, 1) << @intCast(peak)) - 1 <= rows) : (peak += 1) {
+            var parents: [E.most_window]i32 = undefined;
+            treeOfPeak(parents[0..rows], peak);
+            try cache.reset(e);
+            try e.forward(&.{.{ .cache = cache, .rows = rows, .parents = parents[0..rows] }}, ids[0..rows], .{ .draws = picks[0..rows] });
+        }
+    }
+}
+
 pub fn time(io: std.Io, e: anytype, d: anytype, cache: anytype, warmed: *Seen) !void {
     var phases: profile.Times = .{};
     return timed(io, e, d, cache, warmed, &phases);
@@ -53,6 +92,9 @@ fn timed(io: std.Io, e: anytype, d: anytype, cache: anytype, warmed: *Seen, phas
         }
         measured[rows - 1] = .{ .rows = @intCast(rows), .ms = try timeWidth(io, e, cache, rows, &ids, &picks) };
     }
+    const trees_start = profile.now(io);
+    try warmTrees(e, cache, &ids, &picks);
+    warm_ns += profile.elapsed(io, trees_start);
     try cache.reset(e);
     for (measured[0..e.window_rows]) |m| d.setCost(m.rows, m.ms);
     phases.warmups += warm_ns;
@@ -120,8 +162,24 @@ fn run(io: std.Io, e: anytype, d: anytype, cache: anytype, warmed: *Seen, phases
             warmed.mark(shape);
         }
     }
+    try warmTrees(e, cache, &ids, &picks);
     try cache.reset(e);
     phases.warmups += profile.elapsed(io, started);
 }
 
 pub const Test = if (@import("builtin").is_test) @import("cuda_warm_test.zig") else struct {};
+
+test "a tree of each register-slot peak, as the slot plan the forward stages counts it" {
+    const slots = @import("core").tree_slots;
+    for ([_]usize{ 16, 32 }) |rows| {
+        var peak: usize = 2;
+        while ((@as(usize, 1) << @intCast(peak)) - 1 <= rows) : (peak += 1) {
+            var parents: [64]i32 = undefined;
+            treeOfPeak(parents[0..rows], peak);
+            try std.testing.expectEqual(@as(i32, -1), parents[0]);
+            for (parents[1..rows], 1..) |p, row| try std.testing.expect(p >= 0 and p < @as(i32, @intCast(row)));
+            var steps: [64]slots.Step = undefined;
+            try std.testing.expectEqual(peak, try slots.build(std.testing.allocator, parents[0..rows], steps[0..rows], 0, slots.max_slots));
+        }
+    }
+}

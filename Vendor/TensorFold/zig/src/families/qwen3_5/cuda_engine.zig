@@ -282,8 +282,8 @@ pub const Engine = struct {
             defer stage.free();
             try weights.load(e, &ck, &stage);
         }
-        if (gb10 and g.hidden == 5120 and g.layers == 64 and g.experts == 0 and
-            @import("sys").c.getenv("TF_WIDE_KMAJOR") != null and !envOff("TF_WIDE_KMAJOR"))
+        // the 17 to 32-row word panels a 31-node tree's window reads (TF_WIDE_KMAJOR=0: the cluster tiles instead)
+        if (gb10 and g.hidden == 5120 and g.layers == 64 and g.experts == 0 and !envOff("TF_WIDE_KMAJOR"))
             e.wide_words = try wide_weight_layout.prepare(e);
         e.verify_weights = null;
         if (gb10) {

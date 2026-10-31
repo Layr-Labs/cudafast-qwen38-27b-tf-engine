@@ -481,11 +481,11 @@ test "fused MLP: single-CTA variant has no cluster and preserves narrow fallback
     const gate: cuda.qlinear.Affine4 = .{ .w = 10, .verify_w = 100, .s = 20, .b = 30, .n = 17408, .k = 5120, .npad = 17408 };
     var up = gate;
     up.w = 40; up.verify_w = 400;
-    for ([_]usize{ 1, 15, 16, 17, 32 }) |rows| {
+    for ([_]usize{ 1, 15, 16, 17, 32, 33 }) |rows| {
         try pair.pair(stream, 1000, 2000, gate, up, 3000, 4000, rows);
-        const single = rows == 16;
+        const single = rows >= 16 and rows <= 32; // a full window, or two row tiles over the same panels
         try t.expectEqual(@as(usize, if (single) 22 else 20), PairTrace.id);
-        try t.expectEqual(@as(u32, if (single) 68 else @intCast(2 * ((rows + 15) / 16) * 272)), PairTrace.grid);
+        try t.expectEqual(@as(u32, @intCast(if (single) 68 * ((rows + 15) / 16) else 2 * ((rows + 15) / 16) * 272)), PairTrace.grid);
         try t.expectEqual(@as(u32, if (single) 1 else 2), PairTrace.cluster);
         try t.expectEqual(@as(u32, if (single) 41088 else 37376), PairTrace.shared);
         try t.expectEqual(@as(u64, if (single) 100 else 10), PairTrace.parts.p[0].w);
