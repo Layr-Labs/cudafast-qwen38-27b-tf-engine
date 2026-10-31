@@ -100,9 +100,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __r
     release_next();
     const int t = threadIdx.x;
     const int E = D / 256;
-    // a programmatic launch (cuda_engine.zig's norm): the weights stream in while the kernel before finishes,
-    // then griddepcontrol.wait before any input (H, R, P) is read; a plain launch's wait returns at once. Every load
-    // is straight-line (an index past D repeats the row's last 8 entries, unused), so H, R and P are in flight together
+    // Static weights overlap the prior kernel; residual vectors load only at use to shorten their live range.
     uint4 wv[4];
     if ((E & 3) == 0) {
 #pragma unroll
@@ -117,13 +115,9 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __r
     float* XS = after_wait(XS0);
     if ((E & 3) == 0) {
         const size_t row = blockIdx.x;
-        uint4 hw[4], rw[4];
+        uint4 hw[4];
 #pragma unroll
         for (int j = 0; j < 4; j++) hw[j] = *reinterpret_cast<const uint4*>(H + row * D + min((t + 256 * j) * 8, D - 8));
-        if (R != nullptr) {
-#pragma unroll
-            for (int j = 0; j < 4; j++) rw[j] = *reinterpret_cast<const uint4*>(R + row * D + min((t + 256 * j) * 8, D - 8));
-        }
         if (past_rows(P, blockIdx.x)) return;
         // h + r and w * (h * inv) move 8 entries a lane through xrow; the squares keep a thread's E entries in order
 #pragma unroll
@@ -131,8 +125,9 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __r
             const int d = (t + 256 * j) * 8;
             if (d >= D) break;
             if (R != nullptr) {
+                const uint4 rw = *reinterpret_cast<const uint4*>(R + row * D + d);
                 __nv_bfloat16* hb = reinterpret_cast<__nv_bfloat16*>(&hw[j]);
-                const __nv_bfloat16* rb = reinterpret_cast<const __nv_bfloat16*>(&rw[j]);
+                const __nv_bfloat16* rb = reinterpret_cast<const __nv_bfloat16*>(&rw);
 #pragma unroll
                 for (int k = 0; k < 8; k++) hb[k] = __float2bfloat16_rn(bf(hb[k]) + bf(rb[k]));
                 *reinterpret_cast<uint4*>(H + row * D + d) = hw[j];
