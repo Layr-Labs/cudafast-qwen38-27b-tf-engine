@@ -29,7 +29,7 @@ pub fn projectMany(e: *Engine, ls: []const Proj, x: u64, xs: u64, outs: []const 
         return;
     }
     const k = ls[0].inputs();
-    if (sums) try e.run(e.fns.sums, .{ rows, (k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ x, xs, @as(c_int, @intCast(k)), params });
+    if (sums) try e.runAfter(e.fns.sums, .{ rows, (k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ x, xs, @as(c_int, @intCast(k)), params });
     var many: [A.segs_max]A.Out = undefined;
     if (wide) {
         for (ls, outs, many[0..ls.len]) |l, out, *m| m.* = .{ .q = l.a4, .out = out };
