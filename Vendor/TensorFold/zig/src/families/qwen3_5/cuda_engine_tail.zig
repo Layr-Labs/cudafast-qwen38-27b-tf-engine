@@ -7,6 +7,8 @@ const tables_len = @import("cuda_round.zig").bytes;
 pub fn finish(e: anytype, io: std.Io, started: i96) !void {
     errdefer if (e.kit) |k| k.deinit(e.gpa);
     _ = try e.scratch(.allocate);
+    // the fused gdn_post's arrival counts start at zero; each head's last CTA returns its count to zero
+    if (e.gdn_count != 0) try e.d.check(e.d.api.cuMemsetD32_v2(e.gdn_count, 0, @import("cuda_round.zig").max_segs * e.g.v_heads), "cuMemsetD32");
     e.tables = try DeviceBuffer.alloc(e.d, tables_len);
     errdefer e.tables.free();
     e.staged = try cuda.HostBuffer.alloc(e.d, tables_len);

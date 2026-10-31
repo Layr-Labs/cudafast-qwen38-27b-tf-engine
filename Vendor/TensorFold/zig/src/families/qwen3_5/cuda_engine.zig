@@ -50,6 +50,8 @@ pub fn aligned(n: usize) usize {
 
 /// qwen35.cuh's Geo.
 pub const Geo = extern struct { hid: c_int, nk: c_int, nv: c_int, qh: c_int, kvh: c_int, nl: c_int };
+/// qwen35.cu's GdnPost: gdn_post's arguments for a slot scan that runs it on a head's last CTA (count 0: y only).
+pub const GdnPost = extern struct { z: u64 = 0, nw: u64 = 0, out: u64 = 0, xs: u64 = 0, count: u64 = 0, eps: f32 = 0 };
 
 const layers = @import("cuda_layers.zig");
 pub const Proj = layers.Proj;
@@ -160,6 +162,9 @@ pub const Engine = struct {
     beta: u64,
     y: u64,
     mix: u64,
+    gdn_count: u64 = 0,
+    h_added: bool = false, // the last residual producer added its rows into h (cuda_forward.zig's residual)
+    fuse_residual: bool = false, // prompt out/o/down on the rows2 output tiles add into h (TF_FUSED_RESIDUAL=0: write r) // a (window, value head)'s arrivals for the slot scans' fused gdn_post (0: gdn_post launches)
     qraw: u64,
     kraw: u64,
     vraw: u64,
@@ -274,6 +279,7 @@ pub const Engine = struct {
         e.affine.half_prompt = !gb10; // the 27B's prompt tile (Tile<64, 128, 128, 2, 2, 2>), quicker on an RTX 5090
         // GB10: split-K decode/verify projections on the cluster tile (bits unchanged); TF_CLUSTER_DECODE=0 restores lane_gemv
         e.affine.cluster_decode = gb10 and !envOff("TF_CLUSTER_DECODE");
+        e.fuse_residual = !envOff("TF_FUSED_RESIDUAL");
         // prompt chunks keep the residual rows in L2 across their projections (cache residency only, never a value)
         e.l2_persist = 0;
         if (gb10 and !envOff("TF_L2_PERSIST") and d.api.cuCtxSetLimit(cuda.abi.limit_persisting_l2, l2_persist_bytes) == cuda.abi.success) e.l2_persist = l2_persist_bytes;
@@ -408,7 +414,7 @@ pub const Engine = struct {
 
     /// A stream's device bytes at a `cap`-token window: recurrences, convolution tails, keys and values, taps, log.
     pub fn streamBytes(e: *const Engine, cap: usize) usize {
-        return 2 * e.g.stateBytes() + e.g.kvBytes(cap, e.kv8) + e.tapBytes() + 2 * e.g.logBytes(most_window);
+        return 2 * e.g.stateBytes() + e.g.kvBytes(cap, e.kv8) + e.tapBytes() + caches.log_parts * e.g.logBytes(most_window);
     }
 
     /// A stream's tap ring: tap_rows rows of the tapped layers' residuals.
@@ -454,6 +460,8 @@ pub const Engine = struct {
         e.qkv = try t.alloc(R * g.convWidth() * 2);
         inline for (.{ "gate", "up", "act" }) |name| @field(e, name) = try t.alloc(R * g.intermediate * 2);
         e.xs = try t.alloc(R * (@max(g.intermediate, wide) / 64) * 4);
+        // TF_FUSED_GDN_POST=0 restores the gdn_post launch after a recorded window's slot scan
+        e.gdn_count = if (envOff("TF_FUSED_GDN_POST")) 0 else try t.alloc(max_segs * g.v_heads * 4);
         inline for (.{ "a", "b", "beta" }) |name| @field(e, name) = try t.alloc(R * g.v_heads * 2);
         e.g_ = try t.alloc(R * g.v_heads * 4);
         e.qraw = try t.alloc(R * 2 * g.attnWidth() * 2);
@@ -581,7 +589,8 @@ pub const Engine = struct {
         }
         var row0: usize = 0;
         for (parts, 0..) |p, i| {
-            segs[i] = p.cache.fold(p.cache.seg(e, p.cache.len, row0, p.rows));
+            // a recorded slot scan of 2+ rows may leave its folded prefix unwritten (cuda_cache.zig `fold`)
+            segs[i] = p.cache.fold(p.cache.seg(e, p.cache.len, row0, p.rows), record and keep != .hidden and p.rows != 1);
             row0 += p.rows;
         }
         if (keep == .draws) {
@@ -705,6 +714,11 @@ pub const Engine = struct {
 
     /// The same scan selected by body, exposed for host launch-contract fixtures.
     pub fn deltaScan(e: *Engine, record: bool, slot_count: u8, segments: usize, layer: c_int) !void {
+        return e.deltaScanPost(record, slot_count, segments, layer, .{});
+    }
+
+    /// deltaScan; a recorded window's slot scan with post.count set also runs gdn_post (qwen35.cu q35_post_tail).
+    pub fn deltaScanPost(e: *Engine, record: bool, slot_count: u8, segments: usize, layer: c_int, post: GdnPost) !void {
         const scan = if (!record) e.fns.gdn_chain else switch (slot_count) {
             1 => e.fns.gdn_slots_1,
             2 => e.fns.gdn_slots_2,
@@ -718,7 +732,9 @@ pub const Engine = struct {
         const input = e.tables.ptr + @as(usize, if (record) Round.steps_at else rowpar_at);
         // qwen35_slots.cuh: up to four slots scan two value rows a warp, so a block covers eight
         const rows_a_warp: usize = if (record and (slot_count == 3 or slot_count == 35)) 4 else if (record and slot_count <= 4) 2 else 1;
-        try e.runAfter(scan, .{ 1, geometry.dk / (4 * rows_a_warp), e.g.v_heads * segments }, .{ 32, 4, 1 }, .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, input, layer, e.y, e.tables.ptr + params_at });
+        const grid = .{ 1, geometry.dk / (4 * rows_a_warp), e.g.v_heads * segments };
+        if (!record) return e.runAfter(scan, grid, .{ 32, 4, 1 }, .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, input, layer, e.y, e.tables.ptr + params_at });
+        try e.runAfter(scan, grid, .{ 32, 4, 1 }, .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, input, layer, e.y, e.tables.ptr + params_at, post });
     }
 
     /// The launches of a forward of `shape`, from the embedding to the kept rows' logits (captured once a shape).

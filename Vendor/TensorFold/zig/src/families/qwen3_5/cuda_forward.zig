@@ -13,7 +13,7 @@ pub const attn_tiles = 4 * 32 * 512;
 /// tf_q35_attn_partial's one key and value tile (Bf16Tiles1), and the chunk blocks it launches a (row, key head):
 /// each takes every partial_chunks-th of the MAXCH chunks, so a short stream's rows dispatch no idle blocks.
 const attn_tile = attn_tiles / 2;
-const partial_chunks = 8;
+const partial_chunks = 12;
 /// qwen35_attn_tc.cuh's GROUP_LEN: a stream at least this long has its rows on tf_q35_attn_rows.
 pub const group_len = 8192;
 const ids_at = E.Engine.ids_at;
@@ -48,6 +48,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     const geo = e.geo;
     const group = g.q_heads / g.kv_heads;
 
+    e.h_added = false;
     try e.embed(t_ids, e.h, total, t_params);
     // the producers of the out, o and down inputs write their group sums; a prompt GEMM past 16 rows needs none
     const sums: u64 = if (prompt and total > 16) 0 else e.xs;
@@ -59,7 +60,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     var di: usize = 0;
     var ai: c_int = 0;
     for (e.layers, 0..) |l, i| {
-        try e.normInput(i != 0, l.input_norm, total, prompt);
+        try e.normInput(i != 0 and !taken(e), l.input_norm, total, prompt);
         if (e.learning) |k| try k.input(i, e.h, total);
         switch (l.mixer) {
             .delta => |m| {
@@ -69,14 +70,19 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 try e.runAfter(e.fns.gdn_pre, .{ 1, 2 * g.k_heads + g.v_heads, gdn_blocks }, .{ 32, gdn_rows, 1 }, .{ geo, e.qkv, t_segs, t_rows, t_par, layer, m.conv, e.a, e.b, m.a_log, m.dt_bias, e.q, e.k, e.v, e.g_, e.beta, t_params });
                 // one recorded window of 2+ rows: gdn_pre logged its tails, conv_commit would only return
                 if (!(record and nseg == 1 and total > 1)) try e.runAfter(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
-                if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else try e.deltaScan(record, shape.slots, nseg, layer);
-                try e.runAfter(e.fns.gdn_post, .{ 1, g.v_heads, gdn_blocks }, .{ 32, gdn_rows, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums });
-                try e.projAgain(m.out, e.mix, e.r, total, prompt);
+                // a recorded decode window's slot scan runs gdn_post on each head's last CTA (one launch less a layer)
+                const fused_post = record and !prompt and e.gdn_count != 0;
+                if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else if (fused_post) try e.deltaScanPost(record, shape.slots, nseg, layer, .{ .z = e.z, .nw = m.norm, .out = e.mix, .xs = sums, .count = e.gdn_count, .eps = g.eps }) else try e.deltaScan(record, shape.slots, nseg, layer);
+                if (!fused_post) try e.runAfter(e.fns.gdn_post, .{ 1, g.v_heads, gdn_blocks }, .{ 32, gdn_rows, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums });
+                try residual(e, m.out, e.mix, total, prompt, true);
                 di += 1;
             },
             .attention => |m| {
                 const aw = g.attnWidth();
-                try e.projMany(&.{ m.q, m.k, m.v }, e.x, &.{ e.qraw, e.kraw, e.vraw }, total, prompt);
+                if (tail and i == e.layers.len - 1)
+                    try @import("cuda_prompt_tail.zig").query(e, m, total)
+                else
+                    try e.projMany(&.{ m.q, m.k, m.v }, e.x, &.{ e.qraw, e.kraw, e.vraw }, total, prompt);
                 if (e.learning) |k| try k.attention(i, e.qraw, e.kraw, e.vraw, total);
                 if (prompt and total > 16 and !e.kv8) {
                     // Preserve the original two head sums and bf16 boundary before rotary/cache stores.
@@ -93,11 +99,9 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     try @import("cuda_prompt_tail.zig").run(e, @intCast(ai), total);
                     return;
                 }
-                var merged = false;
                 if (shape.paged) {
                     try @import("cuda_attention.zig").partial(e, shape, ai);
-                    try launch(e, e.fns.attn_merge_gate, sig.attn_merge_gate, .{ g.q_heads, total, 1 }, .{ 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.qraw, e.mix, sums });
-                    merged = true;
+                    try launchAfter(e, e.fns.attn_merge_gate, sig.attn_merge_gate, .{ g.q_heads, total, 1 }, .{ 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.qraw, e.mix, sums });
                 } else if (prompt and nseg == 1 and (g.q_heads / g.kv_heads) % 2 == 0) {
                     // a prompt chunk's rows over its own cache: tensor-core tiles in place of the decode partials
                     try @import("cuda_prompt.zig").run(e, @intCast(ai), total);
@@ -115,15 +119,14 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     }
                     // the merge with the gate and the gated rows' group sums, attn_gate's bits
                     try launchAfter(e, e.fns.attn_merge_gate, sig.attn_merge_gate, .{ g.q_heads, total, 1 }, .{ 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.qraw, e.mix, sums });
-                    merged = true;
                 }
-                if (!merged and (shape.paged or (prompt and nseg == 1 and (g.q_heads / g.kv_heads) % 2 == 0))) try launchAfter(e, e.fns.attn_gate, sig.attn_gate, .{ (total * aw + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.y, e.qraw, e.mix, @as(c_int, @intCast(total)), t_params, sums });
+                if (prompt and nseg == 1 and (g.q_heads / g.kv_heads) % 2 == 0) try launchAfter(e, e.fns.attn_gate, sig.attn_gate, .{ (total * aw + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.y, e.qraw, e.mix, @as(c_int, @intCast(total)), t_params, sums });
                 if (e.learning) |k| try k.gated(i, e.mix, total);
-                try e.projAgain(m.o, e.mix, e.r, total, prompt);
+                try residual(e, m.o, e.mix, total, prompt, true);
                 ai += 1;
             },
         }
-        try e.normInput(true, l.post_norm, total, prompt);
+        try e.normInput(!taken(e), l.post_norm, total, prompt);
         if (e.learning) |k| try k.post(i, e.h, e.x, total);
         switch (l.mlp) {
             .dense => |m| {
@@ -132,7 +135,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     cuda.prompt_many.Kernels.mlpFits(m.gate.a4, m.up.a4) and m.gate.a4.n == g.intermediate;
                 if (fused) {
                     try e.prompt_many.mlp(e.stream, e.x, m.gate.a4, m.up.a4, e.act, total);
-                    try e.projAgain(m.down, e.act, e.r, total, prompt);
+                    try residual(e, m.down, e.act, total, prompt, e.mlp == null and e.pockets.of(i) == null);
                 } else if (!prompt and total <= E.most_verify and e.learning == null and e.mlp == null and e.affine.split == null and
                     m.gate == .a4 and m.up == .a4 and cuda.mlp_pair.Kernels.fits(m.gate.a4, m.up.a4) and m.gate.a4.n == g.intermediate)
                 {
@@ -154,12 +157,29 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
             .moe => |m| try e.routedRows(m.router, m.experts, e.x, e.r, total, promptMoe(prompt, total), t_params),
         }
         if (shape.taps) for (e.taps[0..e.n_taps], 0..) |t, ti| if (t == i) {
-            try e.run(e.fns.tap, .{ total, (g.hidden + 2047) / 2048, 1 }, .{ 256, 1, 1 }, .{ e.h, e.r, t_segs, t_rows, @as(c_int, @intCast(ti)), @as(c_int, @intCast(g.hidden)), t_params });
+            try e.runAfter(e.fns.tap, .{ total, (g.hidden + 2047) / 2048, 1 }, .{ 256, 1, 1 }, .{ e.h, if (e.h_added) @as(u64, 0) else e.r, t_segs, t_rows, @as(c_int, @intCast(ti)), @as(c_int, @intCast(g.hidden)), t_params });
         };
         // a captured forward's first layer is a graph of its own (cuda_engine.zig's cutCapture)
         if (i == 0) try e.cutCapture();
     }
     try finish(e, total, heads, shape.hidden);
+}
+
+/// out, o or down into the residual: a prompt's rows2 output tiles add their rows into h itself (the next norm then
+/// reads h alone, its bits unchanged); everything else writes r for the norm to add. `can`: no hook reads r.
+fn residual(e: *E.Engine, l: E.Proj, x: u64, total: usize, prompt: bool, can: bool) !void {
+    if (can and e.fuse_residual and prompt and total > 16 and e.learning == null and !e.int8.on and l == .a4 and e.prompt_many.addsResidual(l.a4, total)) {
+        try e.prompt_many.prompt(e.stream, x, &.{.{ .q = l.a4, .out = e.h, .add = true }}, total);
+        e.h_added = true;
+        return;
+    }
+    try e.projAgain(l, x, e.r, total, prompt);
+}
+
+/// Whether the last residual producer added into h; the norm that consumes it clears it.
+fn taken(e: anytype) bool {
+    defer e.h_added = false;
+    return e.h_added;
 }
 
 /// A launch whose arguments are checked against the kernel's .cu signature: a wrong count or kind does not build.
@@ -192,8 +212,9 @@ fn sharedSized(e: *E.Engine, f: cuda.Function, comptime s: sig.Sig, grid: [3]usi
 pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool) !void {
     if (hidden) return;
     const g = e.g;
-    if (e.learning == null and heads < total) try e.normTail(e.final_norm, total, heads) else
-        try e.norm(true, e.final_norm, total);
+    const added = if (@hasField(@TypeOf(e.*), "h_added")) taken(e) else false;
+    if (e.learning == null and heads < total) try @import("cuda_norm.zig").normTailRows(e, !added, e.final_norm, total, heads) else
+        try e.norm(!added, e.final_norm, total);
     if (e.learning) |k| try k.final(e.h, total);
     // the head over the kept rows
     try e.proj(e.head, e.x + (total - heads) * g.hidden * 2, e.logits, heads, false);

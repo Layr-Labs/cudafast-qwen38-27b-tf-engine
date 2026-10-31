@@ -215,7 +215,12 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __r
 }
 
 // 64-group sums of bf16 rows D wide (the decode projections' input sums). Grid (rows, groups / 64), a thread a group.
-extern "C" __global__ void __launch_bounds__(64) tf_q35_sums(const __nv_bfloat16* __restrict__ X, float* __restrict__ XS, int D, const int* __restrict__ P) {
+extern "C" __global__ void __launch_bounds__(64) tf_q35_sums(const __nv_bfloat16* __restrict__ X0, float* __restrict__ XS0, int D, const int* __restrict__ P0) {
+    release_next();
+    await_prior();
+    const __nv_bfloat16* X = after_wait(X0);
+    float* XS = after_wait(XS0);
+    const int* P = after_wait(P0);
     if (past_rows(P, blockIdx.x)) return;
     const size_t row = blockIdx.x;
     const int g = blockIdx.y * blockDim.x + threadIdx.x;
@@ -446,25 +451,13 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_chain(Geo geo, cons
     for (int i = 0; i < PT; i++) st[i] = state[i];
 }
 
-// out = bf16(silu(z) * bf16(w * rmsnorm(y))) per value head; blockDim.y independent row warps, at most four.
-extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post(Geo geo, const __nv_bfloat16* __restrict__ Y0, const __nv_bfloat16* __restrict__ Z0,
-                                                                   const __nv_bfloat16* __restrict__ NW, float eps, __nv_bfloat16* __restrict__ OUT0,
-                                                                   const int* __restrict__ P, float* __restrict__ XS0) {
-    __shared__ __align__(16) __nv_bfloat16 row_done[4][DK];
-    __nv_bfloat16* done = row_done[threadIdx.y];
-    const int lane = threadIdx.x, hv = blockIdx.y;
-    release_next();
-    await_prior();
-    const __nv_bfloat16* Y = after_wait(Y0);
-    const __nv_bfloat16* Z = after_wait(Z0);
-    __nv_bfloat16* OUT = after_wait(OUT0);
-    float* XS = after_wait(XS0);
-    const size_t m = blockIdx.z * blockDim.y + threadIdx.y;
-    if (past_rows(P, m)) return;
+// out = bf16(silu(z) * bf16(w * rmsnorm(y))) for row m's value head hv, a warp; yw is the lane's four y values.
+__device__ __forceinline__ void q35_post_row(Geo geo, uint2 yw, const __nv_bfloat16* __restrict__ Z, const __nv_bfloat16* __restrict__ NW,
+                                             float eps, __nv_bfloat16* __restrict__ OUT, float* __restrict__ XS, size_t m, int hv) {
+    const int lane = threadIdx.x;
     const size_t W = (size_t)geo.nv * DK;
     constexpr int PER = DK / 32;
     const size_t at = m * W + hv * DK + lane * PER;
-    const uint2 yw = *reinterpret_cast<const uint2*>(Y + at);
     const uint2 zw = *reinterpret_cast<const uint2*>(Z + at);
     const uint2 nw = *reinterpret_cast<const uint2*>(NW + lane * PER);
     const __nv_bfloat16* yp = reinterpret_cast<const __nv_bfloat16*>(&yw);
@@ -487,10 +480,61 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post(Geo geo, const
         op[j] = __float2bfloat16_rn(zf / (1.0f + expf(-zf)) * x);
     }
     *reinterpret_cast<uint2*>(OUT + at) = ow;
-    *reinterpret_cast<uint2*>(done + lane * PER) = ow;
     if (XS == nullptr) return;
-    __syncwarp();
-    if (lane < DK / 64) XS[m * (W / 64) + hv * (DK / 64) + lane] = group_sum(done + lane * 64);
+    // group_sum's order over each 64-wide group, its 16 lanes' values shuffled to the group's lane (lanes 0 and 1)
+    static_assert(DK == 128 && PER == 4, "two 64-wide groups of sixteen lanes");
+    float gs = 0.0f;
+#pragma unroll
+    for (int src = 0; src < 16; src++) {
+        uint2 w;
+        w.x = __shfl_sync(0xffffffffu, ow.x, (lane & 1) * 16 + src);
+        w.y = __shfl_sync(0xffffffffu, ow.y, (lane & 1) * 16 + src);
+        const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&w);
+#pragma unroll
+        for (int j = 0; j < PER; j++) gs += bf(b[j]);
+    }
+    if (lane < DK / 64) XS[m * (W / 64) + hv * (DK / 64) + lane] = gs;
+}
+
+// out = bf16(silu(z) * bf16(w * rmsnorm(y))) per value head; blockDim.y independent row warps, at most four.
+extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post(Geo geo, const __nv_bfloat16* __restrict__ Y0, const __nv_bfloat16* __restrict__ Z0,
+                                                                   const __nv_bfloat16* __restrict__ NW, float eps, __nv_bfloat16* __restrict__ OUT0,
+                                                                   const int* __restrict__ P, float* __restrict__ XS0) {
+    const int hv = blockIdx.y;
+    release_next();
+    await_prior();
+    const __nv_bfloat16* Y = after_wait(Y0);
+    const size_t m = blockIdx.z * blockDim.y + threadIdx.y;
+    if (past_rows(P, m)) return;
+    const uint2 yw = *reinterpret_cast<const uint2*>(Y + m * geo.nv * DK + hv * DK + threadIdx.x * (DK / 32));
+    q35_post_row(geo, yw, after_wait(Z0), NW, eps, after_wait(OUT0), after_wait(XS0), m, hv);
+}
+
+// gdn_post fused into a recorded window's slot scan (count != nullptr): the last of a value head's dv-block CTAs to
+// finish runs the head's post on the window's rows, a warp a row, with gdn_post's own arithmetic.
+struct GdnPost { const __nv_bfloat16* z; const __nv_bfloat16* nw; __nv_bfloat16* out; float* xs; unsigned* count; float eps; };
+
+__device__ __noinline__ void q35_post_tail(Geo geo, const GdnPost pa, const Seg* segs, const __nv_bfloat16* y, const int* P) {
+    if (pa.count == nullptr || past_windows(P, blockIdx.z / geo.nv)) return;
+    __threadfence();  // this CTA's y rows, then its arrival
+    __syncthreads();
+    int last = 0;
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        unsigned* c = pa.count + blockIdx.z;
+        last = atomicAdd(c, 1u) == gridDim.y - 1;
+        if (last) *c = 0;  // every CTA of the head has arrived: ready for the next layer's scan
+    }
+    if (!__syncthreads_or(last)) return;
+    __threadfence();
+    const int hv = blockIdx.z % geo.nv;
+    const Seg sg = segs[blockIdx.z / geo.nv];
+    for (int r = threadIdx.y; r < sg.rows; r += blockDim.y) {
+        const size_t m = sg.row0 + r;
+        if (past_rows(P, m)) continue;
+        // the other CTAs' y rows, from L2
+        const uint2 yw = __ldcg(reinterpret_cast<const uint2*>(y + m * geo.nv * DK + hv * DK + threadIdx.x * (DK / 32)));
+        q35_post_row(geo, yw, pa.z, pa.nw, pa.eps, pa.out, pa.xs, m, hv);
+    }
 }
 
 #include "qwen35_head_norm.cuh"

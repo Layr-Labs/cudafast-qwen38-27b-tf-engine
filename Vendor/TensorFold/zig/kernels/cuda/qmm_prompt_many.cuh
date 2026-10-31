@@ -17,6 +17,7 @@ struct ManyPart {
     const __nv_bfloat16* biases;
     void* out;
     int n, npad, first;  // first: the part's first CTA in the launch
+    int add;             // the persistent rows2 output tiles: out is the residual h, and h += bf16(this output)
 };
 
 struct ManyParts {
@@ -171,7 +172,9 @@ __device__ __forceinline__ void prompt_many_body(
         if (i < parts.count && (int)blockIdx.x >= parts.p[i].first) q = i;
     const ManyPart& P = parts.p[q];
     const int2 at = tile_of((int)blockIdx.x - P.first, M, P.n, BM, BN, group);
-    if (short_tile<BM, WM>(M - at.x))
+    if (BM / WM > 16 && M - at.x <= 16 * WM)
+        prompt_tile<GS, 16 * WM, BN, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x, at.y);
+    else if (short_tile<BM, WM>(M - at.x))
         prompt_tile<GS, BM - 16 * WM, BN, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x, at.y);
     else
         prompt_tile<GS, BM, BN, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x, at.y);
@@ -186,13 +189,18 @@ __device__ __forceinline__ void prompt_split_body(
     const int rows_t = (M + BM - 1) / BM, full = rows_t * (full_cols / BN);
     if ((int)blockIdx.x < full) {
         const int2 at = tile_of((int)blockIdx.x, M, full_cols, BM, BN, group);
-        if (short_tile<BM, WM>(M - at.x))
+        if (BM / WM > 16 && M - at.x <= 16 * WM)
+            prompt_tile<GS, 16 * WM, BN, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x, at.y);
+        else if (short_tile<BM, WM>(M - at.x))
             prompt_tile<GS, BM - 16 * WM, BN, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x, at.y);
         else
             prompt_tile<GS, BM, BN, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x, at.y);
     } else {
         const int2 at = tile_of((int)blockIdx.x - full, M, P.n - full_cols, BM, BN / 2, group);
-        if (short_tile<BM, WM>(M - at.x))
+        if (BM / WM > 16 && M - at.x <= 16 * WM)
+            prompt_tile<GS, 16 * WM, BN / 2, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx,
+                                                             at.x, full_cols + at.y);
+        else if (short_tile<BM, WM>(M - at.x))
             prompt_tile<GS, BM - 16 * WM, BN / 2, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx,
                                                                 at.x, full_cols + at.y);
         else
@@ -350,7 +358,9 @@ __device__ __forceinline__ void prompt_mlp_body(
         const __nv_bfloat16* __restrict__ x, const ManyParts& parts, __nv_bfloat16* __restrict__ act, int M, int K,
         int ldx, int group) {
     const int2 at = tile_of((int)blockIdx.x, M, parts.p[0].n, BM, 64, group);
-    if (short_tile<BM, WM>(M - at.x))
+    if (BM / WM > 16 && M - at.x <= 16 * WM)
+        prompt_mlp_tile<GS, 16 * WM, WM, WN, STAGES>(x, parts, act, M, K, ldx, at.x, at.y);
+    else if (short_tile<BM, WM>(M - at.x))
         prompt_mlp_tile<GS, BM - 16 * WM, WM, WN, STAGES>(x, parts, act, M, K, ldx, at.x, at.y);
     else
         prompt_mlp_tile<GS, BM, WM, WN, STAGES>(x, parts, act, M, K, ldx, at.x, at.y);

@@ -2,7 +2,8 @@
 const cuda = @import("cuda");
 const common = @import("core").recurrent_workspace;
 const Engine = @import("cuda_engine.zig").Engine;
-const Cache = @import("cuda_cache.zig").Cache;
+const caches = @import("cuda_cache.zig");
+const Cache = caches.Cache;
 pub const Pool = common.Workspace(cuda.DeviceBuffer);
 pub const Lease = Pool.Lease;
 
@@ -59,7 +60,7 @@ pub fn prepare(e: *Engine, c: *Cache, rows: usize, record: bool) !void {
     if (!record) return release(c); // its scratch stays for another window until idle or the cap frees it
     const n = try common.rowClass(rows, @import("cuda_engine.zig").most_window);
     if (rows > 1) clear(c, true);
-    try ensure(e, c, false, 2 * e.g.logBytes(n), rows == 1);
+    try ensure(e, c, false, caches.log_parts * e.g.logBytes(n), rows == 1);
     if (rows == 1) try ensure(e, c, true, e.g.stateBytes(), false);
 }
 
@@ -69,7 +70,7 @@ pub fn logStays(e: *const Engine, c: *const Cache, rows: usize) bool {
     const n = common.rowClass(rows, @import("cuda_engine.zig").most_window) catch return false;
     const l = c.log_lease orelse return false;
     const b = pool.view(@intFromPtr(e), l) catch return false;
-    return b.len == 2 * e.g.logBytes(n) and b.ptr == c.log.ptr;
+    return b.len == caches.log_parts * e.g.logBytes(n) and b.ptr == c.log.ptr;
 }
 
 pub fn mark(c: *Cache, before: bool) !void {
@@ -92,7 +93,7 @@ pub fn idle(e: *Engine) void {
 
 /// What one scratch-owning cache may hold at once: a rollback copy and a widest window's log (1.1.1's own two).
 pub fn bound(e: *const Engine) usize {
-    return e.g.stateBytes() + 2 * e.g.logBytes(@import("cuda_engine.zig").most_window);
+    return e.g.stateBytes() + caches.log_parts * e.g.logBytes(@import("cuda_engine.zig").most_window);
 }
 
 pub fn shutdown(e: *Engine) void {
