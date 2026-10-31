@@ -24,7 +24,7 @@ const lp_top = 20;
 pub const Config = @import("cuda_draft_config.zig").Config;
 pub const frame = @import("cuda_draft_frame.zig");
 pub const memory = @import("cuda_draft_memory.zig");
-const Fns = struct { gather_taps: cuda.Function, gather_rows: cuda.Function, dyn_conv: cuda.Function, norm_rope: cuda.Function, ring_put: cuda.Function, attn: cuda.Function, dyn_conv_batch: cuda.Function, norm_rope_batch: cuda.Function, mask_rows: cuda.Function, attn_partial: cuda.Function, attn_partial_rows4: cuda.Function, attn_merge: cuda.Function };
+const Fns = struct { gather_taps: cuda.Function, gather_rows: cuda.Function, dyn_conv: cuda.Function, norm_rope: cuda.Function, ring_put: cuda.Function, attn: cuda.Function, dyn_conv_batch: cuda.Function, norm_rope_batch: cuda.Function, mask_rows: cuda.Function, attn_partial: cuda.Function, attn_merge: cuda.Function };
 
 /// qwen35_draft.cu's TapRows.
 const TapRows = extern struct { n: c_int, rows: [engine.most_window]c_int };
@@ -94,6 +94,8 @@ pub const Draft = struct {
     ids: u64, // u32 the block's ids
     staged: cuda.HostBuffer, // pinned: the ids up, the words and projected rows down
     streams: std.AutoHashMapUnmanaged(*Stream, *Ctx) = .empty,
+    /// Captured frames (cuda_draft_frame.zig run): each key's graph, or null where capture failed, and its span output.
+    graphs: std.AutoHashMapUnmanaged(u64, struct { exec: ?cuda.graph.Exec, spanned: ?u64 }) = .empty,
     /// Contexts between streams, allocated and run once (`reserve`), as the driver stalls a buffer's first kernel.
     pool: std.ArrayList(*Ctx) = .empty,
     /// Grown trees' nodes offered and landed, by own chance: the nodes' chances the round loop prices.
@@ -172,6 +174,9 @@ pub const Draft = struct {
     }
 
     pub fn deinit(d: *Draft) void {
+        var gs = d.graphs.valueIterator();
+        while (gs.next()) |g| if (g.exec) |*x| x.deinit();
+        d.graphs.deinit(d.gpa);
         var it = d.streams.valueIterator();
         while (it.next()) |ctx| d.drop(ctx.*);
         d.streams.deinit(d.gpa);
@@ -221,7 +226,7 @@ pub const Draft = struct {
     }
 
     fn drop(d: *Draft, ctx: *Ctx) void {
-        if (ctx.ring.borrowed) ctx.ring.free() else @import("cuda_cache.zig").giveBlock(&ctx.ring);
+        ctx.ring.free();
         d.gpa.destroy(ctx);
     }
 
@@ -247,7 +252,7 @@ pub const Draft = struct {
     fn createCold(d: *Draft) !*Ctx {
         const ctx = try d.gpa.create(Ctx);
         errdefer d.gpa.destroy(ctx);
-        ctx.* = .{ .ring = try @import("cuda_cache.zig").takeBlock(d.e, d.c.ringBytes()) };
+        ctx.* = .{ .ring = try DeviceBuffer.alloc(d.e.d, d.c.ringBytes()) };
         errdefer ctx.ring.free();
         try ctx.ring.fill8(0, null);
         return ctx;
@@ -522,6 +527,12 @@ pub const Draft = struct {
 
 /// Acceptance by depth until a stream has its own (the reference's chat text: measured, see the commit).
 const prior = [_]f64{ 0.75, 0.65, 0.58, 0.52, 0.47, 0.43, 0.4, 0.37, 0.35, 0.33, 0.31, 0.29, 0.28, 0.27, 0.26 };
+
+/// TF_DRAFT_GRAPH=0: drafter frames run launch by launch instead of from their captured graphs.
+pub fn graphsOff() bool {
+    const v = platform.c.getenv("TF_DRAFT_GRAPH") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "0");
+}
 
 /// TF_TIMING=1: each call's wall time on stderr.
 pub fn timing(what: []const u8, io: std.Io, t0: std.Io.Timestamp) void {

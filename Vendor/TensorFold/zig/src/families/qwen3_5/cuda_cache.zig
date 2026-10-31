@@ -46,17 +46,6 @@ fn take(e: *Engine, len: usize) !DeviceBuffer {
 /// The engine whose pool `give` fills: the one that allocated through `take` (one engine a process).
 var pool_of: ?*Engine = null;
 
-/// `take` for the engine's other per-phase device buffers (recurrent scratch, drafter rings): a pooled block of exactly
-/// `len` bytes or a new one, which the caller zeroes or overwrites before any read.
-pub fn takeBlock(e: *Engine, len: usize) !DeviceBuffer {
-    return take(e, len);
-}
-
-/// `give` for those buffers: kept for the next phase's same-size buffer, or freed.
-pub fn giveBlock(b: *DeviceBuffer) void {
-    give(b);
-}
-
 /// Stop recycling into `e`'s pool (its deinit).
 pub fn forget(e: *Engine) void {
     if (pool_of == e) pool_of = null;

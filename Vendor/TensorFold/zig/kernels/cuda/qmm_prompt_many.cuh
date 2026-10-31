@@ -29,12 +29,14 @@ template <int GS, int BM, int BN, int WM, int WN, int STAGES>
 __device__ __forceinline__ void prompt_tile(
         const __nv_bfloat16* __restrict__ x, const uint32_t* __restrict__ w, const __nv_bfloat16* __restrict__ scales,
         const __nv_bfloat16* __restrict__ biases, void* __restrict__ out, int N, int npad, int M, int K, int ldx, int m0,
-        int n0) {
+        int n0, int ga = 0, int gb = -1, const float* __restrict__ in = nullptr, float* __restrict__ park = nullptr) {
+    // [ga, gb) of the tile's groups (gb < 0: all), into accumulators from zero or from `in` (this thread's parked
+    // fp32, exact: the chain goes on where it stopped); `park` keeps them for the next CTA instead of storing bf16
     using T = Tile<GS, BM, BN, WM, WN, STAGES>;
     extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm = warp / WN, wn = warp % WN;
-    const int KG = K / GS, per = KG, g0 = 0;
+    const int KG = K / GS, g0 = ga, per = (gb < 0 ? KG : gb) - ga;
 
     auto stage = [&](int s) { return buf + s * T::STAGE; };
     // each thread's copies, addressed once: its input chunk column and rows r0 + i * (THREADS / CHUNKS), its weight
@@ -75,9 +77,15 @@ __device__ __forceinline__ void prompt_tile(
 #pragma unroll
     for (int i = 0; i < T::MT; ++i)
 #pragma unroll
-        for (int j = 0; j < T::NT; ++j)
+        for (int j = 0; j < T::NT; ++j) {
+            if (in) {
+                const float4 v = __ldcg(reinterpret_cast<const float4*>(in) + i * T::NT + j);
+                acc[i][j][0] = v.x; acc[i][j][1] = v.y; acc[i][j][2] = v.z; acc[i][j][3] = v.w;
+            } else {
 #pragma unroll
-            for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
+                for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
+            }
+        }
 #pragma unroll
     for (int s = 0; s < STAGES - 1; ++s) {
         if (s < per) load(s, g0 + s);
@@ -131,6 +139,14 @@ __device__ __forceinline__ void prompt_tile(
         }
     }
     wait<0>();
+    if (park) {
+#pragma unroll
+        for (int i = 0; i < T::MT; ++i)
+#pragma unroll
+            for (int j = 0; j < T::NT; ++j)
+                reinterpret_cast<float4*>(park)[i * T::NT + j] = make_float4(acc[i][j][0], acc[i][j][1], acc[i][j][2], acc[i][j][3]);
+        return;
+    }
 #pragma unroll
     for (int i = 0; i < T::MT; ++i)
 #pragma unroll
@@ -175,6 +191,56 @@ __device__ __forceinline__ void prompt_many_body(
         prompt_tile<GS, BM - 16 * WM, BN, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x, at.y);
     else
         prompt_tile<GS, BM, BN, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x, at.y);
+}
+
+// Prompt GEMMs of up to four projections of one input as a persistent stream-K launch: the (tile, group) iterations
+// split evenly over the resident CTAs, so no part-full last wave leaves SMs idle. A tile's chain is never reordered:
+// the CTA holding its first groups runs them from zero and parks the fp32 accumulators (exact) in `ws`, raising its
+// flag; the next CTA, after its own whole tiles, takes them and runs the remaining groups into them. So every element
+// keeps prompt_tile's one chain and bf16 store. gridDim.x <= tiles (a share is at least a tile, so a tile spans at
+// most two CTAs), every CTA resident (cooperative launch); a CTA publishes its head first and waits for its
+// predecessor's last, so no wait can cycle.
+template <int GS, int BM, int BN, int WM, int WN, int STAGES>
+__device__ __forceinline__ void prompt_sk_body(const __nv_bfloat16* __restrict__ x, const ManyParts& parts, int M,
+                                               int K, int ldx, int group, int tiles, float* __restrict__ ws,
+                                               unsigned* __restrict__ flags, unsigned epoch) {
+    using T = Tile<GS, BM, BN, WM, WN, STAGES>;
+    constexpr int ACC = T::MT * T::NT * 4;
+    const int tid = threadIdx.x, c = blockIdx.x, KG = K / GS;
+    const long long I = (long long)tiles * KG;
+    const long long s0 = I * c / gridDim.x, e0 = I * (c + 1) / gridDim.x;
+    const int t_first = (int)(s0 / KG), off_first = (int)(s0 % KG);
+    const int t_last = (int)((e0 - 1) / KG), end_last = (int)((e0 - 1) % KG) + 1;
+    auto tile = [&](int t, int ga, int gb, const float* in, float* park) {
+        int q = 0;
+#pragma unroll
+        for (int i = 1; i < MANY; ++i)
+            if (i < parts.count && t >= parts.p[i].first) q = i;
+        const ManyPart& P = parts.p[q];
+        const int2 at = tile_of(t - P.first, M, P.n, BM, BN, group);
+        __syncthreads();                                  // the previous tile's warps are done with the stages
+        prompt_tile<GS, BM, BN, WM, WN, STAGES>(x, P.w, P.scales, P.biases, P.out, P.n, P.npad, M, K, ldx, at.x, at.y,
+                                                ga, gb, in, park);
+    };
+    const bool head = end_last < KG;                      // this share ends inside tile t_last: its groups [0, end_last)
+    if (head) {
+        tile(t_last, 0, end_last, nullptr, ws + (static_cast<size_t>(c) * T::THREADS + tid) * ACC);
+        __threadfence();
+        __syncthreads();
+        if (tid == 0) asm volatile("st.release.gpu.global.u32 [%0], %1;\n" ::"l"(flags + c), "r"(epoch) : "memory");
+    }
+    for (int t = off_first ? t_first + 1 : t_first; t < (head ? t_last : t_last + 1); ++t) tile(t, 0, -1, nullptr, nullptr);
+    if (off_first) {                                      // this share starts inside tile t_first: CTA c - 1 holds its head
+        if (tid == 0) {
+            unsigned f;
+            do {
+                asm volatile("ld.acquire.gpu.global.u32 %0, [%1];\n" : "=r"(f) : "l"(flags + c - 1) : "memory");
+            } while (f != epoch);
+        }
+        __syncthreads();
+        __threadfence();
+        tile(t_first, off_first, -1, ws + (static_cast<size_t>(c - 1) * T::THREADS + tid) * ACC, nullptr);
+    }
 }
 
 // One projection whose last column panels run as half-width tiles: the first CTAs take BN-wide panels over columns
@@ -363,3 +429,45 @@ __global__ void __launch_bounds__(WM * WN * 32) prompt_many_kernel(
 }
 
 } // namespace tf_qmm_prefill
+
+// Prompt GEMM variants the engine times at open on the device it runs on and picks per projection class
+// (prompt_many.zig `variants`, cuda_prompt_tune.zig). Every one runs prompt_tile's (or prompt_mlp_body's) chain
+// per element: an element's m16 row block and n8 column block start at multiples of 16 and 8 in each shape, its
+// MMAs run over K in group then k16 order into one fp32 accumulator from zero, and it is stored once as bf16, so
+// warp layout, stage count and tile placement change only speed, never bits.
+#define TF_PROMPT_MANY_V(NAME, WM, WN, ST)                                                                          \
+    extern "C" __global__ void __launch_bounds__(WM * WN * 32) NAME(const __nv_bfloat16* __restrict__ x,            \
+            const __grid_constant__ tf_qmm_prefill::ManyParts parts, int M, int K, int ldx, int group) {            \
+        tf_qmm_prefill::prompt_many_body<64, 128, 128, WM, WN, ST>(x, parts, M, K, ldx, group);                     \
+    }
+#define TF_PROMPT_SK_V(NAME, WM, WN, ST)                                                                            \
+    extern "C" __global__ void __launch_bounds__(WM * WN * 32) NAME(const __nv_bfloat16* __restrict__ x,            \
+            const __grid_constant__ tf_qmm_prefill::ManyParts parts, int M, int K, int ldx, int group, int tiles,   \
+            float* __restrict__ ws, unsigned* __restrict__ flags, unsigned epoch) {                                 \
+        tf_qmm_prefill::prompt_sk_body<64, 128, 128, WM, WN, ST>(x, parts, M, K, ldx, group, tiles, ws, flags,      \
+                                                                 epoch);                                            \
+    }
+#define TF_PROMPT_SPLIT_V(NAME, WM, WN, ST)                                                                         \
+    extern "C" __global__ void __launch_bounds__(WM * WN * 32) NAME(const __nv_bfloat16* __restrict__ x,            \
+            const __grid_constant__ tf_qmm_prefill::ManyPart part, int M, int K, int ldx, int group,                \
+            int full_cols) {                                                                                        \
+        tf_qmm_prefill::prompt_split_body<64, 128, 128, WM, WN, ST>(x, part, M, K, ldx, group, full_cols);          \
+    }
+#define TF_PROMPT_MLP_V(NAME, WM, WN, ST)                                                                           \
+    extern "C" __global__ void __launch_bounds__(WM * WN * 32) NAME(const __nv_bfloat16* __restrict__ x,            \
+            const __grid_constant__ tf_qmm_prefill::ManyParts parts, __nv_bfloat16* __restrict__ act, int M, int K, \
+            int ldx, int group) {                                                                                   \
+        tf_qmm_prefill::prompt_mlp_body<64, 128, WM, WN, ST>(x, parts, act, M, K, ldx, group);                      \
+    }
+
+TF_PROMPT_MANY_V(tf_pmv_many_222, 2, 2, 2)
+TF_PROMPT_MANY_V(tf_pmv_many_242, 2, 4, 2)
+TF_PROMPT_MANY_V(tf_pmv_many_223, 2, 2, 3)
+TF_PROMPT_MANY_V(tf_pmv_many_143, 1, 4, 3)
+TF_PROMPT_SK_V(tf_pmv_sk_222, 2, 2, 2)
+TF_PROMPT_SK_V(tf_pmv_sk_242, 2, 4, 2)
+TF_PROMPT_SPLIT_V(tf_pmv_split_242, 2, 4, 2)
+TF_PROMPT_SPLIT_V(tf_pmv_split_143, 1, 4, 3)
+TF_PROMPT_MLP_V(tf_pmv_mlp_222, 2, 2, 2)
+TF_PROMPT_MLP_V(tf_pmv_mlp_242, 2, 4, 2)
+TF_PROMPT_MLP_V(tf_pmv_mlp_143, 1, 4, 3)

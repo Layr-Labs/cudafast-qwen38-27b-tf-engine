@@ -65,12 +65,7 @@ fn rope(d: anytype, x: u64, w: u64, out: u64, rows: usize, heads: usize) !void {
 pub fn attention(d: anytype, rows: usize, layer: usize) !void {
     const c = d.c;
     const partial = .{ d.q, d.kb, d.vb, d.segments, @as(c_int, @intCast(c.block)), @as(c_int, @intCast(c.heads)), @as(c_int, @intCast(c.kv_heads)), @as(c_int, @intCast(c.ringRows())), @as(c_int, @intCast(c.window)), @as(c_int, @intCast(layer)), d.pm, d.pl, d.po };
-    // four query heads a key head (128 wide): a block takes four rows of a stream and a key head's heads, so each
-    // staged key and value serves 16 (row, head) partials; the same bits as tf_q35d_attn_partial's
-    if (c.heads == 4 * c.kv_heads and c.head_dim == 128 and c.block % 4 == 0)
-        try launch(d, d.fns.attn_partial_rows4, sig.draft_partial_rows, .{ rows / 4, c.kv_heads, chunks }, .{ 128, 1, 1 }, partial)
-    else
-        try launch(d, d.fns.attn_partial, sig.draft_partial, .{ rows, c.heads, chunks }, .{ 128, 1, 1 }, partial);
+    try launch(d, d.fns.attn_partial, sig.draft_partial, .{ rows, c.heads, chunks }, .{ 128, 1, 1 }, partial);
     const merge = .{ d.pm, d.pl, d.po, @as(c_int, @intCast(c.heads)), d.att };
     try launch(d, d.fns.attn_merge, sig.draft_merge, .{ rows, c.heads, 1 }, .{ 32, 1, 1 }, merge);
 }
@@ -81,19 +76,12 @@ pub fn publish(d: anytype, items: []const dr.Hold, contexts: []const *draft.Ctx)
         try d.selectHold(ctx, it);
     }
 }
-pub fn forward(d: anytype, items: []const dr.Hold, contexts: []const *draft.Ctx) !void {
+/// The frame's device work, from the embed through the selector projection: one launch sequence per (streams, head).
+fn body(d: anytype, n: usize, narrow_: bool) !?u64 {
     const c = d.c;
     const e = d.e;
-    const B = items.len * c.block;
-    const st = d.staged.bytes;
-    try stage(c, items, contexts, st);
-    for (contexts) |ctx| {
-        ctx.held_n = 0;
-        ctx.grown = 0;
-    }
-    errdefer cuda.completion.drain(e.d, e.stream, "a failed DFlash frame did not drain before its pinned staging was reused");
-    try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(d.ids, st.ptr, B * 4, e.stream.handle), "cuMemcpyHtoDAsync");
-    try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(d.segments, st.ptr + segments_at, items.len * @sizeOf(Segment), e.stream.handle), "cuMemcpyHtoDAsync");
+    const B = n * c.block;
+    const rows = n * (c.block - 1);
     try e.embed(d.ids, d.h, B, 0);
     for (d.w.layers, 0..) |l, i| {
         try d.norm(d.h, l.input_norm, d.x, B);
@@ -114,16 +102,64 @@ pub fn forward(d: anytype, items: []const dr.Hold, contexts: []const *draft.Ctx)
         try d.projAgain(l.down, d.act, d.o, B);
         try conv(d, d.o, l.mlp_base, d.h2, d.h, B, 1);
     }
-    const rows = items.len * (c.block - 1);
     var masked = d.h + c.hidden * 2;
-    if (items.len > 1) {
+    if (n > 1) {
         try e.run(d.fns.mask_rows, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ d.h, d.h2, @as(c_int, @intCast(c.hidden)), @as(c_int, @intCast(c.block)) });
         masked = d.h2;
     }
     try d.norm(masked, d.w.final_norm, d.x, rows);
-    const spanned = if (narrow(contexts)) try head(d, rows) else try full(d, rows);
+    const spanned = if (narrow_) try head(d, rows) else try full(d, rows);
     try e.draws.topkRows(e.stream, spanned orelse d.logits, if (spanned != null) span_width else c.vocab, @intCast(c.topk), d.parts, d.words, rows);
     try d.projAgain(d.w.selector, d.x, d.hp, rows);
+    return spanned;
+}
+
+/// body() replayed from a CUDA graph captured on its first run for that key (streams, head, buffers): the frame's
+/// hundred-odd launches go to the GPU in one submission. TF_DRAFT_GRAPH=0, or a failed capture, runs it eagerly.
+fn run(d: anytype, n: usize, narrow_: bool) !?u64 {
+    const e = d.e;
+    if (draft.graphsOff()) return body(d, n, narrow_);
+    var key: u64 = n | (@as(u64, @intFromBool(narrow_)) << 8);
+    key = std.hash.Wyhash.hash(key, std.mem.asBytes(&[_]u64{ d.h, d.x, d.logits, d.hp, d.words, d.ids, d.segments, d.scratch.ptr }));
+    if (d.graphs.get(key)) |g| {
+        if (g.exec) |x| {
+            try x.launchOn(e.stream);
+            return g.spanned;
+        }
+        return body(d, n, narrow_);
+    }
+    cuda.graph.beginCapture(e.stream, .thread_local) catch return body(d, n, narrow_);
+    const spanned = body(d, n, narrow_) catch |err| {
+        var broken = cuda.graph.endCapture(e.stream) catch return err;
+        broken.deinit();
+        return err;
+    };
+    var exec: ?cuda.graph.Exec = null;
+    if (cuda.graph.endCapture(e.stream)) |captured_| {
+        var captured = captured_;
+        defer captured.deinit();
+        exec = captured.instantiate() catch null;
+    } else |_| {}
+    try d.graphs.put(d.gpa, key, .{ .exec = exec, .spanned = spanned });
+    if (exec) |x| try x.launchOn(e.stream) else _ = try body(d, n, narrow_);
+    return spanned;
+}
+
+pub fn forward(d: anytype, items: []const dr.Hold, contexts: []const *draft.Ctx) !void {
+    const c = d.c;
+    const e = d.e;
+    const B = items.len * c.block;
+    const st = d.staged.bytes;
+    try stage(c, items, contexts, st);
+    for (contexts) |ctx| {
+        ctx.held_n = 0;
+        ctx.grown = 0;
+    }
+    errdefer cuda.completion.drain(e.d, e.stream, "a failed DFlash frame did not drain before its pinned staging was reused");
+    try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(d.ids, st.ptr, B * 4, e.stream.handle), "cuMemcpyHtoDAsync");
+    try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(d.segments, st.ptr + segments_at, items.len * @sizeOf(Segment), e.stream.handle), "cuMemcpyHtoDAsync");
+    const rows = items.len * (c.block - 1);
+    const spanned = try run(d, items.len, narrow(contexts));
     try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + words_at, d.words, rows * lp_words * 4, e.stream.handle), "cuMemcpyDtoHAsync");
     try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + hp_at, d.hp, rows * c.rank * 2, e.stream.handle), "cuMemcpyDtoHAsync");
     try e.stream.synchronize();

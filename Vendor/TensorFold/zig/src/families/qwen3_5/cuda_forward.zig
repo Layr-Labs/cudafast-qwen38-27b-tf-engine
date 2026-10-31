@@ -14,8 +14,6 @@ pub const attn_tiles = 4 * 32 * 512;
 /// each takes every partial_chunks-th of the MAXCH chunks, so a short stream's rows dispatch no idle blocks.
 const attn_tile = attn_tiles / 2;
 const partial_chunks = 8;
-/// qwen35_attn_tc.cuh's GROUP_LEN: a stream at least this long has its rows on tf_q35_attn_rows.
-pub const group_len = 8192;
 const ids_at = E.Engine.ids_at;
 const segs_at = E.Engine.segs_at;
 const rowseg_at = E.Engine.rowseg_at;
@@ -51,6 +49,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     // an image chunk's rows take the tower's features, and rotate at their staged t, h, w positions
     const mpos: u64 = if (e.features != 0) e.tables.ptr + mpos_at else 0;
     if (e.features != 0) try e.run(e.fns.splice, .{ total, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, e.features, e.tables.ptr + src_at, @as(c_int, @intCast(g.hidden)), t_params });
+    const tail = prompt and @import("cuda_prompt_tail.zig").fits(e, total, nseg, shape.hidden, shape.paged);
     var di: usize = 0;
     var ai: c_int = 0;
     for (e.layers, 0..) |l, i| {
@@ -59,12 +58,25 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
         switch (l.mixer) {
             .delta => |m| {
                 const layer: c_int = @intCast(di);
-                try e.projMany(&.{ m.qkv, m.z, m.a, m.b }, e.x, &.{ e.qkv, e.z, e.a, e.b }, total, prompt);
+                // a lone prompt chunk on GB10: z (read only by gdn_post) runs on the side stream while the main stream runs
+                // gdn_pre, conv_commit and the delta-rule chain, whose 96 blocks leave most SMs idle; same kernels, same bits
+                const beside = prompt and nseg == 1 and total > 16 and e.side != null and e.learning == null and !e.int8.on;
+                if (beside) {
+                    try e.projMany(&.{ m.qkv, m.a, m.b }, e.x, &.{ e.qkv, e.a, e.b }, total, prompt);
+                    try e.side_x.?.record(e.stream);
+                    try e.side.?.wait(e.side_x.?);
+                    const main = e.stream;
+                    e.stream = e.side.?;
+                    defer e.stream = main;
+                    try e.projAgain(m.z, e.x, e.z, total, prompt);
+                    try e.side_z.?.record(e.stream);
+                } else try e.projMany(&.{ m.qkv, m.z, m.a, m.b }, e.x, &.{ e.qkv, e.z, e.a, e.b }, total, prompt);
                 if (e.learning) |k| try k.delta(i, e.qkv, e.z, e.b, e.a, total);
                 try e.runAfter(e.fns.gdn_pre, .{ 1, 2 * g.k_heads + g.v_heads, total }, .{ 32, 1, 1 }, .{ geo, e.qkv, t_segs, t_rows, t_par, layer, m.conv, e.a, e.b, m.a_log, m.dt_bias, e.q, e.k, e.v, e.g_, e.beta, t_params });
                 // one recorded window of 2+ rows: gdn_pre logged its tails, conv_commit would only return
                 if (!(record and nseg == 1 and total > 1)) try e.runAfter(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
                 if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else try e.deltaScan(record, shape.slots, nseg, layer);
+                if (beside) try e.stream.wait(e.side_z.?);
                 try e.runAfter(e.fns.gdn_post, .{ 1, g.v_heads, total }, .{ 32, 1, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums });
                 try e.projAgain(m.out, e.mix, e.r, total, prompt);
                 di += 1;
@@ -73,13 +85,12 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 const aw = g.attnWidth();
                 try e.projMany(&.{ m.q, m.k, m.v }, e.x, &.{ e.qraw, e.kraw, e.vraw }, total, prompt);
                 if (e.learning) |k| try k.attention(i, e.qraw, e.kraw, e.vraw, total);
-                if (e.kv8) {
-                    try e.runAfter(e.fns.head_norm, .{ total * g.q_heads, 1, 1 }, .{ 64, 1, 1 }, .{ e.qraw, m.q_norm, e.qn, @as(c_int, @intCast(g.q_heads)), @as(c_int, @intCast(2 * aw)), @as(c_int, 2 * head_dim), g.eps, t_params });
-                    try e.runAfter(e.fns.head_norm, .{ total * g.kv_heads, 1, 1 }, .{ 64, 1, 1 }, .{ e.kraw, m.k_norm, e.kn, @as(c_int, @intCast(g.kv_heads)), @as(c_int, @intCast(g.kv_heads * head_dim)), @as(c_int, head_dim), g.eps, t_params });
-                    try launch(e, e.fp8.rope, sig.rope, .{ total, g.q_heads + g.kv_heads, 1 }, .{ head_dim, 1, 1 }, .{ geo, e.qn, e.kn, e.vraw, t_segs, t_rows, t_anc, @as(c_int, ai), t_params, mpos });
-                } else {
-                    // both head norms and the rope in one launch: a block a (row, head), each normed head rotated in place
-                    try launchAfter(e, e.fns.norm_rope, sig.norm_rope, .{ total, g.q_heads + g.kv_heads, 1 }, .{ head_dim, 1, 1 }, .{ geo, e.qraw, e.kraw, m.q_norm, m.k_norm, e.qn, e.vraw, t_segs, t_rows, t_anc, @as(c_int, ai), t_params, mpos, g.eps });
+                try e.runAfter(e.fns.head_norm, .{ total * g.q_heads, 1, 1 }, .{ 64, 1, 1 }, .{ e.qraw, m.q_norm, e.qn, @as(c_int, @intCast(g.q_heads)), @as(c_int, @intCast(2 * aw)), @as(c_int, 2 * head_dim), g.eps, t_params });
+                try e.runAfter(e.fns.head_norm, .{ total * g.kv_heads, 1, 1 }, .{ 64, 1, 1 }, .{ e.kraw, m.k_norm, e.kn, @as(c_int, @intCast(g.kv_heads)), @as(c_int, @intCast(g.kv_heads * head_dim)), @as(c_int, head_dim), g.eps, t_params });
+                if (e.kv8) try launch(e, e.fp8.rope, sig.rope, .{ total, g.q_heads + g.kv_heads, 1 }, .{ head_dim, 1, 1 }, .{ geo, e.qn, e.kn, e.vraw, t_segs, t_rows, t_anc, @as(c_int, ai), t_params, mpos }) else try launchAfter(e, e.fns.rope, sig.rope, .{ total, g.q_heads + g.kv_heads, 1 }, .{ head_dim, 1, 1 }, .{ geo, e.qn, e.kn, e.vraw, t_segs, t_rows, t_anc, @as(c_int, ai), t_params, mpos });
+                if (tail and i == e.layers.len - 1) {
+                    try @import("cuda_prompt_tail.zig").run(e, @intCast(ai), total);
+                    return;
                 }
                 if (shape.paged) {
                     try @import("cuda_attention.zig").partial(e, shape, ai);
@@ -96,13 +107,11 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                         try launch(e, e.fp8.attn_rows, sig.attn_rows8, .{ groups, max_chunks, g.kv_heads }, .{ 256, 1, 1 }, rows_args);
                     } else {
                         try sharedSized(e, e.fns.attn_partial, sig.attn_partial, .{ total, partial_chunks, g.kv_heads }, 128, attn_tile, args);
-                        // streams of caches no longer than GROUP_LEN have no row for attn_rows (its blocks would only return)
-                        if (!shape.short) try shared(e, e.fns.attn_rows, sig.attn_rows, .{ groups, max_chunks, g.kv_heads }, 256, rows_args);
+                        try shared(e, e.fns.attn_rows, sig.attn_rows, .{ groups, max_chunks, g.kv_heads }, 256, rows_args);
                     }
-                    // the merge with the gate and the gated rows' group sums, attn_gate's bits
-                    try launchAfter(e, e.fns.attn_merge_gate, sig.attn_merge_gate, .{ g.q_heads, total, 1 }, .{ 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.qraw, e.mix, sums });
+                    try launchAfter(e, e.fns.attn_merge, sig.attn_merge, .{ g.q_heads, total, 1 }, .{ 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.y });
                 }
-                if (shape.paged or (prompt and nseg == 1 and (g.q_heads / g.kv_heads) % 2 == 0)) try launchAfter(e, e.fns.attn_gate, sig.attn_gate, .{ (total * aw + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.y, e.qraw, e.mix, @as(c_int, @intCast(total)), t_params, sums });
+                try launchAfter(e, e.fns.attn_gate, sig.attn_gate, .{ (total * aw + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.y, e.qraw, e.mix, @as(c_int, @intCast(total)), t_params, sums });
                 if (e.learning) |k| try k.gated(i, e.mix, total);
                 try e.projAgain(m.o, e.mix, e.r, total, prompt);
                 ai += 1;
@@ -117,23 +126,13 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     cuda.prompt_many.Kernels.mlpFits(m.gate.a4, m.up.a4) and m.gate.a4.n == g.intermediate;
                 if (fused) {
                     try e.prompt_many.mlp(e.stream, e.x, m.gate.a4, m.up.a4, e.act, total);
-                    try e.projAgain(m.down, e.act, e.r, total, prompt);
-                } else if (!prompt and total <= E.most_verify and e.learning == null and e.mlp == null and e.affine.split == null and
-                    m.gate == .a4 and m.up == .a4 and cuda.mlp_pair.Kernels.fits(m.gate.a4, m.up.a4) and m.gate.a4.n == g.intermediate)
-                {
-                    // a window: gate, up and the activation in one launch, act's group sums past the norm's (which gate
-                    // and up still read; most_verify rows of each fit xs), then down over them; every bit as the two
-                    // projections, mlp_act and down give
-                    const act_sums = e.xs + E.most_verify * (g.hidden / 64) * 4;
-                    try e.mlp_pair.pair(e.stream, e.x, e.xs, m.gate.a4, m.up.a4, e.act, act_sums, total);
-                    try e.project(m.down, e.act, act_sums, e.r, total, prompt, t_params, false);
                 } else {
                     try e.projMany(&.{ m.gate, m.up }, e.x, &.{ e.gate, e.up }, total, prompt);
                     if (e.learning) |k| try k.mlp(i, e.gate, e.up, total);
                     const n: c_longlong = @intCast(total * g.intermediate);
                     try e.runAfter(e.fns.mlp_act, .{ (total * g.intermediate + 1023) / 1024, 1, 1 }, .{ 256, 1, 1 }, .{ e.gate, e.up, e.act, n, t_params, @as(c_int, @intCast(g.intermediate)), sums });
-                    try e.projAgain(m.down, e.act, e.r, total, prompt);
                 }
+                try e.projAgain(m.down, e.act, e.r, total, prompt);
                 if (e.mlp) |k| try k.f(k.ctx, i, e.x, e.r, total, e.taught) else try e.pockets.add(e.stream, i, e.x, e.r, total, e.taught);
             },
             .moe => |m| try e.routedRows(m.router, m.experts, e.x, e.r, total, promptMoe(prompt, total), t_params),

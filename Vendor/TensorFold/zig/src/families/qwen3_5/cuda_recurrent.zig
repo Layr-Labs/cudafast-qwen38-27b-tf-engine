@@ -13,13 +13,12 @@ pub fn enabled(e: *const Engine) bool {
 
 pub const Provider = struct {
     e: *const Engine,
-    // Forward produces every byte read by keep; scratch never initializes the persistent recurrence. A disposed
-    // block goes to the engine's pool (cuda_cache.zig), so the next phase's first window does not allocate it again.
+    // Forward produces every byte read by keep; scratch never initializes the persistent recurrence.
     pub fn allocate(p: Provider, bytes: usize) !cuda.DeviceBuffer {
-        return @import("cuda_cache.zig").takeBlock(@constCast(p.e), bytes);
+        return cuda.DeviceBuffer.alloc(p.e.d, bytes);
     }
     pub fn dispose(_: Provider, b: *cuda.DeviceBuffer) void {
-        @import("cuda_cache.zig").giveBlock(b);
+        b.free();
     }
 };
 

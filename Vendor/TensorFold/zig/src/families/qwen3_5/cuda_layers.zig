@@ -65,8 +65,6 @@ pub const Fns = struct {
     attn_partial_contiguous: cuda.Function,
     attn_merge: cuda.Function,
     attn_gate: cuda.Function,
-    attn_merge_gate: cuda.Function,
-    norm_rope: cuda.Function,
     mlp_act: cuda.Function,
     argmax: cuda.Function,
     argmax_slices: cuda.Function,
