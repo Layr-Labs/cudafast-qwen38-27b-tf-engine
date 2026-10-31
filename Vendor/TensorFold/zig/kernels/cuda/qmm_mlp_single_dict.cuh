@@ -124,6 +124,7 @@ __device__ __forceinline__ void mlp_single_dict_body(const __nv_bfloat16* __rest
         commit();
     }
     grid_wait();
+    qmm_dict::x_keep_l2(x + static_cast<size_t>(m0) * ldx, rows, K, ldx);
 #pragma unroll
     for (int s = 0; s < STAGES - 1; ++s) {
         if (s < per) load_x(s, g0 + s);
@@ -142,7 +143,6 @@ __device__ __forceinline__ void mlp_single_dict_body(const __nv_bfloat16* __rest
         const unsigned char* p = stage(it % STAGES);
         const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
         const uint32_t* pk = reinterpret_cast<const uint32_t*>(p + T::X + T::W + mrun);
-        __nv_bfloat16* const dw = reinterpret_cast<__nv_bfloat16*>(dec) + wn * 64;    // this warp's 32 + 32 values
         uint32_t pe[4] = {0u, 0u, 0u, 0u};
         if (mpair) {
 #pragma unroll
@@ -178,41 +178,42 @@ __device__ __forceinline__ void mlp_single_dict_body(const __nv_bfloat16* __rest
                 }
             }
         }
-        // four passes of 32 columns a warp: each lane decodes one column's scale and bias into the warp's 128 bytes,
-        // then the pass's four n8 tiles take the original kernel's fmas on them
+        float xv[I][2];
+#pragma unroll
+        for (int i = 0; i < I; ++i) {
+            const int row = wm * (BM / WM) + i * 16 + (lane >> 2);
+            xv[i][0] = px[row];
+            xv[i][1] = px[row + 8];
+        }
 #pragma unroll
         for (int pass = 0; pass < 4; ++pass) {
+            unsigned short s_bits, b_bits;
             if (mpair) {
-                reinterpret_cast<unsigned short*>(dw)[lane] = static_cast<unsigned short>(pe[pass] & 0xFFFFu);
-                reinterpret_cast<unsigned short*>(dw)[32 + lane] = static_cast<unsigned short>(pe[pass] >> 16);
+                s_bits = static_cast<unsigned short>(pe[pass] & 0xFFFFu);
+                b_bits = static_cast<unsigned short>(pe[pass] >> 16);
             } else {
                 const int c = (wn % 2) * 128 + pass * 32 + lane, tt = c / 64, ct = c % 64;
-#pragma unroll
-                for (int which = 0; which < 2; ++which) {
-                    const int off = (tt * 128 + which * 64 + ct) * mbits;
-                    const uint32_t idx = __funnelshift_r(pk[off >> 5], pk[(off >> 5) + 1], off & 31) & mmask;
-                    reinterpret_cast<unsigned short*>(dw)[which * 32 + lane] = mtab[(which ? mns : 0) + idx];
-                }
+                const int offs = (tt * 128 + ct) * mbits, offb = (tt * 128 + 64 + ct) * mbits;
+                const uint32_t idxs = __funnelshift_r(pk[offs >> 5], pk[(offs >> 5) + 1], offs & 31) & mmask;
+                const uint32_t idxb = __funnelshift_r(pk[offb >> 5], pk[(offb >> 5) + 1], offb & 31) & mmask;
+                s_bits = mtab[idxs];
+                b_bits = mtab[mns + idxb];
             }
-            __syncwarp();
+            const float sf = __bfloat162float(__ushort_as_bfloat16(s_bits));
+            const float bf = __bfloat162float(__ushort_as_bfloat16(b_bits));
 #pragma unroll
             for (int jj = 0; jj < 4; ++jj) {
                 const int j = pass * 4 + jj;
                 const int col = jj * 8 + (lane & 3) * 2;
-                const __nv_bfloat162 s2 = *reinterpret_cast<const __nv_bfloat162*>(dw + col);
-                const __nv_bfloat162 b2 = *reinterpret_cast<const __nv_bfloat162*>(dw + 32 + col);
-                const float sv[2] = {__low2float(s2), __high2float(s2)};
-                const float bv[2] = {__low2float(b2), __high2float(b2)};
+                const float sv[2] = {__shfl_sync(0xffffffffu, sf, col), __shfl_sync(0xffffffffu, sf, col + 1)};
+                const float bv[2] = {__shfl_sync(0xffffffffu, bf, col), __shfl_sync(0xffffffffu, bf, col + 1)};
 #pragma unroll
                 for (int i = 0; i < I; ++i) {
-                    const int row = wm * (BM / WM) + i * 16 + (lane >> 2);
-                    const float xv[2] = {px[row], px[row + 8]};
 #pragma unroll
                     for (int e = 0; e < 4; ++e)
-                        acc[i][j][e] = __fmaf_rn(xv[e >> 1], bv[e & 1], __fmaf_rn(d[i][j][e], sv[e & 1], acc[i][j][e]));
+                        acc[i][j][e] = __fmaf_rn(xv[i][e >> 1], bv[e & 1], __fmaf_rn(d[i][j][e], sv[e & 1], acc[i][j][e]));
                 }
             }
-            __syncwarp();                         // the next pass rewrites the warp's values
         }
     }
     wait<0>();
