@@ -128,6 +128,9 @@ extern "C" __global__ void tf_dict_pack(const uint16_t* __restrict__ s, const ui
     out[i] = word;
 }
 
+// Joint (scale, bias) pair dictionary: each (group, column) cell's pair keyed by its separate indices, si << 12 | bi
+// (both under 4096), marked in a 2^24-bit presence bitmap (524288 words), ranked, and indexed by its rank.
+// tf_dict_pair_mark: the (kg, npad) cells' pair keys, through the separate dictionaries' bitmaps and ranks.
 extern "C" __global__ void tf_dict_pair_mark(const uint16_t* __restrict__ s, const uint16_t* __restrict__ b, long long count,
                                              const uint32_t* __restrict__ bitmap, const uint32_t* __restrict__ rank,
                                              uint32_t* __restrict__ pairs) {
@@ -138,6 +141,8 @@ extern "C" __global__ void tf_dict_pair_mark(const uint16_t* __restrict__ s, con
     }
 }
 
+// tf_dict_pair_rank: 256 blocks of 1024 threads, two words a thread: each word's count of smaller present keys within
+// its block's 2048 words (rank), and each block's total (totals[block]).
 extern "C" __global__ void __launch_bounds__(1024) tf_dict_pair_rank(const uint32_t* __restrict__ pairs, uint32_t* __restrict__ rank,
                                                                      uint32_t* __restrict__ totals) {
     __shared__ uint32_t sums[1024];
@@ -158,6 +163,8 @@ extern "C" __global__ void __launch_bounds__(1024) tf_dict_pair_rank(const uint3
     if (t == 1023) totals[blockIdx.x] = sums[1023];
 }
 
+// tf_dict_pair_offsets: one block of 256 threads: the blocks' totals into their exclusive offsets (in place), and the
+// pair count np into totals[256].
 extern "C" __global__ void __launch_bounds__(256) tf_dict_pair_offsets(uint32_t* __restrict__ totals) {
     __shared__ uint32_t sums[256];
     const int t = threadIdx.x;
@@ -174,12 +181,15 @@ extern "C" __global__ void __launch_bounds__(256) tf_dict_pair_offsets(uint32_t*
     if (t == 255) totals[256] = sums[255];
 }
 
+// The pair index of key: its block's offset, its word's rank in the block, and the smaller keys in its word.
 __device__ __forceinline__ uint32_t dict_pair_index(const uint32_t* __restrict__ pairs, const uint32_t* __restrict__ rank,
                                                     const uint32_t* __restrict__ offsets, uint32_t key) {
     const uint32_t w = key >> 5;
     return offsets[w >> 11] + rank[w] + __popc(pairs[w] & ((1u << (key & 31)) - 1u));
 }
 
+// tf_dict_pair_table: each present key's entry at its pair index, the scale's bf16 | the bias's bf16 << 16, from the
+// separate table (ns scale values, then the bias values); one thread a bitmap word.
 extern "C" __global__ void tf_dict_pair_table(const uint32_t* __restrict__ pairs, const uint32_t* __restrict__ rank,
                                               const uint32_t* __restrict__ offsets, const uint16_t* __restrict__ stab, int ns,
                                               uint32_t* __restrict__ table) {
@@ -194,6 +204,9 @@ extern "C" __global__ void tf_dict_pair_table(const uint32_t* __restrict__ pairs
     }
 }
 
+// tf_dict_pair_pack: each 64-column tile's group of the (kg, npad) scales s and biases b as 64 pair indices of `pbits`
+// bits, packed little-endian into 2 * pbits words: out [npad / 64][kg][2 * pbits], or group-major
+// [kg][npad / 64][2 * pbits] (`kmajor`).
 extern "C" __global__ void tf_dict_pair_pack(const uint16_t* __restrict__ s, const uint16_t* __restrict__ b, int kg, int npad,
                                              const uint32_t* __restrict__ bitmap, const uint32_t* __restrict__ rank,
                                              const uint32_t* __restrict__ pairs, const uint32_t* __restrict__ prank,
@@ -217,6 +230,8 @@ extern "C" __global__ void tf_dict_pair_pack(const uint16_t* __restrict__ s, con
     out[i] = word;
 }
 
+// tf_dict_pair_check: every (kg, npad) cell's index read back from the stream (as a decode kernel reads it) through the
+// table must give the cell's own scale and bias; mismatches counted into bad[0].
 extern "C" __global__ void tf_dict_pair_check(const uint16_t* __restrict__ s, const uint16_t* __restrict__ b, int kg, int npad,
                                               const uint32_t* __restrict__ stream, const uint32_t* __restrict__ table, int pbits,
                                               int kmajor, unsigned long long* __restrict__ bad) {
