@@ -22,6 +22,17 @@ pub fn projectMany(e: *Engine, ls: []const Proj, x: u64, xs: u64, outs: []const 
     const segmented = by_kernel and !(prompt and rows > 16) and ls.len <= A.segs_max and for (ls) |l| {
         if (l != .a4 or l.inputs() != ls[0].inputs()) break false;
     } else true;
+    // GB10: a verify window of 17 to 32 rows groups its projections by kernel too, both m16 row tiles a weight group
+    const wide = e.affine.narrow != null and !prompt and rows > A.max_rows and rows <= 32 and ls.len <= A.segs_max and for (ls) |l| {
+        if (l != .a4 or l.inputs() != ls[0].inputs()) break false;
+    } else true;
+    if (wide) {
+        const k = ls[0].inputs();
+        if (sums) try e.run(e.fns.sums, .{ rows, (k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ x, xs, @as(c_int, @intCast(k)), params });
+        var many: [A.segs_max]A.Out = undefined;
+        for (ls, outs, many[0..ls.len]) |l, out, *m| m.* = .{ .q = l.a4, .out = out };
+        return e.affine.verifyGrouped(e.stream, x, xs, many[0..ls.len], rows);
+    }
     if (!segmented) {
         for (ls, outs, 0..) |l, out, i| try e.project(l, x, xs, out, rows, prompt, params, sums and i == 0);
         return;
