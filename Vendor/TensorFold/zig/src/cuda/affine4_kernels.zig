@@ -527,7 +527,11 @@ pub const Affine4Kernels = struct {
             g.add(x); g.add(xs); g.add(parts);
             for ([_]usize{ rows, 5120, 5120 }) |v| g.add(int(v));
             const base: u32 = if (rows32) gdn_stream32_smem else 22656;
-            const shared: u32 = if (dict) base + 4 * @as(u32, @intCast(bn)) + tab else base;
+            // a 16-row launch takes at least the output stream's 35328 bytes (qlinear.out16_smem): two CTAs an SM at most,
+            // so its 66 CTAs spread over GB10's 48 SMs instead of packing four a SM (an allocation only; the kernel reads
+            // and writes the same bytes, the same bits)
+            const raw: u32 = if (dict) base + 4 * @as(u32, @intCast(bn)) + tab else base;
+            const shared: u32 = if (rows32) raw else @max(raw, linear.out16_smem);
             const f = if (dict) dict_fn.? else if (rows32) a.gdn_stream32_fn.? else a.gdn_stream16_fn.?;
             return launch_.launch(f, .{ .grid = .{ .x = u(first) }, .block = .{ .x = 128 }, .shared = shared, .pdl = true }, s, &g);
         }
@@ -822,7 +826,7 @@ pub const Affine4Kernels = struct {
             var g: launch_.Args = .{};
             g.add(x); g.add(xs); g.add(parts);
             for ([_]usize{ rows, q.k, q.k }) |v| g.add(int(v));
-            const shared = if (dict) group_smem + q.tabBytesUpTo(linear.out_pair_tab_max) else group_smem;
+            const shared = if (dict) linear.out16_smem + q.tabBytesUpTo(linear.out_pair_tab_max) else linear.out16_smem;
             return launch_.launch(if (dict) a.stream16_dict_fn.? else stream_fn.?, .{ .grid = .{ .x = 80 }, .block = .{ .x = 512 }, .shared = shared, .pdl = a.pdl }, s, &g);
         }
         const tiles = (q.n + 63) / 64;

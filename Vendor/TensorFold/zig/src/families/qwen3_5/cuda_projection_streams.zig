@@ -35,11 +35,11 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     if (bytes == 0) return null;
     const pack = try e.mods[3].function("tf_pack_kmajor");
     const grouped = try e.mods[0].function("tf_qmm_gdn_stream16");
-    try grouped.allowDynamicShared(22656);
+    try grouped.allowDynamicShared(cuda.qlinear.out16_smem); // decodeMany's 16-row launch floor (35328 >= 22656)
     // its twin for dictionary-coded parts: a 256-column CTA's decoded scales and biases and its part's table
     const grouped_dict: ?cuda.Function = if (e.affine.dict == null) null else blk: {
         const f = try e.mods[0].function("tf_qmm_gdn_stream16_dict");
-        try f.allowDynamicShared(22656 + 4 * 256 + @as(u32, @max(cuda.qlinear.dict_tab_max, cuda.qlinear.gdn_pair_tab_max)));
+        try f.allowDynamicShared(@max(cuda.qlinear.out16_smem, 22656 + 4 * 256 + @as(u32, @max(cuda.qlinear.dict_tab_max, cuda.qlinear.gdn_pair_tab_max))));
         break :blk f;
     };
     const down = try e.mods[0].function("tf_qmm_output_stream16");
