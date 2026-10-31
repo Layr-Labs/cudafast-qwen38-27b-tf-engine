@@ -83,6 +83,7 @@ fn device(d: *cuda.Driver, gb10: bool, wide: bool) q.engine.Engine {
     e.affine.stream16_fns = @splat(null);
     e.affine.gdn_stream16_fn = null;
     e.affine.stream16_dict_fn = null;
+    e.affine.down128_dict_fn = null;
     e.affine.gdn_stream16_dict_fn = null;
     e.affine.gdn_stream32_fn = null;
     e.affine.gdn_stream32_dict_fn = null;

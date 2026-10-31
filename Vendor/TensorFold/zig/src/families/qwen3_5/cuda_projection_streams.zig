@@ -48,7 +48,12 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     // its twin for a dictionary-coded down/out/o projection: the table past the stages
     const down_dict: ?cuda.Function = if (e.affine.dict == null) null else blk: {
         const f = try e.mods[0].function("tf_qmm_output_stream16_dict");
-        try f.allowDynamicShared(35328 + @as(u32, @max(cuda.qlinear.dict_tab_max, cuda.qlinear.out_pair_tab_max)));
+        try f.allowDynamicShared(cuda.qlinear.out16_smem + @as(u32, @max(cuda.qlinear.dict_tab_max, cuda.qlinear.out_pair_tab_max)));
+        break :blk f;
+    };
+    const down128_dict: ?cuda.Function = if (e.affine.dict == null) null else blk: {
+        const f = try e.mods[0].function("tf_qmm_output_down128_dict");
+        try f.allowDynamicShared(cuda.qlinear.out_down128_smem + @as(u32, @max(cuda.qlinear.dict_tab_max, cuda.qlinear.out_pair_tab_max)));
         break :blk f;
     };
     try out.allowDynamicShared(35328);
@@ -80,6 +85,7 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     };
     if (output) e.affine.stream16_fns = .{ down, out };
     if (output) e.affine.stream16_dict_fn = down_dict;
+    if (output) e.affine.down128_dict_fn = down128_dict;
     if (input) {
         e.affine.gdn_stream16_fn = grouped;
         e.affine.gdn_stream16_dict_fn = grouped_dict;

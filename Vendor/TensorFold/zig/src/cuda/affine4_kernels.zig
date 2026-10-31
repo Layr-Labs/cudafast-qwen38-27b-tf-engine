@@ -132,6 +132,7 @@ pub const Affine4Kernels = struct {
     group_fn: Function,
     stream16_fns: [2]?Function = @splat(null),
     stream16_dict_fn: ?Function = null, // tf_qmm_output_stream16 on a dictionary-coded down projection
+    down128_dict_fn: ?Function = null,
     gdn_stream16_dict_fn: ?Function = null, // tf_qmm_gdn_stream16 with its dictionary-coded parts
     gdn_stream16_fn: ?Function = null,
     gdn_stream32_fn: ?Function = null,
@@ -191,6 +192,7 @@ pub const Affine4Kernels = struct {
         a.pdl = gb10;
         a.stream16_fns = @splat(null);
         a.stream16_dict_fn = null;
+        a.down128_dict_fn = null;
         a.gdn_stream16_dict_fn = null;
         a.gdn_stream16_fn = null;
         a.gdn_stream32_fn = null;
@@ -822,8 +824,9 @@ pub const Affine4Kernels = struct {
             var g: launch_.Args = .{};
             g.add(x); g.add(xs); g.add(parts);
             for ([_]usize{ rows, q.k, q.k }) |v| g.add(int(v));
-            const shared = if (dict) linear.out16_smem + q.tabBytesUpTo(linear.out_pair_tab_max) else linear.out16_smem;
-            return launch_.launch(if (dict) a.stream16_dict_fn.? else stream_fn.?, .{ .grid = .{ .x = 80 }, .block = .{ .x = 512 }, .shared = shared, .pdl = a.pdl }, s, &g);
+            const wide_down = dict and q.k == 17408 and a.down128_dict_fn != null;
+            const shared = if (dict) (if (wide_down) linear.out_down128_smem else linear.out16_smem) + q.tabBytesUpTo(linear.out_pair_tab_max) else linear.out16_smem;
+            return launch_.launch(if (wide_down) a.down128_dict_fn.? else if (dict) a.stream16_dict_fn.? else stream_fn.?, .{ .grid = .{ .x = if (wide_down) 40 else 80 }, .block = .{ .x = 512 }, .shared = shared, .pdl = a.pdl }, s, &g);
         }
         const tiles = (q.n + 63) / 64;
         const rows_t = (rows + 15) / 16;
