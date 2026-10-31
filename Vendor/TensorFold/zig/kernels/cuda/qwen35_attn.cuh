@@ -2,30 +2,30 @@
 #pragma once
 #include "qwen35_page_run.h"
 
-extern "C" __global__ void tf_q35_attn_partial_contiguous(Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
+extern "C" __global__ void tf_q35_attn_partial_contiguous(Geo geo, const __nv_bfloat16* __restrict__ Q0, const Seg* __restrict__ segs,
                                                  const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
                                                  const int* __restrict__ P, float scale,
-                                                 float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
+                                                 float* __restrict__ PM0, float* __restrict__ PL0, float* __restrict__ PO0) {
+    release_next();
+    await_prior();
+    const __nv_bfloat16* Q = after_wait(Q0);
+    float* PM = after_wait(PM0);
+    float* PL = after_wait(PL0);
+    float* PO = after_wait(PO0);
     constexpr int DPL = HD / 32;
     const int QH = geo.qh, KVH = geo.kvh;
     const int lane = threadIdx.x & 31, g = threadIdx.x >> 5;
     const int c = blockIdx.x, h = blockIdx.y;
     if (c >= MAXCH || past_rows(P, blockIdx.z)) return;
     const size_t m = blockIdx.z;
-    const int qh = h * (QH / KVH) + g;
     const Seg sg = segs[rowseg[m]];
     const Ancestor anc = rowanc[m];
-    // chunks cut at logical positions (a window key's: the stream's length plus its ancestors), as a step's are
     const int keys = sg.len + rows_seen(anc), ck = chunk_keys(keys);
+    const int nch = (keys + ck - 1) / ck;
+    if (c >= nch) return;
+    const int qh = h * (QH / KVH) + g;
     const int k0 = c * ck, k1 = min(k0 + ck, keys);
     const size_t slot = (m * QH + qh) * MAXCH + c;
-    if (k0 >= k1) {
-        if (lane == 0) {
-            PM[slot] = -INFINITY;
-            PL[slot] = 0.0f;
-        }
-        return;
-    }
     const __nv_bfloat16* K = reinterpret_cast<const __nv_bfloat16*>(sg.kv) + (size_t)layer * 2 * KVH * sg.cap * HD;
     const __nv_bfloat16* V = K + (size_t)KVH * sg.cap * HD;
     float q[DPL], o[DPL];
@@ -128,30 +128,30 @@ extern "C" __global__ void tf_q35_attn_partial_legacy(Geo geo, const __nv_bfloat
 }
 
 // Mixed streams branch once a block; each visited page ID is reused by every key and value in that run.
-extern "C" __global__ void tf_q35_attn_partial_paged(Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
+extern "C" __global__ void tf_q35_attn_partial_paged(Geo geo, const __nv_bfloat16* __restrict__ Q0, const Seg* __restrict__ segs,
                                                  const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
                                                  const int* __restrict__ P, float scale,
-                                                 float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
+                                                 float* __restrict__ PM0, float* __restrict__ PL0, float* __restrict__ PO0) {
+    release_next();
+    await_prior();
+    const __nv_bfloat16* Q = after_wait(Q0);
+    float* PM = after_wait(PM0);
+    float* PL = after_wait(PL0);
+    float* PO = after_wait(PO0);
     constexpr int DPL = HD / 32;
     const int QH = geo.qh, KVH = geo.kvh;
     const int lane = threadIdx.x & 31, g = threadIdx.x >> 5;
     const int c = blockIdx.x, h = blockIdx.y;
     if (c >= MAXCH || past_rows(P, blockIdx.z)) return;
     const size_t m = blockIdx.z;
-    const int qh = h * (QH / KVH) + g;
     const Seg sg = segs[rowseg[m]];
     const Ancestor anc = rowanc[m];
-    // chunks cut at logical positions (a window key's: the stream's length plus its ancestors), as a step's are
     const int keys = sg.len + rows_seen(anc), ck = chunk_keys(keys);
+    const int nch = (keys + ck - 1) / ck;
+    if (c >= nch) return;
+    const int qh = h * (QH / KVH) + g;
     const int k0 = c * ck, k1 = min(k0 + ck, keys);
     const size_t slot = (m * QH + qh) * MAXCH + c;
-    if (k0 >= k1) {
-        if (lane == 0) {
-            PM[slot] = -INFINITY;
-            PL[slot] = 0.0f;
-        }
-        return;
-    }
     const __nv_bfloat16* KV = reinterpret_cast<const __nv_bfloat16*>(sg.kv);
     float q[DPL], o[DPL];
 #pragma unroll

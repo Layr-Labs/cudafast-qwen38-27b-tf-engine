@@ -53,6 +53,20 @@ fn timed(io: std.Io, e: anytype, d: anytype, cache: anytype, warmed: *Seen, phas
         }
         measured[rows - 1] = .{ .rows = @intCast(rows), .ms = try timeWidth(io, e, cache, rows, &ids, &picks) };
     }
+    if (e.window_rows >= 16) {
+        const par2 = [16]i32{ -1, 0, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 };
+        const par3 = [16]i32{ -1, 0, 0, 1, 1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 };
+        for ([_][]const i32{ &par2, &par3 }, [_]u8{ 2, 35 }) |par, v| {
+            const shape = E.Engine.Shape.init(16, 1, true, e.n_taps > 0, v);
+            while (warmed.passes(shape) < 2) {
+                const warm_start = profile.now(io);
+                try cache.reset(e);
+                try e.forward(&.{.{ .cache = cache, .rows = 16, .parents = par }}, ids[0..16], .{ .draws = picks[0..16] });
+                warmed.mark(shape);
+                warm_ns += profile.elapsed(io, warm_start);
+            }
+        }
+    }
     try cache.reset(e);
     for (measured[0..e.window_rows]) |m| d.setCost(m.rows, m.ms);
     phases.warmups += warm_ns;
@@ -118,6 +132,18 @@ fn run(io: std.Io, e: anytype, d: anytype, cache: anytype, warmed: *Seen, phases
             try cache.reset(e);
             try e.forward(&.{.{ .cache = cache, .rows = rows }}, ids[0..rows], .{ .draws = picks[0..rows] });
             warmed.mark(shape);
+        }
+    }
+    if (e.window_rows >= 16) {
+        const par2 = [16]i32{ -1, 0, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 };
+        const par3 = [16]i32{ -1, 0, 0, 1, 1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 };
+        for ([_][]const i32{ &par2, &par3 }, [_]u8{ 2, 35 }) |par, v| {
+            const shape = E.Engine.Shape.init(16, 1, true, e.n_taps > 0, v);
+            while (warmed.passes(shape) < 2) {
+                try cache.reset(e);
+                try e.forward(&.{.{ .cache = cache, .rows = 16, .parents = par }}, ids[0..16], .{ .draws = picks[0..16] });
+                warmed.mark(shape);
+            }
         }
     }
     try cache.reset(e);
