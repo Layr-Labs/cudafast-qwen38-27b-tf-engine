@@ -349,3 +349,228 @@ template __global__ void tf_qmm_group::group_kernel<64, 64, 64, 1, 4, 4, false, 
     const __nv_bfloat16* __restrict__, const float* __restrict__, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
 template __global__ void tf_qmm_group::group_kernel<64, 128, 64, 1, 4, 3, false, false, false, false>(
     const __nv_bfloat16* __restrict__, const float* __restrict__, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
+
+// A dense MLP's decode gate and up projections and its activation in one launch: clusters of two CTAs over the same
+// 64 columns of one 16-row tile, rank 0 gate's and rank 1 up's, each the group_kernel<64, 16, 64, 1, 4, 8> tile's
+// arithmetic (its loads, MMA chain, per-group fmas and bf16 rounding). Rank 0 stores its bf16 gate values into rank
+// 1's shared memory (distributed shared memory) and is done; rank 1 writes act = bf16(silu(gate) * up) as
+// tf_q35_mlp_act does, and each row's group sum of those 64 act values in tf_q35_mlp_act's order (group_sum), into AS
+// (the down projection's input sums).
+namespace tf_qmm_group {
+
+__device__ __forceinline__ float act_group_sum(const __nv_bfloat16* x) {   // qwen35.cu's group_sum
+    float s = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 64; j += 8) {
+        const uint4 w = *reinterpret_cast<const uint4*>(x + j);
+        const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&w);
+#pragma unroll
+        for (int k = 0; k < 8; k++) s += __bfloat162float(b[k]);
+    }
+    return s;
+}
+
+template <int STAGES>
+__device__ __forceinline__ void mlp_pair_body(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
+                                              const Parts& parts, __nv_bfloat16* __restrict__ act,
+                                              float* __restrict__ as, int M, int K, int ldx, int rows_t) {
+    constexpr int GS = 64, BM = 16, BN = 64, WM = 1, WN = 4;
+    using T = LaneTile<GS, BM, BN, WM, WN, STAGES>;
+    constexpr int I = T::MT, J = T::NT;
+    extern __shared__ __align__(128) unsigned char buf[];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int wm = warp / WN, wn = warp % WN;
+    const int KG = K / GS, cid = blockIdx.x / 2, rank = blockIdx.x % 2;
+    const Part P = parts.p[rank];                // rank 0: gate, 1: up (same n, npad, tiles)
+    const int tile = cid / rows_t;
+    const int m0 = cid % rows_t * BM, n0 = tile * BN, per = KG, g0 = 0;
+
+    auto stage = [&](int s) { return buf + s * T::STAGE; };
+    const int rows = min(BM, M - m0);
+    constexpr int TILE_BYTES = 64 * GS / 2;
+    constexpr int XC = (BM * T::CHUNKS + T::THREADS - 1) / T::THREADS, WC = (T::W / 16 + T::THREADS - 1) / T::THREADS;
+    constexpr int SC = (2 * T::S / 16 + T::THREADS - 1) / T::THREADS;
+    const __nv_bfloat16* xsrc[XC];
+    const unsigned char* wsrc[WC];
+    const __nv_bfloat16* ssrc[SC];
+    int xdst[XC], wdst[WC], sdst[SC];
+    bool xok[XC], wok[WC], sok[SC];
+#pragma unroll
+    for (int j = 0; j < XC; ++j) {
+        const int c = tid + j * T::THREADS, r = c / T::CHUNKS, ch = c % T::CHUNKS;
+        xok[j] = c < BM * T::CHUNKS && r < rows;
+        xsrc[j] = x + static_cast<size_t>(m0 + min(r, rows - 1)) * ldx + ch * 8;
+        xdst[j] = r * T::ROW + swz<T::CHUNKS>(r, ch) * 16;
+    }
+#pragma unroll
+    for (int j = 0; j < WC; ++j) {
+        const int c = tid + j * T::THREADS, t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
+        wok[j] = c < T::W / 16;
+        wsrc[j] = reinterpret_cast<const unsigned char*>(P.w) + static_cast<size_t>(n0 / 64 + t) * KG * TILE_BYTES +
+                  off * 16;
+        wdst[j] = T::X + c * 16;
+    }
+#pragma unroll
+    for (int j = 0; j < SC; ++j) {
+        const int c = tid + j * T::THREADS, which = c / (T::S / 16), off = c % (T::S / 16);
+        sok[j] = c < 2 * (T::S / 16);
+        ssrc[j] = (which ? P.biases : P.scales) + n0 + off * 8;
+        sdst[j] = T::X + T::W + which * T::S + off * 16;
+    }
+    const bool xsok = tid < rows;
+    const float* xssrc = xs + static_cast<size_t>(m0 + min(tid, rows - 1)) * KG;
+    auto load_x = [&](int s, int g) {
+        unsigned char* p = stage(s);
+#pragma unroll
+        for (int j = 0; j < XC; ++j)
+            if (xok[j]) cp16(p + xdst[j], xsrc[j] + g * GS);
+        if (xsok) cp4(p + T::X + T::W + 2 * T::S + tid * 4, xssrc + g);
+    };
+    auto load_w = [&](int s, int g) {
+        unsigned char* p = stage(s);
+#pragma unroll
+        for (int j = 0; j < WC; ++j)
+            if (wok[j]) cp16(p + wdst[j], wsrc[j] + static_cast<size_t>(g) * TILE_BYTES);
+#pragma unroll
+        for (int j = 0; j < SC; ++j)
+            if (sok[j]) cp16(p + sdst[j], ssrc[j] + static_cast<size_t>(g) * P.npad);
+    };
+    uint32_t mask;
+    asm volatile("mov.b32 %0, 0x000F000F;\n" : "=r"(mask));
+
+    float acc[I][J][4];
+#pragma unroll
+    for (int i = 0; i < I; ++i)
+#pragma unroll
+        for (int j = 0; j < J; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
+#pragma unroll
+    for (int c = tid; c < BM * T::CHUNKS; c += T::THREADS)
+        if (c / T::CHUNKS >= rows)
+#pragma unroll
+            for (int s = 0; s < STAGES; ++s)
+                *reinterpret_cast<uint4*>(stage(s) + c / T::CHUNKS * T::ROW + c % T::CHUNKS * 16) = uint4{};
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s) {
+        if (s < per) load_w(s, g0 + s);
+        commit();
+    }
+    grid_wait();
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s) {
+        if (s < per) load_x(s, g0 + s);
+        commit();
+    }
+    grid_launch();
+    for (int it = 0; it < per; ++it) {
+        wait<STAGES - 2>();
+        __syncthreads();
+        const int next = it + STAGES - 1;
+        if (next < per) {
+            load_x(next % STAGES, g0 + next);
+            load_w(next % STAGES, g0 + next);
+        }
+        commit();
+        const unsigned char* p = stage(it % STAGES);
+        const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
+        const __nv_bfloat16* ps = reinterpret_cast<const __nv_bfloat16*>(p + T::X + T::W);
+        const float* px = reinterpret_cast<const float*>(p + T::X + T::W + 2 * T::S);
+        uint32_t words[T::NT][GS / 32];
+#pragma unroll
+        for (int j = 0; j < T::NT; ++j)
+#pragma unroll
+            for (int v = 0; v < GS / 32; ++v) words[j][v] = pw[((wn * T::NT + j) * 32 + lane) * (GS / 32) + v];
+        float d[I][J][4];
+#pragma unroll
+        for (int kt = 0; kt < GS / 16; ++kt) {
+            uint32_t a[I][4];
+#pragma unroll
+            for (int i = 0; i < I; ++i) {
+                const int r = wm * (BM / WM) + i * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
+                const int ch = kt * 2 + (lane >> 4);
+                ldmatrix4(a[i], p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16);
+            }
+#pragma unroll
+            for (int j = 0; j < T::NT; ++j) {
+                const uint32_t b0 = pairm(words[j][kt / 2], (kt & 1) * 8, mask);
+                const uint32_t b1 = pairm(words[j][kt / 2], (kt & 1) * 8 + 4, mask);
+#pragma unroll
+                for (int i = 0; i < I; ++i) {
+                    if (kt == 0) mma0(d[i][j], a[i], b0, b1);
+                    else mma(d[i][j], a[i], b0, b1);
+                }
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < T::NT; ++j) {
+            const int col = wn * (BN / WN) + j * 8 + (lane & 3) * 2;
+            const __nv_bfloat162 s2 = *reinterpret_cast<const __nv_bfloat162*>(ps + col);
+            const __nv_bfloat162 b2 = *reinterpret_cast<const __nv_bfloat162*>(ps + BN + col);
+            const float sv[2] = {__low2float(s2), __high2float(s2)};
+            const float bv[2] = {__low2float(b2), __high2float(b2)};
+#pragma unroll
+            for (int i = 0; i < I; ++i) {
+                const int row = wm * (BM / WM) + i * 16 + (lane >> 2);
+                const float xv[2] = {px[row], px[row + 8]};
+#pragma unroll
+                for (int e = 0; e < 4; ++e)
+                    acc[i][j][e] = __fmaf_rn(xv[e >> 1], bv[e & 1], __fmaf_rn(d[i][j][e], sv[e & 1], acc[i][j][e]));
+            }
+        }
+    }
+    wait<0>();
+#if __CUDA_ARCH__ >= 900
+    // rank 0 stores gate's tile, bf16 (BM, BN), into rank 1's memory past the stages (no load of rank 1's lands
+    // there), the cluster barrier orders those stores, and rank 0 is done; rank 1 then works from its own memory
+    auto cluster = cooperative_groups::this_cluster();
+    __nv_bfloat16* gate_tile = reinterpret_cast<__nv_bfloat16*>(buf + T::SMEM);
+    if (rank == 0) {
+        __nv_bfloat16* to = cluster.map_shared_rank(gate_tile, 1);
+#pragma unroll
+        for (int i = 0; i < I; ++i)
+#pragma unroll
+            for (int j = 0; j < J; ++j)
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int r = wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8, c = wn * (BN / WN) + j * 8 + (lane & 3) * 2;
+                    *reinterpret_cast<__nv_bfloat162*>(to + r * BN + c) = __floats2bfloat162_rn(acc[i][j][2 * h], acc[i][j][2 * h + 1]);
+                }
+    }
+    cluster.sync();                              // gate's tile in rank 1's memory; every stage of both CTAs drained
+    if (rank == 1) {
+        __nv_bfloat16* own = reinterpret_cast<__nv_bfloat16*>(buf);
+        const int N = P.n;
+#pragma unroll
+        for (int i = 0; i < I; ++i)
+#pragma unroll
+            for (int j = 0; j < J; ++j)
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int r = wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8, c = wn * (BN / WN) + j * 8 + (lane & 3) * 2;
+                    const __nv_bfloat162 g2 = *reinterpret_cast<const __nv_bfloat162*>(gate_tile + r * BN + c);
+                    const __nv_bfloat162 u2 = __floats2bfloat162_rn(acc[i][j][2 * h], acc[i][j][2 * h + 1]);
+                    const float gf[2] = {__low2float(g2), __high2float(g2)};
+                    const float uf[2] = {__low2float(u2), __high2float(u2)};
+                    __nv_bfloat16 o[2];
+#pragma unroll
+                    for (int e = 0; e < 2; ++e) o[e] = __float2bfloat16_rn(gf[e] / (1.0f + expf(-gf[e])) * uf[e]);
+                    const __nv_bfloat162 o2 = __halves2bfloat162(o[0], o[1]);
+                    *reinterpret_cast<__nv_bfloat162*>(own + r * BN + c) = o2;
+                    if (m0 + r < M) *reinterpret_cast<__nv_bfloat162*>(act + static_cast<size_t>(m0 + r) * N + n0 + c) = o2;
+                }
+        __syncthreads();                         // the CTA's act tile complete
+        if (tid < rows) as[static_cast<size_t>(m0 + tid) * (N / 64) + n0 / 64] = act_group_sum(own + tid * BN);
+    }
+#else
+    __trap();
+#endif
+}
+
+} // namespace tf_qmm_group
+
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_pair(const __nv_bfloat16* __restrict__ x,
+        const float* __restrict__ xs, const __grid_constant__ tf_qmm_group::Parts parts, __nv_bfloat16* __restrict__ act,
+        float* __restrict__ as, int M, int K, int ldx, int rows_t) {
+    tf_qmm_group::mlp_pair_body<8>(x, xs, parts, act, as, M, K, ldx, rows_t);
+}

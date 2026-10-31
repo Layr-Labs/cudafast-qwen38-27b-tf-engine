@@ -11,6 +11,7 @@ pub const Shape = struct {
     slots: u8,
     hidden: bool = false,
     paged: bool = false,
+    short: bool = false, // every stream's cache holds fewer than GROUP_LEN positions: no row of attn_rows's
 
     pub fn init(rows: usize, segments: usize, record: bool, taps: bool, slots: u8) Shape {
         std.debug.assert(rows > 0 and rows <= @as(usize, if (record) Round.most_verify else Round.max_rows) and segments > 0 and segments <= rows);
@@ -21,6 +22,6 @@ pub const Shape = struct {
 
     pub fn key(s: Shape) u32 {
         // captured shapes only: a window bucket's rows fit the low byte
-        return @as(u32, @as(u8, @intCast(s.total))) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, s.slots) << 19 | @as(u32, @intFromBool(s.hidden)) << 27 | @as(u32, @intFromBool(s.paged)) << 28;
+        return @as(u32, @as(u8, @intCast(s.total))) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, s.slots) << 19 | @as(u32, @intFromBool(s.hidden)) << 27 | @as(u32, @intFromBool(s.paged)) << 28 | @as(u32, @intFromBool(s.short)) << 29;
     }
 };
