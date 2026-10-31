@@ -29,7 +29,6 @@ __device__ __forceinline__ uint32_t fma2(uint32_t a, uint32_t b, uint32_t c) {
     asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(d) : "r"(a), "r"(b), "r"(c));
     return d;
 }
-
 template <int GS, int BM, int BN, int WM, int WN, int STAGES, bool F32>
 __global__ void __launch_bounds__(WM * WN * 32) prefill_kernel(
         const __nv_bfloat16* __restrict__ x, const uint32_t* __restrict__ w, const __nv_bfloat16* __restrict__ scales,
@@ -179,3 +178,12 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_split(const __nv
         const __grid_constant__ tf_qmm_prefill::ManyPart part, int M, int K, int ldx, int group, int full_cols) {
     tf_qmm_prefill::prompt_split_body<64, 128, 128, 1, 4, 2>(x, part, M, K, ldx, group, full_cols);
 }
+
+// tf_qmm_prompt_many's projections as a persistent stream-K launch (prompt_sk_body): every tile's chain and store
+// are prompt_tile's; a tile split over two CTAs passes its fp32 accumulators from the first to the second.
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_sk(const __nv_bfloat16* __restrict__ x,
+        const __grid_constant__ tf_qmm_prefill::ManyParts parts, int M, int K, int ldx, int group, int tiles,
+        float* __restrict__ ws, unsigned* __restrict__ flags, unsigned epoch) {
+    tf_qmm_prefill::prompt_sk_body<64, 128, 128, 1, 4, 2>(x, parts, M, K, ldx, group, tiles, ws, flags, epoch);
+}
+
