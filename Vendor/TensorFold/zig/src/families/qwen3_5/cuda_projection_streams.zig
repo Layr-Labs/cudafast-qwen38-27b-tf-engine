@@ -19,10 +19,10 @@ fn candidates(layer: *layers.Layer, input: bool, output: bool) [6]?*layers.Proj 
     return list;
 }
 
-fn size(p: layers.Proj) usize {
+fn size(p: layers.Proj, short_lane: bool) usize {
     if (p != .a4) return 0;
     const q = p.a4;
-    const out = q.n == 5120 and (q.k == 6144 or q.k == 17408) and cuda.qlinear.splitK(q.n, q.k) == 4;
+    const out = q.n == 5120 and (q.k == 17408 or (!short_lane and q.k == 6144)) and cuda.qlinear.splitK(q.n, q.k) == 4;
     const in = q.k == 5120 and (q.n == 10240 or q.n == 6144 or q.n == 48);
     if (!out and !in) return 0;
     return q.npad * q.k / 2;
@@ -30,8 +30,9 @@ fn size(p: layers.Proj) usize {
 
 /// Existing views remain available to every other projection role and row count.
 pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
+    const short_lane = e.affine.short_lane;
     var bytes: usize = 0;
-    for (e.layers) |*layer| for (candidates(layer, input, output)) |maybe| { if (maybe) |p| { bytes += size(p.*); } };
+    for (e.layers) |*layer| for (candidates(layer, input, output)) |maybe| { if (maybe) |p| { bytes += size(p.*, short_lane); } };
     if (bytes == 0) return null;
     const pack = try e.mods[3].function("tf_pack_kmajor");
     const grouped = try e.mods[0].function("tf_qmm_gdn_stream16");
@@ -59,7 +60,7 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     var at: usize = 0;
     for (e.layers) |*layer| for (candidates(layer, input, output)) |maybe| {
         if (maybe) |p| {
-            const nbytes = size(p.*);
+            const nbytes = size(p.*, short_lane);
             if (nbytes == 0) continue;
             const q = p.a4;
             const words = q.npad * q.k / 8;
@@ -72,7 +73,7 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     at = 0;
     for (e.layers) |*layer| for (candidates(layer, input, output)) |maybe| {
         if (maybe) |p| {
-            const nbytes = size(p.*);
+            const nbytes = size(p.*, short_lane);
             if (nbytes == 0) continue;
             p.a4.stream_w = buffer.ptr + at;
             at += nbytes;

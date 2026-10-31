@@ -26,12 +26,10 @@ __device__ __forceinline__ void mlp_single_dict_body(const __nv_bfloat16* __rest
     const int rows = min(BM, M - m0);
     constexpr int TILE_BYTES = 64 * GS / 2;
     constexpr int XC = (BM * T::CHUNKS + T::THREADS - 1) / T::THREADS, WC = (T::W / 16 + T::THREADS - 1) / T::THREADS;
-    constexpr int SC = (2 * T::S / 16 + T::THREADS - 1) / T::THREADS;
     const __nv_bfloat16* xsrc[XC];
     const unsigned char* wsrc[WC];
-    const __nv_bfloat16* ssrc[SC];
-    int xdst[XC], wdst[WC], sdst[SC];
-    bool xok[XC], wok[WC], sok[SC];
+    int xdst[XC], wdst[WC];
+    bool xok[XC], wok[WC];
 #pragma unroll
     for (int j = 0; j < XC; ++j) {
         const int c = tid + j * T::THREADS, r = c / T::CHUNKS, ch = c % T::CHUNKS;
@@ -47,21 +45,12 @@ __device__ __forceinline__ void mlp_single_dict_body(const __nv_bfloat16* __rest
                   off * 16;
         wdst[j] = T::X + c * 16;
     }
-#pragma unroll
-    for (int j = 0; j < SC; ++j) {
-        const int c = tid + j * T::THREADS, which = c / (T::S / 16), off = c % (T::S / 16);
-        sok[j] = c < 2 * (T::S / 16);
-        const auto Q = parts.p[(off * 8) / (BN / 2)];
-        ssrc[j] = (which ? Q.biases : Q.scales) + n0 + (off * 8) % (BN / 2);
-        sdst[j] = T::X + T::W + which * T::S + off * 16;
-    }
     static_assert(KMAJOR && BN == 512 && WN == 4, "the twin decodes the K-major 2 x 256-column panel");
     // each part's `first` holds its dictionary code; its scales point at the group-major indices
     // [kg][npad / 64][16 * bits], its biases at its table (ns scale values, then nb bias values)
     const int code0 = parts.p[0].first, code1 = parts.p[1].first;
     const int bits0 = dict_bits(code0), bits1 = dict_bits(code1);
     const int tab0 = (dict_ns(code0) + dict_nb(code0) + 7) / 8 * 16;            // gate's table bytes (16-byte padded)
-    unsigned char* const dec = buf + T::SMEM;                                    // a warp's 32 scales, 32 biases
     const unsigned short* const tabs = reinterpret_cast<const unsigned short*>(buf + T::SMEM + MLP_DICT_DEC);
     // the stage's index runs: gate's four tiles (64 * bits0 bytes), then up's; a thread loads one 16-byte chunk
     const int run0 = 4 * bits0, run1 = 4 * bits1;
@@ -139,7 +128,6 @@ __device__ __forceinline__ void mlp_single_dict_body(const __nv_bfloat16* __rest
         const unsigned char* p = stage(it % STAGES);
         const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
         const uint32_t* pk = reinterpret_cast<const uint32_t*>(p + T::X + T::W + mrun);
-        __nv_bfloat16* const dw = reinterpret_cast<__nv_bfloat16*>(dec) + wn * 64;    // this warp's 32 + 32 values
         const float* px = reinterpret_cast<const float*>(p + T::X + T::W + 2 * T::S);
         uint32_t words[T::NT][GS / 32];
 #pragma unroll
@@ -167,38 +155,31 @@ __device__ __forceinline__ void mlp_single_dict_body(const __nv_bfloat16* __rest
                 }
             }
         }
-        // four passes of 32 columns a warp: each lane decodes one column's scale and bias into the warp's 128 bytes,
+        // four passes of 32 columns a warp: each lane decodes one column's scale and bias and shares via shfl,
         // then the pass's four n8 tiles take the original kernel's fmas on them
+        const int row0 = wm * (BM / WM) + (lane >> 2);
+        const float xv0[2] = {px[row0], px[row0 + 8]};
 #pragma unroll
         for (int pass = 0; pass < 4; ++pass) {
-            {
-                const int c = (wn % 2) * 128 + pass * 32 + lane, tt = c / 64, ct = c % 64;
-#pragma unroll
-                for (int which = 0; which < 2; ++which) {
-                    const int off = (tt * 128 + which * 64 + ct) * mbits;
-                    const uint32_t idx = __funnelshift_r(pk[off >> 5], pk[(off >> 5) + 1], off & 31) & mmask;
-                    reinterpret_cast<unsigned short*>(dw)[which * 32 + lane] = mtab[(which ? mns : 0) + idx];
-                }
-            }
-            __syncwarp();
+            const int c = (wn % 2) * 128 + pass * 32 + lane, tt = c / 64, ct = c % 64;
+            const int offs = (tt * 128 + ct) * mbits, offb = (tt * 128 + 64 + ct) * mbits;
+            const uint32_t idxs = __funnelshift_r(pk[offs >> 5], pk[(offs >> 5) + 1], offs & 31) & mmask;
+            const uint32_t idxb = __funnelshift_r(pk[offb >> 5], pk[(offb >> 5) + 1], offb & 31) & mmask;
+            const float sf = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&mtab[idxs]));
+            const float bf = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&mtab[mns + idxb]));
 #pragma unroll
             for (int jj = 0; jj < 4; ++jj) {
                 const int j = pass * 4 + jj;
                 const int col = jj * 8 + (lane & 3) * 2;
-                const __nv_bfloat162 s2 = *reinterpret_cast<const __nv_bfloat162*>(dw + col);
-                const __nv_bfloat162 b2 = *reinterpret_cast<const __nv_bfloat162*>(dw + 32 + col);
-                const float sv[2] = {__low2float(s2), __high2float(s2)};
-                const float bv[2] = {__low2float(b2), __high2float(b2)};
+                const float sv[2] = {__shfl_sync(0xffffffffu, sf, col), __shfl_sync(0xffffffffu, sf, col + 1)};
+                const float bv[2] = {__shfl_sync(0xffffffffu, bf, col), __shfl_sync(0xffffffffu, bf, col + 1)};
 #pragma unroll
                 for (int i = 0; i < I; ++i) {
-                    const int row = wm * (BM / WM) + i * 16 + (lane >> 2);
-                    const float xv[2] = {px[row], px[row + 8]};
 #pragma unroll
                     for (int e = 0; e < 4; ++e)
-                        acc[i][j][e] = __fmaf_rn(xv[e >> 1], bv[e & 1], __fmaf_rn(d[i][j][e], sv[e & 1], acc[i][j][e]));
+                        acc[i][j][e] = __fmaf_rn(xv0[e >> 1], bv[e & 1], __fmaf_rn(d[i][j][e], sv[e & 1], acc[i][j][e]));
                 }
             }
-            __syncwarp();                         // the next pass rewrites the warp's values
         }
     }
     wait<0>();

@@ -87,7 +87,7 @@ pub const Kernels = struct {
     }
 
     fn outputRole(outs: []const Out) bool {
-        return outs.len == 1 and outs[0].q.n == 5120 and (outs[0].q.k == 6144 or outs[0].q.k == 17408);
+        return outs.len == 1 and outs[0].q.n == 5120 and (outs[0].q.k == 6144 or outs[0].q.k == 17408 or outs[0].q.k == 25600);
     }
 
     fn recurrentRole(outs: []const Out) bool {
@@ -102,7 +102,8 @@ pub const Kernels = struct {
     pub fn splitCols(kk: *const Kernels, n: usize, rows: usize) ?usize {
         const cols = n / tile_n;
         const tiles = (rows + tile_m - 1) / tile_m * cols;
-        if (n % tile_n != 0 or cols < 10 or tiles <= kk.slots or tiles % kk.slots == 0) return null;
+        if (n % tile_n != 0 or cols < 10 or tiles % kk.slots == 0) return null;
+        if (tiles < kk.slots) return 0;
         return (cols - cols / 5) * tile_n;
     }
 

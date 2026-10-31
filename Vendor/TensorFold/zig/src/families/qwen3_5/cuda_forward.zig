@@ -151,7 +151,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
             .moe => |m| try e.routedRows(m.router, m.experts, e.x, e.r, total, promptMoe(prompt, total), t_params),
         }
         if (shape.taps) for (e.taps[0..e.n_taps], 0..) |t, ti| if (t == i) {
-            try e.run(e.fns.tap, .{ total, (g.hidden + 2047) / 2048, 1 }, .{ 256, 1, 1 }, .{ e.h, e.r, t_segs, t_rows, @as(c_int, @intCast(ti)), @as(c_int, @intCast(g.hidden)), t_params });
+            try e.runAfter(e.fns.tap, .{ total, (g.hidden + 2047) / 2048, 1 }, .{ 256, 1, 1 }, .{ e.h, e.r, t_segs, t_rows, @as(c_int, @intCast(ti)), @as(c_int, @intCast(g.hidden)), t_params });
         };
     }
     try finish(e, total, heads, shape.hidden);

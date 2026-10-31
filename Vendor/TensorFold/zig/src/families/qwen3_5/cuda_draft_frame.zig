@@ -54,13 +54,13 @@ pub fn stage(c: draft.Config, items: []const dr.Hold, contexts: []const *draft.C
 /// A launch whose arguments are checked against the kernel's .cu signature: a wrong count or kind does not build.
 fn launch(d: anytype, f: cuda.Function, comptime s: sig.Sig, grid: [3]usize, block: [3]usize, args: anytype) !void {
     sig.check(s, @TypeOf(args));
-    return d.e.run(f, grid, block, args);
+    return d.e.runAfter(f, grid, block, args);
 }
 fn conv(d: anytype, x: u64, base: u64, res: u64, out: u64, rows: usize, branch: c_int) !void {
-    try d.e.run(d.fns.dyn_conv_batch, .{ rows, (d.c.hidden + 255) / 256, 1 }, .{ 256, 1, 1 }, .{ x, d.dyn, base, res, out, @as(c_int, @intCast(d.c.hidden)), @as(c_int, @intCast(d.c.group)), branch, @as(c_int, @intCast(d.c.block)) });
+    try d.e.runAfter(d.fns.dyn_conv_batch, .{ rows, (d.c.hidden + 255) / 256, 1 }, .{ 256, 1, 1 }, .{ x, d.dyn, base, res, out, @as(c_int, @intCast(d.c.hidden)), @as(c_int, @intCast(d.c.group)), branch, @as(c_int, @intCast(d.c.block)) });
 }
 fn rope(d: anytype, x: u64, w: u64, out: u64, rows: usize, heads: usize) !void {
-    try d.e.run(d.fns.norm_rope_batch, .{ rows * heads, 1, 1 }, .{ 32, 1, 1 }, .{ x, w, out, @as(c_int, @intCast(heads)), @as(c_int, @intCast(heads * 128)), d.segments, @as(c_int, @intCast(d.c.block)), d.c.eps, d.c.theta });
+    try d.e.runAfter(d.fns.norm_rope_batch, .{ rows * heads, 1, 1 }, .{ 32, 1, 1 }, .{ x, w, out, @as(c_int, @intCast(heads)), @as(c_int, @intCast(heads * 128)), d.segments, @as(c_int, @intCast(d.c.block)), d.c.eps, d.c.theta });
 }
 pub fn attention(d: anytype, rows: usize, layer: usize) !void {
     const c = d.c;
@@ -86,7 +86,7 @@ pub fn mlp(d: anytype, l: anytype, B: usize) !void {
     const e = d.e;
     const c = d.c;
     if (draft.pairedMlp() and B > 0 and B <= 16 and cuda.mlp_pair.Kernels.fits(l.gate, l.up)) {
-        try e.run(e.fns.sums, .{ B, (l.gate.k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ d.xin, d.xs, @as(c_int, @intCast(l.gate.k)), @as(u64, 0) });
+        try e.runAfter(e.fns.sums, .{ B, (l.gate.k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ d.xin, d.xs, @as(c_int, @intCast(l.gate.k)), @as(u64, 0) });
         // The unused gate buffer has room for the FP32 group sums. Never overwrite xs while pair reads it.
         const act_sums = d.gate;
         try e.mlp_pair.pair(e.stream, d.xin, d.xs, l.gate, l.up, d.act, act_sums, B);
@@ -94,7 +94,7 @@ pub fn mlp(d: anytype, l: anytype, B: usize) !void {
     } else {
         try d.proj(l.gate, d.xin, d.gate, B);
         try d.projAgain(l.up, d.xin, d.up, B);
-        try e.run(e.fns.mlp_act, .{ (B * c.intermediate + 1023) / 1024, 1, 1 }, .{ 256, 1, 1 }, .{ d.gate, d.up, d.act, @as(c_longlong, @intCast(B * c.intermediate)), @as(u64, 0), @as(c_int, @intCast(c.intermediate)), d.xs });
+        try e.runAfter(e.fns.mlp_act, .{ (B * c.intermediate + 1023) / 1024, 1, 1 }, .{ 256, 1, 1 }, .{ d.gate, d.up, d.act, @as(c_longlong, @intCast(B * c.intermediate)), @as(u64, 0), @as(c_int, @intCast(c.intermediate)), d.xs });
         try d.projAgain(l.down, d.act, d.o, B);
     }
 }
@@ -220,7 +220,7 @@ fn head(d: anytype, rows: usize) !?u64 {
         .x3, .bf => return full(d, rows),
     };
     if (q.n != spans[1][1] or q.k % 64 != 0) return full(d, rows);
-    const first: cuda.qlinear.Affine4 = .{ .w = q.w, .s = q.s, .b = q.b, .n = spans[0][1], .k = q.k, .npad = q.npad };
+    const first: cuda.qlinear.Affine4 = .{ .w = q.w, .s = q.s, .b = q.b, .sb = q.sb, .tab = q.tab, .code = q.code, .n = spans[0][1], .k = q.k, .npad = q.npad };
     const tail: cuda.qlinear.Affine4 = .{ .w = q.w + tail_tile * q.k / 2, .s = q.s + tail_tile * 2, .b = q.b + tail_tile * 2, .n = q.n - tail_tile, .k = q.k, .npad = q.npad };
     const a = d.logits; // rows x 98,304, then rows x 320, then the packed rows x 98,592
     const b = a + rows * first.n * 2;

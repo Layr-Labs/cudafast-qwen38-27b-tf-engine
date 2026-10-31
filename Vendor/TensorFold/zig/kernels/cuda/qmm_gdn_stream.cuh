@@ -43,13 +43,15 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
         woff[j] = static_cast<size_t>(t) * TILE_BYTES + off * 16;
         wdst[j] = T::X + c * 16;
     }
+    if constexpr (!DICT) {
 #pragma unroll
-    for (int j = 0; j < SC; ++j) {
-        const int c = tid + j * T::THREADS, which = c / (T::S / 16), off = c % (T::S / 16);
-        sok[j] = c < 2 * (T::S / 16);
-        sbias[j] = which;
-        soff[j] = off * 8;
-        sdst[j] = T::X + T::W + which * T::S + off * 16;
+        for (int j = 0; j < SC; ++j) {
+            const int c = tid + j * T::THREADS, which = c / (T::S / 16), off = c % (T::S / 16);
+            sok[j] = c < 2 * (T::S / 16);
+            sbias[j] = which;
+            soff[j] = off * 8;
+            sdst[j] = T::X + T::W + which * T::S + off * 16;
+        }
     }
     const bool xsok = tid < rows;
     const float* xssrc = xs + static_cast<size_t>(min(tid, rows - 1)) * KG;
@@ -142,7 +144,6 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
                 reinterpret_cast<unsigned short*>(dec)[half * BN + col] =
                     reinterpret_cast<const unsigned short*>(table)[(half ? qmm_dict::dict_ns(code) : 0) + idx];
             }
-            __syncwarp();
         }
         const __nv_bfloat16* ps = reinterpret_cast<const __nv_bfloat16*>(DICT ? dec : p + T::X + T::W);
         const float* px = reinterpret_cast<const float*>(p + T::X + T::W + 2 * T::S);
@@ -165,6 +166,7 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
                 else mma(d[j], a, b0, b1);
             }
         }
+        if constexpr (DICT) __syncwarp();
         const int row = lane >> 2;
         const float xv[2] = {px[row], px[row + 8]};
 #pragma unroll
