@@ -235,6 +235,33 @@ pub const Affine4Kernels = struct {
         return a.wide(a.verify128_fn, linear.verify128_smem, 128, s, x, xs, weight, out, rows);
     }
 
+    /// GB10: verify() of each projection of one input, windows of 17 to 32 rows, in one launch of verify_fn (both row
+    /// tiles over each weight panel). Clusters hold the largest split's C blocks; a part of split sk holds C / sk of its
+    /// column tiles a cluster, each tile's K slices summed in slice order as in a launch of its own.
+    pub fn verifyMany(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, outs: []const Out, rows: usize) !void {
+        if (outs.len == 0 or outs.len > segs_max) return error.TooManyParts;
+        if (rows <= max_rows or rows > 32) return error.WindowTooWide;
+        var c: usize = 1;
+        for (outs) |o| c = @max(c, splitK(o.q.n, o.q.k));
+        var parts: Parts = std.mem.zeroes(Parts);
+        var clusters: usize = 0;
+        for (outs, 0..) |o, i| {
+            if (o.q.k != outs[0].q.k) return error.InputMismatch;
+            const tiles = (o.q.n + 63) / 64;
+            const sk = splitK(o.q.n, o.q.k);
+            const per = c / sk; // splits are powers of two up to 8: sk divides c
+            parts.p[i] = .{ .w = o.q.w, .scales = o.q.s, .biases = o.q.b, .out = o.out, .n = int(o.q.n), .npad = int(o.q.npad), .sk = int(sk), .tiles = int(tiles), .first = int(clusters) };
+            clusters += (tiles + per - 1) / per;
+        }
+        parts.count = int(outs.len);
+        var g: launch_.Args = .{};
+        g.add(x);
+        g.add(xs);
+        g.add(parts);
+        for ([_]usize{ rows, outs[0].q.k, outs[0].q.k, 1, c }) |v| g.add(int(v));
+        try launch_.launch(a.verify_fn, .{ .grid = .{ .x = u(clusters * c) }, .block = .{ .x = 128 }, .shared = linear.verify_smem, .cluster = if (c > 1) .{ .x = u(c) } else null, .pdl = a.pdl }, s, &g);
+    }
+
     /// The same ordered group and K-slice chains as decode(), with both row tiles reusing the loaded weights.
     pub fn cluster32(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, weight: Affine4, out: u64, rows: usize) !void {
         return a.wide(a.verify_fn, linear.verify_smem, 32, s, x, xs, weight, out, rows);
