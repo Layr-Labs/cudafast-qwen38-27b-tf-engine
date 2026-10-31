@@ -47,14 +47,23 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
     if(tid==0) {
 #pragma unroll
         for(int g=1;g<=FutureGroups;++g)if(g<per){
-            const auto* w=weight(g0+g);const auto* s=p.scales+size_t(g0+g)*p.npad+n0;const auto* b=p.biases+size_t(g0+g)*p.npad+n0;
+            const auto* w=weight(g0+g);
             asm volatile("cp.async.bulk.prefetch.L2.global [%0], 2048;" :: "l"(w) : "memory");
-            asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(s) : "memory");
-            asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(b) : "memory");
+            if constexpr(DICT){
+                if(D.ok){
+                    const int gg=g0+g;
+                    const auto* idx=D.src+qmm_dict::dict_window(D,gg);
+                    asm volatile("cp.async.bulk.prefetch.L2.global [%0], 256;" :: "l"(idx) : "memory");
+                }
+            } else {
+                const auto* s=p.scales+size_t(g0+g)*p.npad+n0;const auto* b=p.biases+size_t(g0+g)*p.npad+n0;
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(s) : "memory");
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(b) : "memory");
+            }
         }
     }
 #endif
-    grid_wait();load_x(0);commit();grid_launch();
+    grid_wait();x_keep_l2(x,rows,K,ldx);load_x(0);commit();grid_launch();
     uint32_t mask;asm volatile("mov.b32 %0, 0x000F000F;\n":"=r"(mask));
     float acc[2][4]{};
     for(int it=0;it<per;++it){
