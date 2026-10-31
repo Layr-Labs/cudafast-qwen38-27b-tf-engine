@@ -2,9 +2,13 @@
 #pragma once
 
 // A tapped layer's residual bf16(h + r) into the segment's tap ring at the row's position; grid (rows, D / 2048).
-extern "C" __global__ void __launch_bounds__(256) tf_q35_tap(const __nv_bfloat16* __restrict__ H, const __nv_bfloat16* __restrict__ R,
+extern "C" __global__ void __launch_bounds__(256) tf_q35_tap(const __nv_bfloat16* __restrict__ H0, const __nv_bfloat16* __restrict__ R0,
                                                               const Seg* __restrict__ segs, const int* __restrict__ rowseg, int tap, int D,
                                                               const int* __restrict__ P) {
+    release_next();
+    await_prior();
+    const __nv_bfloat16* H = after_wait(H0);
+    const __nv_bfloat16* R = after_wait(R0);
     if (past_rows(P, blockIdx.x)) return;
     const size_t m = blockIdx.x;
     const Seg sg = segs[rowseg[m]];
