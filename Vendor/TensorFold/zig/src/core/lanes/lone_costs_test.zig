@@ -105,6 +105,33 @@ test "lone price: tile probes are bounded, respect available rows, and stop afte
     try std.testing.expectEqual(@as(?u32, null), own.probe(&e, p));
 }
 
+test "lone price: a minimum trial width skips serial probes without discarding measured costs" {
+    var cfg = try setup();
+    defer cfg.deinit(a);
+    cfg.lone_cost_min_rows = 16;
+    var target: fake.Fake = .{ .gpa = a };
+    defer target.deinit();
+    var clock: fake.FixedClock = .{};
+    var e = Engine.init(a, &cfg, target.backend(), clock.clock());
+    defer e.deinit();
+    var s = try Stream.init(a, .{ .id = "minimum-trial", .prompt = &.{3}, .max_new = 128 });
+    defer s.deinit(a);
+    const tokens: [63]u32 = @splat(7);
+    var plan: win.Plan = .{ .stream = &s, .position = 1, .kind = .head, .tokens = &tokens };
+    s.rounds = 8;
+    try std.testing.expectEqual(@as(?u32, 15), own.probe(&e, plan));
+    try e.rule.observeCost(15, 77, false, win.who(&s));
+    own.observe(&s, 16, 16, 77);
+    s.rounds += 8;
+    try std.testing.expectEqual(@as(?u32, 31), own.probe(&e, plan));
+    cfg.lone_cost_min_rows = 65;
+    try std.testing.expectEqual(@as(?u32, null), own.probe(&e, plan));
+    try std.testing.expectEqual(@as(?f64, 77), s.depth.?.ms.?.get(15));
+    cfg.lone_cost_min_rows = 16;
+    plan.tokens = tokens[0..7];
+    try std.testing.expectEqual(@as(?u32, null), own.probe(&e, plan));
+}
+
 const be = @import("backend.zig");
 const Clock = struct {
     target: *const fake.Fake,
