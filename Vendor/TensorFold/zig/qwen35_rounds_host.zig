@@ -29,6 +29,76 @@ test "Verify width calibration: row 63 is an ancestor bit, while a 128-row promp
     }
 }
 
+test "Verify width calibration: a shared schedule never writes beyond admitted verification rows" {
+    const R = q.round;
+    var storage: [R.bytes]u8 align(8) = @splat(0xA5);
+    var parents: [R.most_window]i32 = undefined;
+    for (&parents, 0..) |*p, row| p.* = if (row == 0) -1 else @intCast(row - 1);
+    const part: q.engine.Part = .{ .cache = undefined, .rows = parents.len, .parents = &parents };
+    const parts = [_]q.engine.Part{ part, part, .{ .cache = undefined, .rows = 1 } };
+    _ = try R.build(&storage, parts[0..2], true);
+    try core.tree_slots.validate(&parents, R.steps(&storage)[0..64], 0, 16);
+    try core.tree_slots.validate(&parents, R.steps(&storage)[64..128], 64, 16);
+    const limit = R.steps_at + R.most_verify * @sizeOf(core.tree_slots.Step);
+    for (storage[limit..][0..@sizeOf(core.tree_slots.Step)]) |byte| try std.testing.expectEqual(@as(u8, 0xA5), byte);
+    try std.testing.expectError(error.InvalidQwenSegments, R.build(&storage, &parts, true));
+    for (storage[limit..][0..@sizeOf(core.tree_slots.Step)]) |byte| try std.testing.expectEqual(@as(u8, 0xA5), byte);
+    _ = try R.build(&storage, &.{q.engine.Part{ .cache = undefined, .rows = R.max_rows }}, false);
+    try std.testing.expectEqual(@as(u32, R.max_rows - 1), R.ancestors(&storage)[R.max_rows - 1].depth);
+    for (storage[limit..][0..@sizeOf(core.tree_slots.Step)]) |byte|
+        try std.testing.expectEqual(@as(u8, 0xA5), byte);
+}
+
+test "Verify width calibration: long prompt cohorts do not consume verification schedules" {
+    const R = q.round;
+    var storage: [R.bytes]u8 align(8) = @splat(0xA5);
+    const parts = [_]q.engine.Part{
+        .{ .cache = undefined, .rows = 2048 },
+        .{ .cache = undefined, .rows = 1024 },
+        .{ .cache = undefined, .rows = 1024 },
+    };
+    _ = try R.buildWithScratch(&storage, &parts, false, &.{});
+    const anc = R.ancestors(&storage);
+    try std.testing.expectEqual(@as(u32, 2047), anc[2047].depth);
+    try std.testing.expectEqual(@as(u32, 0), anc[2048].depth);
+    try std.testing.expectEqual(@as(u32, 1023), anc[3071].depth);
+    try std.testing.expectEqual(@as(u32, 0), anc[3072].depth);
+    try std.testing.expectEqual(@as(u32, 1023), anc[4095].depth);
+    for (storage[R.steps_at..][0 .. R.most_verify * @sizeOf(core.tree_slots.Step)]) |byte|
+        try std.testing.expectEqual(@as(u8, 0xA5), byte);
+    try std.testing.expectError(error.InvalidQwenParents, R.build(&storage, &.{
+        .{ .cache = undefined, .rows = 2, .parents = &.{ -1, 0 } },
+    }, false));
+}
+
+test "Verify width calibration: real admission binds recorded cohorts independently of prompt capacity" {
+    var e: q.engine.Engine = undefined;
+    e.g.vocab = 1;
+    e.g.q_heads = 4;
+    e.g.kv_heads = 1;
+    e.learning = null;
+    e.verify_rows = q.round.most_verify;
+    var caches: [3]q.engine.Cache = undefined;
+    for (&caches) |*cache| {
+        cache.cap = q.round.max_rows;
+        cache.len = 0;
+    }
+    const parts = [_]q.engine.Part{
+        .{ .cache = &caches[0], .rows = 64 },
+        .{ .cache = &caches[1], .rows = 64 },
+        .{ .cache = &caches[2], .rows = 1 },
+    };
+    const ids: [q.round.max_rows]u32 = @splat(0);
+    try e.admit(parts[0..2], ids[0..128], .logits);
+    try std.testing.expectError(error.UnsupportedQwenGeometry, e.admit(&parts, ids[0..129], .logits));
+    try e.admit(&.{.{ .cache = &caches[0], .rows = ids.len }}, &ids, .last);
+    const prompts = [_]q.engine.Part{
+        .{ .cache = &caches[0], .rows = 2048 },
+        .{ .cache = &caches[1], .rows = 2048 },
+    };
+    try std.testing.expectError(error.InvalidQwenSegments, e.admit(&prompts, &ids, .last));
+}
+
 test "Verify width calibration: shared register-slot plans retain every parent and original output row" {
     try std.testing.expect(@hasDecl(core, "tree_slots"));
     if (comptime @hasDecl(core, "tree_slots") and @hasDecl(q, "round")) {
@@ -285,4 +355,120 @@ test "Verify width calibration: straight metadata needs no branch scratch and ma
     try std.testing.expectError(error.OutOfMemory, R.buildWithScratch(&storage, &fork, true, &.{}));
     try std.testing.expect((try R.build(&storage, &fork, true)) > 1);
     try core.tree_slots.validate(&branch, R.steps(&storage)[0..branch.len], 0, 16);
+}
+
+test "Verify width calibration: actual DeltaNet glue groups recorded buckets" {
+    const Recorded = struct {
+        var count: usize = 0;
+        var grids: [2][3]u32 = undefined;
+        var blocks: [2][3]u32 = undefined;
+        fn launch(
+            f: cuda.abi.Function,
+            gx: c_uint,
+            gy: c_uint,
+            gz: c_uint,
+            bx: c_uint,
+            by: c_uint,
+            bz: c_uint,
+            _: c_uint,
+            _: cuda.abi.Stream,
+            _: ?[*]?*anyopaque,
+            _: ?[*]?*anyopaque,
+        ) callconv(.c) cuda.abi.Result {
+            const id = @intFromPtr(f);
+            if (id != 2 and id != 3) return cuda.abi.success;
+            std.debug.assert(id == count + 2);
+            grids[count] = .{ gx, gy, gz };
+            blocks[count] = .{ bx, by, bz };
+            count += 1;
+            return if (id == 3) cuda.abi.error_not_ready else cuda.abi.success;
+        }
+    };
+    var d: cuda.Driver = undefined;
+    d.api.cuLaunchKernel = Recorded.launch;
+    var kit: @typeInfo(@typeInfo(@FieldType(q.Engine, "kit")).optional.child).pointer.child = undefined;
+    kit.b16.embed_fn = function(&d, 1);
+    kit.b16.dense_fn = function(&d, 1);
+    var e: q.Engine = undefined;
+    e.d = &d;
+    e.kit = &kit;
+    e.stream = .{ .d = &d, .handle = null };
+    e.g = .{
+        .hidden = 512,
+        .intermediate = 512,
+        .layers = 1,
+        .vocab = 512,
+        .k_heads = 2,
+        .v_heads = 4,
+        .q_heads = 4,
+        .kv_heads = 1,
+        .eps = 1e-6,
+        .tied = false,
+        .context = 4096,
+        .linear = @splat(true),
+    };
+    e.geo = .{ .hid = 512, .nk = 2, .nv = 4, .qh = 4, .kvh = 1, .nl = 1 };
+    e.tables = .{ .d = &d, .ptr = 0x100000, .len = q.round.bytes };
+    e.features = 0;
+    e.learning = null;
+    e.int8.on = false;
+    e.affine.pdl = false;
+    e.affine.group_wide = false;
+    e.affine.split = null;
+    inline for (.{
+        "h", "x", "r", "xs", "qkv", "z", "a", "b", "q", "k", "v", "g_", "beta", "y", "mix", "embed_w",
+    }, 0..) |name, i| @field(e, name) = 0x200000 + i * 0x10000;
+    inline for (@typeInfo(@TypeOf(e.fns)).@"struct".field_names) |name| @field(e.fns, name) = function(&d, 1);
+    e.fns.gdn_pre = function(&d, 2);
+    e.fns.gdn_post = function(&d, 3);
+    e.prompt_attn.chain = function(&d, 1);
+    var storage: [q.round.bytes]u8 align(16) = @splat(0);
+    e.staged.bytes = &storage;
+    const p: q.engine.Proj = .{ .bf = .{ .w = 0x400000, .n = 512, .k = 512 } };
+    var layers = [_]q.engine.Layer{.{
+        .input_norm = 0x400000,
+        .post_norm = 0x400000,
+        .mixer = .{ .delta = .{
+            .qkv = p,
+            .z = p,
+            .a = p,
+            .b = p,
+            .out = p,
+            .conv = 0x400000,
+            .norm = 0x400000,
+            .a_log = 0x400000,
+            .dt_bias = 0x400000,
+        } },
+        .mlp = .{ .dense = .{ .gate = p, .up = p, .down = p } },
+    }};
+    e.layers = &layers;
+    for ([_]bool{ true, false }) |record| for ([_]bool{ false, true }) |exact| {
+        if (!record and exact) continue;
+        for ([_]usize{ 1, 2, 3, 15, 16, 17, 127, 128, 129, 4096 }) |rows| {
+            if (record and rows > q.engine.most_verify) continue;
+            for ([_]usize{ 1, 2, 16, 128 }) |segments| {
+                if (segments > rows or (!record and segments != 1)) continue;
+                var shape = q.Engine.Shape.init(rows, segments, record, false, 1);
+                if (exact) {
+                    shape.total = @intCast(rows);
+                    shape.nseg = @intCast(segments);
+                }
+                shape.hidden = true;
+                Recorded.count = 0;
+                try std.testing.expectError(error.NotReady, e.body(shape));
+                const grouped: u32 = if ((record and shape.total >= 16) or (!record and rows > 16)) 4 else 1;
+                const blocks: u32 = (@as(u32, shape.total) + grouped - 1) / grouped;
+                try std.testing.expectEqual(@as(usize, 2), Recorded.count);
+                try std.testing.expectEqualDeep([3]u32{ 1, 2 * 2 + 4, blocks }, Recorded.grids[0]);
+                try std.testing.expectEqualDeep([3]u32{ 1, 4, blocks }, Recorded.grids[1]);
+                for (Recorded.blocks) |block| try std.testing.expectEqualDeep([3]u32{ 32, grouped, 1 }, block);
+                var visits: [4096]u8 = @splat(0);
+                for (0..Recorded.grids[0][2]) |bz| for (0..Recorded.blocks[0][1]) |by| {
+                    const row = bz * Recorded.blocks[0][1] + by;
+                    if (row < rows) visits[row] += 1;
+                };
+                for (visits[0..rows]) |count| try std.testing.expectEqual(@as(u8, 1), count);
+            }
+        }
+    };
 }

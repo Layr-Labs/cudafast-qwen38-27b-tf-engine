@@ -494,11 +494,11 @@ pub fn constrain(e: *Engine, p: *Plan) !void {
 pub fn build(e: *Engine, p: Plan, early: bool) !be.Window {
     const a = e.arena.allocator();
     const rows = 1 + p.count();
-    const parents = try accept.rowParents(a, rows, p.parents);
-    const ds = try accept.depths(a, parents);
+    const parents = if (p.parents != null) try accept.rowParents(a, rows, p.parents) else null;
+    const ds = if (parents) |ps| try accept.depths(a, ps) else null;
     const positions = try a.alloc(u64, rows);
-    for (positions, ds) |*x, d| x.* = p.position + 1 + d;
-    return .{ .stream = p.stream, .pending = p.stream.pending.?, .held = p.held, .tokens = p.tokens, .parents = if (p.parents != null) parents else null, .positions = positions, .early = early, .masks = p.masks };
+    for (positions, 0..) |*x, row| x.* = p.position + 1 + (if (ds) |d| d[row] else row);
+    return .{ .stream = p.stream, .pending = p.stream.pending.?, .held = p.held, .tokens = p.tokens, .parents = parents, .positions = positions, .early = early, .masks = p.masks };
 }
 
 pub fn rowParents(e: *Engine, w: be.Window) ![]const i32 {
@@ -513,4 +513,45 @@ pub fn tokens(e: *Engine, w: be.Window, o: be.Verified) ![]u32 {
     @memcpy(out[1 .. 1 + w.held], o.drafts[0..w.held]);
     @memcpy(out[1 + w.held ..], w.tokens);
     return out;
+}
+
+test "chain window builds backend positions within a bounded host arena" {
+    var storage: [512]u8 align(16) = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    var engine: Engine = undefined;
+    engine.arena = std.heap.ArenaAllocator.init(fixed.allocator());
+    defer engine.arena.deinit();
+    var stream: Stream = undefined;
+    stream.pending = 7;
+    const drafts: [31]u32 = @splat(8);
+    const p: Plan = .{ .stream = &stream, .position = 100, .kind = .head, .tokens = &drafts };
+    const window = try build(&engine, p, false);
+    try std.testing.expectEqual(@as(usize, 32), window.rows());
+    try std.testing.expect(window.parents == null);
+    try std.testing.expectEqual(@as(u32, 7), window.pending);
+    try std.testing.expectEqualSlices(u32, &drafts, window.tokens);
+    for (window.positions, 0..) |position, row|
+        try std.testing.expectEqual(@as(u64, 101 + row), position);
+}
+
+test "tree window preserves branch positions and invalid-parent errors" {
+    var engine: Engine = undefined;
+    engine.arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer engine.arena.deinit();
+    var stream: Stream = undefined;
+    stream.pending = 7;
+    const p: Plan = .{
+        .stream = &stream,
+        .position = 100,
+        .kind = .head,
+        .tokens = &.{ 8, 9, 10, 11 },
+        .parents = &.{ -1, 0, 0, 2 },
+    };
+    const window = try build(&engine, p, true);
+    try std.testing.expectEqualSlices(i32, &.{ -1, 0, 1, 1, 3 }, window.parents.?);
+    try std.testing.expectEqualSlices(u64, &.{ 101, 102, 103, 103, 104 }, window.positions);
+    try std.testing.expect(window.early);
+    var invalid = p;
+    invalid.parents = &.{ -1, 3, 0, 2 };
+    try std.testing.expectError(error.ParentAfterChild, build(&engine, invalid, false));
 }

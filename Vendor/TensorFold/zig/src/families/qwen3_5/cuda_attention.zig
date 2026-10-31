@@ -10,11 +10,7 @@ pub fn hasPages(segs: anytype) bool {
 pub fn partial(e: anytype, shape: anytype, layer: c_int) !void {
     const f = if (e.kv8) (if (shape.paged) e.fp8.attn_partial_paged else e.fp8.attn_partial_contiguous) else (if (shape.paged) e.fns.attn_partial_paged else e.fns.attn_partial_contiguous);
     const t = e.tables.ptr;
-    if (@hasDecl(@TypeOf(e.*), "runAfter")) {
-        try e.runAfter(f, .{ 64, e.g.kv_heads, shape.total }, .{ 32 * (e.g.q_heads / e.g.kv_heads), 1, 1 }, .{ e.geo, e.qn, t + Round.segs_at, t + Round.rowseg_at, t + Round.rowanc_at, layer, t + Round.params_at, @as(f32, 1.0 / 16.0), e.pm, e.pl, e.po });
-    } else {
-        try e.run(f, .{ 64, e.g.kv_heads, shape.total }, .{ 32 * (e.g.q_heads / e.g.kv_heads), 1, 1 }, .{ e.geo, e.qn, t + Round.segs_at, t + Round.rowseg_at, t + Round.rowanc_at, layer, t + Round.params_at, @as(f32, 1.0 / 16.0), e.pm, e.pl, e.po });
-    }
+    try e.run(f, .{ 64, e.g.kv_heads, shape.total }, .{ 32 * (e.g.q_heads / e.g.kv_heads), 1, 1 }, .{ e.geo, e.qn, t + Round.segs_at, t + Round.rowseg_at, t + Round.rowanc_at, layer, t + Round.params_at, @as(f32, 1.0 / 16.0), e.pm, e.pl, e.po });
 }
 
 test "Qwen attention path: unpaged, paged and mixed segment tables" {

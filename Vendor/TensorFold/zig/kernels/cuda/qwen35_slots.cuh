@@ -113,10 +113,10 @@ __device__ __forceinline__ void q35_slots(Geo geo, const __nv_bfloat16* q, const
                 state[r][1] = t.y;
                 state[r][2] = t.z;
                 state[r][3] = t.w;
-            } else if (step.read_slot == -1) {
+            } else if (step.read_slot < 0) {
 #pragma unroll
                 for (int i = 0; i < PT; ++i) state[r][i] = root[r][i];
-            }  // -2 (tree_slots.in_registers, carried plans): the step before was the parent's, its state is in the registers
+            }
         }
         const __nv_bfloat16* kb = reinterpret_cast<const __nv_bfloat16*>(&in.k);
         const __nv_bfloat16* qb = reinterpret_cast<const __nv_bfloat16*>(&in.q);

@@ -78,8 +78,7 @@ pub fn stageBytes(s: Shape) usize {
 pub fn total(s: Shape) usize {
     var t = packedBytes(s.hidden, s.taps * s.hidden) + packedBytes(s.rank, s.hidden) + 2 * aligned(s.hidden * 2);
     t += s.layers * (2 * aligned(s.hidden * 2) + packedBytes(s.q_width, s.hidden) + 2 * packedBytes(s.kv_width, s.hidden) + packedBytes(s.hidden, s.q_width) +
-        2 * aligned(s.head_dim * 2) + 2 * packedBytes(s.intermediate, s.hidden) + packedBytes(s.hidden, s.intermediate) + 2 * packedBytes(s.dynamic, s.hidden) + 2 * aligned(4 * s.hidden * 2) +
-        2 * aligned(Affine4.layout(s.intermediate, s.hidden).words) + aligned(Affine4.layout(s.hidden, s.intermediate).words));
+        2 * aligned(s.head_dim * 2) + 2 * packedBytes(s.intermediate, s.hidden) + packedBytes(s.hidden, s.intermediate) + 2 * packedBytes(s.dynamic, s.hidden) + 2 * aligned(4 * s.hidden * 2));
     return t;
 }
 
@@ -94,7 +93,7 @@ fn toBf16(x: f32) u16 {
     return @intCast((u +% rounding) >> 16);
 }
 
-/// MLX affine-4, group 64: minimize weight error with a bf16 scale and bias; pack low nibbles first.
+/// MLX affine-4, group 64: scale bf16((max - min) / 15), bias bf16(min), nibbles round((w - bias) / scale), low first.
 fn quantize(gpa: std.mem.Allocator, w: []align(1) const u16, n: usize, k: usize) !struct { words: []u32, scales: []u16, biases: []u16 } {
     const groups = k / 64;
     const words = try gpa.alloc(u32, n * k / 8);
@@ -113,10 +112,8 @@ fn quantize(gpa: std.mem.Allocator, w: []align(1) const u16, n: usize, k: usize)
                 lo = @min(lo, x);
                 hi = @max(hi, x);
             }
-            var fit = [2]f32{ (hi - lo) / 15.0, lo };
-            fit = leastSquares(row, fit);
-            const scale = toBf16(fit[0]);
-            const bias = toBf16(fit[1]);
+            const scale = toBf16((hi - lo) / 15.0);
+            const bias = toBf16(lo);
             scales[r * groups + g] = scale;
             biases[r * groups + g] = bias;
             const s = bf16(scale);
@@ -133,57 +130,6 @@ fn quantize(gpa: std.mem.Allocator, w: []align(1) const u16, n: usize, k: usize)
         }
     }
     return .{ .words = words, .scales = scales, .biases = biases };
-}
-
-/// A group's (scale, bias) improved by alternating code assignment and a least-squares line fit; kept only where the
-/// squared error with bf16-rounded scale and bias drops.
-fn leastSquares(row: []align(1) const u16, start: [2]f32) [2]f32 {
-    var best = start;
-    var best_err = groupError(row, start);
-    var cur = start;
-    for (0..3) |_| {
-        const s = cur[0];
-        if (s <= 0) break;
-        var sq: f64 = 0;
-        var sqq: f64 = 0;
-        var sw: f64 = 0;
-        var sqw: f64 = 0;
-        for (row) |h| {
-            const x: f64 = bf16(h);
-            const q: f64 = std.math.clamp(@round((x - cur[1]) / s), 0.0, 15.0);
-            sq += q;
-            sqq += q * q;
-            sw += x;
-            sqw += q * x;
-        }
-        const det = 64 * sqq - sq * sq;
-        if (det <= 0) break;
-        const ns = (64 * sqw - sq * sw) / det;
-        const nb = (sw - ns * sq) / 64;
-        if (!(ns > 0)) break;
-        cur = .{ @floatCast(ns), @floatCast(nb) };
-        const err = groupError(row, cur);
-        if (err < best_err) {
-            best_err = err;
-            best = cur;
-        }
-    }
-    return best;
-}
-
-/// The group's squared error under bf16-rounded scale and bias, as quantize then stores and the kernels read it.
-fn groupError(row: []align(1) const u16, fit: [2]f32) f64 {
-    const s = bf16(toBf16(fit[0]));
-    const b = bf16(toBf16(fit[1]));
-    const inv = if (s == 0) 0.0 else 1.0 / s;
-    var err: f64 = 0;
-    for (row) |h| {
-        const x = bf16(h);
-        const q = std.math.clamp(@round((x - b) * inv), 0.0, 15.0);
-        const d: f64 = x - (q * s + b);
-        err += d * d;
-    }
-    return err;
 }
 
 /// A bf16 (n, k) tensor quantized and packed through `stage` into the drafter's arena.
@@ -205,25 +151,8 @@ fn linear(gpa: std.mem.Allocator, e: *Engine, stage: *DeviceBuffer, w: *Weights,
         at += p.len;
     }
     const l = Affine4.layout(n, k);
-    var out: Affine4 = .{ .w = try w.alloc(l.words), .s = try w.alloc(l.scales), .b = try w.alloc(l.scales), .n = n, .k = k, .npad = l.npad };
+    const out: Affine4 = .{ .w = try w.alloc(l.words), .s = try w.alloc(l.scales), .b = try w.alloc(l.scales), .n = n, .k = k, .npad = l.npad };
     try e.affine.pack(e.stream, raw[0], raw[1], raw[2], out);
-    if (e.mlp_pair.kmajor_fn != null and n == 17408 and k == 5120) {
-        out.verify_w = try w.alloc(l.words);
-        const pack = try e.mods[3].function("tf_pack_kmajor");
-        const words = l.npad * k / 8;
-        try e.run(pack, .{ (words + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ out.w, out.verify_w, @as(c_int, @intCast(k / 64)), @as(c_int, @intCast(l.npad / 64)) });
-    } else if (e.affine.stream16_fns[0] != null and n == 5120 and k == 17408) {
-        out.stream_w = try w.alloc(l.words);
-        const pack = try e.mods[3].function("tf_pack_kmajor");
-        const words = l.npad * k / 8;
-        try e.run(pack, .{ (words + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ out.w, out.stream_w, @as(c_int, @intCast(k / 64)), @as(c_int, @intCast(l.npad / 64)) });
-    }
-    // the drafter's scales and biases dictionary-coded as the target's (TF_DRAFT_DICT=0 keeps them uncoded); its
-    // biases are each group's minimum, so the joint pairs outnumber a pair table and the separate coding serves
-    if (e.dict) |*ds| if (!std.mem.eql(u8, std.mem.span(@import("sys").c.getenv("TF_DRAFT_DICT") orelse ""), "0")) {
-        const kmajor = e.dict_kmajor and n == 17408 and k == 5120;
-        try e.affine.encode(e.stream, &out, ds, kmajor, cuda.qlinear.pairTabRoom(n, k, kmajor));
-    };
     try e.stream.synchronize();
     return out;
 }
@@ -245,8 +174,6 @@ fn hostBf16(gpa: std.mem.Allocator, ck: *core.Checkpoint, name: []const u8, shap
 pub fn load(gpa: std.mem.Allocator, io: std.Io, e: *Engine, dir: []const u8, s: Shape) !Weights {
     var ck = try core.Checkpoint.openModel(gpa, io, dir);
     defer ck.close();
-    var sponge = @import("cuda_sponge.zig").take(e.d, total(s));
-    defer sponge.free();
     var w: Weights = .{ .fc = undefined, .hidden_norm = 0, .final_norm = 0, .selector = undefined, .predecessor = &.{}, .successor = &.{}, .layers = &.{}, .arena = try DeviceBuffer.alloc(e.d, total(s)) };
     errdefer w.arena.free();
     try w.arena.fill8(0, null);
@@ -306,17 +233,4 @@ test "bf16 rounding of a quantized group's scale and bias" {
     try std.testing.expectEqual(@as(u16, 0), q.scales[0]);
     try std.testing.expectEqual(@as(u16, 0x3f80), q.biases[0]);
     try std.testing.expectEqual(@as(u32, 0), q.words[0]);
-}
-
-
-test "drafter refit preserves flat groups and improves a linear weight ramp" {
-    const flat: [64]u16 = @splat(0x3f80);
-    const unchanged = leastSquares(&flat, .{ 0, 1 });
-    try std.testing.expectEqual(@as(f32, 0), unchanged[0]);
-    try std.testing.expectEqual(@as(f32, 1), unchanged[1]);
-    var row: [64]u16 = undefined;
-    for (&row, 0..) |*h, i| h.* = toBf16(@as(f32, @floatFromInt(i)) / 63.0 - 0.5);
-    const initial = [2]f32{ 1.0 / 15.0, -0.5 };
-    const fitted = leastSquares(&row, initial);
-    try std.testing.expect(groupError(&row, fitted) < groupError(&row, initial));
 }

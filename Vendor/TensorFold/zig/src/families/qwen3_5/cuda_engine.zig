@@ -32,8 +32,6 @@ pub const max_rows = Round.max_rows;
 pub const max_segs = Round.max_segs;
 /// Rows of a verify forward at most: each row's logits are kept and drawn.
 pub const most_verify = Round.most_verify;
-/// L2 set aside for a prompt chunk's residual rows (a 496-row chunk's are 5 MB; GB10 allows 18 MB).
-const l2_persist_bytes: usize = 8 << 20;
 /// tf_q35_argmax_slices' blocks a row (ARGMAX_SLICE entries each).
 fn argmaxSlices(vocab: usize) usize {
     return (vocab + 4095) / 4096;
@@ -114,10 +112,6 @@ pub const Engine = struct {
     dict_kmajor: bool, // gate and up coded group-major, for tf_qmm_mlp_single16 on the K-major panels (TF_MLP_KMAJOR=2)
     prompt_many: cuda.prompt_many.Kernels, // prompt GEMMs, several projections of one input a launch
     mlp_pair: cuda.mlp_pair.Kernels, // decode gate, up and activation in one launch (qmm_group.cu tf_qmm_mlp_pair)
-    /// L2 set aside for persisting lines (0: none) and, during a prompt chunk's forward, the residual rows' window:
-    /// each norm writes the rows it reads a sublayer later, past a projection's weights streaming through L2.
-    l2_persist: usize = 0,
-    h_window: ?cuda.abi.AccessPolicyWindow = null,
     wide_words: ?DeviceBuffer = null,
     projection_streams: ?DeviceBuffer = null,
     wide: cuda.qlinear.AffineNKernels, // the tiles of every width but 4, and their packs
@@ -177,17 +171,12 @@ pub const Engine = struct {
     picks: u64, // drawRows' slice scratch: most_verify rows of cuda.sample.Draws.row_scratch
     // per-forward tables (ids, segments, rows' segment, parent and ancestors, the draws' rules) staged in pinned memory
     tables: DeviceBuffer,
-    staged: cuda.HostBuffer,
+    staged: cuda.copy_source.Buffer,
     host_logits: cuda.HostBuffer,
     /// The kept rows' device draws, when forward was given them.
     tokens: [most_verify]u32 = undefined,
     /// The captured forwards by shape (`Shape.key`): the launches from the embedding to the head.
     graphs: std.AutoHashMapUnmanaged(u32, cuda.graph.Exec) = .empty,
-    /// A captured forward's first layer as a graph of its own (keyed as `graphs`): launched first, it starts the GPU
-    /// while the host still launches the larger rest, whose launch would otherwise leave the GPU idle until it returns.
-    heads: std.AutoHashMapUnmanaged(u32, cuda.graph.Exec) = .empty,
-    cut_armed: bool = false,
-    cut_head: ?cuda.graph.Exec = null,
     /// A drafter's tapped layers (`setTaps`): each row's residual after them lands in its stream's tap ring.
     taps: [8]u32 = undefined,
     n_taps: usize = 0,
@@ -238,9 +227,6 @@ pub const Engine = struct {
         e.window_rows = most_window;
         e.arena_at = 0;
         e.graphs = .empty;
-        e.heads = .empty;
-        e.cut_armed = false;
-        e.cut_head = null;
         e.rec_scratch = recurrent.Pool.init(gpa, @intFromPtr(e));
         e.n_taps = 0;
         e.features = 0;
@@ -274,9 +260,6 @@ pub const Engine = struct {
         e.affine.half_prompt = !gb10; // the 27B's prompt tile (Tile<64, 128, 128, 2, 2, 2>), quicker on an RTX 5090
         // GB10: split-K decode/verify projections on the cluster tile (bits unchanged); TF_CLUSTER_DECODE=0 restores lane_gemv
         e.affine.cluster_decode = gb10 and !envOff("TF_CLUSTER_DECODE");
-        // prompt chunks keep the residual rows in L2 across their projections (cache residency only, never a value)
-        e.l2_persist = 0;
-        if (gb10 and !envOff("TF_L2_PERSIST") and d.api.cuCtxSetLimit(cuda.abi.limit_persisting_l2, l2_persist_bytes) == cuda.abi.success) e.l2_persist = l2_persist_bytes;
         e.affine.group_wide = gb10 and !envOff("TF_WIDE_GROUP");
         // GB10: out/o (short K slices) on lane_gemv's column CTAs instead (bits unchanged); TF_SHORT_LANE=0 restores the cluster tile
         e.affine.short_lane = gb10 and !envOff("TF_SHORT_LANE");
@@ -290,15 +273,6 @@ pub const Engine = struct {
             e.mlp_pair.dict_fn = null;
         }
         if (e.affine.dict != null) e.dict = try cuda.qlinear.DictStore.init(d);
-        // the joint (scale, bias) pair dictionary, installed wherever it is smaller; TF_DICT_PAIR=0 keeps the separate
-        // coding, =check encodes and checks the pairs but keeps the separate coding
-        if (e.dict) |*ds| {
-            ds.pair = .on;
-            if (@import("sys").c.getenv("TF_DICT_PAIR")) |v| {
-                const mode = std.mem.span(v);
-                if (std.mem.eql(u8, mode, "0")) ds.pair = .off else if (std.mem.eql(u8, mode, "check")) ds.pair = .check;
-            }
-        }
         // the same choice as verify_weight_layout.prepare's below: tf_qmm_mlp_single16 unless TF_MLP_KMAJOR says otherwise
         e.dict_kmajor = gb10 and std.mem.eql(u8, std.mem.span(@import("sys").c.getenv("TF_MLP_KMAJOR") orelse "2"), "2");
         errdefer if (e.dict) |*ds| ds.deinit();
@@ -332,7 +306,6 @@ pub const Engine = struct {
             defer stage.free();
             try weights.load(e, &ck, &stage);
         }
-        if (e.dict) |ds| if (ds.pair != .off) std.debug.print("info: pair dictionary ({s}): {d} projections encoded, {d} declined, {d} mismatching cells; index streams {d} B (separate coding {d} B); largest table {d} entries; projections by index bits {any}\n", .{ @tagName(ds.pair), ds.pair_coded, ds.pair_declined, ds.pair_bad, ds.pair_bytes, ds.pair_separate_bytes, ds.pair_np_max, ds.pair_pbits });
         if (gb10 and g.hidden == 5120 and g.layers == 64 and g.experts == 0 and
             @import("sys").c.getenv("TF_WIDE_KMAJOR") != null and !envOff("TF_WIDE_KMAJOR"))
             e.wide_words = try wide_weight_layout.prepare(e);
@@ -381,9 +354,6 @@ pub const Engine = struct {
         var it = e.graphs.valueIterator();
         while (it.next()) |x| x.deinit();
         e.graphs.deinit(e.gpa);
-        var hit = e.heads.valueIterator();
-        while (hit.next()) |x| x.deinit();
-        e.heads.deinit(e.gpa);
         e.host_logits.free();
         e.staged.free();
         e.tables.free();
@@ -470,15 +440,6 @@ pub const Engine = struct {
         return total;
     }
 
-    /// While a forward is captured: the work so far becomes the head graph and the capture goes on for the rest.
-    pub fn cutCapture(e: *Engine) !void {
-        if (!e.cut_armed or e.cut_head != null) return;
-        var head = try cuda.graph.endCapture(e.stream);
-        defer head.deinit();
-        e.cut_head = try head.instantiate();
-        try cuda.graph.beginCapture(e.stream, .thread_local);
-    }
-
     pub fn run(e: *Engine, f: cuda.Function, grid: [3]usize, block: [3]usize, args: anytype) !void {
         var a: cuda.Args = .{};
         inline for (args) |v| a.add(v);
@@ -524,14 +485,6 @@ pub const Engine = struct {
 
     pub const norm = @import("cuda_norm.zig").norm;
     pub const normInput = @import("cuda_norm.zig").normInput;
-
-    /// The residual rows of a prompt chunk of `rows` as a persisting L2 window (null: none set aside, or a window).
-    pub fn hWindow(e: *const Engine, rows: usize) ?cuda.abi.AccessPolicyWindow {
-        if (e.l2_persist == 0 or rows <= 16) return null;
-        const bytes = rows * e.g.hidden * 2;
-        const ratio: f32 = @min(1.0, @as(f32, @floatFromInt(e.l2_persist)) / @as(f32, @floatFromInt(bytes)));
-        return .{ .base = e.h, .bytes = bytes, .hit_ratio = ratio, .hit_prop = cuda.abi.access_persisting, .miss_prop = cuda.abi.access_streaming };
-    }
     pub const normTail = @import("cuda_norm.zig").normTail;
 
     /// Refuse the whole frame before settling any prior window or launching work.
@@ -567,15 +520,12 @@ pub const Engine = struct {
         const heads: usize = if (record) total else 1;
         // the prompt GEMM only for prompt chunks: a window's rows keep the bits of one-row steps
         const prompt = !record;
-        // the tables
+        try e.staged.wait();
         const st = e.staged.bytes;
         @memcpy(std.mem.bytesAsSlice(u32, st[ids_at..][0 .. total * 4]), ids);
         @memset(st[ids_at + total * 4 .. ids_at + max_rows * 4], 0); // a bucket's padding rows read token 0
         const segs = std.mem.bytesAsSlice(Seg, st[segs_at..][0 .. parts.len * @sizeOf(Seg)]);
-        // past 1 row a window's scan carries each parent's state in the registers to its first child
-        // (tree_slots.carried: one slot fewer, -2 steps); TF_CARRIED=0 restores build's plans
-        const carry = record and total > 1 and !envOff("TF_CARRIED");
-        const slot_peak = try Round.buildCarried(st, parts, record, carry);
+        const slot_peak = try Round.build(st, parts, record);
         for (parts) |p| {
             try p.cache.settle(e);
             // a pending kept prefix rides in this forward's slot scan only when its log half survives `prepare`
@@ -612,14 +562,9 @@ pub const Engine = struct {
             @memcpy(std.mem.bytesAsSlice(i32, st[src_at..][0 .. total * 4]), im.src[p0..][0..total]);
             Round.stageImageTables(st, im, p0, total);
         }
-        try e.tables.uploadAsync(0, st[0..if (images != null) tables_len else src_at], e.stream.handle); // text: as before
-        // carried plans of 2..32 rows (at most 3 slots) scan four value rows a warp on qwen35_slots_lean.cuh (slots_3's
-        // arithmetic, its addressing hoisted; 2 slots where they suffice); TF_SLOTS_LEAN=0 keeps prior dispatch
-        const lean = record and total > 1 and total <= 32 and e.affine.pdl and !envOff("TF_SLOTS_LEAN");
-        const wide = total > 16 and total <= 32 and e.affine.pdl and !envOff("TF_WIDE_SLOTS");
-        const slot_variant: usize = if (lean and carry and slot_peak <= 3)
-            (if (slot_peak <= 2) 37 else 38)
-        else if (wide and slot_peak == 3) 3 else Round.narrowVariant(total, slot_peak, record and e.affine.pdl and !envOff("TF_GDN16"));
+        try e.staged.copyTo(e.tables, 0, st[0..if (images != null) tables_len else src_at], e.stream);
+        const slot_variant = if (total > 16 and total <= 32 and slot_peak == 3 and e.affine.pdl and !envOff("TF_WIDE_SLOTS")) 3 else
+            Round.narrowVariant(total, slot_peak, record and e.affine.pdl and !envOff("TF_GDN16"));
         var shape = Shape.init(total, parts.len, record, e.n_taps > 0, @intCast(slot_variant));
         if (record and @import("cuda_round_timing.zig").Trace.enabled())
             std.debug.print("[timing] verify_slots peak={d} variant={d}\n", .{ slot_peak, shape.slots });
@@ -644,20 +589,12 @@ pub const Engine = struct {
             // uncaptured: a prompt chunk's GEMMs dwarf its launches, and each length's graph would pay the stall
             e.features = if (images) |im| im.features else 0;
             defer e.features = 0;
-            e.h_window = e.hWindow(total);
-            defer e.h_window = null;
             try e.body(shape);
         } else {
             const gop = try e.graphs.getOrPut(e.gpa, shape.key());
             if (!gop.found_existing) {
                 errdefer _ = e.graphs.remove(shape.key());
                 // captured, nothing runs: the replay below is this shape's first run
-                e.cut_armed = true;
-                defer {
-                    e.cut_armed = false;
-                    if (e.cut_head) |*h| h.deinit();
-                    e.cut_head = null;
-                }
                 try cuda.graph.beginCapture(e.stream, .thread_local);
                 e.body(shape) catch |err| {
                     var broken = cuda.graph.endCapture(e.stream) catch return err;
@@ -667,15 +604,7 @@ pub const Engine = struct {
                 var captured = try cuda.graph.endCapture(e.stream);
                 defer captured.deinit();
                 gop.value_ptr.* = try captured.instantiate();
-                if (e.cut_head) |h| {
-                    e.heads.put(e.gpa, shape.key(), h) catch |err| {
-                        gop.value_ptr.deinit();
-                        return err;
-                    };
-                    e.cut_head = null;
-                }
             }
-            if (e.heads.get(shape.key())) |h| try h.launchOn(e.stream);
             try gop.value_ptr.launchOn(e.stream);
         }
         for (parts) |p| p.cache.advanced(p.rows, record);
@@ -701,8 +630,6 @@ pub const Engine = struct {
                 const out = e.host_logits.bytes[0 .. heads * g.vocab * 2];
                 try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(out.ptr, e.logits, out.len, e.stream.handle), "cuMemcpyDtoHAsync");
                 try e.stream.synchronize();
-                // the chunk is done: its persisting lines turn normal, so decode has all of L2
-                if (prompt and e.l2_persist > 0) _ = e.d.api.cuCtxResetPersistingL2Cache();
                 if (keep == .last) @memcpy(parts[0].cache.logits, e.rowLogits(0));
             },
         }
@@ -721,13 +648,11 @@ pub const Engine = struct {
             8 => e.fns.gdn_slots_8,
             16 => e.fns.gdn_slots_16,
             35 => e.fns.gdn_slots16_3,
-            37 => e.fns.gdn_lean_2,
-            38 => e.fns.gdn_lean_3,
             else => return error.InvalidGdnSlots,
         };
         const input = e.tables.ptr + @as(usize, if (record) Round.steps_at else rowpar_at);
         // qwen35_slots.cuh: up to four slots scan two value rows a warp, so a block covers eight
-        const rows_a_warp: usize = if (record and (slot_count == 3 or slot_count == 35 or slot_count == 37 or slot_count == 38)) 4 else if (record and slot_count <= 4) 2 else 1;
+        const rows_a_warp: usize = if (record and (slot_count == 3 or slot_count == 35)) 4 else if (record and slot_count <= 4) 2 else 1;
         try e.runAfter(scan, .{ 1, geometry.dk / (4 * rows_a_warp), e.g.v_heads * segments }, .{ 32, 4, 1 }, .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, input, layer, e.y, e.tables.ptr + params_at });
     }
 
@@ -745,7 +670,7 @@ pub const Engine = struct {
 test "dense read cost: hidden and slot variants have distinct graph keys" {
     var seen: [32]u32 = undefined;
     var n: usize = 0;
-    for ([_]u8{ 1, 2, 3, 4, 8, 16, 35, 37, 38 }) |slots| {
+    for ([_]u8{ 1, 2, 3, 4, 8, 16, 35 }) |slots| {
         for ([_]bool{ false, true }) |hidden| {
             const shape: Engine.Shape = .{ .total = 1, .nseg = 1, .record = true, .prompt = false, .taps = true, .slots = slots, .hidden = hidden };
             for (seen[0..n]) |key| try std.testing.expect(key != shape.key());

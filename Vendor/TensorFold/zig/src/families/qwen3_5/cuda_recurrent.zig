@@ -42,9 +42,6 @@ fn ensure(e: *Engine, c: *Cache, before: bool, bytes: usize, reuse_pending: bool
     if (lease.*) |l| {
         const b = try pool.view(@intFromPtr(e), l);
         if (b.len == bytes) return;
-        // a log lease never shrinks under a narrower window: its halves still hold every row, and a pending kept
-        // prefix in one of them still folds into the next slot scan instead of a whole-recurrence apply
-        if (!before and bytes > 0 and bytes < b.len and keepsLog()) return;
         if (reuse_pending and !before and bytes < b.len and !try pool.reclaimable(@intFromPtr(e), l)) return;
         clear(c, before);
     }
@@ -72,13 +69,7 @@ pub fn logStays(e: *const Engine, c: *const Cache, rows: usize) bool {
     const n = common.rowClass(rows, @import("cuda_engine.zig").most_window) catch return false;
     const l = c.log_lease orelse return false;
     const b = pool.view(@intFromPtr(e), l) catch return false;
-    return (if (keepsLog()) b.len >= 2 * e.g.logBytes(n) else b.len == 2 * e.g.logBytes(n)) and b.ptr == c.log.ptr;
-}
-
-/// TF_LOGLEASE=0: a narrower window shrinks the log lease again (its pending prefix applied before the window).
-fn keepsLog() bool {
-    const v = @import("sys").c.getenv("TF_LOGLEASE") orelse return true;
-    return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
+    return b.len == 2 * e.g.logBytes(n) and b.ptr == c.log.ptr;
 }
 
 pub fn mark(c: *Cache, before: bool) !void {

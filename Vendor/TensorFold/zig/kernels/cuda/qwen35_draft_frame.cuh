@@ -3,15 +3,9 @@
 struct DraftSegment { unsigned long long ring; long long begin, position; };
 constexpr int DRAFT_CHUNKS = 9;
 
-extern "C" __global__ void tf_q35d_dyn_conv_batch(const __nv_bfloat16* __restrict__ X0, const __nv_bfloat16* __restrict__ DYN0,
-                                              const __nv_bfloat16* __restrict__ BASE, const __nv_bfloat16* __restrict__ RES0,
-                                              __nv_bfloat16* __restrict__ OUT0, int D, int group, int branch, int block_rows) {
-    release_next();
-    await_prior();
-    const __nv_bfloat16* X = after_wait(X0);
-    const __nv_bfloat16* DYN = after_wait(DYN0);
-    const __nv_bfloat16* RES = after_wait(RES0);
-    __nv_bfloat16* OUT = after_wait(OUT0);
+extern "C" __global__ void tf_q35d_dyn_conv_batch(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ DYN,
+                                              const __nv_bfloat16* __restrict__ BASE, const __nv_bfloat16* __restrict__ RES,
+                                              __nv_bfloat16* __restrict__ OUT, int D, int group, int branch, int block_rows) {
     const int t = blockIdx.x;
     const int groups = D / group;
     // grid (rows, channel blocks): a thread a channel, so a 16-row window fills the device instead of 16 blocks
@@ -30,13 +24,9 @@ extern "C" __global__ void tf_q35d_dyn_conv_batch(const __nv_bfloat16* __restric
     }
 }
 
-extern "C" __global__ void __launch_bounds__(32) tf_q35d_norm_rope_batch(const __nv_bfloat16* __restrict__ X0, const __nv_bfloat16* __restrict__ W,
-                                                                     __nv_bfloat16* __restrict__ OUT0, int heads, int stride, const DraftSegment* segments, int block_rows,
+extern "C" __global__ void __launch_bounds__(32) tf_q35d_norm_rope_batch(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W,
+                                                                     __nv_bfloat16* __restrict__ OUT, int heads, int stride, const DraftSegment* segments, int block_rows,
                                                                      float eps, float theta) {
-    release_next();
-    await_prior();
-    const __nv_bfloat16* X = after_wait(X0);
-    __nv_bfloat16* OUT = after_wait(OUT0);
     const int head = blockIdx.x % heads;
     const size_t m = blockIdx.x / heads;
     const int t = threadIdx.x;
@@ -67,74 +57,16 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35d_norm_rope_batch(const _
     }
 }
 
-extern "C" __global__ void __launch_bounds__(32) tf_q35d_norm_rope_qk_batch(const __nv_bfloat16* __restrict__ XQ0,
-        const __nv_bfloat16* __restrict__ WQ, __nv_bfloat16* __restrict__ OUTQ0, int q_heads,
-        const __nv_bfloat16* __restrict__ XK0, const __nv_bfloat16* __restrict__ WK, __nv_bfloat16* __restrict__ OUTK0,
-        int kv_heads, int rows, const DraftSegment* segments, int block_rows, float eps, float theta) {
-    release_next();
-    await_prior();
-    const __nv_bfloat16* XQ = after_wait(XQ0);
-    __nv_bfloat16* OUTQ = after_wait(OUTQ0);
-    const __nv_bfloat16* XK = after_wait(XK0);
-    __nv_bfloat16* OUTK = after_wait(OUTK0);
-    const int qb = rows * q_heads;
-    const bool isq = blockIdx.x < qb;
-    const int bx = isq ? blockIdx.x : blockIdx.x - qb;
-    const int heads = isq ? q_heads : kv_heads;
-    const __nv_bfloat16* X = isq ? XQ : XK;
-    const __nv_bfloat16* W = isq ? WQ : WK;
-    __nv_bfloat16* OUT = isq ? OUTQ : OUTK;
-    const int head = bx % heads;
-    const size_t m = bx / heads;
-    const int t = threadIdx.x;
-    const __nv_bfloat16* x = X + m * ((size_t)heads * HD) + head * HD;
-    float v[4], acc = 0.0f;
-#pragma unroll
-    for (int i = 0; i < 4; i++) {
-        v[i] = bf(x[4 * t + i]);
-        acc += v[i] * v[i];
-    }
-    acc = warp_sum(acc);
-    const float inv = rsqrtf(acc / (float)HD + eps);
-    float n[4];
-#pragma unroll
-    for (int i = 0; i < 4; i++) n[i] = rbf(rbf(v[i] * inv) * bf(W[4 * t + i]));
-    const float pos = (float)(segments[m / block_rows].position + (long long)(m % block_rows));
-    __nv_bfloat16* out = OUT + (m * heads + head) * HD;
-#pragma unroll
-    for (int i = 0; i < 4; i++) {
-        const int d = 4 * t + i;
-        const float partner = __shfl_xor_sync(0xffffffffu, n[i], 16);
-        const int j = d < HD / 2 ? d : d - HD / 2;
-        const float angle = pos * powf(theta, -(float)j / (float)(HD / 2));
-        float sn, cs;
-        sincosf(angle, &sn, &cs);
-        out[d] = __float2bfloat16_rn(d < HD / 2 ? n[i] * cs - partner * sn : n[i] * cs + partner * sn);
-    }
-}
-
 // Remove each stream's pending row before the output head and selector; rows stay grouped by stream.
-extern "C" __global__ void tf_q35d_mask_rows(const __nv_bfloat16* X0, __nv_bfloat16* OUT0, int D, int block_rows) {
-    release_next();
-    await_prior();
-    const __nv_bfloat16* X = after_wait(X0);
-    __nv_bfloat16* OUT = after_wait(OUT0);
+extern "C" __global__ void tf_q35d_mask_rows(const __nv_bfloat16* X, __nv_bfloat16* OUT, int D, int block_rows) {
     const int row = blockIdx.x, source = row / (block_rows - 1) * block_rows + 1 + row % (block_rows - 1);
     for (int c = threadIdx.x; c < D; c += blockDim.x) OUT[(size_t)row * D + c] = X[(size_t)source * D + c];
 }
 
 // 256 keys of one row, its stream's ring and block rows only: four warps' lanes score them, warp 0 merges the slices.
-extern "C" __global__ void __launch_bounds__(128) tf_q35d_attn_partial(const __nv_bfloat16* Q0,
-        const __nv_bfloat16* KB0, const __nv_bfloat16* VB0, const DraftSegment* segments,
-        int block_rows, int heads, int kv_heads, int W, int window, int layer, float* PM0, float* PL0, float* PO0) {
-    release_next();
-    await_prior();
-    const __nv_bfloat16* Q = after_wait(Q0);
-    const __nv_bfloat16* KB = after_wait(KB0);
-    const __nv_bfloat16* VB = after_wait(VB0);
-    float* PM = after_wait(PM0);
-    float* PL = after_wait(PL0);
-    float* PO = after_wait(PO0);
+extern "C" __global__ void __launch_bounds__(128) tf_q35d_attn_partial(const __nv_bfloat16* Q,
+        const __nv_bfloat16* KB, const __nv_bfloat16* VB, const DraftSegment* segments,
+        int block_rows, int heads, int kv_heads, int W, int window, int layer, float* PM, float* PL, float* PO) {
     constexpr int DPL = HD / 32, CHUNK = 256, WARPS = 4, SLICE = CHUNK / WARPS, PER = SLICE / 32, BATCH = 16;
     __shared__ float qs[HD];
     __shared__ float ps[CHUNK];
@@ -424,22 +356,14 @@ __device__ __forceinline__ void attn_partial_heads(const __nv_bfloat16* Q,
 }
 
 // attn_partial_heads of four rows a block: tf_q35d_attn_partial's bits for heads = 4 * kv_heads.
-extern "C" __global__ void __launch_bounds__(128) tf_q35d_attn_partial_rows4(const __nv_bfloat16* Q0,
-        const __nv_bfloat16* KB0, const __nv_bfloat16* VB0, const DraftSegment* segments,
-        int block_rows, int heads, int kv_heads, int W, int window, int layer, float* PM0, float* PL0, float* PO0) {
-    release_next();
-    await_prior();
-    attn_partial_heads<4>(after_wait(Q0), after_wait(KB0), after_wait(VB0), segments, block_rows, heads, kv_heads, W, window, layer, after_wait(PM0), after_wait(PL0), after_wait(PO0));
+extern "C" __global__ void __launch_bounds__(128) tf_q35d_attn_partial_rows4(const __nv_bfloat16* Q,
+        const __nv_bfloat16* KB, const __nv_bfloat16* VB, const DraftSegment* segments,
+        int block_rows, int heads, int kv_heads, int W, int window, int layer, float* PM, float* PL, float* PO) {
+    attn_partial_heads<4>(Q, KB, VB, segments, block_rows, heads, kv_heads, W, window, layer, PM, PL, PO);
 }
 
-extern "C" __global__ void __launch_bounds__(32) tf_q35d_attn_merge(const float* PM0, const float* PL0,
-        const float* PO0, int heads, __nv_bfloat16* OUT0) {
-    release_next();
-    await_prior();
-    const float* PM = after_wait(PM0);
-    const float* PL = after_wait(PL0);
-    const float* PO = after_wait(PO0);
-    __nv_bfloat16* OUT = after_wait(OUT0);
+extern "C" __global__ void __launch_bounds__(32) tf_q35d_attn_merge(const float* PM, const float* PL,
+        const float* PO, int heads, __nv_bfloat16* OUT) {
     constexpr int DPL = HD / 32;
     const int lane = threadIdx.x, m = blockIdx.x, h = blockIdx.y;
     const size_t base = ((size_t)m * heads + h) * DRAFT_CHUNKS;

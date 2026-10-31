@@ -50,7 +50,7 @@ const Engine = struct {
     g: struct { vocab: usize = 8 } = .{},
     verify_rows: usize = 2,
     tables: cuda.DeviceBuffer = undefined,
-    staged: cuda.HostBuffer = undefined,
+    staged: cuda.copy_source.Buffer = undefined,
     host_logits: cuda.HostBuffer = undefined,
     pub fn scratch(_: *@This(), _: enum { allocate }) !usize {
         return 0;

@@ -58,7 +58,6 @@ pub const FunctionAttribute = enum(c_int) {
 pub const func_cache_prefer_shared: c_int = 1;
 
 pub const LaunchAttributeId = enum(c_uint) {
-    access_policy_window = 1,
     cooperative = 2,
     cluster_dimension = 4,
     cluster_scheduling_policy_preference = 5,
@@ -90,20 +89,12 @@ pub const Memcpy2D = extern struct {
     height: usize,
 };
 
-/// CUaccessPolicyWindow: accesses to [base, base + bytes) take `hit_prop` with probability `hit_ratio`, else `miss_prop`.
-pub const AccessPolicyWindow = extern struct { base: DevicePtr, bytes: usize, hit_ratio: f32, hit_prop: c_int, miss_prop: c_int };
-pub const access_streaming: c_int = 1;
-pub const access_persisting: c_int = 2;
-/// CU_LIMIT_PERSISTING_L2_CACHE_SIZE: the L2 set aside for persisting lines (normal accesses use it while it is free).
-pub const limit_persisting_l2: c_int = 6;
-
 /// CUlaunchAttributeValue: a 64-byte union aligned for its pointer members.
 pub const LaunchAttributeValue = extern union {
     pad: [64]u8,
     align8: ?*anyopaque,
     int: c_int,
     cluster_dim: extern struct { x: c_uint, y: c_uint, z: c_uint },
-    access_policy_window: AccessPolicyWindow,
 };
 
 pub const LaunchAttribute = extern struct {
@@ -192,8 +183,6 @@ pub const Api = struct {
     cuCtxGetCurrent: *const fn (*Context) callconv(.c) R,
     cuCtxGetDevice: *const fn (*Device) callconv(.c) R,
     cuCtxSynchronize: *const fn () callconv(.c) R,
-    cuCtxSetLimit: *const fn (c_int, usize) callconv(.c) R,
-    cuCtxResetPersistingL2Cache: *const fn () callconv(.c) R,
     cuMemGetInfo_v2: *const fn (*usize, *usize) callconv(.c) R,
     cuMemAlloc_v2: *const fn (*DevicePtr, usize) callconv(.c) R,
     cuMemFree_v2: *const fn (DevicePtr) callconv(.c) R,

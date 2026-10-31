@@ -9,7 +9,7 @@ pub fn finish(e: anytype, io: std.Io, started: i96) !void {
     _ = try e.scratch(.allocate);
     e.tables = try DeviceBuffer.alloc(e.d, tables_len);
     errdefer e.tables.free();
-    e.staged = try cuda.HostBuffer.alloc(e.d, tables_len);
+    e.staged = try cuda.copy_source.Buffer.alloc(e.d, tables_len);
     errdefer e.staged.free();
     e.host_logits = try cuda.HostBuffer.alloc(e.d, e.verify_rows * e.g.vocab * 2);
     errdefer e.host_logits.free();

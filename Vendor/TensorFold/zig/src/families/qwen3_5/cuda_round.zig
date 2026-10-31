@@ -15,7 +15,7 @@ pub const rowseg_at = segs_at + max_segs * @sizeOf(Seg);
 pub const rowpar_at = rowseg_at + max_rows * 4;
 pub const rowanc_at = rowpar_at + max_rows * 4;
 pub const steps_at = rowanc_at + max_rows * @sizeOf(Ancestor);
-pub const rules_at = steps_at + max_rows * @sizeOf(slots.Step);
+pub const rules_at = steps_at + most_verify * @sizeOf(slots.Step);
 pub const meta_at = rules_at + most_verify * @sizeOf(Rule);
 pub const tokens_at = meta_at + most_verify * 4;
 pub const params_at = tokens_at + most_verify * 4;
@@ -51,14 +51,8 @@ pub fn ancestors(st: []u8) []Ancestor {
     return @alignCast(std.mem.bytesAsSlice(Ancestor, st[rowanc_at..][0 .. max_rows * @sizeOf(Ancestor)]));
 }
 pub fn steps(st: []u8) []slots.Step {
-    return @alignCast(std.mem.bytesAsSlice(slots.Step, st[steps_at..][0 .. max_rows * @sizeOf(slots.Step)]));
+    return @alignCast(std.mem.bytesAsSlice(slots.Step, st[steps_at..][0 .. most_verify * @sizeOf(slots.Step)]));
 }
-/// TF_SLOTS_CHECK=1: every carried plan checked by tree_slots.validateCarried before its upload (a gate run's check).
-fn checkPlans() bool {
-    const v = @import("sys").c.getenv("TF_SLOTS_CHECK") orelse return false;
-    return std.mem.eql(u8, std.mem.span(v), "1");
-}
-
 pub fn variant(peak: usize) usize {
     return if (peak <= 1) 1 else if (peak <= 2) 2 else if (peak <= 4) 4 else if (peak <= 8) 8 else 16;
 }
@@ -71,20 +65,8 @@ pub fn build(st: []u8, parts: []const @import("cuda_engine.zig").Part, record: b
     return buildWithScratch(st, parts, record, &scratch);
 }
 
-/// `build` with tree_slots.carried's plans for branching parts when `carry` (a step after its parent's reads the
-/// registers, read_slot -2): only for the slot scans that take -1 alone as the root (every gdn_slots kernel of
-/// qwen35_slots.cuh and qwen35_slots16.cuh). Chains keep build's straight steps.
-pub fn buildCarried(st: []u8, parts: []const @import("cuda_engine.zig").Part, record: bool, carry: bool) !usize {
-    var scratch: [max_rows * @sizeOf(usize)]u8 align(@alignOf(usize)) = undefined;
-    return plan(st, parts, record, &scratch, carry);
-}
-
 /// Branch scheduling uses scratch; straight chains only need their staged steps.
 pub fn buildWithScratch(st: []u8, parts: []const @import("cuda_engine.zig").Part, record: bool, scratch: []u8) !usize {
-    return plan(st, parts, record, scratch, false);
-}
-
-fn plan(st: []u8, parts: []const @import("cuda_engine.zig").Part, record: bool, scratch: []u8, carry: bool) !usize {
     if (st.len < bytes or @intFromPtr(st.ptr) % @alignOf(Ancestor) != 0 or parts.len == 0 or parts.len > max_segs) return error.InvalidQwenSegments;
     const rowseg = std.mem.bytesAsSlice(i32, st[rowseg_at..][0 .. max_rows * 4]);
     const rowpar = std.mem.bytesAsSlice(i32, st[rowpar_at..][0 .. max_rows * 4]);
@@ -93,8 +75,10 @@ fn plan(st: []u8, parts: []const @import("cuda_engine.zig").Part, record: bool, 
     var sizes = std.heap.FixedBufferAllocator.init(scratch);
     var first: usize = 0;
     var peak: usize = 1;
+    const limit: usize = if (record) most_verify else max_rows;
     for (parts, 0..) |p, segment| {
-        if (p.rows == 0 or p.rows > max_rows - first or (record and p.rows > most_window)) return error.InvalidQwenSegments;
+        if (p.rows == 0 or p.rows > limit - first or (record and p.rows > most_window))
+            return error.InvalidQwenSegments;
         if (p.parents) |ps| if (!record or ps.len != p.rows or ps[0] != -1) return error.InvalidQwenParents;
         var local: [max_rows]i32 = undefined;
         var chain = true;
@@ -110,18 +94,13 @@ fn plan(st: []u8, parts: []const @import("cuda_engine.zig").Part, record: bool, 
         }
         if (record) {
             if (chain) {
-                for (schedule[first..][0..p.rows], 0..) |*step, row| step.* = .{ .row = @intCast(first + row), .read_slot = if (row == 0) -1 else if (carry) slots.in_registers else 0, .write_slot = if (carry) -1 else 0 };
+                for (schedule[first..][0..p.rows], 0..) |*step, row| step.* = .{ .row = @intCast(first + row), .read_slot = if (row == 0) -1 else 0, .write_slot = 0 };
             } else {
                 sizes.reset();
-                peak = @max(peak, if (carry)
-                    try slots.carried(sizes.allocator(), local[0..p.rows], schedule[first..][0..p.rows], @intCast(first), slots.max_slots)
-                else
-                    try slots.build(sizes.allocator(), local[0..p.rows], schedule[first..][0..p.rows], @intCast(first), slots.max_slots));
-                if (carry and checkPlans()) try slots.validateCarried(local[0..p.rows], schedule[first..][0..p.rows], @intCast(first), slots.max_slots);
+                peak = @max(peak, try slots.build(sizes.allocator(), local[0..p.rows], schedule[first..][0..p.rows], @intCast(first), slots.max_slots));
             }
         }
         first += p.rows;
     }
-    if (record and first > most_verify) return error.InvalidQwenSegments;
     return peak;
 }

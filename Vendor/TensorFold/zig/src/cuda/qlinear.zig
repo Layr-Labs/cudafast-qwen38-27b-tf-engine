@@ -35,18 +35,8 @@ pub const Affine4 = struct {
     tab: u64 = 0,
     code: u32 = 0,
 
-    /// The table's shared-memory bytes (16-byte padded) when coded, as qmm_dict.cuh's dict_tab_bytes: ns + nb bf16
-    /// for a separate code; np u32 for a pair code up to dict_tab_max, else 0 (the twins read it through L2).
+    /// The table's bytes (16-byte padded) when coded.
     pub fn tabBytes(q: Affine4) u32 {
-        return q.tabBytesUpTo(dict_tab_max);
-    }
-
-    /// tabBytes for a twin whose pair-table room is `room` bytes (a separate table's bytes regardless).
-    pub fn tabBytesUpTo(q: Affine4, room: u32) u32 {
-        if (pairCode(q.code)) {
-            const b = ((q.code >> 5 & 0x1FFF) * 4 + 15) / 16 * 16;
-            return if (b <= room) b else 0;
-        }
         return ((q.code >> 5 & 0x1FFF) + (q.code >> 18 & 0x1FFF) + 7) / 8 * 16;
     }
 
@@ -275,13 +265,6 @@ pub const symbols = struct {
     pub const dict_rank = "tf_dict_rank";
     pub const dict_table = "tf_dict_table";
     pub const dict_pack = "tf_dict_pack";
-    // the joint (scale, bias) pair dictionary's encoder (affine4_pack.cu; /root/cf/pairdict/FORMAT.md)
-    pub const dict_pair_mark = "tf_dict_pair_mark";
-    pub const dict_pair_rank = "tf_dict_pair_rank";
-    pub const dict_pair_offsets = "tf_dict_pair_offsets";
-    pub const dict_pair_table = "tf_dict_pair_table";
-    pub const dict_pair_pack = "tf_dict_pair_pack";
-    pub const dict_pair_check = "tf_dict_pair_check";
 };
 
 /// qmm_group.cu's Part and Parts, passed by value: four projections at most, one used here.
@@ -323,30 +306,6 @@ pub const dict_bits_max: u32 = 12;
 /// A code's layout bit: its indices lie group-major ([k / 64][npad / 64][16 * bits]) for tf_qmm_mlp_single16's K-major
 /// panels, which only that kernel's twin reads; every other twin reads tile-major codes.
 pub const dict_kmajor: u32 = 1 << 31;
-/// Pair mode's code: pbits | np << 5 with nb (bits 18..30) zero; np at most this (a 13-bit field).
-pub const dict_pair_max: u32 = 8191;
-/// The lane twins' (lane_gemv.cu) and gdn_stream16 twin's (qmm_gdn_stream.cuh) shared pair-table room at two CTAs an SM.
-pub const lane_pair_tab_max: u32 = 14592;
-pub const out_pair_tab_max: u32 = 14336;
-pub const gdn_pair_tab_max: u32 = 26496;
-/// group_kernel_dict's (qmm_group.cu GROUP_PAIR_SMEM, GROUP_PAIR_SMEM_ONE): two CTAs an SM in a cluster launch; any
-/// table in a launch of single CTAs (one CTA an SM there beats reading a large table through L2).
-pub const group_pair_tab_max: u32 = 14592;
-pub const group_pair_tab_one: u32 = 32768;
-/// The largest pair table each decode twin of an (n, k) projection keeps in shared memory or reads through L2 at no
-/// loss: the group (cluster) and lane twins read a larger one through L2 slower than the separate coding.
-/// tf_qmm_mlp_single16 (K-major gate and up) and tf_qmm_output_stream16 (down, out, o) read any through L2; the gdn_stream16
-/// twin (the GDN input projections) keeps its room; the vocabulary projection is a launch of single CTAs.
-pub fn pairTabRoom(n: usize, k: usize, kmajor: bool) u32 {
-    if (kmajor or k == 17408 or (k == 6144 and n == 5120)) return 32768;
-    if (n >= 65536) return group_pair_tab_one;
-    if (k == 5120 and (n == 10240 or n == 6144 or n == 48)) return gdn_pair_tab_max;
-    return @min(group_pair_tab_max, lane_pair_tab_max);
-}
-/// A pair code (FORMAT.md): coded, nb = 0.
-pub fn pairCode(code: u32) bool {
-    return code != 0 and (code >> 18 & 0x1FFF) == 0;
-}
 
 /// Split-K lane_gemv's fp32 slice partials and per-tile tickets: splitK keeps tiles * sk under 384 and tiles under 192.
 pub const Split = struct {

@@ -35,21 +35,6 @@ __device__ __forceinline__ uint32_t pairm(uint32_t w, int s, uint32_t mask) {
 template <int GS, int BN, int STAGES>
 using GemvTile = LaneTile<GS, 16, BN, 1, 4, STAGES>;
 
-// The lane twins keep a pair table of up to LANE_PAIR_SMEM bytes in shared memory (their two-CTAs-an-SM room past the
-// stages and dec[], qlinear.zig lane_pair_tab_max), more than qmm_dict.cuh's DICT_PAIR_SMEM; a larger one is read through L2.
-constexpr int LANE_PAIR_SMEM = 14592;
-
-__device__ __forceinline__ int lane_pair_bytes(int code) { return (dict_np(code) * 4 + 15) / 16 * 16; }
-
-// dict_table, with the lane twins' pair room
-template <int THREADS, typename PartT>
-__device__ __forceinline__ void lane_table(const PartT& P, unsigned char* tab, int tid) {
-    if (!dict_pair(P.npad) || lane_pair_bytes(P.npad) > LANE_PAIR_SMEM) return dict_table<THREADS>(P, tab, tid);
-    const int chunks = lane_pair_bytes(P.npad) / 16;
-    const unsigned char* src = reinterpret_cast<const unsigned char*>(P.biases);
-    for (int c = tid; c < chunks; c += THREADS) cp16(tab + c * 16, src + c * 16);
-}
-
 // Visit mapped groups in order, preserving group_kernel's MMA and fma chain before after(i).
 template <int GS, int BN, int STAGES, bool DICT = false, typename Map, typename After>
 __device__ __forceinline__ void gemv_items(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs, const Part& P, int M,
@@ -93,13 +78,8 @@ __device__ __forceinline__ void gemv_items(const __nv_bfloat16* __restrict__ x, 
         sdst[j] = T::X + T::W + which * T::S + off * 16;
     }
     [[maybe_unused]] const DictLanes D = [&] {
-        if constexpr (DICT) {
-            DictLanes d = dict_lanes<BN, 4>(P, 0, KG, tid);
-            if (d.pair) d.gtab = lane_pair_bytes(P.npad) > LANE_PAIR_SMEM ? reinterpret_cast<const uint32_t*>(P.biases) : nullptr;
-            return d;
-        } else {
-            return DictLanes{};
-        }
+        if constexpr (DICT) return dict_lanes<BN, 4>(P, 0, KG, tid);
+        else return DictLanes{};
     }();
     const bool xsok = tid < rows;
     const float* xssrc = xs + static_cast<size_t>(min(tid, rows - 1)) * KG;
@@ -136,21 +116,19 @@ __device__ __forceinline__ void gemv_items(const __nv_bfloat16* __restrict__ x, 
 #pragma unroll
             for (int s = 0; s < STAGES; ++s)
                 *reinterpret_cast<uint4*>(stage(s) + c / T::CHUNKS * T::ROW + c % T::CHUNKS * 16) = uint4{};
-    if constexpr (DICT) lane_table<T::THREADS>(P, buf + T::SMEM + DICT_DEC, tid);
+    if constexpr (DICT) dict_table<T::THREADS>(P, buf + T::SMEM + DICT_DEC, tid);
 #pragma unroll
     for (int s = 0; s < STAGES - 1; ++s) {
         if (s < items) load_w(s, s);
         commit();
     }
     grid_wait();
-    qmm_dict::x_keep_l2(x, rows, K, ldx);
 #pragma unroll
     for (int s = 0; s < STAGES - 1; ++s) {
         if (s < items) load_x(s, s);
         commit();
     }
     grid_launch();
-    const int b_off = DICT ? (D.pair ? 0 : 16) : 0;
     for (int it = 0; it < items; ++it) {
         wait<STAGES - 2>();
         __syncthreads();
@@ -162,10 +140,7 @@ __device__ __forceinline__ void gemv_items(const __nv_bfloat16* __restrict__ x, 
         commit();
         const unsigned char* p = stage(it % STAGES);
         const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
-        // the lane's scale or bias fetched before the MMAs (a pair table read through L2 waits under them), stored
-        // into dec[] after them
-        [[maybe_unused]] uint32_t dv = 0;
-        if constexpr (DICT) dv = qmm_dict::dict_fetch_raw(D, p + T::X + T::W, buf + T::SMEM + DICT_DEC, map(it).x);
+        if constexpr (DICT) dict_decode(D, p + T::X + T::W, buf + T::SMEM, map(it).x);
         const __nv_bfloat16* ps = DICT ? reinterpret_cast<const __nv_bfloat16*>(buf + T::SMEM)
                                        : reinterpret_cast<const __nv_bfloat16*>(p + T::X + T::W);
         const float* px = reinterpret_cast<const float*>(p + T::X + T::W + 2 * T::S);
@@ -188,28 +163,16 @@ __device__ __forceinline__ void gemv_items(const __nv_bfloat16* __restrict__ x, 
                 else mma(d[j], a, b0, b1);
             }
         }
-        [[maybe_unused]] float sf = 0.0f, bf = 0.0f;
-        if constexpr (DICT) qmm_dict::dict_raw_vals(D, dv, sf, bf);
+        if constexpr (DICT) __syncwarp();        // the warp's decoded scales and biases
         const int row = lane >> 2;
         const float xv[2] = {px[row], px[row + 8]};
 #pragma unroll
         for (int j = 0; j < NT; ++j) {
-            float sv[2], bv[2];
-            if constexpr (DICT) {
-                const int c0 = j * 8 + (lane & 3) * 2;
-                sv[0] = __shfl_sync(0xffffffffu, sf, c0);
-                sv[1] = __shfl_sync(0xffffffffu, sf, c0 + 1);
-                bv[0] = __shfl_sync(0xffffffffu, bf, b_off + c0);
-                bv[1] = __shfl_sync(0xffffffffu, bf, b_off + c0 + 1);
-            } else {
-                const int col = wn * (BN / 4) + j * 8 + (lane & 3) * 2;
-                const __nv_bfloat162 s2 = *reinterpret_cast<const __nv_bfloat162*>(ps + col);
-                const __nv_bfloat162 b2 = *reinterpret_cast<const __nv_bfloat162*>(ps + BN + col);
-                sv[0] = __low2float(s2);
-                sv[1] = __high2float(s2);
-                bv[0] = __low2float(b2);
-                bv[1] = __high2float(b2);
-            }
+            const int col = wn * (BN / 4) + j * 8 + (lane & 3) * 2;
+            const __nv_bfloat162 s2 = *reinterpret_cast<const __nv_bfloat162*>(ps + col);
+            const __nv_bfloat162 b2 = *reinterpret_cast<const __nv_bfloat162*>(ps + BN + col);
+            const float sv[2] = {__low2float(s2), __high2float(s2)};
+            const float bv[2] = {__low2float(b2), __high2float(b2)};
 #pragma unroll
             for (int e = 0; e < 4; ++e)
                 acc[j][e] = __fmaf_rn(xv[e >> 1], bv[e & 1], __fmaf_rn(d[j][e], sv[e & 1], acc[j][e]));

@@ -2,6 +2,16 @@
 
 Each release's page on GitHub has its notes and measurements. See [the 1.0.0 release notes](RELEASE-NOTES-1.0.0.md) for the native binary's supported models and migration details.
 
+## Unreleased
+
+- Shared verification searches for accepted children only after the current row in validated parent order. First-matching sibling selection stays unchanged. Runtime speed remains unmeasured.
+
+- Shared decode windows compute chain positions directly without temporary parent and depth arrays. Branched windows keep their existing validation and positions. Runtime speed remains unmeasured.
+
+- Qwen3.5 CUDA groups recorded DeltaNet buckets of at least 16 rows into four row warps per block. Prompt and single-token launch choices remain unchanged. Host launch checks pass; GPU output and speed remain unverified.
+
+- Qwen3.5 CUDA uploads round metadata from engine-owned pinned storage without a second host copy. The source waits before reuse and remains owned after transfer errors. Host lifetime checks and forward compilation pass; GPU output and throughput remain unverified.
+
 ## 1.1.6
 
 - DeepSeek-V4.1 (experimental): a tool call in the model's spaced DSML spelling now comes back in `tool_calls`, streamed and whole, instead of in the reply's text, and a lone DSML opener inside a `<tool_call>` no longer crashes the parser; the `TF_DSV41_ASSETS` refusal names the file boot actually opens (`engram-token-map.bin`) (#1324).
