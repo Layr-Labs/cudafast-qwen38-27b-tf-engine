@@ -69,9 +69,11 @@ pub const Config = struct {
     cluster_spread: bool = false,
     pdl: bool = false,
     cooperative: bool = false,
+    /// An L2 access policy over a byte range the kernel touches (cache residency only: never a value).
+    window: ?abi.AccessPolicyWindow = null,
 
     fn plain(self: Config) bool {
-        return self.cluster == null and !self.pdl and !self.cooperative;
+        return self.cluster == null and !self.pdl and !self.cooperative and self.window == null;
     }
 
     pub fn validate(self: Config) Error!void {
@@ -91,7 +93,7 @@ pub fn launch(f: Function, cfg: Config, stream: Stream, args: *Args) Error!void 
     if (cfg.plain()) {
         return launched(f, cfg, d.api.cuLaunchKernel(f.handle, g.x, g.y, g.z, b.x, b.y, b.z, cfg.shared, stream.handle, args.pointers(), null), "cuLaunchKernel");
     }
-    var attrs: [4]abi.LaunchAttribute = undefined;
+    var attrs: [5]abi.LaunchAttribute = undefined;
     const n = fillAttributes(cfg, &attrs);
     const lc: abi.LaunchConfig = .{
         .grid_x = g.x,
@@ -143,8 +145,13 @@ fn attribute(id: abi.LaunchAttributeId) abi.LaunchAttribute {
     return .{ .id = id, .value = .{ .pad = @splat(0) } };
 }
 
-fn fillAttributes(cfg: Config, out: *[4]abi.LaunchAttribute) usize {
+fn fillAttributes(cfg: Config, out: *[5]abi.LaunchAttribute) usize {
     var n: usize = 0;
+    if (cfg.window) |w| {
+        out[n] = attribute(.access_policy_window);
+        out[n].value.access_policy_window = w;
+        n += 1;
+    }
     if (cfg.pdl) {
         out[n] = attribute(.programmatic_stream_serialization);
         out[n].value.int = 1;

@@ -39,7 +39,7 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     // its twin for dictionary-coded parts: a 256-column CTA's decoded scales and biases and its part's table
     const grouped_dict: ?cuda.Function = if (e.affine.dict == null) null else blk: {
         const f = try e.mods[0].function("tf_qmm_gdn_stream16_dict");
-        try f.allowDynamicShared(22656 + 4 * 256 + cuda.qlinear.dict_tab_max);
+        try f.allowDynamicShared(22656 + 4 * 256 + @as(u32, @max(cuda.qlinear.dict_tab_max, cuda.qlinear.gdn_pair_tab_max)));
         break :blk f;
     };
     const down = try e.mods[0].function("tf_qmm_output_stream16");

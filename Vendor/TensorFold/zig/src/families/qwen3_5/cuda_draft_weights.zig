@@ -78,7 +78,8 @@ pub fn stageBytes(s: Shape) usize {
 pub fn total(s: Shape) usize {
     var t = packedBytes(s.hidden, s.taps * s.hidden) + packedBytes(s.rank, s.hidden) + 2 * aligned(s.hidden * 2);
     t += s.layers * (2 * aligned(s.hidden * 2) + packedBytes(s.q_width, s.hidden) + 2 * packedBytes(s.kv_width, s.hidden) + packedBytes(s.hidden, s.q_width) +
-        2 * aligned(s.head_dim * 2) + 2 * packedBytes(s.intermediate, s.hidden) + packedBytes(s.hidden, s.intermediate) + 2 * packedBytes(s.dynamic, s.hidden) + 2 * aligned(4 * s.hidden * 2));
+        2 * aligned(s.head_dim * 2) + 2 * packedBytes(s.intermediate, s.hidden) + packedBytes(s.hidden, s.intermediate) + 2 * packedBytes(s.dynamic, s.hidden) + 2 * aligned(4 * s.hidden * 2) +
+        2 * aligned(Affine4.layout(s.intermediate, s.hidden).words) + aligned(Affine4.layout(s.hidden, s.intermediate).words));
     return t;
 }
 
@@ -151,8 +152,25 @@ fn linear(gpa: std.mem.Allocator, e: *Engine, stage: *DeviceBuffer, w: *Weights,
         at += p.len;
     }
     const l = Affine4.layout(n, k);
-    const out: Affine4 = .{ .w = try w.alloc(l.words), .s = try w.alloc(l.scales), .b = try w.alloc(l.scales), .n = n, .k = k, .npad = l.npad };
+    var out: Affine4 = .{ .w = try w.alloc(l.words), .s = try w.alloc(l.scales), .b = try w.alloc(l.scales), .n = n, .k = k, .npad = l.npad };
     try e.affine.pack(e.stream, raw[0], raw[1], raw[2], out);
+    if (e.mlp_pair.kmajor_fn != null and n == 17408 and k == 5120) {
+        out.verify_w = try w.alloc(l.words);
+        const pack = try e.mods[3].function("tf_pack_kmajor");
+        const words = l.npad * k / 8;
+        try e.run(pack, .{ (words + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ out.w, out.verify_w, @as(c_int, @intCast(k / 64)), @as(c_int, @intCast(l.npad / 64)) });
+    } else if (e.affine.stream16_fns[0] != null and n == 5120 and k == 17408) {
+        out.stream_w = try w.alloc(l.words);
+        const pack = try e.mods[3].function("tf_pack_kmajor");
+        const words = l.npad * k / 8;
+        try e.run(pack, .{ (words + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ out.w, out.stream_w, @as(c_int, @intCast(k / 64)), @as(c_int, @intCast(l.npad / 64)) });
+    }
+    // the drafter's scales and biases dictionary-coded as the target's (TF_DRAFT_DICT=0 keeps them uncoded); its
+    // biases are each group's minimum, so the joint pairs outnumber a pair table and the separate coding serves
+    if (e.dict) |*ds| if (!std.mem.eql(u8, std.mem.span(@import("sys").c.getenv("TF_DRAFT_DICT") orelse ""), "0")) {
+        const kmajor = e.dict_kmajor and n == 17408 and k == 5120;
+        try e.affine.encode(e.stream, &out, ds, kmajor, cuda.qlinear.pairTabRoom(n, k, kmajor));
+    };
     try e.stream.synchronize();
     return out;
 }

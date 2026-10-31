@@ -93,9 +93,11 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     try @import("cuda_prompt_tail.zig").run(e, @intCast(ai), total);
                     return;
                 }
+                var merged = false;
                 if (shape.paged) {
                     try @import("cuda_attention.zig").partial(e, shape, ai);
-                    try launch(e, e.fns.attn_merge, sig.attn_merge, .{ g.q_heads, total, 1 }, .{ 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.y });
+                    try launch(e, e.fns.attn_merge_gate, sig.attn_merge_gate, .{ g.q_heads, total, 1 }, .{ 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.qraw, e.mix, sums });
+                    merged = true;
                 } else if (prompt and nseg == 1 and (g.q_heads / g.kv_heads) % 2 == 0) {
                     // a prompt chunk's rows over its own cache: tensor-core tiles in place of the decode partials
                     try @import("cuda_prompt.zig").run(e, @intCast(ai), total);
@@ -113,8 +115,9 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     }
                     // the merge with the gate and the gated rows' group sums, attn_gate's bits
                     try launchAfter(e, e.fns.attn_merge_gate, sig.attn_merge_gate, .{ g.q_heads, total, 1 }, .{ 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.qraw, e.mix, sums });
+                    merged = true;
                 }
-                if (shape.paged or (prompt and nseg == 1 and (g.q_heads / g.kv_heads) % 2 == 0)) try launchAfter(e, e.fns.attn_gate, sig.attn_gate, .{ (total * aw + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.y, e.qraw, e.mix, @as(c_int, @intCast(total)), t_params, sums });
+                if (!merged and (shape.paged or (prompt and nseg == 1 and (g.q_heads / g.kv_heads) % 2 == 0))) try launchAfter(e, e.fns.attn_gate, sig.attn_gate, .{ (total * aw + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.y, e.qraw, e.mix, @as(c_int, @intCast(total)), t_params, sums });
                 if (e.learning) |k| try k.gated(i, e.mix, total);
                 try e.projAgain(m.o, e.mix, e.r, total, prompt);
                 ai += 1;
@@ -153,6 +156,8 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
         if (shape.taps) for (e.taps[0..e.n_taps], 0..) |t, ti| if (t == i) {
             try e.run(e.fns.tap, .{ total, (g.hidden + 2047) / 2048, 1 }, .{ 256, 1, 1 }, .{ e.h, e.r, t_segs, t_rows, @as(c_int, @intCast(ti)), @as(c_int, @intCast(g.hidden)), t_params });
         };
+        // a captured forward's first layer is a graph of its own (cuda_engine.zig's cutCapture)
+        if (i == 0) try e.cutCapture();
     }
     try finish(e, total, heads, shape.hidden);
 }

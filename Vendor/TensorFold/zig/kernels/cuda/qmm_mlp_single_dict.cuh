@@ -60,22 +60,25 @@ __device__ __forceinline__ void mlp_single_dict_body(const __nv_bfloat16* __rest
     // [kg][npad / 64][16 * bits], its biases at its table (ns scale values, then nb bias values)
     const int code0 = parts.p[0].first, code1 = parts.p[1].first;
     const int bits0 = dict_bits(code0), bits1 = dict_bits(code1);
-    const int tab0 = (dict_ns(code0) + dict_nb(code0) + 7) / 8 * 16;            // gate's table bytes (16-byte padded)
+    const bool pair0 = dict_pair(code0), pair1 = dict_pair(code1);
+    const int tab0 = pair0 ? 0 : (dict_ns(code0) + dict_nb(code0) + 7) / 8 * 16;
     unsigned char* const dec = buf + T::SMEM;                                    // a warp's 32 scales, 32 biases
     const unsigned short* const tabs = reinterpret_cast<const unsigned short*>(buf + T::SMEM + MLP_DICT_DEC);
     // the stage's index runs: gate's four tiles (64 * bits0 bytes), then up's; a thread loads one 16-byte chunk
-    const int run0 = 4 * bits0, run1 = 4 * bits1;
+    const int run0 = (pair0 ? 2 : 4) * bits0, run1 = (pair1 ? 2 : 4) * bits1;
     const bool dok = tid < run0 + run1;
     const int dpart = tid < run0 ? 0 : 1, dchunk = tid < run0 ? tid : tid - run0;
-    const int dstep = 16 * (dpart ? bits1 : bits0);
+    const int dstep = dict_step(dpart ? code1 : code0);
     const unsigned char* dsrc = reinterpret_cast<const unsigned char*>(parts.p[dpart].scales) +
                                 static_cast<size_t>(n0 / 64) * dstep + dchunk * 16;
     const int dpitch = P.npad / 64 * dstep;                                      // one group of every tile
-    const int ddst = T::X + T::W + (dpart ? 64 * bits0 : 0) + dchunk * 16;
+    const int ddst = T::X + T::W + (dpart ? 16 * run0 : 0) + dchunk * 16;
     // the lane's two values a pass: projection wn / 2's column (wn % 2) * 128 + pass * 32 + lane, scale and bias
     const int mpart = wn / 2, mbits = mpart ? bits1 : bits0, mns = dict_ns(mpart ? code1 : code0);
     const uint32_t mmask = (1u << mbits) - 1u;
-    const int mrun = mpart ? 64 * bits0 : 0;
+    const int mrun = mpart ? 16 * run0 : 0;
+    const bool mpair = mpart ? pair1 : pair0;
+    const uint32_t* const mgtab = reinterpret_cast<const uint32_t*>(parts.p[mpart].biases);
     const unsigned short* const mtab = tabs + (mpart ? tab0 / 2 : 0);
     const bool xsok = tid < rows;
     const float* xssrc = xs + static_cast<size_t>(m0 + min(tid, rows - 1)) * KG;
@@ -110,7 +113,7 @@ __device__ __forceinline__ void mlp_single_dict_body(const __nv_bfloat16* __rest
             for (int s = 0; s < STAGES; ++s)
                 *reinterpret_cast<uint4*>(stage(s) + c / T::CHUNKS * T::ROW + c % T::CHUNKS * 16) = uint4{};
     {   // both tables, static data: loaded with the first stage, before the wait
-        const int c0 = tab0 / 16, c1 = (dict_ns(code1) + dict_nb(code1) + 7) / 8;
+        const int c0 = tab0 / 16, c1 = pair1 ? 0 : (dict_ns(code1) + dict_nb(code1) + 7) / 8;
         for (int c = tid; c < c0 + c1; c += T::THREADS)
             cp16(buf + T::SMEM + MLP_DICT_DEC + c * 16, c < c0 ? reinterpret_cast<const unsigned char*>(parts.p[0].biases) + c * 16
                                                               : reinterpret_cast<const unsigned char*>(parts.p[1].biases) + (c - c0) * 16);
@@ -140,6 +143,14 @@ __device__ __forceinline__ void mlp_single_dict_body(const __nv_bfloat16* __rest
         const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
         const uint32_t* pk = reinterpret_cast<const uint32_t*>(p + T::X + T::W + mrun);
         __nv_bfloat16* const dw = reinterpret_cast<__nv_bfloat16*>(dec) + wn * 64;    // this warp's 32 + 32 values
+        uint32_t pe[4] = {0u, 0u, 0u, 0u};
+        if (mpair) {
+#pragma unroll
+            for (int pass = 0; pass < 4; ++pass) {
+                const int c = (wn % 2) * 128 + pass * 32 + lane, off = (c / 64 * 64 + c % 64) * mbits;
+                pe[pass] = __ldg(mgtab + (__funnelshift_r(pk[off >> 5], pk[(off >> 5) + 1], off & 31) & mmask));
+            }
+        }
         const float* px = reinterpret_cast<const float*>(p + T::X + T::W + 2 * T::S);
         uint32_t words[T::NT][GS / 32];
 #pragma unroll
@@ -171,7 +182,10 @@ __device__ __forceinline__ void mlp_single_dict_body(const __nv_bfloat16* __rest
         // then the pass's four n8 tiles take the original kernel's fmas on them
 #pragma unroll
         for (int pass = 0; pass < 4; ++pass) {
-            {
+            if (mpair) {
+                reinterpret_cast<unsigned short*>(dw)[lane] = static_cast<unsigned short>(pe[pass] & 0xFFFFu);
+                reinterpret_cast<unsigned short*>(dw)[32 + lane] = static_cast<unsigned short>(pe[pass] >> 16);
+            } else {
                 const int c = (wn % 2) * 128 + pass * 32 + lane, tt = c / 64, ct = c % 64;
 #pragma unroll
                 for (int which = 0; which < 2; ++which) {

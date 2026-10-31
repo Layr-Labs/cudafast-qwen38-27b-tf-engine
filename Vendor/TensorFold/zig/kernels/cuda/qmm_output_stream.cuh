@@ -11,10 +11,7 @@ constexpr int Stage=4416, SliceBytes=Stage*2, Bytes=SliceBytes*4;
 // The part's npad holds the code, so the word stream's tile count is the grid's (one CTA a 64-column tile).
 __device__ __forceinline__ void dict_decode_at(const qmm_dict::DictLanes& D,const unsigned char* packed,unsigned char* dec,
         const unsigned char* table,int g){
-    const uint32_t* pk=reinterpret_cast<const uint32_t*>(packed);
-    const int off=(g*D.step&63)*8+D.bit0;
-    const uint32_t idx=__funnelshift_r(pk[off>>5],pk[(off>>5)+1],off&31)&D.mask;
-    reinterpret_cast<unsigned short*>(dec)[D.pos]=reinterpret_cast<const unsigned short*>(table)[D.base+idx];
+    qmm_dict::dict_put(D,dec,qmm_dict::dict_fetch(D,packed,table,g));
 }
 
 template<int FutureGroups,int Slices=4,int Rolling=0,bool DICT=false>
@@ -73,7 +70,7 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
         wait<0>();__syncthreads();
         if(it+1<per){load_w(it+1);load_x(it+1);}commit();
         const auto* at=stage(it);const auto* wp=reinterpret_cast<const uint32_t*>(at+2048);
-        if constexpr(DICT){dict_decode_at(D,at+4096,dec,table,g0+it);__syncwarp();}
+        uint32_t dv=0;if constexpr(DICT)dv=qmm_dict::dict_fetch(D,at+4096,table,g0+it);
         const auto* sp=reinterpret_cast<const __nv_bfloat16*>(DICT?dec:at+4096);const auto* sums=reinterpret_cast<const float*>(at+4352);
         uint32_t words[2][2];
 #pragma unroll
@@ -90,6 +87,7 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
                 if(kt==0)mma0(d[j],a,b0,b1);else mma(d[j],a,b0,b1);
             }
         }
+        if constexpr(DICT){qmm_dict::dict_put(D,dec,dv);__syncwarp();}
 #pragma unroll
         for(int j=0;j<2;++j){const int col=wn*16+j*8+(lane&3)*2;
             const auto s2=*reinterpret_cast<const __nv_bfloat162*>(sp+col),b2=*reinterpret_cast<const __nv_bfloat162*>(sp+64+col);
