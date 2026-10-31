@@ -136,6 +136,8 @@ pub const Affine4Kernels = struct {
     gdn_stream16_fn: ?Function = null,
     gdn_stream32_fn: ?Function = null,
     gdn_stream32_dict_fn: ?Function = null,
+    head_amax_fn: ?Function = null, // GB10 dictionary head: group_dict's tile writing each row's per-tile best (headArgmax)
+    head_merge_fn: ?Function = null,
     gemv_fn: Function,
     verify_fn: Function, // two m16 row tiles share each weight panel on the GB10 verify path
     verify64_fn: Function, // four, for wider shared frames
@@ -195,6 +197,8 @@ pub const Affine4Kernels = struct {
         a.gdn_stream16_fn = null;
         a.gdn_stream32_fn = null;
         a.gdn_stream32_dict_fn = null;
+        a.head_amax_fn = null;
+        a.head_merge_fn = null;
         a.wide_fns = @splat(null);
         a.group_wide = false;
         a.wide_verify = false;
@@ -223,6 +227,9 @@ pub const Affine4Kernels = struct {
             try t.group.allowDynamicShared(group_smem + linear.dict_dec + @max(linear.dict_tab_max, linear.group_pair_tab_one));
             try t.gemv.allowDynamicShared(group_smem + lane_room);
             try t.many.allowDynamicShared(group_smem + lane_room);
+            a.head_amax_fn = try group_mod.function(symbols.head_amax);
+            try a.head_amax_fn.?.allowDynamicShared(group_smem + linear.dict_dec + @max(linear.dict_tab_max, linear.group_pair_tab_one));
+            a.head_merge_fn = try group_mod.function(symbols.head_merge);
             // resident lane CTAs at the largest table a projection keeps coded (GB10: the originals' count)
             t.gemv_blocks = @max(1, try t.gemv.occupancy(128, group_smem + lane_room)) * sms;
             a.dict = t;
@@ -691,6 +698,37 @@ pub const Affine4Kernels = struct {
         }
         if (rows <= 64) return a.wide(a.verify64_fn, linear.verify64_smem, 64, s, x, xs, weight, out, rows);
         return a.wide(a.verify128_fn, linear.verify128_smem, 128, s, x, xs, weight, out, rows);
+    }
+
+    /// Whether headArgmax takes q at `rows`: decode()'s dictionary cluster tile without K slices (the vocabulary head).
+    pub fn headArgmaxFits(a: *const Affine4Kernels, q: Affine4, rows: usize) bool {
+        const tiles = (q.n + 63) / 64;
+        return a.head_amax_fn != null and a.head_merge_fn != null and a.coded(q) and rows >= 1 and rows <= max_rows and
+            splitK(q.n, q.k) == 1 and q.n % 64 == 0 and tiles >= a.sms and a.split == null;
+    }
+
+    /// A greedy verify's head: decode()'s tile for q (the same loads, MMA chain, fmas and bf16 rounding a value), each
+    /// row's best of every 64-column tile into pv (rows x tiles f32, then rows x tiles i32), then each row's token into
+    /// toks: the highest bf16 logit, ties to the lowest id, the rule of the engine's argmax over the stored logits.
+    pub fn headArgmax(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, q: Affine4, pv: u64, rows: usize, toks: u64) !void {
+        if (!a.headArgmaxFits(q, rows)) return error.FormatNotLoaded;
+        const tiles = (q.n + 63) / 64;
+        var parts: Parts = std.mem.zeroes(Parts);
+        parts.count = 1;
+        parts.p[0] = groupPart(q, true, pv, 1, tiles, 0);
+        var g: launch_.Args = .{};
+        g.add(x);
+        g.add(xs);
+        g.add(parts);
+        for ([_]usize{ rows, q.k, q.k, 1, 1 }) |v| g.add(int(v));
+        const shared = group_smem + linear.dict_dec + q.tabBytesUpTo(linear.group_pair_tab_one); // cluster()'s, sk = 1
+        try launch_.launch(a.head_amax_fn.?, .{ .grid = .{ .x = u(tiles) }, .block = .{ .x = 128 }, .shared = shared, .pdl = a.pdl }, s, &g);
+        var m: launch_.Args = .{};
+        m.add(pv);
+        m.add(pv + rows * tiles * 4);
+        m.add(int(tiles));
+        m.add(toks);
+        try launch_.launch(a.head_merge_fn.?, .{ .grid = .{ .x = u(rows) }, .block = .{ .x = 256 }, .pdl = a.pdl }, s, &m);
     }
 
     /// The same ordered group and K-slice chains as decode(), with both row tiles reusing the loaded weights.
