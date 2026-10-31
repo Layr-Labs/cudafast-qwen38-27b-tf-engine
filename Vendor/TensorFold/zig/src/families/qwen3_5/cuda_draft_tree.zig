@@ -25,6 +25,8 @@ pub const Candidates = struct {
     // a sampled stream's rule and its first draft's position: row r's candidates scored as the target's draw at r
     sampling: ?lanes.Sampling = null,
     position: u64 = 0,
+    // the round loop's landing rates: when set, a tree grows by the chances the loop prices its nodes at
+    landing: ?*const Landing = null,
 };
 
 /// A candidate's score as the target's draw sees it: its logit at the stream's temperature plus the draw's noise.
@@ -142,6 +144,12 @@ fn chancesAfter(c: Candidates, r: usize, pred: u32, out: *[lp_top]f64) void {
     for (out[0..c.topk]) |*v| v.* -= log_total;
 }
 
+/// A candidate's log-chance as the round loop prices it: its landing rate when the hold carries one, else its own.
+fn priced(c: Candidates, own: f64) f64 {
+    const l = c.landing orelse return own;
+    return @log(@max(l.chance(c.sampling != null, own), std.math.floatMin(f64)));
+}
+
 /// Up to `most` nodes best first: the open node of least path cost next (ties by parent, token, row); the count grown.
 pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32, parents: []i32, own: []f64) usize {
     const Open = struct { cost: f64, parent: i32, token: u32, row: usize, own: f64 };
@@ -167,7 +175,7 @@ pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32
             const w = ids(c, row);
             for (order[0..@min(branch, c.topk)]) |j| {
                 if (!std.math.isFinite(lc[j]) or n_open == open.len) break;
-                open[n_open] = .{ .cost = path - lc[j], .parent = parent, .token = w[2 + j], .row = row, .own = lc[j] };
+                open[n_open] = .{ .cost = path - priced(c, lc[j]), .parent = parent, .token = w[2 + j], .row = row, .own = lc[j] };
                 n_open += 1;
             }
         }
