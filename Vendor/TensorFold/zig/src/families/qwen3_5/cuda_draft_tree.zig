@@ -5,9 +5,12 @@ const lanes = @import("lanes");
 const engine = @import("cuda_engine.zig");
 
 /// Children a node, the selector's weight, the softmax scale, and the nodes a tree takes by default.
-const branch = 12;
+const branch = 8;
 const edge_weight = 0.6;
 const scale = 1.5;
+/// Subtracted from the best child's path cost. The paid forward is a flat 16 rows, and a matched
+/// chain is longer than another first-row sibling, so the best child is expanded before a weak one.
+const greedy_bonus = 1.5;
 /// A sampled stream's candidates carry the draw's own Gumbel noise at this weight (the 27B engine's draft_tree).
 const noise_weight = 0.7;
 const default_nodes = 15;
@@ -144,7 +147,7 @@ fn chancesAfter(c: Candidates, r: usize, pred: u32, out: *[lp_top]f64) void {
 
 /// Up to `most` nodes best first: the open node of least path cost next (ties by parent, token, row); the count grown.
 pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32, parents: []i32, own: []f64) usize {
-    const Open = struct { cost: f64, parent: i32, token: u32, row: usize, own: f64 };
+    const Open = struct { cost: f64, fair: f64, parent: i32, token: u32, row: usize, own: f64 };
     var open: [branch * (engine.most_window + 1)]Open = undefined;
     var n_open: usize = 0;
     var count: usize = 0;
@@ -165,9 +168,11 @@ pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32
                 }
             }.more);
             const w = ids(c, row);
-            for (order[0..@min(branch, c.topk)]) |j| {
+            for (order[0..@min(branch, c.topk)], 0..) |j, rank| {
                 if (!std.math.isFinite(lc[j]) or n_open == open.len) break;
-                open[n_open] = .{ .cost = path - lc[j], .parent = parent, .token = w[2 + j], .row = row, .own = lc[j] };
+                const bonus: f64 = if (rank == 0) greedy_bonus else 0;
+                const fair = path - lc[j];
+                open[n_open] = .{ .cost = fair - bonus, .fair = fair, .parent = parent, .token = w[2 + j], .row = row, .own = lc[j] };
                 n_open += 1;
             }
         }
@@ -186,7 +191,7 @@ pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32
         pred = node.token;
         parent = @intCast(count);
         row = node.row + 1;
-        path = node.cost;
+        path = node.fair;
         count += 1;
     }
     return count;

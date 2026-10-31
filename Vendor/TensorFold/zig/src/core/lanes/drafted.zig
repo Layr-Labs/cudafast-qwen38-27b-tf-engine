@@ -101,7 +101,6 @@ pub const Drafted = struct {
         m.draft_prior = d.prior;
         m.plain_guard = d.plain_guard;
         m.draft_streams = d.batched;
-        m.lone_cost_min_rows = d.cost_probe_min_rows;
         m.draft_probabilities = false;
         m.head_trees = d.trees;
         if (d.tree_nodes > 0) {
