@@ -17,7 +17,7 @@ __device__ __forceinline__ void dict_decode_at(const qmm_dict::DictLanes& D,cons
 template<int FutureGroups,int Slices=4,int Rolling=0,bool DICT=false>
 __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const float* __restrict__ xs,
         const tf_qmm_group::Parts& parts,int M,int K,int ldx) {
-    static_assert(!DICT||(FutureGroups==0&&Rolling==0),"a coded part's L2 prefetch would target its index windows");
+    static_assert(!DICT||Rolling==0,"a coded part's rolling prefetch would target its index windows");
     extern __shared__ __align__(128) unsigned char buf[];
     const auto p=parts.p[0];
     const int slice=threadIdx.x/128,tid=threadIdx.x%128,lane=tid&31,wn=tid>>5;
@@ -47,10 +47,11 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
     if(tid==0) {
 #pragma unroll
         for(int g=1;g<=FutureGroups;++g)if(g<per){
-            const auto* w=weight(g0+g);const auto* s=p.scales+size_t(g0+g)*p.npad+n0;const auto* b=p.biases+size_t(g0+g)*p.npad+n0;
+            const auto* w=weight(g0+g);
             asm volatile("cp.async.bulk.prefetch.L2.global [%0], 2048;" :: "l"(w) : "memory");
+            if constexpr(!DICT){const auto* s=p.scales+size_t(g0+g)*p.npad+n0;const auto* b=p.biases+size_t(g0+g)*p.npad+n0;
             asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(s) : "memory");
-            asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(b) : "memory");
+            asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(b) : "memory");}
         }
     }
 #endif
@@ -130,4 +131,8 @@ extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_stream16_dict(co
 }
 extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_prefetch16(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
     tf_qmm_output_stream::body<4>(x,xs,parts,M,K,ldx);
+}
+// The coded twin of tf_qmm_output_prefetch16 (out/o, K = 6144): the first groups' words prefetched to L2, the same bits.
+extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_prefetch16_dict(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
+    tf_qmm_output_stream::body<4,4,0,true>(x,xs,parts,M,K,ldx);
 }

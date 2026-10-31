@@ -52,6 +52,11 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
         break :blk f;
     };
     try out.allowDynamicShared(35328);
+    const out_dict: ?cuda.Function = if (e.affine.dict == null) null else blk: {
+        const f = try e.mods[0].function("tf_qmm_output_prefetch16_dict");
+        try f.allowDynamicShared(35328 + 4 * cuda.qlinear.dict_dec + cuda.qlinear.dict_tab_max);
+        break :blk f;
+    };
     var buffer = try cuda.DeviceBuffer.alloc(e.d, bytes);
     errdefer buffer.free();
     try buffer.fill8(0, null);
@@ -80,6 +85,7 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     };
     if (output) e.affine.stream16_fns = .{ down, out };
     if (output) e.affine.stream16_dict_fn = down_dict;
+    if (output) e.affine.stream16_out_dict_fn = out_dict;
     if (input) e.affine.gdn_stream16_fn = grouped;
     if (input) e.affine.gdn_stream16_dict_fn = grouped_dict;
     return buffer;

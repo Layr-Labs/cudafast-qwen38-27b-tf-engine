@@ -17,7 +17,7 @@ pub const Sig = struct {
 };
 
 /// The bf16 decode partial: a block a (row, chunk, key head) of the query heads' rows.
-pub const attn_partial = Sig{ .name = "attn_partial", .handle = "e.fns.attn_partial", .symbol = "tf_q35_attn_partial", .params = &.{ .geo, .ptr, .ptr, .ptr, .ptr, .i32, .ptr, .f32, .ptr, .ptr, .ptr } };
+pub const attn_partial = Sig{ .name = "attn_partial", .handle = "e.fns.attn_partial", .symbol = "tf_q35_attn_partial", .params = &.{ .geo, .ptr, .ptr, .ptr, .ptr, .i32, .ptr, .f32, .ptr, .ptr, .ptr, .ptr, .i32, .i32, .i32 } };
 
 /// The e4m3 decode partial: the bf16 one's tiles in the e4m3 scales.
 pub const attn_partial8 = Sig{ .name = "attn_partial8", .handle = "e.fp8.attn_partial", .symbol = "tf_q35_attn_partial8", .params = &.{ .geo, .ptr, .ptr, .ptr, .ptr, .i32, .ptr, .f32, .ptr, .ptr, .ptr } };

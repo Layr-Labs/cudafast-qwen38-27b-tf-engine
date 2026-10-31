@@ -90,6 +90,27 @@ __device__ __forceinline__ T* plain(T* p) {
 }
 __device__ __forceinline__ void keep4(const uint4& v) { asm volatile("" ::"r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)); }
 
+// An L2 warm-up of the next weight stream (cache state only; no value changes): the first `take` bytes of each of `tiles`
+// tiles of `tile_bytes` at w, issued as bulk L2 prefetches by the grid's first blocks while a latency-bound kernel runs.
+__device__ __forceinline__ void warm_tiles(const void* w, int tile_bytes, int tiles, int take) {
+#if __CUDA_ARCH__ >= 900
+    if (w == nullptr || take <= 0) return;
+    constexpr int CH = 16384;
+    const int nb = gridDim.x * gridDim.y * gridDim.z;
+    const int b = blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
+    const int issuers = min(nb, 40);
+    if (b >= issuers) return;
+    const int per = (take + CH - 1) / CH;
+    for (int i = threadIdx.x + blockDim.x * threadIdx.y; ; i += blockDim.x * blockDim.y) {
+        const int t = b + issuers * (i / per), c = i % per;
+        if (t >= tiles) break;
+        const int sz = min(CH, take - c * CH);
+        const char* a = reinterpret_cast<const char*>(w) + (size_t)t * tile_bytes + (size_t)c * CH;
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(a), "r"(sz) : "memory");
+    }
+#endif
+}
+
 // h = bf16(h + r) (r may be null), x = bf16(w * (h * inv)), XS (may be null) x's group sums; D 256k up to 8192.
 extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __restrict__ H0, const __nv_bfloat16* __restrict__ R0,
                                                                const __nv_bfloat16* __restrict__ W, __nv_bfloat16* __restrict__ X0, float eps, int D,
@@ -693,9 +714,11 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm_rope(Geo geo, cons
 extern "C" __global__ void __launch_bounds__(128) tf_q35_attn_partial(Geo geo, const __nv_bfloat16* __restrict__ Q0, const Seg* __restrict__ segs,
                                                                         const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
                                                                         const int* __restrict__ P, float scale,
-                                                                        float* __restrict__ PM0, float* __restrict__ PL0, float* __restrict__ PO0) {
+                                                                        float* __restrict__ PM0, float* __restrict__ PL0, float* __restrict__ PO0,
+                                                                        const void* pfw, int pft, int pfn, int pfb) {
     release_next();
     await_prior();
+    warm_tiles(plain(pfw), pft, pfn, pfb);
     const __nv_bfloat16* Q = after_wait(Q0);
     float* PM = after_wait(PM0);
     float* PL = after_wait(PL0);

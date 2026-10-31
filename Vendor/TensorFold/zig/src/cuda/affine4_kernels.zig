@@ -131,6 +131,7 @@ pub const Affine4Kernels = struct {
     group_fn: Function,
     stream16_fns: [2]?Function = @splat(null),
     stream16_dict_fn: ?Function = null, // tf_qmm_output_stream16 on a dictionary-coded down projection
+    stream16_out_dict_fn: ?Function = null, // tf_qmm_output_prefetch16_dict: a dictionary-coded out/o projection (K = 6144)
     gdn_stream16_dict_fn: ?Function = null, // tf_qmm_gdn_stream16 with its dictionary-coded parts
     gdn_stream16_fn: ?Function = null,
     gemv_fn: Function,
@@ -188,6 +189,7 @@ pub const Affine4Kernels = struct {
         a.pdl = gb10;
         a.stream16_fns = @splat(null);
         a.stream16_dict_fn = null;
+        a.stream16_out_dict_fn = null;
         a.gdn_stream16_dict_fn = null;
         a.gdn_stream16_fn = null;
         a.wide_fns = @splat(null);
@@ -468,6 +470,9 @@ pub const Affine4Kernels = struct {
         // clusters of four, each CTA chaining the tile's slices in order (the same bits); the down projection's long
         // slices (68 groups) stay on the cluster tile, and so does a short K (the drafter's K = 4096, 64 groups a
         // lane CTA: its 80 CTAs keep too few bytes in flight)
+        // coded out/o with its word stream: the stream kernel's four ordered slices a CTA (the same bits as lane_gemv's chain)
+        if (rows == 16 and sk == 4 and q.n == 5120 and q.k == 6144 and q.npad == 5120 and q.stream_w != 0 and
+            a.stream16_out_dict_fn != null and a.coded(q)) return a.cluster(s, x, xs, q, out, rows, sk);
         if (sk > 1 and a.cluster_decode and !(a.short_lane and q.k / 64 / sk < lane_min and q.k / 64 >= lane_groups)) return a.cluster(s, x, xs, q, out, rows, sk);
         return if (sk > 1) a.gemv(s, x, xs, q, out, rows, sk) else a.cluster(s, x, xs, q, out, rows, sk);
     }
@@ -784,7 +789,8 @@ pub const Affine4Kernels = struct {
         const stream_fn = if (q.stream_w == 0) null else a.stream16_fns[@as(usize, if (q.k == 6144) 1 else 0)];
         if (rows == 16 and sk == 4 and q.n == 5120 and (q.k == 6144 or q.k == 17408) and q.stream_w != 0 and stream_fn != null) {
             // a coded down projection streams its index windows in place of its scales and biases (the same bits)
-            const dict = q.k == 17408 and q.npad == 5120 and a.coded(q) and a.stream16_dict_fn != null;
+            const dict = q.npad == 5120 and a.coded(q) and (if (q.k == 17408) a.stream16_dict_fn != null else a.stream16_out_dict_fn != null);
+            const dict_fn = if (q.k == 17408) a.stream16_dict_fn else a.stream16_out_dict_fn;
             var parts: Parts = std.mem.zeroes(Parts);
             parts.count = 1;
             parts.p[0] = .{ .w = q.stream_w, .scales = if (dict) q.sb else q.s, .biases = if (dict) q.tab else q.b, .out = out, .n = int(q.n), .npad = if (dict) @bitCast(q.code) else int(q.npad), .sk = 4, .tiles = 80, .first = 0 };
@@ -792,7 +798,7 @@ pub const Affine4Kernels = struct {
             g.add(x); g.add(xs); g.add(parts);
             for ([_]usize{ rows, q.k, q.k }) |v| g.add(int(v));
             const shared = if (dict) group_smem + 4 * linear.dict_dec + q.tabBytes() else group_smem;
-            return launch_.launch(if (dict) a.stream16_dict_fn.? else stream_fn.?, .{ .grid = .{ .x = 80 }, .block = .{ .x = 512 }, .shared = shared, .pdl = a.pdl }, s, &g);
+            return launch_.launch(if (dict) dict_fn.? else stream_fn.?, .{ .grid = .{ .x = 80 }, .block = .{ .x = 512 }, .shared = shared, .pdl = a.pdl }, s, &g);
         }
         const tiles = (q.n + 63) / 64;
         const rows_t = (rows + 15) / 16;

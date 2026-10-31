@@ -188,8 +188,8 @@ __device__ __forceinline__ void q35_slots(Geo geo, const __nv_bfloat16* q, const
 #define TF_Q35_SLOTS(N, R, REUSE) \
 extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_slots_##N(Geo geo, const __nv_bfloat16* q, \
  const __nv_bfloat16* k, const __nv_bfloat16* v, const float* g, const __nv_bfloat16* beta, const Seg* segs, \
- const SlotStep* steps, int layer, __nv_bfloat16* y, const int* P) { \
-  release_next(); await_prior(); \
+ const SlotStep* steps, int layer, __nv_bfloat16* y, const int* P, const void* pfw, int pft, int pfn, int pfb) { \
+  release_next(); await_prior(); warm_tiles(plain(pfw), pft, pfn, pfb); \
   q35_slots<N, R, REUSE>(geo, after_wait(q), after_wait(k), after_wait(v), after_wait(g), after_wait(beta), segs, steps, layer, after_wait(y), P); }
 TF_Q35_SLOTS(1, 2, false)
 TF_Q35_SLOTS(2, 2, false)
