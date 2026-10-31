@@ -8,6 +8,7 @@
 const cuda = @import("cuda");
 const E = @import("cuda_engine.zig");
 const prompt = @import("cuda_prompt.zig");
+const sig = @import("cuda_signatures.zig");
 
 /// Whether a forward of `total` prompt rows can end on its last row at the last layer.
 pub fn fits(e: *const E.Engine, total: usize, nseg: usize, hidden: bool, paged: bool) bool {
@@ -44,6 +45,7 @@ pub fn query(e: *E.Engine, m: anytype, total: usize) !void {
 /// head, for row total - 1 only. `layer` is the layer's attention index.
 pub fn run(e: *E.Engine, layer: usize, total: usize) !void {
     const g = e.g;
+    const geo = e.geo;
     const l = e.layers[e.layers.len - 1];
     const m = l.mixer.attention;
     const d = l.mlp.dense;
@@ -58,11 +60,16 @@ pub fn run(e: *E.Engine, layer: usize, total: usize) !void {
     const x = e.x + row * hid * 2;
     const act = e.act + row * g.intermediate * 2;
     try prompt.runFrom(e, layer, row, total);
-    try e.runAfter(e.fns.attn_gate, .{ (aw + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ e.geo, y, e.qraw + row * 2 * aw * 2, mix, @as(c_int, 1), @as(u64, 0), @as(u64, 0) });
+    try launchAfter(e, e.fns.attn_gate, sig.attn_gate, .{ (aw + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, y, e.qraw + row * 2 * aw * 2, mix, @as(c_int, 1), @as(u64, 0), @as(u64, 0) });
     try e.prompt_many.prompt(e.stream, mix, &.{.{ .q = m.o.a4, .out = r }}, 1);
     try e.runAfter(e.fns.norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, .{ h, r, l.post_norm, x, g.eps, @as(c_int, @intCast(hid)), params, @as(u64, 0) });
     try e.prompt_many.mlp(e.stream, x, d.gate.a4, d.up.a4, act, 1);
     try e.prompt_many.prompt(e.stream, act, &.{.{ .q = d.down.a4, .out = r }}, 1);
     try e.runAfter(e.fns.norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, .{ h, r, e.final_norm, x, g.eps, @as(c_int, @intCast(hid)), params, e.xs });
     try e.projAgain(e.head, x, e.logits, 1, false);
+}
+
+fn launchAfter(e: *E.Engine, f: cuda.Function, comptime s: sig.Sig, grid: [3]usize, block: [3]usize, args: anytype) !void {
+    sig.check(s, @TypeOf(args));
+    return e.runAfter(f, grid, block, args);
 }
