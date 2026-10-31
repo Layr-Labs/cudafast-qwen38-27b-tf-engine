@@ -436,3 +436,43 @@ test "Draft frames: landing observations end with the last released stream" {
 }
 
 test { _ = @import("qwen35_draft_legacy_host.zig"); }
+
+
+test "Draft history: a short match keeps the tree and a valid prefix keeps its continuation" {
+    _ = setenv("TF_DRAFT_NODES", "15", 1);
+    defer _ = unsetenv("TF_DRAFT_NODES");
+    const F = q.draft.frame;
+    var d: q.draft.Draft = undefined;
+    d.c = config();
+    d.c.block = 16;
+    d.c.rank = 1;
+    d.c.topk = 1;
+    d.selection_base = 0;
+    var storage: [F.stagedLen(1)]u8 align(16) = @splat(0);
+    d.staged = .{ .d = undefined, .bytes = &storage };
+    var books: [256]u16 = @splat(0);
+    d.w.predecessor = &books;
+    d.w.successor = &books;
+    const words = std.mem.bytesAsSlice(u32, storage[F.words_at..][0 .. 15 * 43 * 4]);
+    for (0..15) |r| {
+        words[r * 43 + 2] = @intCast(10 + r);
+        words[r * 43 + 22] = @bitCast(@as(f32, 1));
+    }
+    const histories = [_][]const u32{
+        &.{ 6, 7, 8, 9, 10, 11, 99, 70, 6, 7, 8, 9 },
+        &.{ 6, 7, 8, 9, 10, 11, 12, 70, 6, 7, 8, 9 },
+    };
+    for (histories, 0..) |hist, which| {
+        var ctx: q.draft.Ctx = .{ .ring = undefined };
+        try d.selectHold(&ctx, .{ .stream = undefined, .pending = 9, .position = 12, .depth = 1, .tokens = hist });
+        try std.testing.expectEqual(@as(usize, 15), ctx.grown);
+        try std.testing.expectEqual(@as(usize, 15), ctx.held_n);
+        if (which == 0) {
+            for (ctx.held[0..15], 0..) |token, r| try std.testing.expectEqual(@as(u32, @intCast(10 + r)), token);
+        } else {
+            try std.testing.expectEqualSlices(u32, &.{ 10, 11, 12, 70, 6, 7, 8, 9, 18, 19, 20, 21, 22, 23, 24 }, ctx.held[0..15]);
+            for (ctx.own[0..15]) |own| try std.testing.expectEqual(@as(f64, 0), own);
+        }
+        for (ctx.parents[0..15], 0..) |parent, r| try std.testing.expectEqual(@as(i32, @intCast(r)) - 1, parent);
+    }
+}

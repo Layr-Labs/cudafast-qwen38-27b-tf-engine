@@ -439,11 +439,12 @@ pub const Draft = struct {
                 while (idx > 0) {
                     idx -= 1;
                     if (hist[idx] != it.pending) continue;
-                    var hm: usize = 1;
-                    while (hm <= idx and hm < 64 and hist[idx - hm] == hist[hist.len - 1 - hm]) hm += 1;
                     var dm: usize = 0;
                     while (dm < rows and idx + 1 + dm < hist.len and hist[idx + 1 + dm] == ch[dm]) dm += 1;
-                    if (dm >= 3 and hm + dm >= 6 and (hm + dm > best_hist + best_draft or (hm + dm == best_hist + best_draft and dm > best_draft))) {
+                    if (dm < 3) continue;
+                    var hm: usize = 1;
+                    while (hm <= idx and hm < 64 and hist[idx - hm] == hist[hist.len - 1 - hm]) hm += 1;
+                    if (hm + dm >= 6 and (hm + dm > best_hist + best_draft or (hm + dm == best_hist + best_draft and dm > best_draft))) {
                         best_pos = idx;
                         best_hist = hm;
                         best_draft = dm;
