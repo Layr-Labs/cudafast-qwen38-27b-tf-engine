@@ -458,6 +458,7 @@ __global__ void __launch_bounds__(WM * WN * 32) group_kernel_dict(
             commit();
         }
         grid_wait();
+        x_keep_l2(x, M, K, ldx);
 #pragma unroll
         for (int s = 0; s < STAGES - 1; ++s) {
             if (s < per) load_x(s, g0 + s);
@@ -774,6 +775,7 @@ __device__ __forceinline__ void mlp_pair_body(const __nv_bfloat16* __restrict__ 
         commit();
     }
     grid_wait();
+    x_keep_l2(x, M, K, ldx);
 #pragma unroll
     for (int s = 0; s < STAGES - 1; ++s) {
         if (s < per) load_x(s, g0 + s);
@@ -920,3 +922,5 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_pair_dict(const __n
 }
 
 #include "qmm_mlp_single_dict.cuh"
+
+#include "qmm_stream32.cuh"
