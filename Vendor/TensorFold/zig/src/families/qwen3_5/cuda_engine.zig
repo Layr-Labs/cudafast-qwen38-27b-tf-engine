@@ -563,8 +563,8 @@ pub const Engine = struct {
             Round.stageImageTables(st, im, p0, total);
         }
         try e.tables.uploadAsync(0, st[0..if (images != null) tables_len else src_at], e.stream.handle); // text: as before
-        const slot_variant = if (total > 16 and total <= 32 and slot_peak == 3 and e.affine.pdl and !envOff("TF_WIDE_SLOTS")) 3 else
-            Round.narrowVariant(total, slot_peak, record and e.affine.pdl and !envOff("TF_GDN16"));
+        const slot_variant = if (total > 16 and total <= 32 and slot_peak == 3 and e.affine.pdl) 3 else
+            Round.narrowVariant(total, slot_peak, record and e.affine.pdl);
         var shape = Shape.init(total, parts.len, record, e.n_taps > 0, @intCast(slot_variant));
         if (record and @import("cuda_round_timing.zig").Trace.enabled())
             std.debug.print("[timing] verify_slots peak={d} variant={d}\n", .{ slot_peak, shape.slots });

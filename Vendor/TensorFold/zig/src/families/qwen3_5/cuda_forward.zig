@@ -13,7 +13,7 @@ pub const attn_tiles = 4 * 32 * 512;
 /// tf_q35_attn_partial's one key and value tile (Bf16Tiles1), and the chunk blocks it launches a (row, key head):
 /// each takes every partial_chunks-th of the MAXCH chunks, so a short stream's rows dispatch no idle blocks.
 const attn_tile = attn_tiles / 2;
-const partial_chunks = 8;
+const partial_chunks = 12;
 /// qwen35_attn_tc.cuh's GROUP_LEN: a stream at least this long has its rows on tf_q35_attn_rows.
 pub const group_len = 8192;
 const ids_at = E.Engine.ids_at;
@@ -95,7 +95,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 }
                 if (shape.paged) {
                     try @import("cuda_attention.zig").partial(e, shape, ai);
-                    try launch(e, e.fns.attn_merge, sig.attn_merge, .{ g.q_heads, total, 1 }, .{ 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.y });
+                    try launchAfter(e, e.fns.attn_merge_gate, sig.attn_merge_gate, .{ g.q_heads, total, 1 }, .{ 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.qraw, e.mix, sums });
                 } else if (prompt and nseg == 1 and (g.q_heads / g.kv_heads) % 2 == 0) {
                     // a prompt chunk's rows over its own cache: tensor-core tiles in place of the decode partials
                     try @import("cuda_prompt.zig").run(e, @intCast(ai), total);
@@ -114,7 +114,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     // the merge with the gate and the gated rows' group sums, attn_gate's bits
                     try launchAfter(e, e.fns.attn_merge_gate, sig.attn_merge_gate, .{ g.q_heads, total, 1 }, .{ 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.qraw, e.mix, sums });
                 }
-                if (shape.paged or (prompt and nseg == 1 and (g.q_heads / g.kv_heads) % 2 == 0)) try launchAfter(e, e.fns.attn_gate, sig.attn_gate, .{ (total * aw + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.y, e.qraw, e.mix, @as(c_int, @intCast(total)), t_params, sums });
+                if (prompt and nseg == 1 and (g.q_heads / g.kv_heads) % 2 == 0) try launchAfter(e, e.fns.attn_gate, sig.attn_gate, .{ (total * aw + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.y, e.qraw, e.mix, @as(c_int, @intCast(total)), t_params, sums });
                 if (e.learning) |k| try k.gated(i, e.mix, total);
                 try e.projAgain(m.o, e.mix, e.r, total, prompt);
                 ai += 1;
