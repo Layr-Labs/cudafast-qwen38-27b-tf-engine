@@ -122,17 +122,61 @@ fn quantize(gpa: std.mem.Allocator, w: []align(1) const u16, n: usize, k: usize)
             const s = bf16(scale);
             const b = bf16(bias);
             const inv = if (s == 0) 0.0 else 1.0 / s;
-            for (0..8) |j| {
-                var word: u32 = 0;
-                for (0..8) |i| {
-                    const q = std.math.clamp(@round((bf16(row[j * 8 + i]) - b) * inv), 0.0, 15.0);
-                    word |= @as(u32, @intFromFloat(q)) << @intCast(4 * i);
-                }
-                words[(r * k + g * 64) / 8 + j] = word;
-            }
+            var codes = nearestCodes(row, s, b, inv);
+            const carried = feedbackCodes(row, s, b, inv);
+            if (carried.err < codes.err) codes = carried;
+            const base = (r * k + g * 64) / 8;
+            for (0..8) |j| words[base + j] = codes.words[j];
         }
     }
     return .{ .words = words, .scales = scales, .biases = biases };
+}
+
+/// One group's packed word stream and the squared error that stream stores under a bf16 scale and bias.
+const Codes = struct { words: [8]u32, err: f64 };
+
+/// The group's words when every weight takes the code nearest the line under (s, b) — the parent's assignment — and
+/// the error those words store, which is the error `groupError` scores.
+fn nearestCodes(row: []align(1) const u16, s: f32, b: f32, inv: f32) Codes {
+    var out = Codes{ .words = .{ 0, 0, 0, 0, 0, 0, 0, 0 }, .err = 0 };
+    for (0..8) |j| {
+        var word: u32 = 0;
+        for (0..8) |i| {
+            const x = bf16(row[j * 8 + i]);
+            const q = std.math.clamp(@round((x - b) * inv), 0.0, 15.0);
+            word |= @as(u32, @intFromFloat(q)) << @intCast(4 * i);
+            const e = @as(f64, x) - (@as(f64, s) * @as(f64, q) + @as(f64, b));
+            out.err += e * e;
+        }
+        out.words[j] = word;
+    }
+    return out;
+}
+
+/// The same words chosen in order, each against the residual the codes before it left in the group: the line is
+/// walked in code units with one sweep of error feedback, so a weight the line cannot reach is paid for by the
+/// weights that follow it instead of by the scale. Two groups of eight are packed in the order the stream stores
+/// them, and the error is the stored one, so a caller may keep whichever stream measures lower.
+fn feedbackCodes(row: []align(1) const u16, s: f32, b: f32, inv: f32) Codes {
+    var out = Codes{ .words = .{ 0, 0, 0, 0, 0, 0, 0, 0 }, .err = std.math.inf(f64) };
+    if (!(s > 0)) return out;
+    var carry: f32 = 0;
+    var err: f64 = 0;
+    for (0..8) |j| {
+        var word: u32 = 0;
+        for (0..8) |i| {
+            const x = bf16(row[j * 8 + i]);
+            const v = (x - b) * inv + carry;
+            const q = std.math.clamp(@round(v), 0.0, 15.0);
+            word |= @as(u32, @intFromFloat(q)) << @intCast(4 * i);
+            carry = v - q;
+            const e = @as(f64, x) - (@as(f64, s) * @as(f64, q) + @as(f64, b));
+            err += e * e;
+        }
+        out.words[j] = word;
+    }
+    out.err = err;
+    return out;
 }
 
 /// A group's (scale, bias) improved by alternating code assignment and a least-squares line fit; kept only where the
@@ -141,7 +185,7 @@ fn leastSquares(row: []align(1) const u16, start: [2]f32) [2]f32 {
     var best = start;
     var best_err = groupError(row, start);
     var cur = start;
-    for (0..3) |_| {
+    for (0..8) |_| {
         const s = cur[0];
         if (s <= 0) break;
         var sq: f64 = 0;
@@ -176,14 +220,7 @@ fn groupError(row: []align(1) const u16, fit: [2]f32) f64 {
     const s = bf16(toBf16(fit[0]));
     const b = bf16(toBf16(fit[1]));
     const inv = if (s == 0) 0.0 else 1.0 / s;
-    var err: f64 = 0;
-    for (row) |h| {
-        const x = bf16(h);
-        const q = std.math.clamp(@round((x - b) * inv), 0.0, 15.0);
-        const d: f64 = x - (q * s + b);
-        err += d * d;
-    }
-    return err;
+    return nearestCodes(row, s, b, inv).err;
 }
 
 /// A bf16 (n, k) tensor quantized and packed through `stage` into the drafter's arena.
