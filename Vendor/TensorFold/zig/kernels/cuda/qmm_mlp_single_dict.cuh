@@ -60,8 +60,10 @@ __device__ __forceinline__ void mlp_single_dict_body(const __nv_bfloat16* __rest
     // [kg][npad / 64][16 * bits], its biases at its table (ns scale values, then nb bias values)
     const int code0 = parts.p[0].first, code1 = parts.p[1].first;
     const int bits0 = dict_bits(code0), bits1 = dict_bits(code1);
+    // pair codes (qmm_dict.cuh): one index a column a group-tile and a u32 table, read through L2 here (the twin's
+    // shared memory keeps room for small separate tables only), each lane's four entries fetched before the MMAs
     const bool pair0 = dict_pair(code0), pair1 = dict_pair(code1);
-    const int tab0 = pair0 ? 0 : (dict_ns(code0) + dict_nb(code0) + 7) / 8 * 16;
+    const int tab0 = pair0 ? 0 : (dict_ns(code0) + dict_nb(code0) + 7) / 8 * 16;  // gate's shared table bytes
     unsigned char* const dec = buf + T::SMEM;                                    // a warp's 32 scales, 32 biases
     const unsigned short* const tabs = reinterpret_cast<const unsigned short*>(buf + T::SMEM + MLP_DICT_DEC);
     // the stage's index runs: gate's four tiles (64 * bits0 bytes), then up's; a thread loads one 16-byte chunk
@@ -143,7 +145,7 @@ __device__ __forceinline__ void mlp_single_dict_body(const __nv_bfloat16* __rest
         const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
         const uint32_t* pk = reinterpret_cast<const uint32_t*>(p + T::X + T::W + mrun);
         __nv_bfloat16* const dw = reinterpret_cast<__nv_bfloat16*>(dec) + wn * 64;    // this warp's 32 + 32 values
-        uint32_t pe[4] = {0u, 0u, 0u, 0u};
+        uint32_t pe[4] = {0u, 0u, 0u, 0u};       // pair mode: the lane's column's entry a pass, in flight under the MMAs
         if (mpair) {
 #pragma unroll
             for (int pass = 0; pass < 4; ++pass) {

@@ -709,16 +709,9 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_attn_partial(Geo geo, c
     const int G = geo.qh / geo.kvh;
     const bool own = segs[rowseg[m]].len < tf_q35_tc::GROUP_LEN;
     const int keys = segs[rowseg[m]].len + rows_seen(rowanc[m]), ck = chunk_keys(keys), nch = (keys + ck - 1) / ck;
+    if ((int)blockIdx.y >= nch) return;
     bool first = true;
-    for (int c = blockIdx.y; c < MAXCH; c += gridDim.y) {
-        if (c >= nch) {
-            if (own && (int)threadIdx.x < G) {
-                const size_t at = (m * geo.qh + (size_t)blockIdx.z * G + threadIdx.x) * MAXCH + c;
-                PM[at] = -INFINITY;
-                PL[at] = 0.0f;
-            }
-            continue;
-        }
+    for (int c = blockIdx.y; c < nch; c += gridDim.y) {
         if (!first) __syncthreads();
         first = false;
         tf_q35_tc::attn_one<tf_q35_tc::Bf16Tiles1<128>>({attn_tiles, nullptr, nullptr, nullptr}, geo, Q, segs, rowseg, rowanc, layer, P, scale, PM, PL, PO, c);
