@@ -21,9 +21,9 @@ test "dense serving: owned CUDA images retain their reviewed lane and decode byt
     try std.testing.expectEqualStrings("6d189c43b347081ba4426b241c5ec4c67979cb2ff3c59a9b6690ef008b50870e", &hash(@embedFile("kernels/cuda/qwen35_slots16.cuh")));
     const group = @embedFile("kernels/cuda/qmm_group.cu");
     try std.testing.expectEqualStrings("3b27b8e964f6e7453e962cd7a259253ae7e1940297439b4b518f05da04dd1041", &hash(group[0..16132]));
-    try std.testing.expectEqualStrings("f9ac138bc70315b29d865f5a76a8a39a622879a5f6b7ac581f96f83252a0dcd4", &hash(group));
-    try std.testing.expectEqualStrings("c824b95480a53c4c88abbaf80444f990309068e4414e34458cca255c01bea35a", &hash(@embedFile("kernels/cuda/qmm_output_stream.cuh")));
-    try std.testing.expectEqualStrings("ac152a74edbdde6190b4b268e885d93588c09e22929dcf4aa610e7c64794ca5e", &hash(@embedFile("kernels/cuda/qmm_gdn_stream.cuh")));
+    try std.testing.expectEqualStrings("598439a7686b356f1e4e2bdf14c9df097b6f7e5ce876eaefa3d7dcd1ccb8f0c3", &hash(group));
+    try std.testing.expectEqualStrings("d05d4ed48ccae572fde30ea8e41a7664bcf050ae94e15e70d5ebba52228cb1ac", &hash(@embedFile("kernels/cuda/qmm_output_stream.cuh")));
+    try std.testing.expectEqualStrings("5b9df453e92ea048d2b2c00f914f612312c49eef2f16d1886a5e1bf16a2b003f", &hash(@embedFile("kernels/cuda/qmm_gdn_stream.cuh")));
     try std.testing.expectEqualStrings("fb1101f0b75e07be8452e79da886930f44c27774f5f431d906edbd933c6dd9bd", &hash(@embedFile("kernels/cuda/qmm_wide_kmajor.cuh")));
     try std.testing.expectEqualStrings("f5d4386f2fc954c813d9f0536432f36cebe6c6ebd05c074f10776d2aa3b545ee", &hash(@embedFile("kernels/cuda/qmm_prefill.cu")));
     try std.testing.expectEqualStrings("98d7a19a2a005f4d7767c6d12ae13ee29bf525b307449b07d6c95c3ec5be27db", &hash(@embedFile("kernels/cuda/qmm_prompt_rows2.cuh")));
@@ -31,7 +31,7 @@ test "dense serving: owned CUDA images retain their reviewed lane and decode byt
     try std.testing.expectEqualStrings("aa0c6e88f0091ab0d01c19d8ad85a07664031e2e93049db56260fc4790459ede", &hash(@embedFile("kernels/cuda/qmm_prompt_persist.cuh")));
     try std.testing.expectEqualStrings("96323e03a11ef111b5c039ca418f99e4d5c00b43171c15be5c1958c41cf2274c", &hash(@embedFile("kernels/cuda/qmm_prompt_persist_rows2.cuh")));
     try std.testing.expectEqualStrings("e9c3e754302e5cacd24529d775368c2e14eb485f6ef59fbd100bdeea085ad589", &hash(@embedFile("kernels/cuda/qmm_prompt_persist_rows3.cuh")));
-    try std.testing.expectEqualStrings("60be13e9f73529390746feddab08953f13531d6763c46188aba1d574d092dfaa", &hash(@embedFile("kernels/cuda/qwen35.cu")));
+    try std.testing.expectEqualStrings("23a05da08a9b94019e79a2a62a2aef273bed00ed6779292dd2e624c5de861ade", &hash(@embedFile("kernels/cuda/qwen35.cu")));
     try std.testing.expectEqualStrings("e6a57b7545249e0bcdda36c677792456ed76d0a35aa3cd88d43601b38061fd3d", &hash(@embedFile("kernels/cuda/qwen35.cuh")));
     try std.testing.expectEqualStrings("eabec596ebb2b76effa205ed1f5538392f16dd0c2fa3e266314635dc728fe96e", &hash(@embedFile("kernels/cuda/qwen35_draft.cu")));
     try std.testing.expectEqualStrings("4f14d7ce48fec892a4bb6d5724619ae6d495a6bb50f81d4a3bccc7a3d578dd9a", &hash(@embedFile("kernels/cuda/qwen35_keep.cu")));
@@ -54,5 +54,5 @@ test "dense serving: owned launches and projections retain their reviewed argume
             try out.append(std.testing.allocator, c);
         };
     }
-    try std.testing.expectEqualStrings("dbf99f0341b3e2f9bb48d091adf09abd004d373a599a1e3d6385145c8bf44f63", &hash(out.items));
+    try std.testing.expectEqualStrings("5ce8363ed1e814399eb06881047a4dbb0a792dad31d6b8ff8e3a9dc3e6edf67e", &hash(out.items));
 }
