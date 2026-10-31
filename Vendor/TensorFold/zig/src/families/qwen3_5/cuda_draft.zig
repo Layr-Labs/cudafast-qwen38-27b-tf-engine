@@ -45,6 +45,24 @@ pub const Ctx = struct {
     scanned: usize = 0,
     wide: bool = false,
     outside: usize = 0, // the stream's tokens so far outside the draft spans (frame.scan)
+    // the stream's verified trees (wideGuard): its rounds and kept rows, the rounds that offered more than 15 nodes and
+    // their kept rows past row 15; `narrow` once those rows no longer pay for the wider window
+    rounds: u32 = 0,
+    kept_rows: u32 = 0,
+    wide_rounds: u32 = 0,
+    wide_extra: u32 = 0,
+    narrow: bool = false,
+    // the stream begins narrow (`began_narrow`, TF_WIDE_START=1 turns this off) and `waiting` collects evidence rounds, each with the
+    // whole tree grown (`shadow` nodes) but only its first 15 offered: the rounds, their kept rows, and the rounds whose
+    // end row had a tail child holding the target's next token; then it widens (`widened`, at `widened_at` tree rounds) or stays narrow
+    waiting: bool = false,
+    began_narrow: bool = false,
+    widened: bool = false,
+    widened_at: u32 = 0,
+    shadow: usize = 0,
+    probe_rounds: u32 = 0,
+    probe_kept: u32 = 0,
+    probe_ext: u32 = 0,
 };
 
 pub const Draft = struct {
@@ -104,6 +122,8 @@ pub const Draft = struct {
     /// The target's window ms by rows (cuda_native.zig times them), for the round loop's prices.
     costs: [engine.most_window]lanes.config.Cost = undefined,
     n_costs: usize = 0,
+    /// The wide-tree guard's constants and the tail discount (TF_WIDE_PROBE, TF_WIDE_MARGIN, TF_TAIL_DISCOUNT, TF_WIDE_START, TF_WIDEN_AFTER, TF_WIDEN_MARGIN), read once at init.
+    guard: GuardTuning = .{},
 
     startup: profile.Times = .{},
     frame_streams: usize = 1,
@@ -124,6 +144,8 @@ pub const Draft = struct {
         const d = try gpa.create(Draft);
         errdefer gpa.destroy(d);
         d.* = .{ .gpa = gpa, .io = io, .e = e, .c = c, .w = undefined, .mod = undefined, .fns = undefined, .scratch = undefined, .taps_in = 0, .th = 0, .thn = 0, .kabs = 0, .kn = 0, .vabs = 0, .xs = 0, .h = 0, .h2 = 0, .x = 0, .xin = 0, .dyn = 0, .qraw = 0, .q = 0, .kraw = 0, .kb = 0, .vb = 0, .att = 0, .o = 0, .gate = 0, .up = 0, .act = 0, .logits = 0, .words = 0, .parts = 0, .hp = 0, .ids = 0, .staged = undefined };
+        d.guard = guardTuning();
+        if (platform.c.getenv("TF_TIMING") != null) std.debug.print("[timing] wide guard {s}, probe {d} wide rounds, margin {d:.2}, tail discount {d:.3}, start {s} (widen after {d} rounds at {d:.2} of the break-even)\n", .{ if (guardOn()) "on" else "off", d.guard.probe, d.guard.margin, d.guard.tail, if (d.guard.start_narrow) "narrow" else "wide", d.guard.widen_after, d.guard.widen_margin });
         d.mod = try cuda.Module.load(e.d, cuda.kernels.qwen35_draft);
         errdefer d.mod.unload();
         inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(d.fns, name) = try d.mod.function("tf_q35d_" ++ name);
@@ -419,15 +441,21 @@ pub const Draft = struct {
     pub fn selectHold(d: *Draft, ctx: *Ctx, it: dr.Hold) !void {
         const rows = d.c.block - 1;
         ctx.grown = 0;
+        ctx.shadow = 0;
         // a sampled hold's candidates ranked as its target draw ranks them (its seed, each draft's position)
         d.drawn = .{ .sampling = it.sampling, .position = it.position };
         defer d.drawn = .{};
         if (it.lanes) |shape| return d.selectLanes(ctx, it.pending, rows, shape);
-        const limit = if (d.c.block == 16) tree.nodes() else 0;
+        const limit = if (d.c.block == 16) d.wideGuard(ctx, tree.nodes()) else 0;
         if (limit > 0) {
             // the whole budget whenever drafts are asked: the block's forward costs the same at any depth
             const n = if (it.depth == 0) 0 else limit;
-            ctx.grown = tree.grow(d.candidates(rows), it.pending, rows, n, &ctx.held, &ctx.parents, &ctx.own);
+            // a stream judging whether to widen grows the whole tree and offers its first `n` nodes (best first: the same
+            // nodes as growing `n`); the rest is what the wider window would have added
+            const shadow = ctx.waiting and n > 0 and tree.nodes() > n;
+            const grown = tree.grow(d.candidates(rows), it.pending, rows, if (shadow) tree.nodes() else n, &ctx.held, &ctx.parents, &ctx.own);
+            ctx.grown = if (shadow) @min(grown, n) else grown;
+            ctx.shadow = if (shadow) grown else 0;
             if (n >= rows and it.tokens.len >= 4) {
                 var ch: [engine.most_window]u32 = undefined;
                 tree.chain(d.candidates(rows), it.pending, ch[0..rows]);
@@ -467,6 +495,65 @@ pub const Draft = struct {
         }
     }
 
+    /// A stream's node budget: `nodes`, or 15 once its wide rounds' kept rows past row 15 (an upper bound of what the
+    /// wider tree adds) fall clearly below the wider window's extra cost in the stream's own tokens, after `guard.probe` wide
+    /// rounds (window costs from the engine's table; TF_WIDE_GUARD=0: always `nodes`). A stream that began narrow
+    /// keeps 15 until `judgeWiden`.
+    fn wideGuard(d: *const Draft, ctx: *Ctx, nodes: usize) usize {
+        if (nodes <= narrow_nodes) return nodes;
+        if (ctx.waiting) {
+            if (ctx.probe_rounds < d.guard.widen_after) return narrow_nodes;
+            d.judgeWiden(ctx, nodes);
+        }
+        if (ctx.narrow) return narrow_nodes;
+        if (!guardOn()) return nodes;
+        if (ctx.wide_rounds < d.guard.probe or ctx.rounds == 0) return nodes;
+        var c16: f64 = 0;
+        var cw: f64 = 0;
+        for (d.costs[0..d.n_costs]) |c| {
+            if (c.width == narrow_nodes + 1) c16 = c.ms;
+            if (c.width == nodes + 1) cw = c.ms;
+        }
+        if (c16 <= 0 or cw <= c16) return nodes;
+        const per_round = @as(f64, @floatFromInt(ctx.kept_rows)) / @as(f64, @floatFromInt(ctx.rounds));
+        const extra = @as(f64, @floatFromInt(ctx.wide_extra)) / @as(f64, @floatFromInt(ctx.wide_rounds));
+        // a round's extra cost, in the stream's tokens: (cw - c16) / (c16 / per_round)
+        if (extra * c16 < d.guard.margin * (cw - c16) * per_round) ctx.narrow = true;
+        return if (ctx.narrow) narrow_nodes else nodes;
+    }
+
+    /// A start-narrow stream's verdict after `guard.widen_after` evidence rounds: the wide window's extra cost
+    /// (cw - c16 ms, from the engine's table, in the stream's own tokens at its kept rows a round) against the rows its tail
+    /// would have added, counted as one row for each round whose end row had a tail child with the target's next token (a
+    /// lower bound), at `guard.widen_margin` of the break-even. Widens (the u6 guard may narrow it again) or stays narrow.
+    fn judgeWiden(d: *const Draft, ctx: *Ctx, nodes: usize) void {
+        ctx.waiting = false;
+        var c16: f64 = 0;
+        var cw: f64 = 0;
+        for (d.costs[0..d.n_costs]) |c| {
+            if (c.width == narrow_nodes + 1) c16 = c.ms;
+            if (c.width == nodes + 1) cw = c.ms;
+        }
+        const priced = c16 > 0 and cw > c16;
+        const gain = @as(f64, @floatFromInt(ctx.probe_ext)) * c16;
+        const cost = d.guard.widen_margin * (cw - c16) * @as(f64, @floatFromInt(ctx.probe_kept));
+        const widen = !priced or gain >= cost;
+        if (platform.c.getenv("TF_TIMING") != null) std.debug.print("[timing] widen check after {d} rounds: {d} with a tail child holding the next token, {d} kept rows, window {d:.2} ms and {d:.2} ms: {s}\n", .{ ctx.probe_rounds, ctx.probe_ext, ctx.probe_kept, c16, cw, if (widen) "widen" else "stay narrow" });
+        if (widen) {
+            ctx.narrow = false;
+            ctx.widened = true;
+            ctx.widened_at = ctx.rounds;
+        }
+    }
+
+    /// A stream begins narrow and judges first, unless TF_WIDE_START=1 or TF_WIDE_GUARD=0.
+    fn begin(d: *const Draft, ctx: *Ctx) void {
+        if (!d.guard.start_narrow or !guardOn() or d.c.block != 16 or tree.nodes() <= narrow_nodes) return;
+        ctx.waiting = true;
+        ctx.narrow = true;
+        ctx.began_narrow = true;
+    }
+
     // the Drafter contract
 
     pub fn drafter(d: *Draft) dr.Drafter {
@@ -495,11 +582,13 @@ pub const Draft = struct {
             const ctx = try d.gpa.create(Ctx);
             errdefer d.gpa.destroy(ctx);
             ctx.* = .{ .ring = .{ .d = d.e.d, .ptr = ptr, .len = d.c.ringBytes(), .borrowed = true } };
+            d.begin(ctx);
             return d.streams.put(d.gpa, s, ctx);
         };
         const ctx = d.pool.pop() orelse try d.createCold();
         errdefer d.pool.append(d.gpa, ctx) catch d.drop(ctx);
         ctx.* = .{ .ring = ctx.ring };
+        d.begin(ctx);
         try d.streams.put(d.gpa, s, ctx);
     }
 
@@ -515,8 +604,16 @@ pub const Draft = struct {
                 for (prefix[0..@min(it.follow.len, prefix.len)], 0..) |*x, i| x.* = @intCast(i);
                 const kept = it.rows orelse prefix[0..@min(it.follow.len, prefix.len)];
                 d.landing.observeTree(it.stream.sampling != null, ctx.parents[0..ctx.grown], ctx.own[0..ctx.grown], it.offered, kept);
+                ctx.rounds += 1;
+                ctx.kept_rows += @intCast(kept.len);
+                if (it.offered > narrow_nodes) {
+                    ctx.wide_rounds += 1;
+                    for (kept) |r| ctx.wide_extra += @intFromBool(r > narrow_nodes);
+                }
+                if (ctx.waiting and ctx.shadow > narrow_nodes) shadowRound(ctx, it.follow, kept);
             }
             ctx.grown = 0;
+            ctx.shadow = 0;
             // the target's features: its ring, `offset` the first row's position (cuda_native.zig's featuresFn)
             if (it.rows) |rs| {
                 try d.absorb(ctx, it.features.buffer, it.features.offset, rs.len, rs, it.prompt);
@@ -556,7 +653,10 @@ pub const Draft = struct {
         return .{ .count = @intCast(ctx.grown), .tokens = tokens, .parents = try gpa.dupe(i32, ctx.parents[0..ctx.grown]) };
     }
 
-    /// A grown tree's nodes' chances: each its landing chance under its parent times its parent's.
+    /// A grown tree's nodes' chances: each its landing chance under its parent times its parent's. The tree nodes past
+    /// row 15 (the wide window's tail; a context copy's rows excepted) count `guard.tail` of theirs: every chance is
+    /// computed first, so a tail node's parents enter its product in full. The round loop's window width and its
+    /// calibration-trial spacing (core/lanes/windows.zig, lone_costs.zig) price from these.
     fn chancesFn(p: *anyopaque, s: *Stream, out: []f64) anyerror!bool {
         const d = cast(p);
         const ctx = d.streams.get(s) orelse return error.UnknownStream;
@@ -566,18 +666,141 @@ pub const Draft = struct {
             const step = if (own >= 0) 0.99 else d.landing.chance(sampled, own);
             o.* = step * (if (parent >= 0) out[@intCast(parent)] else 1);
         }
+        if (d.guard.tail < 1 and out.len > narrow_nodes) {
+            for (out[narrow_nodes..], ctx.own[narrow_nodes..out.len]) |*o, own| {
+                if (own < 0) o.* *= d.guard.tail;
+            }
+        }
         return true;
     }
 
     fn releaseFn(p: *anyopaque, s: *Stream) void {
         const d = cast(p);
         if (d.streams.fetchRemove(s)) |kv| {
+            if (kv.value.rounds > 0 and platform.c.getenv("TF_TIMING") != null) {
+                const c = kv.value;
+                std.debug.print("[timing] stream end: {d} tree rounds, {d} wide (over 15 nodes), {d} kept rows in all, {d} kept past row 15{s}\n", .{ c.rounds, c.wide_rounds, c.kept_rows, c.wide_extra, if (c.widened) " (began narrow, widened)" else if (c.began_narrow and c.waiting) " (began narrow, still judging)" else if (c.began_narrow) " (began narrow, stayed narrow)" else if (c.narrow) ", narrowed by the guard" else "" });
+                if (c.widened) std.debug.print("[timing] stream end: widened after {d} tree rounds{s}\n", .{ c.widened_at, if (c.narrow) ", narrowed again by the guard" else "" });
+            }
             if (d.streams.count() == 0) d.landing = .{};
             if (kv.value.ring.borrowed) return d.gpa.destroy(kv.value); // its lane's run goes back with the lane
             d.pool.append(d.gpa, kv.value) catch d.drop(kv.value);
         }
     }
 };
+
+/// The wide-tree guard (Draft.wideGuard): a stream's narrow budget, and the wide rounds it verifies before judging them.
+const narrow_nodes = 15;
+/// A stream narrows only when its extra rows fall clearly below the window's extra cost (the table prices empty context).
+/// 0 by default: `judgeWiden` has already judged a stream that widens. On the official pool the wide-first guard at 1.5
+/// (kshitij-hash's 4d3c3d55) also narrowed the pair that pays for the wide rows, and at 0.6 (1912e410) a low-acceptance
+/// stream stayed wide. TF_WIDE_MARGIN brings the check back.
+const default_guard_margin = 0.0;
+const default_wide_probe = 12;
+/// The constants as one run uses them: TF_WIDE_PROBE (whole wide rounds, at least 1), TF_WIDE_MARGIN (at least 0),
+/// TF_TAIL_DISCOUNT (above 0, at most 1: the share of a tail node's chance the round loop counts; 1: all of it),
+/// TF_WIDE_START (1: a stream begins with its whole tree; default and 0: with 15 nodes, judging whether to widen), TF_WIDEN_AFTER (its evidence rounds, at
+/// least 1) and TF_WIDEN_MARGIN (at least 0: the share of the wider window's break-even its tail rows must reach).
+const GuardTuning = struct {
+    probe: u32 = default_wide_probe,
+    margin: f64 = default_guard_margin,
+    tail: f64 = 1.0,
+    start_narrow: bool = true,
+    widen_after: u32 = default_widen_after,
+    widen_margin: f64 = default_widen_margin,
+};
+const default_widen_after = 16;
+const default_widen_margin = 0.7;
+const GuardEnv = struct { probe: ?[]const u8 = null, margin: ?[]const u8 = null, tail: ?[]const u8 = null, start: ?[]const u8 = null, after: ?[]const u8 = null, widen_margin: ?[]const u8 = null };
+fn envText(name: [*:0]const u8) ?[]const u8 {
+    const v = platform.c.getenv(name) orelse return null;
+    return std.mem.span(v);
+}
+fn guardTuning() GuardTuning {
+    return tuned(.{ .probe = envText("TF_WIDE_PROBE"), .margin = envText("TF_WIDE_MARGIN"), .tail = envText("TF_TAIL_DISCOUNT"), .start = envText("TF_WIDE_START"), .after = envText("TF_WIDEN_AFTER"), .widen_margin = envText("TF_WIDEN_MARGIN") });
+}
+/// A value that does not parse, or is out of range, leaves its default.
+fn tuned(env: GuardEnv) GuardTuning {
+    var t: GuardTuning = .{};
+    if (env.probe) |v| {
+        const n = std.fmt.parseInt(u32, v, 10) catch 0;
+        if (n >= 1) t.probe = n;
+    }
+    if (env.margin) |v| {
+        const m = std.fmt.parseFloat(f64, v) catch -1.0;
+        if (std.math.isFinite(m) and m >= 0) t.margin = m;
+    }
+    if (env.tail) |v| {
+        const x = std.fmt.parseFloat(f64, v) catch 0.0;
+        if (x > 0 and x <= 1) t.tail = x;
+    }
+    if (env.start) |v| {
+        if (std.mem.eql(u8, v, "0")) t.start_narrow = true else if (std.mem.eql(u8, v, "1")) t.start_narrow = false;
+    }
+    if (env.after) |v| {
+        const n = std.fmt.parseInt(u32, v, 10) catch 0;
+        if (n >= 1) t.widen_after = n;
+    }
+    if (env.widen_margin) |v| {
+        const m = std.fmt.parseFloat(f64, v) catch -1.0;
+        if (std.math.isFinite(m) and m >= 0) t.widen_margin = m;
+    }
+    return t;
+}
+/// An evidence round of a start-narrow stream: whether a tail node (past row 15) under the kept path's last row held the
+/// token the target gave after it, the one row the wider tree could have added (`follow` has a token after each kept row).
+fn shadowRound(ctx: *Ctx, follow: []const u32, kept: []const u32) void {
+    ctx.probe_rounds += 1;
+    ctx.probe_kept += @intCast(kept.len);
+    if (kept.len == 0 or follow.len < kept.len) return;
+    const end: i32 = @as(i32, @intCast(kept[kept.len - 1])) - 1; // row r is node r - 1; row 0 (the pending token) is no node
+    const next = follow[kept.len - 1];
+    for (ctx.held[narrow_nodes..ctx.shadow], ctx.parents[narrow_nodes..ctx.shadow]) |token, parent| {
+        if (parent == end and token == next) {
+            ctx.probe_ext += 1;
+            return;
+        }
+    }
+}
+fn guardOn() bool {
+    const v = platform.c.getenv("TF_WIDE_GUARD") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
+
+test "the wide-tree guard's constants: the defaults, valid overrides, and a bad value leaves its default" {
+    try std.testing.expectEqual(GuardTuning{}, tuned(.{}));
+    try std.testing.expectEqual(GuardTuning{ .probe = 6, .margin = 0.4, .tail = 0.5, .start_narrow = true, .widen_after = 5, .widen_margin = 1.5 }, tuned(.{ .probe = "6", .margin = "0.4", .tail = "0.5", .start = "0", .after = "5", .widen_margin = "1.5" }));
+    try std.testing.expectEqual(GuardTuning{ .probe = default_wide_probe, .margin = 0, .tail = 1.0, .widen_margin = 0 }, tuned(.{ .probe = "0", .margin = "0", .tail = "1", .after = "0", .widen_margin = "0" }));
+    try std.testing.expectEqual(GuardTuning{}, tuned(.{ .probe = "-3", .margin = "-0.2", .tail = "0", .start = "2", .after = "-1", .widen_margin = "-1" }));
+    try std.testing.expectEqual(GuardTuning{ .start_narrow = false }, tuned(.{ .start = "1" }));
+    try std.testing.expectEqual(GuardTuning{}, tuned(.{ .probe = "six", .margin = "x", .tail = "-0.5", .start = "", .after = "x", .widen_margin = "x" }));
+    try std.testing.expectEqual(GuardTuning{}, tuned(.{ .probe = "", .margin = "nan", .tail = "1.5", .start = "no", .after = "1.5", .widen_margin = "nan" }));
+    try std.testing.expectEqual(GuardTuning{}, tuned(.{ .probe = "1.5", .margin = "inf", .tail = "nan", .widen_margin = "inf" }));
+}
+
+test "a start-narrow stream's evidence round counts a tail child holding the target's next token under the kept path's last row" {
+    var ctx: Ctx = .{ .ring = undefined };
+    // nodes 0..14 are the narrow tree; tail nodes 15 (under node 3, token 77) and 16 (under the pending row, token 5)
+    for (0..17) |i| {
+        ctx.held[i] = @intCast(100 + i);
+        ctx.parents[i] = @as(i32, @intCast(i)) - 1;
+    }
+    ctx.held[15] = 77;
+    ctx.parents[15] = 3;
+    ctx.held[16] = 5;
+    ctx.parents[16] = -1;
+    ctx.shadow = 17;
+    shadowRound(&ctx, &.{ 101, 102, 103, 77 }, &.{ 0, 1, 2, 3 }); // the path ends at row 3 = node 2: no tail child there
+    try std.testing.expectEqual(@as(u32, 0), ctx.probe_ext);
+    shadowRound(&ctx, &.{ 101, 102, 103, 104, 77 }, &.{ 0, 1, 2, 3, 4 }); // ends at node 3, whose tail child holds 77
+    try std.testing.expectEqual(@as(u32, 1), ctx.probe_ext);
+    shadowRound(&ctx, &.{5}, &.{0}); // ends at the pending row; node 16 under it holds 5
+    try std.testing.expectEqual(@as(u32, 2), ctx.probe_ext);
+    shadowRound(&ctx, &.{6}, &.{0});
+    try std.testing.expectEqual(@as(u32, 2), ctx.probe_ext);
+    try std.testing.expectEqual(@as(u32, 4), ctx.probe_rounds);
+    try std.testing.expectEqual(@as(u32, 4 + 5 + 1 + 1), ctx.probe_kept);
+}
 
 /// Acceptance by depth until a stream has its own (the reference's chat text: measured, see the commit).
 const prior = [_]f64{ 0.75, 0.65, 0.58, 0.52, 0.47, 0.43, 0.4, 0.37, 0.35, 0.33, 0.31, 0.29, 0.28, 0.27, 0.26 };
