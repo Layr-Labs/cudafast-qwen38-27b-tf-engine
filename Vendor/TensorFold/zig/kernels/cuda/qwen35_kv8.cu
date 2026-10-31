@@ -7,6 +7,24 @@
 
 using namespace tf_q35;
 
+__device__ __forceinline__ void release_next() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+#endif
+}
+
+__device__ __forceinline__ void await_prior() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
+}
+
+template <typename T>
+__device__ __forceinline__ T* after_wait(T* p) {
+    asm volatile("" : "+l"(p)::"memory");
+    return p;
+}
+
 // A key's and value's codes and scales.
 struct Row8 {
     unsigned char *k, *v;
@@ -47,8 +65,10 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_rope8(Geo geo, __nv_bfl
                                                                  const __nv_bfloat16* __restrict__ Vr, const Seg* __restrict__ segs,
                                                                  const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
                                                                  const int* __restrict__ P, const int* __restrict__ M) {
+    release_next();
+    await_prior();
     __shared__ float red[HD / 32];
-    rope_rows(geo, Qn, Kn, Vr, segs, rowseg, rowanc, P, M, StoreFp8{layer, geo.kvh, red});
+    rope_rows(geo, after_wait(Qn), after_wait(Kn), after_wait(Vr), after_wait(segs), after_wait(rowseg), after_wait(rowanc), after_wait(P), after_wait(M), StoreFp8{layer, geo.kvh, red});
 }
 
 
@@ -78,6 +98,16 @@ extern "C" __global__ void tf_q35_attn_partial8_contiguous(Geo geo, const __nv_b
                                                   const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
                                                   const int* __restrict__ P, float scale,
                                                   float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
+    release_next();
+    await_prior();
+    Q = after_wait(Q);
+    segs = after_wait(segs);
+    rowseg = after_wait(rowseg);
+    rowanc = after_wait(rowanc);
+    P = after_wait(P);
+    PM = after_wait(PM);
+    PL = after_wait(PL);
+    PO = after_wait(PO);
     constexpr int DPL = HD / 32;
     const int QH = geo.qh, KVH = geo.kvh;
     const int lane = threadIdx.x & 31, g = threadIdx.x >> 5;
@@ -139,6 +169,16 @@ extern "C" __global__ void tf_q35_attn_partial8_legacy(Geo geo, const __nv_bfloa
                                                   const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
                                                   const int* __restrict__ P, float scale,
                                                   float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
+    release_next();
+    await_prior();
+    Q = after_wait(Q);
+    segs = after_wait(segs);
+    rowseg = after_wait(rowseg);
+    rowanc = after_wait(rowanc);
+    P = after_wait(P);
+    PM = after_wait(PM);
+    PL = after_wait(PL);
+    PO = after_wait(PO);
     constexpr int DPL = HD / 32;
     const int QH = geo.qh, KVH = geo.kvh;
     const int lane = threadIdx.x & 31, g = threadIdx.x >> 5;
@@ -204,6 +244,16 @@ extern "C" __global__ void tf_q35_attn_partial8_paged(Geo geo, const __nv_bfloat
                                                   const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
                                                   const int* __restrict__ P, float scale,
                                                   float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
+    release_next();
+    await_prior();
+    Q = after_wait(Q);
+    segs = after_wait(segs);
+    rowseg = after_wait(rowseg);
+    rowanc = after_wait(rowanc);
+    P = after_wait(P);
+    PM = after_wait(PM);
+    PL = after_wait(PL);
+    PO = after_wait(PO);
     constexpr int DPL = HD / 32;
     const int QH = geo.qh, KVH = geo.kvh;
     const int lane = threadIdx.x & 31, g = threadIdx.x >> 5;
@@ -275,6 +325,8 @@ extern "C" __global__ void tf_q35_attn_partial8_paged(Geo geo, const __nv_bfloat
 
 // tf_q35k_compact over e4m3 rows: the path's keys, values and their scales move down to the slots after the cache.
 extern "C" __global__ void __launch_bounds__(256) tf_q35k_compact8(Geo geo, Seg sg, Path path) {
+    release_next();
+    await_prior();
     const int KVH = geo.kvh;
     const int layer = blockIdx.x, h = blockIdx.y;
     const int d = threadIdx.x;
@@ -298,16 +350,36 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_attn_partial8(Geo geo, 
                                                                          const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
                                                                          const int* __restrict__ P, float scale,
                                                                          float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
+    release_next();
+    await_prior();
+    const __nv_bfloat16* Q_ = after_wait(Q);
+    const Seg* segs_ = after_wait(segs);
+    const int* rowseg_ = after_wait(rowseg);
+    const Ancestor* rowanc_ = after_wait(rowanc);
+    const int* P_ = after_wait(P);
+    float* PM_ = after_wait(PM);
+    float* PL_ = after_wait(PL);
+    float* PO_ = after_wait(PO);
     __shared__ __align__(16) uint4 kt[tf_q35_tc::TK * tf_q35_tc::CH], vt[tf_q35_tc::TK * tf_q35_tc::CH];
     __shared__ float ksc[tf_q35_tc::TK], vsc[tf_q35_tc::TK];
-    tf_q35_tc::attn_one<tf_q35_tc::Fp8Tiles<128>>({kt, vt, ksc, vsc}, geo, Q, segs, rowseg, rowanc, layer, P, scale, PM, PL, PO, (int)blockIdx.y);
+    tf_q35_tc::attn_one<tf_q35_tc::Fp8Tiles<128>>({kt, vt, ksc, vsc}, geo, Q_, segs_, rowseg_, rowanc_, layer, P_, scale, PM_, PL_, PO_, (int)blockIdx.y);
 }
 
 extern "C" __global__ void __launch_bounds__(256) tf_q35_attn_rows8(Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
                                                                       const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
                                                                       const int* __restrict__ P, float scale, int total,
                                                                       float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
+    release_next();
+    await_prior();
+    const __nv_bfloat16* Q_ = after_wait(Q);
+    const Seg* segs_ = after_wait(segs);
+    const int* rowseg_ = after_wait(rowseg);
+    const Ancestor* rowanc_ = after_wait(rowanc);
+    const int* P_ = after_wait(P);
+    float* PM_ = after_wait(PM);
+    float* PL_ = after_wait(PL);
+    float* PO_ = after_wait(PO);
     __shared__ __align__(16) uint4 kt[tf_q35_tc::TK * tf_q35_tc::CH], vt[tf_q35_tc::TK * tf_q35_tc::CH];
     __shared__ float ksc[tf_q35_tc::TK], vsc[tf_q35_tc::TK];
-    tf_q35_tc::attn_rows<4, tf_q35_tc::Fp8Tiles<256>>({kt, vt, ksc, vsc}, geo, Q, segs, rowseg, rowanc, layer, P, scale, total, PM, PL, PO, (int)blockIdx.y);
+    tf_q35_tc::attn_rows<4, tf_q35_tc::Fp8Tiles<256>>({kt, vt, ksc, vsc}, geo, Q_, segs_, rowseg_, rowanc_, layer, P_, scale, total, PM_, PL_, PO_, (int)blockIdx.y);
 }

@@ -26,14 +26,22 @@ __device__ __forceinline__ float group_sum(const __nv_bfloat16* x) {
 extern "C" __global__ void __launch_bounds__(256) tf_q35_embed(const int* __restrict__ ids, const uint8_t* __restrict__ W,
                                                                  const __nv_bfloat16* __restrict__ S, const __nv_bfloat16* __restrict__ B,
                                                                  __nv_bfloat16* __restrict__ out, int D, const int* __restrict__ P) {
-    if (past_rows(P, blockIdx.x)) return;
-    const size_t id = ids[blockIdx.x];
+    release_next();
+    await_prior();
+    const int* P_ = after_wait(P);
+    if (past_rows(P_, blockIdx.x)) return;
+    const int* ids_ = after_wait(ids);
+    const uint8_t* W_ = after_wait(W);
+    const __nv_bfloat16* S_ = after_wait(S);
+    const __nv_bfloat16* B_ = after_wait(B);
+    __nv_bfloat16* out_ = after_wait(out);
+    const size_t id = ids_[blockIdx.x];
     for (int b = threadIdx.x; b < D / 2; b += blockDim.x) {
-        const uint8_t v = W[id * (D / 2) + b];
+        const uint8_t v = W_[id * (D / 2) + b];
         const size_t g = id * (D / 64) + (2 * b) / 64;
-        const float s = bf(S[g]), z = bf(B[g]);
-        out[(size_t)blockIdx.x * D + 2 * b] = __float2bfloat16_rn(s * (float)(v & 15) + z);
-        out[(size_t)blockIdx.x * D + 2 * b + 1] = __float2bfloat16_rn(s * (float)(v >> 4) + z);
+        const float s = bf(S_[g]), z = bf(B_[g]);
+        out_[(size_t)blockIdx.x * D + 2 * b] = __float2bfloat16_rn(s * (float)(v & 15) + z);
+        out_[(size_t)blockIdx.x * D + 2 * b + 1] = __float2bfloat16_rn(s * (float)(v >> 4) + z);
     }
 }
 
@@ -41,21 +49,35 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_embed(const int* __rest
 extern "C" __global__ void __launch_bounds__(256) tf_q35_embed8(const int* __restrict__ ids, const uint8_t* __restrict__ W,
                                                                   const __nv_bfloat16* __restrict__ S, const __nv_bfloat16* __restrict__ B,
                                                                   __nv_bfloat16* __restrict__ out, int D, const int* __restrict__ P) {
-    if (past_rows(P, blockIdx.x)) return;
-    const size_t id = ids[blockIdx.x];
+    release_next();
+    await_prior();
+    const int* P_ = after_wait(P);
+    if (past_rows(P_, blockIdx.x)) return;
+    const int* ids_ = after_wait(ids);
+    const uint8_t* W_ = after_wait(W);
+    const __nv_bfloat16* S_ = after_wait(S);
+    const __nv_bfloat16* B_ = after_wait(B);
+    __nv_bfloat16* out_ = after_wait(out);
+    const size_t id = ids_[blockIdx.x];
     for (int d = threadIdx.x; d < D; d += blockDim.x) {
         const size_t g = id * (D / 64) + d / 64;
-        out[(size_t)blockIdx.x * D + d] = __float2bfloat16_rn(bf(S[g]) * (float)W[id * D + d] + bf(B[g]));
+        out_[(size_t)blockIdx.x * D + d] = __float2bfloat16_rn(bf(S_[g]) * (float)W_[id * D + d] + bf(B_[g]));
     }
 }
 
 // Image rows into a prompt chunk's embeddings: row m of H (D wide) takes feature row src[m] where src[m] >= 0.
 extern "C" __global__ void __launch_bounds__(256) tf_q35_splice(__nv_bfloat16* __restrict__ H, const __nv_bfloat16* __restrict__ F,
                                                                   const int* __restrict__ src, int D, const int* __restrict__ P) {
-    if (past_rows(P, blockIdx.x)) return;
-    const int s = src[blockIdx.x];
+    release_next();
+    await_prior();
+    const int* P_ = after_wait(P);
+    if (past_rows(P_, blockIdx.x)) return;
+    const int* src_ = after_wait(src);
+    __nv_bfloat16* H_ = after_wait(H);
+    const __nv_bfloat16* F_ = after_wait(F);
+    const int s = src_[blockIdx.x];
     if (s < 0) return;
-    for (int i = threadIdx.x; i < D; i += blockDim.x) H[(size_t)blockIdx.x * D + i] = F[(size_t)s * D + i];
+    for (int i = threadIdx.x; i < D; i += blockDim.x) H_[(size_t)blockIdx.x * D + i] = F_[(size_t)s * D + i];
 }
 
 __device__ __forceinline__ void release_next() {
@@ -216,10 +238,15 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __r
 
 // 64-group sums of bf16 rows D wide (the decode projections' input sums). Grid (rows, groups / 64), a thread a group.
 extern "C" __global__ void __launch_bounds__(64) tf_q35_sums(const __nv_bfloat16* __restrict__ X, float* __restrict__ XS, int D, const int* __restrict__ P) {
-    if (past_rows(P, blockIdx.x)) return;
+    release_next();
+    await_prior();
+    const int* P_ = after_wait(P);
+    if (past_rows(P_, blockIdx.x)) return;
+    const __nv_bfloat16* X_ = after_wait(X);
+    float* XS_ = after_wait(XS);
     const size_t row = blockIdx.x;
     const int g = blockIdx.y * blockDim.x + threadIdx.x;
-    if (g < D / 64) XS[row * (D / 64) + g] = group_sum(X + row * D + g * 64);
+    if (g < D / 64) XS_[row * (D / 64) + g] = group_sum(X_ + row * D + g * 64);
 }
 
 // Conv, silu, q/k norms, decay and write: blockDim.y independent row warps per head, taps from the parents.

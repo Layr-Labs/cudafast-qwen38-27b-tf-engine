@@ -5,15 +5,22 @@
 extern "C" __global__ void __launch_bounds__(256) tf_q35_tap(const __nv_bfloat16* __restrict__ H, const __nv_bfloat16* __restrict__ R,
                                                               const Seg* __restrict__ segs, const int* __restrict__ rowseg, int tap, int D,
                                                               const int* __restrict__ P) {
-    if (past_rows(P, blockIdx.x)) return;
+    release_next();
+    await_prior();
+    const int* P_ = after_wait(P);
+    if (past_rows(P_, blockIdx.x)) return;
+    const __nv_bfloat16* H_ = after_wait(H);
+    const __nv_bfloat16* R_ = after_wait(R);
+    const Seg* segs_ = after_wait(segs);
+    const int* rowseg_ = after_wait(rowseg);
     const size_t m = blockIdx.x;
-    const Seg sg = segs[rowseg[m]];
+    const Seg sg = segs_[rowseg_[m]];
     if (sg.tap == 0) return;
     const long long pos = sg.len + (long long)m - sg.row0;
     __nv_bfloat16* out = reinterpret_cast<__nv_bfloat16*>(sg.tap) + ((size_t)(pos % sg.tap_rows) * sg.taps + tap) * D;
     const int i = (blockIdx.y * blockDim.x + threadIdx.x) * 8;  // eight entries a thread, grid (rows, D / 2048)
     if (i >= D) return;
-    const uint4 hw = *reinterpret_cast<const uint4*>(H + m * D + i), rw = *reinterpret_cast<const uint4*>(R + m * D + i);
+    const uint4 hw = *reinterpret_cast<const uint4*>(H_ + m * D + i), rw = *reinterpret_cast<const uint4*>(R_ + m * D + i);
     const __nv_bfloat16* hb = reinterpret_cast<const __nv_bfloat16*>(&hw);
     const __nv_bfloat16* rb = reinterpret_cast<const __nv_bfloat16*>(&rw);
     uint4 ow;

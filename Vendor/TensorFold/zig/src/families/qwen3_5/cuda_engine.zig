@@ -259,22 +259,18 @@ pub const Engine = struct {
         e.affine = try cuda.qlinear.Affine4Kernels.resolve(d, e.mods[0], e.mods[1], e.mods[2], e.mods[3], sms, gb10);
         e.affine.half_prompt = !gb10; // the 27B's prompt tile (Tile<64, 128, 128, 2, 2, 2>), quicker on an RTX 5090
         // GB10: split-K decode/verify projections on the cluster tile (bits unchanged); TF_CLUSTER_DECODE=0 restores lane_gemv
-        e.affine.cluster_decode = gb10 and !envOff("TF_CLUSTER_DECODE");
-        e.affine.group_wide = gb10 and !envOff("TF_WIDE_GROUP");
-        // GB10: out/o (short K slices) on lane_gemv's column CTAs instead (bits unchanged); TF_SHORT_LANE=0 restores the cluster tile
-        e.affine.short_lane = gb10 and !envOff("TF_SHORT_LANE");
+        e.affine.cluster_decode = gb10;
+        e.affine.group_wide = gb10;
+        // GB10: out/o (short K slices) on lane_gemv's column CTAs instead (bits unchanged)
+        e.affine.short_lane = gb10;
         errdefer e.affine.deinit();
         e.prompt_many = try cuda.prompt_many.Kernels.resolve(e.mods[1], sms);
         e.mlp_pair = try cuda.mlp_pair.Kernels.resolve(e.mods[0], gb10);
         // GB10: the decode projections read their scales and biases as dictionary indices built at load (exact: the
         // tables hold every value); TF_DICT=0 keeps every launch on the (kg, npad) arrays
-        if (envOff("TF_DICT")) {
-            e.affine.dict = null;
-            e.mlp_pair.dict_fn = null;
-        }
         if (e.affine.dict != null) e.dict = try cuda.qlinear.DictStore.init(d);
-        // the same choice as verify_weight_layout.prepare's below: tf_qmm_mlp_single16 unless TF_MLP_KMAJOR says otherwise
-        e.dict_kmajor = gb10 and std.mem.eql(u8, std.mem.span(@import("sys").c.getenv("TF_MLP_KMAJOR") orelse "2"), "2");
+        // GB10: gate and up coded group-major on the K-major panels
+        e.dict_kmajor = gb10;
         errdefer if (e.dict) |*ds| ds.deinit();
         // sm_120 too: a 32-row window of the 27B verifies in 17.8 ms on one weight pass, 22.3 ms on two 16-row ones
         if (major == 12 and minor == 0) e.affine.wide_verify = true;
@@ -306,8 +302,7 @@ pub const Engine = struct {
             defer stage.free();
             try weights.load(e, &ck, &stage);
         }
-        if (gb10 and g.hidden == 5120 and g.layers == 64 and g.experts == 0 and
-            @import("sys").c.getenv("TF_WIDE_KMAJOR") != null and !envOff("TF_WIDE_KMAJOR"))
+        if (gb10 and g.hidden == 5120 and g.layers == 64 and g.experts == 0)
             e.wide_words = try wide_weight_layout.prepare(e);
         e.verify_weights = null;
         if (gb10) {
@@ -317,9 +312,9 @@ pub const Engine = struct {
                 e.verify_weights = try verify_weight_layout.prepare(e, single);
         }
         errdefer if (e.verify_weights) |*b| b.free();
-        const output_stream = !envOff("TF_OUTPUT_STREAMS");
-        const gdn_stream = !envOff("TF_GDN_STREAM");
-        if (gb10 and g.hidden == 5120 and g.layers == 64 and g.experts == 0 and g.pocket == 0 and (output_stream or gdn_stream))
+        const output_stream = true;
+        const gdn_stream = true;
+        if (gb10 and g.hidden == 5120 and g.layers == 64 and g.experts == 0 and g.pocket == 0)
             e.projection_streams = try projection_stream_layout.prepare(e, gdn_stream, output_stream);
         if (e.mo) |*m| try m.reserveParts(e);
         try @import("cuda_engine_tail.zig").finish(e, io, started);
@@ -470,7 +465,7 @@ pub const Engine = struct {
         if (e.kit) |kit| return kit.b16.embedRows(e.stream, ids, e.embed_w, out, rows, e.g.hidden, params);
         if (e.embed_bits == 16) return modelopt.embed(e, ids, out, rows); // bf16 rows; padding rows' ids are zeroed
         const f = if (e.embed_bits == 8) e.fns.embed8 else e.fns.embed;
-        try e.run(f, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ ids, e.embed_w, e.embed_s, e.embed_b, out, @as(c_int, @intCast(e.g.hidden)), params });
+        try e.runAfter(f, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ ids, e.embed_w, e.embed_s, e.embed_b, out, @as(c_int, @intCast(e.g.hidden)), params });
     }
 
     /// Logits rows first..first + n's greedy tokens into toks: the highest logit, ties to the lower id.
@@ -563,8 +558,8 @@ pub const Engine = struct {
             Round.stageImageTables(st, im, p0, total);
         }
         try e.tables.uploadAsync(0, st[0..if (images != null) tables_len else src_at], e.stream.handle); // text: as before
-        const slot_variant = if (total > 16 and total <= 32 and slot_peak == 3 and e.affine.pdl and !envOff("TF_WIDE_SLOTS")) 3 else
-            Round.narrowVariant(total, slot_peak, record and e.affine.pdl and !envOff("TF_GDN16"));
+        const slot_variant = if (total > 16 and total <= 32 and slot_peak == 3 and e.affine.pdl) 3 else
+            Round.narrowVariant(total, slot_peak, record and e.affine.pdl);
         var shape = Shape.init(total, parts.len, record, e.n_taps > 0, @intCast(slot_variant));
         if (record and @import("cuda_round_timing.zig").Trace.enabled())
             std.debug.print("[timing] verify_slots peak={d} variant={d}\n", .{ slot_peak, shape.slots });
