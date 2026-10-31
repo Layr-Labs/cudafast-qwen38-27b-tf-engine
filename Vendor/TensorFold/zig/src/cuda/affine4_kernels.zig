@@ -33,6 +33,7 @@ pub const Affine4Kernels = struct {
     pub const Out = struct { q: Affine4, out: u64 };
 
     group_fn: Function,
+    kmajor_fn: ?Function = null,
     gemv_fn: Function,
     verify_fn: Function, // two m16 row tiles share each weight panel on the GB10 verify path
     verify64_fn: Function, // four, for wider shared frames
@@ -57,6 +58,7 @@ pub const Affine4Kernels = struct {
     pub fn resolve(d: *const Driver, group_mod: Module, prefill_mod: Module, gemv_mod: Module, pack_mod: Module, sms: usize, gb10: bool) !Affine4Kernels {
         var a: Affine4Kernels = undefined;
         a.group_fn = try group_mod.function(symbols.group);
+        a.kmajor_fn = null;
         a.verify_fn = try group_mod.function(symbols.verify32);
         a.verify64_fn = try group_mod.function(symbols.verify64);
         a.verify128_fn = try group_mod.function(symbols.verify128);
@@ -132,8 +134,28 @@ pub const Affine4Kernels = struct {
     /// On GB10 the K-sliced projections share one lane_gemv launch and the unsliced ones one cluster launch.
     pub fn decodeMany(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, outs: []const Out, rows: usize) !void {
         if (rows > max_rows) return error.WindowTooWide;
+        if (rows == 16 and outs.len == 2) if (a.kmajor_fn) |f| {
+            if (outs[0].q.verify_w != 0 and outs[1].q.verify_w != 0 and
+                outs[0].q.n == 17408 and outs[1].q.n == 17408 and outs[0].q.k == 5120 and outs[1].q.k == 5120)
+                return a.groupMajorPair(f, s, x, xs, outs, rows);
+        };
         const sp = a.split orelse return a.decodeGrouped(s, x, xs, outs, rows);
         return a.gemvSeg(s, x, xs, outs, rows, sp);
+    }
+
+    fn groupMajorPair(a: *const Affine4Kernels, f: Function, s: Stream, x: u64, xs: u64, outs: []const Out, rows: usize) !void {
+        var parts: Parts = std.mem.zeroes(Parts);
+        parts.count=2;
+        var blocks: usize=0;
+        for (outs,0..) |o,i| {
+            const tiles=(o.q.n+127)/128;
+            parts.p[i]=.{.w=o.q.verify_w,.scales=o.q.s,.biases=o.q.b,.out=o.out,.n=int(o.q.n),.npad=int(o.q.npad),.sk=1,.tiles=int(tiles),.first=int(blocks)};
+            blocks+=tiles;
+        }
+        var g: launch_.Args=.{};
+        g.add(x);g.add(xs);g.add(parts);
+        for ([_]usize{rows,outs[0].q.k,outs[0].q.k,1,1}) |v| g.add(int(v));
+        try launch_.launch(f,.{.grid=.{.x=u(blocks)},.block=.{.x=128},.shared=13440,.pdl=a.pdl},s,&g);
     }
 
     /// decode()'s kernels a projection, grouped by kernel: each part's blocks compute exactly what its own launch's would.

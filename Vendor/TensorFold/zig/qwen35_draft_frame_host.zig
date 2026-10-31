@@ -152,6 +152,7 @@ fn actualFrame(block: usize) !void {
     e.embed_b = 3;
     e.affine.prefill_fn = function(&driver, 11);
     e.affine.group_fn = function(&driver, 10);
+    e.affine.kmajor_fn = null;
     e.affine.pdl = false;
     e.affine.wide_verify = false;
     e.fns.norm = function(&driver, 13);
@@ -358,4 +359,71 @@ test "Draft frames: enlarged frame byte counts reject overflow" {
     d.c = config();
     d.c.rank = std.math.maxInt(usize);
     try std.testing.expectError(error.Overflow, d.layout(false));
+}
+
+test "Draft frames: landing observations end with the last released stream" {
+    const gpa = std.testing.allocator;
+    var d: q.draft.Draft = undefined;
+    d.gpa = gpa;
+    d.streams = .empty;
+    defer d.streams.deinit(gpa);
+    d.landing = .{};
+    d.landing.observe(false, -0.1, true);
+    d.landing.observe(true, -1.2, false);
+    const observed = d.landing;
+    var first: lanes.Stream = undefined;
+    var second: lanes.Stream = undefined;
+    const first_ctx = try gpa.create(q.draft.Ctx);
+    var first_owned = true;
+    defer if (first_owned) gpa.destroy(first_ctx);
+    first_ctx.* = undefined;
+    first_ctx.ring.borrowed = true;
+    const second_ctx = try gpa.create(q.draft.Ctx);
+    var second_owned = true;
+    defer if (second_owned) gpa.destroy(second_ctx);
+    second_ctx.* = undefined;
+    second_ctx.ring.borrowed = true;
+    try d.streams.put(gpa, &first, first_ctx);
+    try d.streams.put(gpa, &second, second_ctx);
+    d.drafter().release(&first);
+    first_owned = false;
+    try std.testing.expectEqual(@as(u32, 1), d.streams.count());
+    try std.testing.expectEqualDeep(observed, d.landing);
+    d.drafter().release(&second);
+    second_owned = false;
+    try std.testing.expectEqual(@as(u32, 0), d.streams.count());
+    try std.testing.expectEqualDeep(q.draft.tree.Landing{}, d.landing);
+}
+
+test "Draft frames: bounded head windows forget expired tokens and widen again at each hold" {
+    const F = q.draft.frame;
+    for ([_]usize{ 32, 64 }) |window| {
+        var ctx: q.draft.Ctx = .{ .ring = undefined };
+        var tokens: [130]u32 = @splat(42);
+        tokens[0] = 98304;
+        F.scanRecent(&ctx, tokens[0..window], window);
+        try std.testing.expect(ctx.wide);
+        F.scanRecent(&ctx, tokens[0 .. window + 1], window);
+        try std.testing.expect(!ctx.wide);
+        tokens[window + 1] = 248031;
+        F.scanRecent(&ctx, tokens[0 .. window + 2], window);
+        try std.testing.expect(ctx.wide);
+        F.scanRecent(&ctx, tokens[0 .. 2 * window + 2], window);
+        try std.testing.expect(!ctx.wide);
+        // A fresh context does not inherit the previous phase's wide flag or cursor.
+        var fresh: q.draft.Ctx = .{ .ring = undefined };
+        F.scanRecent(&fresh, &.{ 98303, 248032, 248319 }, window);
+        try std.testing.expect(!fresh.wide);
+        F.scanRecent(&fresh, &.{98304}, window);
+        try std.testing.expect(fresh.wide);
+    }
+    var sticky: q.draft.Ctx = .{ .ring = undefined };
+    F.scanRecent(&sticky, &.{98304}, 0);
+    F.scanRecent(&sticky, &.{ 98304, 42, 42 }, 0);
+    try std.testing.expect(sticky.wide);
+    try std.testing.expectEqual(@as(usize, 3), sticky.scanned);
+    try std.testing.expectEqual(@as(usize, 64), try q.draft.Config.parseHeadLookback(null));
+    try std.testing.expectEqual(@as(usize, 32), try q.draft.Config.parseHeadLookback("32"));
+    try std.testing.expectEqual(@as(usize, 64), try q.draft.Config.parseHeadLookback("64"));
+    try std.testing.expectError(error.BadDraftHeadLookback, q.draft.Config.parseHeadLookback("1"));
 }

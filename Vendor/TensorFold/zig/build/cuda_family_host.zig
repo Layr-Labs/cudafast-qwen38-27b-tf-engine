@@ -105,6 +105,7 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, mods: anytype, step: *std.B
     const shared_run = b.addRunArtifact(b.addTest(.{ .root_module = shared, .filters = &.{"Shared verification:"} }));
     shared_run.has_side_effects = true;
     b.step("test-qwen35-shared-host", "Shared CUDA slots and rollback without device execution").dependOn(&shared_run.step);
+    b.step("test-qwen35-kept-path-host", "Selected-row replay handoff and explicit flush without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = shared, .filters = &.{"sibling paths retain exact replay"} })).step);
     const recurrent = b.createModule(.{ .root_source_file = b.path("zig/src/core/recurrent_workspace.zig"), .target = host, .optimize = .debug });
     b.step("test-recurrent-workspace-host", "Recurrent scratch queue domains, epochs, leases and allocation failures").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = recurrent })).step);
     const policy = b.createModule(.{ .root_source_file = b.path("zig/src/core/recurrent_workspace.zig"), .target = host, .optimize = .fast });

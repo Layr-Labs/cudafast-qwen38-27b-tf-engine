@@ -481,7 +481,7 @@ pub const Draft = struct {
         var contexts: [frame.max_streams]*Ctx = undefined;
         for (items, contexts[0..items.len]) |it, *ctx| {
             ctx.* = d.streams.get(it.stream) orelse return error.UnknownStream;
-            frame.scan(ctx.*, it.tokens);
+            try frame.scan(ctx.*, it.tokens);
         }
         try frame.forward(d, items, contexts[0..items.len]);
     }
@@ -517,6 +517,8 @@ pub const Draft = struct {
     fn releaseFn(p: *anyopaque, s: *Stream) void {
         const d = cast(p);
         if (d.streams.fetchRemove(s)) |kv| {
+            // These observations describe request content; the final stream closes the phase.
+            if (d.streams.count() == 0) d.landing = .{};
             if (kv.value.ring.borrowed) return d.gpa.destroy(kv.value); // its lane's run goes back with the lane
             d.pool.append(d.gpa, kv.value) catch d.drop(kv.value);
         }

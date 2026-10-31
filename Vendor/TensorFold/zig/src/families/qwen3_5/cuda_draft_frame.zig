@@ -173,8 +173,17 @@ pub fn forward(d: anytype, items: []const dr.Hold, contexts: []const *draft.Ctx)
 }
 
 /// A lane stream's prompt and reply tokens since the last scan: one outside the spans marks the stream wide.
-pub fn scan(ctx: *draft.Ctx, toks: []const u32) void {
-    if (!ctx.wide) for (toks[@min(ctx.scanned, toks.len)..]) |t| if (t >= spans[0][1] and t < spans[1][0]) {
+pub fn scan(ctx: *draft.Ctx, toks: []const u32) !void {
+    scanRecent(ctx, toks, try draft.Config.headLookback());
+}
+pub fn scanRecent(ctx: *draft.Ctx, toks: []const u32, lookback: usize) void {
+    std.debug.assert(lookback == 0 or lookback == 32 or lookback == 64);
+    var begin = @min(ctx.scanned, toks.len);
+    if (lookback > 0) {
+        ctx.wide = false;
+        begin = toks.len - @min(toks.len, lookback);
+    }
+    if (!ctx.wide) for (toks[begin..]) |t| if (t >= spans[0][1] and t < spans[1][0]) {
         ctx.wide = true;
         break;
     };

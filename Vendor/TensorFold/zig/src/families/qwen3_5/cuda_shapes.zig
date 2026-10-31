@@ -24,3 +24,11 @@ pub const Shape = struct {
         return @as(u32, @as(u8, @intCast(s.total))) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, s.slots) << 19 | @as(u32, @intFromBool(s.hidden)) << 27 | @as(u32, @intFromBool(s.paged)) << 28;
     }
 };
+
+/// Content-independent launch variants for one native DFlash frame and a serial fallback.
+pub fn draftWarmShapes(taps: bool) [6]Shape {
+    var out: [6]Shape = undefined;
+    out[0] = Shape.init(1, 1, true, taps, 1);
+    for ([_]u8{ 1, 2, 4, 8, 16 }, 1..) |slots, i| out[i] = Shape.init(16, 1, true, taps, slots);
+    return out;
+}

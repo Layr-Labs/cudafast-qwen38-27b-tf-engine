@@ -34,3 +34,11 @@ extern "C" __global__ void tf_transpose_pad16(const uint16_t* __restrict__ x, in
     const int g = static_cast<int>(idx / npad), col = static_cast<int>(idx % npad);
     out[idx] = col < n ? x[static_cast<long long>(col) * kg + g] : 0;
 }
+
+extern "C" __global__ void tf_pack_kmajor(const uint32_t* input, uint32_t* output, int groups, int tiles) {
+    const size_t at=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    const size_t words=size_t(groups)*tiles*512;
+    if(at>=words)return;
+    const size_t panel=at/512, tile=panel/groups, group=panel%groups;
+    output[(group*tiles+tile)*512+at%512]=input[at];
+}

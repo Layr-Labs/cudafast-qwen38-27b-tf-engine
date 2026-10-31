@@ -76,6 +76,7 @@ fn device(d: *cuda.Driver, gb10: bool, wide: bool) q.engine.Engine {
     if (@hasField(cuda.qlinear.Affine4Kernels, "verify128_fn")) e.affine.verify128_fn = function(d, 7);
     e.affine.gemv_blocks = 1;
     e.affine.split = null;
+    e.affine.kmajor_fn = null;
     e.affine.pdl = gb10;
     e.affine.wide_verify = wide;
     return e;
@@ -167,6 +168,9 @@ test "verify matmuls: other devices retain the original sixteen-row dispatch" {
 }
 
 const Resolve = struct {
+    fn alloc(out: *cuda.abi.DevicePtr, _: usize) callconv(.c) cuda.abi.Result { out.*=0x100000;return 0; }
+    fn free(_: cuda.abi.DevicePtr) callconv(.c) cuda.abi.Result { return 0; }
+    fn memset(_: cuda.abi.DevicePtr, _: c_uint, _: usize) callconv(.c) cuda.abi.Result { return 0; }
     var requested = false;
     var shared: [3]c_int = @splat(0); // verify32, verify64, verify128
     fn get(out: *cuda.abi.Function, _: cuda.abi.Module, name: [*:0]const u8) callconv(.c) cuda.abi.Result {
@@ -190,6 +194,9 @@ const Resolve = struct {
 
 test "verify matmuls: real module resolution sets the new function's shared-memory allowance" {
     var d: cuda.Driver = undefined;
+    d.api.cuMemAlloc_v2 = Resolve.alloc;
+    d.api.cuMemFree_v2 = Resolve.free;
+    d.api.cuMemsetD32_v2 = Resolve.memset;
     d.api.cuModuleGetFunction = Resolve.get;
     d.api.cuFuncSetAttribute = Resolve.attribute;
     d.api.cuOccupancyMaxActiveBlocksPerMultiprocessor = Resolve.occupancy;
@@ -202,4 +209,53 @@ test "verify matmuls: real module resolution sets the new function's shared-memo
     try t.expectEqual([3]c_int{ 32640, 43008, 57600 }, Resolve.shared);
     try t.expectEqual(@as(usize, 96), a.gemv_blocks);
     try t.expectEqual(@as(usize, 128), a.verifyRows());
+}
+
+const PackTrace = struct {
+    var count: usize = 0;
+    var bytes: usize = 0;
+    var synced = false;
+    var original: [2]u64 = undefined;
+    var alternate: [2]u64 = undefined;
+    fn alloc(out: *cuda.abi.DevicePtr, n: usize) callconv(.c) cuda.abi.Result {
+        bytes = n; out.* = 0x100000; return 0;
+    }
+    fn sync(_: cuda.abi.Stream) callconv(.c) cuda.abi.Result { synced = true; return 0; }
+    fn launch(_: cuda.abi.Function, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, args: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+        const a = args.?;
+        original[count] = @as(*const u64, @ptrCast(@alignCast(a[0].?))).*;
+        alternate[count] = @as(*const u64, @ptrCast(@alignCast(a[1].?))).*;
+        count += 1; return 0;
+    }
+};
+
+test "verify weights: preparation owns one weight-only view and retains original consumers" {
+    var d: cuda.Driver = undefined;
+    var e = engine(&d, true);
+    d.api.cuMemAlloc_v2 = PackTrace.alloc;
+    d.api.cuMemFree_v2 = Resolve.free;
+    d.api.cuModuleGetFunction = Resolve.get;
+    d.api.cuFuncSetAttribute = Resolve.attribute;
+    d.api.cuStreamSynchronize = PackTrace.sync;
+    d.api.cuLaunchKernel = PackTrace.launch;
+    e.mods[0] = .{ .d = &d, .handle = null };
+    e.mods[3] = .{ .d = &d, .handle = null };
+    const gate: q.engine.Proj = .{ .a4 = .{ .w = 10, .s = 20, .b = 30, .n = 17408, .k = 5120, .npad = 17408 } };
+    var up = gate; up.a4.w = 40;
+    var layers: [1]q.engine.Layer = undefined;
+    layers[0].mlp = .{ .dense = .{ .gate = gate, .up = up, .down = gate } };
+    e.layers = &layers;
+    PackTrace.count = 0; PackTrace.synced = false;
+    var buffer = (try @import("qwen35").engine.verify_weight_layout.prepare(&e)).?;
+    defer buffer.free();
+    try t.expectEqual(@as(usize, 2), PackTrace.count);
+    try t.expectEqual(@as(usize, 17408 * 5120), PackTrace.bytes);
+    try t.expectEqual([2]u64{10, 40}, PackTrace.original);
+    try t.expectEqual([2]u64{buffer.ptr, buffer.ptr + 17408 * 5120 / 2}, PackTrace.alternate);
+    try t.expect(PackTrace.synced);
+    try t.expect(e.affine.kmajor_fn != null);
+    try t.expectEqual(gate.a4.w, layers[0].mlp.dense.gate.a4.w);
+    try t.expectEqual(up.a4.w, layers[0].mlp.dense.up.a4.w);
+    try t.expectEqual(PackTrace.alternate[1], layers[0].mlp.dense.up.a4.verify_w);
+    try t.expectEqual(@as(u64, 0), layers[0].mlp.dense.down.a4.verify_w);
 }

@@ -13,7 +13,7 @@ pub const tap_held = 2048;
 pub const tap_rows = tap_held + engine.most_verify;
 
 /// qwen35.cuh's Seg and Path.
-pub const Seg = extern struct { rec: u64, conv: u64, kv: u64, tap: u64, log: u64, before: u64, cap: c_int, len: c_int, row0: c_int, rows: c_int, tap_rows: c_int, taps: c_int, delta: c_int, pt: u64 = 0, ps: u64 = 0, ptok: c_int = 0, pn: c_int = 0, plog: u64 = 0 };
+pub const Seg = extern struct { rec: u64, conv: u64, kv: u64, tap: u64, log: u64, before: u64, cap: c_int, len: c_int, row0: c_int, rows: c_int, tap_rows: c_int, taps: c_int, delta: c_int, pt: u64 = 0, ps: u64 = 0, ptok: c_int = 0, pn: c_int = 0, plog: u64 = 0, pmask: u64 = 0 };
 pub const Path = extern struct { n: c_int, rows: [engine.most_window]c_int };
 
 /// A cache's keys and values as pages (qwen35.cuh kv_row): page i of the stream's positions at `base` + ids[i] pages.
@@ -123,8 +123,10 @@ pub const Cache = struct {
     logits: []u16,
     /// The newest verify window, until its path is kept: where it started, its rows.
     last: ?struct { start: usize, rows: usize } = null,
-    /// A kept prefix of the newest window (rows 0..pend-1) whose recurrence replay the next recorded slot scan folds.
+    /// A kept path whose recurrence replay the next recorded slot scan folds.
     pend: c_int = 0,
+    /// Selected window rows in ascending order; zero denotes the ordinary prefix.
+    pend_mask: u64 = 0,
     /// The log half that window wrote (the next window writes the other half of `log`).
     pend_log: u64 = 0,
     /// Which half of `log` the next window writes.
@@ -158,7 +160,7 @@ pub const Cache = struct {
         own = false;
         errdefer out.deinit(gpa);
         errdefer cuda.completion.drain(e.d, e.stream, "qwen3_5: failed cache initialization did not drain");
-        try kv.fill8(0, e.stream.handle);
+        // As in reset(), rope writes every readable KV row; unused capacity remains inaccessible.
         if (paged) |p| try p.table.uploadAsync(0, std.mem.sliceAsBytes(p.ids), e.stream.handle);
         try e.stream.synchronize();
         return out;
@@ -194,6 +196,7 @@ pub const Cache = struct {
         }
         self.state = views[0];
         self.pend = 0;
+        self.pend_mask = 0;
         self.before = views[1];
         self.log = views[2];
         self.tap = if (e.n_taps > 0) views[3] else null;
@@ -206,6 +209,7 @@ pub const Cache = struct {
         const none: DeviceBuffer = .{ .d = e.d, .ptr = 0, .len = 0, .borrowed = true };
         self.state = none;
         self.pend = 0;
+        self.pend_mask = 0;
         self.before = none;
         self.log = none;
         self.tap = null;
@@ -232,7 +236,7 @@ pub const Cache = struct {
         errdefer gpa.free(logits);
         errdefer cuda.completion.drain(e.d, e.stream, "qwen3_5: failed cache state initialization did not drain");
         try state.fill8(0, e.stream.handle);
-        if (!adaptive) try log.fill8(0, e.stream.handle);
+        // Recorded forwards overwrite log rows before keep/replay; last=null and pend=0 hide older records.
         if (tap) |t| try t.fill8(0, e.stream.handle);
         try e.stream.synchronize();
         const scratch = if (adaptive) recurrent.bound(e) else 0;
@@ -252,6 +256,7 @@ pub const Cache = struct {
         recurrent.release(self);
         self.len = 0;
         self.pend = 0;
+        self.pend_mask = 0;
         self.written = 0;
         self.last = null;
         self.untaught = false;
@@ -303,9 +308,11 @@ pub const Cache = struct {
         if (path.len > last.rows or path[0] != 0) return error.NothingToKeep;
         var p: Path = .{ .n = @intCast(path.len), .rows = @splat(0) };
         var prefix = true;
+        var mask: u64 = 0;
         for (path, 0..) |r, i| {
             if (r >= last.rows or (i > 0 and r <= path[i - 1])) return error.NothingToKeep;
             p.rows[i] = @intCast(r);
+            mask |= @as(u64, 1) << @intCast(r);
             prefix = prefix and r == i;
         }
         if (last.rows == 1) {
@@ -316,39 +323,44 @@ pub const Cache = struct {
         const g = e.g;
         const sg = self.seg(e, last.start, 0, last.rows);
         try recurrent.mark(self, false);
-        if (!prefix) try e.run(e.keeps.apply, .{ 1, geometry.dk / 4, g.v_heads * g.deltas() }, .{ 32, 4, 1 }, .{ e.geo, sg, p });
         try e.run(e.keeps.conv, .{ g.deltas(), (g.convBytes() / 2 + 255) / 256, 1 }, .{ 256, 1, 1 }, .{ e.geo, sg, @as(c_int, @intCast(path[path.len - 1])) });
         if (!prefix and g.attentions() > 0) try e.run(if (e.kv8) e.fp8.compact else e.keeps.compact, .{ g.attentions(), g.kv_heads, 1 }, .{ geometry.head_dim, 1, 1 }, .{ e.geo, sg, p });
-        if (prefix) {
-            // a chain's prefix: the next recorded slot scan replays it from this log half while it loads the state
-            self.pend = p.n;
-            self.pend_log = sg.log;
-            self.flip = !self.flip;
-        }
+        // The next recorded scan replays this path from the other log half while loading its root state.
+        self.pend = p.n;
+        self.pend_mask = if (prefix) 0 else mask;
+        self.pend_log = sg.log;
+        self.flip = !self.flip;
         self.last = null;
         self.len = last.start + path.len;
     }
 
-    /// A pending kept prefix replayed into the recurrences now (before anything but a recorded slot scan reads them).
+    /// A pending kept path replayed into the recurrences now (before anything but a recorded slot scan reads them).
     pub fn flush(self: *Cache, e: *Engine) !void {
         if (self.pend == 0) return;
         var p: Path = .{ .n = self.pend, .rows = @splat(0) };
         const n: usize = @intCast(self.pend);
-        for (p.rows[0..n], 0..) |*r, i| r.* = @intCast(i);
+        var mask = self.pend_mask;
+        for (p.rows[0..n], 0..) |*r, i| {
+            r.* = if (self.pend_mask == 0) @intCast(i) else @intCast(@ctz(mask));
+            mask &= mask -% 1;
+        }
         var sg = self.seg(e, self.len, 0, 0);
         sg.log = self.pend_log;
         self.pend = 0;
+        self.pend_mask = 0;
         const g = e.g;
         try recurrent.mark(self, false);
         try e.run(e.keeps.apply, .{ 1, geometry.dk / 4, g.v_heads * g.deltas() }, .{ 32, 4, 1 }, .{ e.geo, sg, p });
     }
 
-    /// The pending prefix handed to this forward's slot scan (`segs`' entry for this cache).
+    /// The pending path handed to this forward's slot scan (`segs`' entry for this cache).
     pub fn fold(self: *Cache, seg_: Seg) Seg {
         var sg = seg_;
         sg.pn = self.pend;
         sg.plog = self.pend_log;
+        sg.pmask = self.pend_mask;
         self.pend = 0;
+        self.pend_mask = 0;
         return sg;
     }
 

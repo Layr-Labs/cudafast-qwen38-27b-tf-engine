@@ -191,6 +191,7 @@ pub fn openDrafter(gpa: std.mem.Allocator, io: std.Io, p: *anyopaque, dir: []con
     const d = try Draft.init(gpa, io, l.e, dir);
     errdefer d.deinit();
     try l.e.setTaps(d.taps());
+    try l.e.warmDraftGraphs();
     d.target_taps = l.e.tapBytes();
     cost_adapter.identify(l, dir, .dflash);
     l.calibration = d;

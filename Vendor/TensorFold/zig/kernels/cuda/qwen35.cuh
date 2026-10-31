@@ -39,7 +39,10 @@ struct Seg {
     int ptok;                 // positions a KV page holds
     int pn;
     unsigned long long plog;
+    unsigned long long pmask; // selected previous rows, ascending; zero: prefix 0..pn-1
 };
+
+static_assert(sizeof(Seg) == 120 && MAXW == 64, "selected-row replay ABI");
 
 // Seg.kv's element of layer a's key (s 0) or value (s 1) at pos, head h: cap rows a head, or pos's page's row.
 __device__ __forceinline__ size_t kv_row(const Seg& sg, int kvh, int a, int s, int h, int pos) {

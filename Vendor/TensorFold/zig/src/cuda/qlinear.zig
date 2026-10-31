@@ -18,6 +18,7 @@ const Stream = stream_.Stream;
 /// MLX affine 4-bit tiled for qmm: packed words, (kg, npad) scales and biases, n outputs from k inputs.
 pub const proposal = @import("proposal_head.zig");
 pub const Affine4 = struct {
+    verify_w: u64 = 0, // optional group-major words for sixteen-row gate/up; all ordinary paths retain w
     w: u64,
     s: u64,
     b: u64,

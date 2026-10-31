@@ -48,8 +48,11 @@ __device__ __forceinline__ void q35_slots(Geo geo, const __nv_bfloat16* q, const
     if (sg.pn > 0) {
         Seg prev = sg;
         prev.log = sg.plog;
+        unsigned long long mask = sg.pmask;
         for (int j = 0; j < sg.pn; ++j) {
-            const LogRow l = log_row(geo, prev, layer, j);
+            const int row = sg.pmask ? __ffsll(mask) - 1 : j;
+            mask &= mask - 1;
+            const LogRow l = log_row(geo, prev, layer, row);
             const float pg = l.g[hv];
 #pragma unroll
             for (int r = 0; r < R; ++r) {

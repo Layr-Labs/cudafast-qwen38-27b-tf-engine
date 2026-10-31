@@ -25,6 +25,8 @@ test "Shared verification: all 128 streams share one bounded verification frame"
 const Driver = struct {
     var copies: usize = 0;
     var launches: usize = 0;
+    const Replay = extern struct { n: c_int, rows: [64]c_int };
+    var replay: ?Replay = null;
     fn copy(dst: u64, src: u64, bytes: usize) callconv(.c) cuda.abi.Result {
         @memcpy(@as([*]u8, @ptrFromInt(dst))[0..bytes], @as([*]const u8, @ptrFromInt(src))[0..bytes]);
         copies += 1;
@@ -33,7 +35,8 @@ const Driver = struct {
     fn copyAsync(dst: u64, src: u64, bytes: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
         return copy(dst, src, bytes);
     }
-    fn launch(_: cuda.abi.Function, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, _: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+    fn launch(f: cuda.abi.Function, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, args: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+        if (@intFromPtr(f) == 2) replay = @as(*const Replay, @ptrCast(@alignCast(args.?[2].?))).*;
         launches += 1;
         return cuda.abi.success;
     }
@@ -51,7 +54,7 @@ fn engine(d: *cuda.Driver) q.engine.Engine {
     e.kv8 = false;
     e.geo = .{ .hid = 256, .nk = 1, .nv = 1, .qh = 1, .kvh = 1, .nl = 1 };
     const f: cuda.Function = .{ .d = d, .handle = @ptrFromInt(1) };
-    e.keeps = .{ .apply = f, .conv = f, .compact = f };
+    e.keeps = .{ .apply = .{ .d = d, .handle = @ptrFromInt(2) }, .conv = f, .compact = f };
     return e;
 }
 fn buffer(d: *cuda.Driver, data: []u8) cuda.DeviceBuffer {
@@ -206,4 +209,46 @@ test "Shared verification: the actual cache constructor unwinds the before bank 
     try std.testing.expectEqual(@as(usize, 5), Owners.allocations);
     cache.deinit(a);
     try Owners.balanced();
+}
+
+
+test "Shared verification: sibling paths retain exact replay rows through fold and explicit flush" {
+    const Seg = @typeInfo(@TypeOf(q.engine.Cache.seg)).@"fn".return_type.?;
+    try std.testing.expectEqual(@as(usize, 120), @sizeOf(Seg));
+    try std.testing.expectEqual(@as(usize, 112), @offsetOf(Seg, "pmask"));
+    var d: cuda.Driver = undefined;
+    var e = engine(&d);
+    const b: cuda.DeviceBuffer = .{ .d = &d, .ptr = 4096, .len = 8192, .borrowed = true };
+    const paths = [_][]const u32{ &.{0}, &.{ 0, 1, 2 }, &.{ 0, 2, 7 }, &.{ 0, 31, 63 } };
+    for (paths) |path| {
+        var cache: q.engine.Cache = .{ .state = b, .kv = b, .log = b, .cap = 256, .len = 81, .last = .{ .start = 17, .rows = 64 }, .logits = &.{} };
+        Driver.launches = 0;
+        Driver.replay = null;
+        try cache.keep(&e, path);
+        try std.testing.expectEqual(@as(usize, 1), Driver.launches); // convolution tail only; no attention layers
+        try std.testing.expect(Driver.replay == null);
+        try std.testing.expectEqual(@as(c_int, @intCast(path.len)), cache.pend);
+        try std.testing.expectEqual(17 + path.len, cache.len);
+        const saved = cache;
+        const sg = cache.fold(cache.seg(&e, cache.len, 0, 16));
+        try std.testing.expectEqual(@as(u64, 4096), sg.plog);
+        try std.testing.expectEqual(@as(u64, 8192), sg.log);
+        try std.testing.expectEqual(@as(c_int, 0), cache.pend);
+        var mask = sg.pmask;
+        for (path, 0..) |row, j| {
+            const selected: u32 = if (sg.pmask == 0) @intCast(j) else @intCast(@ctz(mask));
+            try std.testing.expectEqual(row, selected);
+            mask &= mask -% 1;
+        }
+        try std.testing.expectEqual(@as(u64, 0), mask);
+        cache = saved;
+        try cache.flush(&e);
+        const replay = Driver.replay.?;
+        try std.testing.expectEqual(@as(c_int, @intCast(path.len)), replay.n);
+        for (path, replay.rows[0..path.len]) |want, got| try std.testing.expectEqual(want, @as(u32, @intCast(got)));
+        try std.testing.expectEqual(@as(c_int, 0), cache.pend);
+        Driver.replay = null;
+        try cache.flush(&e);
+        try std.testing.expect(Driver.replay == null);
+    }
 }

@@ -6,6 +6,7 @@ const core = @import("core");
 const Round = @import("cuda_round.zig");
 const geometry = @import("cuda_geometry.zig");
 const weights = @import("cuda_weights.zig");
+pub const verify_weight_layout = @import("cuda_verify_weights.zig");
 const caches = @import("cuda_cache.zig");
 const routed = @import("cuda_routed.zig");
 const hooks = @import("cuda_learn_hooks.zig");
@@ -120,6 +121,7 @@ pub const Engine = struct {
     /// Rows a verify forward takes at most, and a window's rows at most.
     verify_rows: usize,
     window_rows: usize,
+    verify_weights: ?DeviceBuffer = null, // immutable second packed view; no request content
     // weights
     embed_w: u64,
     embed_s: u64,
@@ -273,6 +275,13 @@ pub const Engine = struct {
             defer stage.free();
             try weights.load(e, &ck, &stage);
         }
+        e.verify_weights = null;
+        if (gb10) {
+            const layout = @import("sys").c.getenv("TF_VERIFY_KMAJOR");
+            if (layout == null or std.mem.eql(u8, std.mem.span(layout.?), "1"))
+                e.verify_weights = try verify_weight_layout.prepare(e);
+        }
+        errdefer if (e.verify_weights) |*b| b.free();
         if (e.mo) |*m| try m.reserveParts(e);
         try @import("cuda_engine_tail.zig").finish(e, io, started);
         return e;
@@ -309,6 +318,7 @@ pub const Engine = struct {
         e.host_logits.free();
         e.staged.free();
         e.tables.free();
+        if (e.verify_weights) |*b| b.free();
         e.arena.free();
         e.gpa.free(e.layers);
         e.gpa.free(e.dir);
@@ -476,7 +486,7 @@ pub const Engine = struct {
         const slot_peak = try Round.build(st, parts, record);
         for (parts) |p| {
             try p.cache.settle(e);
-            // a pending kept prefix rides in this forward's slot scan only when its log half survives `prepare`
+            // a pending kept path rides in this forward's slot scan only when its log half survives `prepare`
             if (!(record and keep != .hidden and recurrent.logStays(e, p.cache, p.rows))) try p.cache.flush(e);
             try recurrent.prepare(e, p.cache, p.rows, record);
         }
@@ -531,21 +541,7 @@ pub const Engine = struct {
             defer e.features = 0;
             try e.body(shape);
         } else {
-            const gop = try e.graphs.getOrPut(e.gpa, shape.key());
-            if (!gop.found_existing) {
-                errdefer _ = e.graphs.remove(shape.key());
-                // captured, nothing runs: the replay below is this shape's first run
-                try cuda.graph.beginCapture(e.stream, .thread_local);
-                e.body(shape) catch |err| {
-                    var broken = cuda.graph.endCapture(e.stream) catch return err;
-                    broken.deinit();
-                    return err;
-                };
-                var captured = try cuda.graph.endCapture(e.stream);
-                defer captured.deinit();
-                gop.value_ptr.* = try captured.instantiate();
-            }
-            try gop.value_ptr.launchOn(e.stream);
+            try (try e.graphFor(shape)).launchOn(e.stream);
         }
         for (parts) |p| p.cache.advanced(p.rows, record);
         switch (keep) {
@@ -576,7 +572,37 @@ pub const Engine = struct {
         recurrent.completed(e);
     }
 
+    /// Capture immutable launch geometry without executing or reading any stream content.
+    fn graphFor(e: *Engine, shape: Shape) !cuda.graph.Exec {
+        const gop = try e.graphs.getOrPut(e.gpa, shape.key());
+        if (!gop.found_existing) {
+            errdefer _ = e.graphs.remove(shape.key());
+            try cuda.graph.beginCapture(e.stream, .thread_local);
+            e.body(shape) catch |err| {
+                var broken = cuda.graph.endCapture(e.stream) catch return err;
+                broken.deinit();
+                return err;
+            };
+            var captured = try cuda.graph.endCapture(e.stream);
+            defer captured.deinit();
+            gop.value_ptr.* = try captured.instantiate();
+        }
+        return gop.value_ptr.*;
+    }
+
+    /// All single-stream, native 16-row tree shapes, established before any request exists.
+    /// Uploading an executable does not run it; the first forward supplies fresh device tables.
+    pub fn warmDraftGraphs(e: *Engine) !void {
+        if (envOff("TF_TARGET_GRAPH_WARM") or e.learning != null or e.pockets.any()) return;
+        for (draftWarmShapes(e.n_taps > 0)) |shape| {
+            const graph = try e.graphFor(shape);
+            try graph.upload(e.stream);
+        }
+        try e.stream.synchronize();
+    }
+
     pub const Shape = @import("cuda_shapes.zig").Shape;
+    pub const draftWarmShapes = @import("cuda_shapes.zig").draftWarmShapes;
 
     /// The same scan selected by body, exposed for host launch-contract fixtures.
     pub fn deltaScan(e: *Engine, record: bool, slot_count: u8, segments: usize, layer: c_int) !void {

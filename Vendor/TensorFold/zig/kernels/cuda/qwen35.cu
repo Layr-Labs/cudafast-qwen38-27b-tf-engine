@@ -457,6 +457,8 @@ struct StoreBf16 {
     }
 };
 
+#include "qwen35_head_rope.cuh"
+
 // Queries rotated in place, keys rotated and values copied into the row's cache slot; grid (rows), HD threads.
 extern "C" __global__ void __launch_bounds__(256) tf_q35_rope(Geo geo, __nv_bfloat16* __restrict__ Qn, const __nv_bfloat16* __restrict__ Kn,
                                                                 const __nv_bfloat16* __restrict__ Vr, const Seg* __restrict__ segs,

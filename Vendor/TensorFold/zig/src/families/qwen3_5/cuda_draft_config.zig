@@ -22,6 +22,19 @@ pub const Config = struct {
     taps: [8]u32,
     n_taps: usize,
 
+    /// Zero preserves the sticky full-head policy; bounded windows re-evaluate each hold.
+    pub fn headLookback() !usize {
+        const value = std.c.getenv("TF_DRAFT_HEAD_LOOKBACK");
+        return parseHeadLookback(if (value) |v| std.mem.span(v) else null);
+    }
+    pub fn parseHeadLookback(value: ?[]const u8) !usize {
+        const v = value orelse return 64;
+        if (std.mem.eql(u8, v, "0")) return 0;
+        if (std.mem.eql(u8, v, "32")) return 32;
+        if (std.mem.eql(u8, v, "64")) return 64;
+        return error.BadDraftHeadLookback;
+    }
+
     pub fn qWidth(c: Config) usize {
         return c.heads * c.head_dim;
     }
@@ -87,6 +100,7 @@ pub const Config = struct {
         _ = std.math.mul(usize, c.kv_heads, c.head_dim) catch return error.UnsupportedDraftConfig;
         if (c.window < 16 or c.window > engine.tap_held) return error.UnsupportedDraftConfig;
         c.block = 16;
+        _ = try headLookback();
         return c;
     }
 };

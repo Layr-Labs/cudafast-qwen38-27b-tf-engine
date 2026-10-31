@@ -64,6 +64,7 @@ test "selected live shape reaches real tiled projections and DeltaNet scan dispa
     e.fns.gdn_slots_1 = function(&d, 3);
     e.affine.gemv_fn = function(&d, 2);
     e.affine.gemv_blocks = 1;
+    e.affine.kmajor_fn = null;
     e.affine.pdl = false;
     e.affine.wide_verify = false;
     e.affine.split = null;
@@ -253,4 +254,22 @@ test "target reserve: context 32 reaches eager preparation through real admissio
 }
 test "target reserve: context 64 reaches eager preparation at the capacity boundary" {
     try q.native.reservation.Test.check(64);
+}
+
+test "DFlash warm shapes cover every one-frame verify bucket without prompt data" {
+    for ([_]bool{ false, true }) |taps| {
+        const shapes = q.engine.Engine.draftWarmShapes(taps);
+        for (shapes, 0..) |shape, i| {
+            try std.testing.expect(shape.record and !shape.prompt and !shape.hidden and !shape.paged);
+            try std.testing.expectEqual(@as(u8, 1), shape.nseg);
+            for (shapes[0..i]) |prior| try std.testing.expect(prior.key() != shape.key());
+        }
+        for (1..17) |rows| for ([_]u8{ 1, 2, 4, 8, 16 }) |slots| {
+            if (rows == 1 and slots != 1) continue;
+            const wanted = Shape.init(rows, 1, true, taps, slots).key();
+            var found = false;
+            for (shapes) |shape| found = found or shape.key() == wanted;
+            try std.testing.expect(found);
+        };
+    }
 }

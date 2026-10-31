@@ -270,33 +270,30 @@ __device__ __forceinline__ void prompt_mlp_body(
             sv[j] = ps[col] * 0x10001u;
             bv[j] = ps[BN + col] * 0x10001u;
         }
-        // Refill each A row after its last column use; carry B prefetch across K steps.
-        uint32_t a[T::MT][4];
-        auto load_a_row = [&](int kt, int i) {
+        // Keep two activation rows live while all column fragments advance in the original K order.
+        uint32_t a[2][4];
+        auto load_a = [&](int kt, int i, int slot) {
             const int r = wm * (BM / WM) + i * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
             const int ch = kt * 2 + (lane >> 4);
-            ldmatrix4(a[i], p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16);
+            ldmatrix4(a[slot], p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16);
         };
+        uint2 b[T::NT];
+        auto load_b = [&](int kt) {
 #pragma unroll
-        for (int i = 0; i < T::MT; ++i) load_a_row(0, i);
-        auto weight_pair = [&](int j, int kt) {
-            return make_uint2(fma2(pair(words[j][kt / 2], (kt & 1) * 8), sv[j], bv[j]),
-                              fma2(pair(words[j][kt / 2], (kt & 1) * 8 + 4), sv[j], bv[j]));
+            for (int j = 0; j < T::NT; ++j)
+                b[j] = make_uint2(fma2(pair(words[j][kt / 2], (kt & 1) * 8), sv[j], bv[j]),
+                                       fma2(pair(words[j][kt / 2], (kt & 1) * 8 + 4), sv[j], bv[j]));
         };
-        uint2 b[2];
-        b[0] = weight_pair(0, 0);
 #pragma unroll
         for (int kt = 0; kt < GS / 16; ++kt) {
+            load_b(kt);
+            load_a(kt, 0, 0);
 #pragma unroll
-            for (int j = 0; j < T::NT; ++j) {
-                const int next_j = (j + 1) % T::NT, next_kt = kt + (j + 1 == T::NT);
-                const int slot = (kt * T::NT + j) & 1;
-                if (next_kt < GS / 16) b[slot ^ 1] = weight_pair(next_j, next_kt);
+            for (int i = 0; i < T::MT; ++i) {
+                if (i + 1 < T::MT) load_a(kt, i + 1, (i + 1) & 1);
 #pragma unroll
-                for (int i = 0; i < T::MT; ++i) {
-                    mma(acc[i][j], a[i], b[slot].x, b[slot].y);
-                    if (j + 1 == T::NT && kt + 1 < GS / 16) load_a_row(kt + 1, i);
-                }
+                for (int j = 0; j < T::NT; ++j)
+                    mma(acc[i][j], a[i & 1], b[j].x, b[j].y);
             }
         }
     }
