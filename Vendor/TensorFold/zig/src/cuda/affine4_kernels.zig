@@ -239,13 +239,13 @@ pub const Affine4Kernels = struct {
     fn streamed(a: *const Affine4Kernels, q: Affine4, rows: usize, sk: usize) bool {
         if (q.stream_w == 0) return false;
         const f = a.stream16_fns[@as(usize, if (q.k == 6144) 1 else 0)];
-        return f != null and rows == 16 and sk == 4 and q.n == 5120 and (q.k == 6144 or q.k == 17408);
+        return f != null and (rows >= 8 and rows <= 16) and sk == 4 and q.n == 5120 and (q.k == 6144 or q.k == 17408);
     }
 
     /// The existing coded four-slice stream can also consume a 16-row out/o projection.
     /// Keep the ordinary short-lane route whenever its view or kernel is unavailable.
     fn dictOutStream(a: *const Affine4Kernels, q: Affine4, rows: usize, sk: usize) bool {
-        return a.short_lane and a.cluster_decode and rows == 16 and sk == 4 and
+        return a.short_lane and a.cluster_decode and (rows >= 8 and rows <= 16) and sk == 4 and
             q.n == 5120 and q.npad == 5120 and q.k == 6144 and q.stream_w != 0 and
             a.stream16_fns[1] != null and a.stream16_dict_fn != null and a.coded(q);
     }
@@ -812,7 +812,7 @@ pub const Affine4Kernels = struct {
     /// qmm_group's tile 2: a cluster of `sk` CTAs a column tile, its K slices summed over distributed shared memory.
     pub fn cluster(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, q: Affine4, out: u64, rows: usize, sk: usize) !void {
         const stream_fn = if (q.stream_w == 0) null else a.stream16_fns[@as(usize, if (q.k == 6144) 1 else 0)];
-        if (rows == 16 and sk == 4 and q.n == 5120 and (q.k == 6144 or q.k == 17408) and q.stream_w != 0 and stream_fn != null) {
+        if ((rows >= 8 and rows <= 16) and sk == 4 and q.n == 5120 and (q.k == 6144 or q.k == 17408) and q.stream_w != 0 and stream_fn != null) {
             // A coded down projection, or an eligible out/o projection, streams its index windows.
             const dict = q.npad == 5120 and a.coded(q) and a.stream16_dict_fn != null and
                 (q.k == 17408 or a.dictOutStream(q, rows, sk));
@@ -822,7 +822,7 @@ pub const Affine4Kernels = struct {
             var g: launch_.Args = .{};
             g.add(x); g.add(xs); g.add(parts);
             for ([_]usize{ rows, q.k, q.k }) |v| g.add(int(v));
-            const shared = if (dict) group_smem + q.tabBytesUpTo(linear.out_pair_tab_max) else group_smem;
+            const shared = if (dict) linear.out16_smem + q.tabBytesUpTo(linear.out_pair_tab_max) else linear.out16_smem;
             return launch_.launch(if (dict) a.stream16_dict_fn.? else stream_fn.?, .{ .grid = .{ .x = 80 }, .block = .{ .x = 512 }, .shared = shared, .pdl = a.pdl }, s, &g);
         }
         const tiles = (q.n + 63) / 64;
