@@ -57,6 +57,12 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q, 
             }
         }
     }
+    // a recorded window keeps its own rows in the log: the folded root goes back now, its stores draining under the steps
+    if (recorded(P) && sg.rows != 1 && sg.pn > 0)
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+#pragma unroll
+            for (int i = 0; i < PT; ++i) st[r * DK + i] = root[r][i];
     if (sg.rows == 1)
 #pragma unroll
         for (int r = 0; r < R; ++r)
@@ -203,14 +209,7 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q, 
         const float tot = spread_sum<R>(pend, dk);
         if ((dk & ((1 << SR) - 1)) == 0) y[((size_t)pend_row * NV + hv) * DK + dv0 + (dk >> SR)] = __float2bfloat16_rn(tot);
     }
-    if (record && sg.rows != 1) {
-        if (sg.pn > 0)
-#pragma unroll
-            for (int r = 0; r < R; ++r)
-#pragma unroll
-                for (int i = 0; i < PT; ++i) st[r * DK + i] = root[r][i];
-        return;
-    }
+    if (record && sg.rows != 1) return;  // the folded root went back before the steps
 #pragma unroll
     for (int r = 0; r < R; ++r)
 #pragma unroll

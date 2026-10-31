@@ -237,15 +237,9 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_pre(Geo geo, const 
                                                                   __nv_bfloat16* __restrict__ V0, float* __restrict__ G0, __nv_bfloat16* __restrict__ BETA0,
                                                                   const int* __restrict__ P) {
     release_next();
-    await_prior();
-    const __nv_bfloat16* QKV = after_wait(QKV0);
-    const __nv_bfloat16* Ain = after_wait(Ain0);
-    const __nv_bfloat16* Bin = after_wait(Bin0);
-    __nv_bfloat16* Q = after_wait(Q0);
-    __nv_bfloat16* K = after_wait(K0);
-    __nv_bfloat16* V = after_wait(V0);
-    float* G = after_wait(G0);
-    __nv_bfloat16* BETA = after_wait(BETA0);
+    // Ahead of the wait: the staged tables (copied before this forward's first launch), the weights, and in a recorded
+    // window the stream's conv tail (left by an earlier forward's keep, settled before this one was launched). After
+    // it: this forward's rows. The loads move, the arithmetic does not.
     const int lane = threadIdx.x;
     const int head = blockIdx.y;
     const int w = blockIdx.z * blockDim.y + threadIdx.y;
@@ -259,17 +253,32 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_pre(Geo geo, const 
 #pragma unroll
     for (int tap = 0; tap < TAPS; tap++) src[tap] = back(rowpar, w, TAPS - 1 - tap);
     constexpr int PER = DK / 32;
+    const bool rec = recorded(P);
     // a recorded window's row logs the tail after it (taps 1..TAPS-1) here, so conv_commit only moves the stream's
-    __nv_bfloat16* tail = recorded(P) ? log_row(geo, sg, layer, w - sg.row0).conv : nullptr;
+    __nv_bfloat16* tail = rec ? log_row(geo, sg, layer, w - sg.row0).conv : nullptr;
     // a lane's PER channels in 8-byte loads: each tap's row, the weights (PER x TAPS in a row), the logged tail
     static_assert(PER == 4 && TAPS == 4, "a tap's channels and a channel's taps are one uint2");
     const int cl = c0 + lane * PER;
     uint2 xw[TAPS], ww[TAPS];
 #pragma unroll
     for (int tap = 0; tap < TAPS; tap++) {
-        const int at = src[tap];
-        xw[tap] = *reinterpret_cast<const uint2*>(at < 0 ? CS + (size_t)(-1 - at) * C + cl : QKV + (size_t)at * C + cl);
         ww[tap] = *reinterpret_cast<const uint2*>(CW + (size_t)cl * TAPS + tap * PER);
+        if (rec && src[tap] < 0) xw[tap] = *reinterpret_cast<const uint2*>(CS + (size_t)(-1 - src[tap]) * C + cl);
+    }
+    await_prior();
+    const __nv_bfloat16* QKV = after_wait(QKV0);
+    const __nv_bfloat16* Ain = after_wait(Ain0);
+    const __nv_bfloat16* Bin = after_wait(Bin0);
+    __nv_bfloat16* Q = after_wait(Q0);
+    __nv_bfloat16* K = after_wait(K0);
+    __nv_bfloat16* V = after_wait(V0);
+    float* G = after_wait(G0);
+    __nv_bfloat16* BETA = after_wait(BETA0);
+#pragma unroll
+    for (int tap = 0; tap < TAPS; tap++) {
+        const int at = src[tap];
+        if (at >= 0) xw[tap] = *reinterpret_cast<const uint2*>(QKV + (size_t)at * C + cl);
+        else if (!rec) xw[tap] = *reinterpret_cast<const uint2*>(CS + (size_t)(-1 - at) * C + cl);
         if (tail != nullptr && tap > 0) *reinterpret_cast<uint2*>(tail + (size_t)(tap - 1) * C + cl) = xw[tap];
     }
     const __nv_bfloat16* cw = reinterpret_cast<const __nv_bfloat16*>(ww);
@@ -459,6 +468,11 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post(Geo geo, const
     __nv_bfloat16* done = row_done[threadIdx.y];
     const int lane = threadIdx.x, hv = blockIdx.y;
     release_next();
+    // ahead of the wait: the layer's norm weights (static); after it, this forward's rows. The loads move, the
+    // arithmetic does not
+    constexpr int PER0 = DK / 32;
+    const uint2 nw = *reinterpret_cast<const uint2*>(plain(NW) + lane * PER0);
+    asm volatile("" ::"r"(nw.x), "r"(nw.y));  // the load issues before the wait (keep4's rule)
     await_prior();
     const __nv_bfloat16* Y = after_wait(Y0);
     const __nv_bfloat16* Z = after_wait(Z0);
@@ -471,7 +485,6 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post(Geo geo, const
     const size_t at = m * W + hv * DK + lane * PER;
     const uint2 yw = *reinterpret_cast<const uint2*>(Y + at);
     const uint2 zw = *reinterpret_cast<const uint2*>(Z + at);
-    const uint2 nw = *reinterpret_cast<const uint2*>(NW + lane * PER);
     const __nv_bfloat16* yp = reinterpret_cast<const __nv_bfloat16*>(&yw);
     const __nv_bfloat16* zp = reinterpret_cast<const __nv_bfloat16*>(&zw);
     const __nv_bfloat16* wp = reinterpret_cast<const __nv_bfloat16*>(&nw);
@@ -634,12 +647,12 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35_attn_merge_gate(Geo geo,
 
 // tf_q35_head_norm of a (row, head) on threads 0-63, then tf_q35_rope's rotation of it: a query head's into Qn, a key
 // head's with its value into the cache slot. Grid (rows, query heads + key heads), HD threads.
-template <typename Store>
+template <typename Store, bool EARLY = false>
 __device__ __forceinline__ void norm_rope_rows(const Geo& geo, const __nv_bfloat16* __restrict__ QRAW, const __nv_bfloat16* __restrict__ KRAW,
                                                const __nv_bfloat16* __restrict__ WQ, const __nv_bfloat16* __restrict__ WK,
                                                __nv_bfloat16* __restrict__ Qn, const __nv_bfloat16* __restrict__ Vr, const Seg* __restrict__ segs,
                                                const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, const int* __restrict__ P,
-                                               const int* __restrict__ M, float eps, Store store) {
+                                               const int* __restrict__ M, float eps, Store store, uint2 wpre = make_uint2(0, 0)) {
     __shared__ float sums[2];
     __shared__ __align__(16) __nv_bfloat16 xs[HD];
     const int QH = geo.qh, KVH = geo.kvh;
@@ -666,7 +679,9 @@ __device__ __forceinline__ void norm_rope_rows(const Geo& geo, const __nv_bfloat
 #pragma unroll
         for (int i = 0; i < 4; i++) {
             const int d = 4 * t + i;
-            xs[d] = __float2bfloat16_rn(bf(W[d]) * (v[i] * inv));
+            // EARLY: the head's norm weights were read before the wait (the same values)
+            const __nv_bfloat16 wd = EARLY ? reinterpret_cast<const __nv_bfloat16*>(&wpre)[i] : W[d];
+            xs[d] = __float2bfloat16_rn(bf(wd) * (v[i] * inv));
         }
     }
     __syncthreads();
@@ -685,8 +700,16 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm_rope(Geo geo, cons
                                                                      const Ancestor* __restrict__ rowanc, int layer, const int* __restrict__ P,
                                                                      const int* __restrict__ M, float eps) {
     release_next();
+    // ahead of the wait: the head's norm weights (static); after it, this forward's rows. The loads move, the
+    // arithmetic does not
+    uint2 wv = make_uint2(0, 0);
+    if (threadIdx.x < 64) {
+        const __nv_bfloat16* W = blockIdx.y < (unsigned)geo.qh ? WQ : WK;
+        wv = *reinterpret_cast<const uint2*>(plain(W) + 4 * threadIdx.x);
+        asm volatile("" ::"r"(wv.x), "r"(wv.y));  // issued before the wait (keep4's rule)
+    }
     await_prior();
-    norm_rope_rows(geo, after_wait(QRAW), after_wait(KRAW), WQ, WK, after_wait(Qn), after_wait(Vr), segs, rowseg, rowanc, P, M, eps, StoreBf16{layer, geo.kvh});
+    norm_rope_rows<StoreBf16, true>(geo, after_wait(QRAW), after_wait(KRAW), WQ, WK, after_wait(Qn), after_wait(Vr), segs, rowseg, rowanc, P, M, eps, StoreBf16{layer, geo.kvh}, wv);
 }
 
 #include "qwen35_rows.cuh"
@@ -715,16 +738,9 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_attn_partial(Geo geo, c
     const int G = geo.qh / geo.kvh;
     const bool own = segs[rowseg[m]].len < tf_q35_tc::GROUP_LEN;
     const int keys = segs[rowseg[m]].len + rows_seen(rowanc[m]), ck = chunk_keys(keys), nch = (keys + ck - 1) / ck;
+    if ((int)blockIdx.y >= nch) return;
     bool first = true;
-    for (int c = blockIdx.y; c < MAXCH; c += gridDim.y) {
-        if (c >= nch) {
-            if (own && (int)threadIdx.x < G) {
-                const size_t at = (m * geo.qh + (size_t)blockIdx.z * G + threadIdx.x) * MAXCH + c;
-                PM[at] = -INFINITY;
-                PL[at] = 0.0f;
-            }
-            continue;
-        }
+    for (int c = blockIdx.y; c < nch; c += gridDim.y) {
         if (!first) __syncthreads();
         first = false;
         tf_q35_tc::attn_one<tf_q35_tc::Bf16Tiles1<128>>({attn_tiles, nullptr, nullptr, nullptr}, geo, Q, segs, rowseg, rowanc, layer, P, scale, PM, PL, PO, c);
