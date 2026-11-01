@@ -1,0 +1,8 @@
+{
+  "local_patches": [
+    {
+      "file": "Vendor/TensorFold/VENDOR.json (annotation only)",
+      "why": "Repeat measurement of submission b46986f1-63c8-4244-9a81-8ac49c451514; runtime source bytes are identical to that submission."
+    }
+  ]
+}

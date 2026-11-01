@@ -253,3 +253,59 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_lean_##N##_late(Geo
   q35_slots_lean<N, false>(geo, q, k, v, g, beta, segs, steps, layer, y, P); }
 TF_Q35_LEAN(2)
 TF_Q35_LEAN(3)
+
+// A recorded window's lean scan that also runs the layer's gdn_post (TF_FUSED_GDN_POST=0: gdn_post launches after
+// it). The last of a (window, value head)'s dv-block CTAs to arrive (count, returned to zero by that CTA for the next
+// layer's scan) runs tf_q35_gdn_post's row (q35_post_row) on the window's rows, a warp a row: the same bits, one launch
+// less a linear layer. Every row's y and z load before any row computes; the other CTAs' y entries come from L2.
+__device__ __forceinline__ void q35_lean_post(Geo geo, const Seg* segs, const __nv_bfloat16* y, const __nv_bfloat16* z,
+        const __nv_bfloat16* nw0, float eps, __nv_bfloat16* out, float* xs, unsigned* count, const int* P) {
+    constexpr int RPW = 8;  // the lean scans' windows hold at most 32 rows: four warps of eight
+    __shared__ __align__(16) __nv_bfloat16 row_done[4][DK];
+    __shared__ int last;
+    if (past_windows(P, blockIdx.z / geo.nv)) return;
+    __threadfence();  // this CTA's y entries, then its arrival
+    __syncthreads();
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        unsigned* c = count + blockIdx.z;
+        last = atomicAdd(c, 1u) == gridDim.y - 1;
+        if (last) *c = 0;  // every CTA of the head has arrived
+    }
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    const int hv = blockIdx.z % geo.nv;
+    const Seg sg = segs[blockIdx.z / geo.nv];
+    const uint2 nw = *reinterpret_cast<const uint2*>(nw0 + threadIdx.x * (DK / 32));
+    const size_t W = (size_t)geo.nv * DK;
+    const int lane_at = hv * DK + threadIdx.x * (DK / 32);
+    uint2 yw[RPW], zw[RPW];
+#pragma unroll
+    for (int u = 0; u < RPW; ++u) {
+        const int r = threadIdx.y + 4 * u;
+        if (r >= sg.rows) break;
+        const size_t at = (size_t)(sg.row0 + r) * W + lane_at;
+        yw[u] = __ldcg(reinterpret_cast<const uint2*>(y + at));
+        zw[u] = *reinterpret_cast<const uint2*>(z + at);
+    }
+#pragma unroll
+    for (int u = 0; u < RPW; ++u) {
+        const int r = threadIdx.y + 4 * u;
+        if (r >= sg.rows) break;
+        const int m = sg.row0 + r;
+        if (past_rows(P, m)) continue;
+        q35_post_row(geo, nw, yw[u], zw[u], out, xs, eps, m, hv, row_done[threadIdx.y]);
+        __syncwarp();  // the group sums' reads of the staging row before the next row's stores
+    }
+}
+
+#define TF_Q35_LEAN_POST(N) \
+extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_lean_##N##_post(Geo geo, const __nv_bfloat16* q, \
+ const __nv_bfloat16* k, const __nv_bfloat16* v, const float* g, const __nv_bfloat16* beta, const Seg* segs, \
+ const SlotStep* steps, int layer, __nv_bfloat16* y, const int* P, const __nv_bfloat16* z, const __nv_bfloat16* nw, \
+ float eps, __nv_bfloat16* out, float* xs, unsigned* count) { \
+  release_next(); \
+  q35_slots_lean<N, true>(geo, q, k, v, g, beta, segs, steps, layer, y, P); \
+  q35_lean_post(geo, segs, after_wait(y), after_wait(z), nw, eps, after_wait(out), after_wait(xs), count, P); }
+TF_Q35_LEAN_POST(2)
+TF_Q35_LEAN_POST(3)
