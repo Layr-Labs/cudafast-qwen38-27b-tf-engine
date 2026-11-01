@@ -622,7 +622,7 @@ test "prompt persistence: only measured projection roles select row rings and pr
     var d: cuda.Driver = undefined;
     var kernels = PromptPersistentTrace.kernels(&d);
     const stream: cuda.Stream = .{ .d = &d, .handle = null };
-    for ([_]usize{ 6144, 17408 }) |k| {
+    for ([_]usize{ 4096, 6144, 17408 }) |k| {
         const outputs = [_]cuda.prompt_many.Out{.{ .q = PromptPersistentTrace.matrix(5120, k), .out = 3000 }};
         try kernels.prompt(stream, 1000, &outputs, 496);
         try t.expectEqual(@as(usize, 42), PromptPersistentTrace.id);
@@ -679,7 +679,7 @@ const OutputStreamTrace = struct {
         return 0;
     }
 };
-test "output stream: original slices require a prepared view and the native sixteen-row shape" {
+test "output stream: narrow target windows preserve the exact-16 drafter path" {
     var d: cuda.Driver = undefined;
     var e = engine(&d, true);
     d.api.cuLaunchKernelEx = OutputStreamTrace.launch;
@@ -688,7 +688,8 @@ test "output stream: original slices require a prepared view and the native sixt
         var q4: cuda.qlinear.Affine4 = .{ .w = 10, .stream_w = 100, .s = 20, .b = 30, .n = 5120, .npad = 5120, .k = k };
         for ([_]usize{ 1, 15, 16, 32 }) |rows| {
             try e.affine.cluster(e.stream, 1000, 2000, q4, 3000, rows, 4);
-            const selected = rows == 16;
+            // The record's drafter stream remains exact-16; other eligible streams take narrow windows too.
+            const selected = if (k == 4096) rows == 16 else rows <= 16;
             try t.expectEqual(@as(usize, if (selected) (if (k == 6144) 21 else 20) else 3), OutputStreamTrace.id);
             try t.expectEqual(@as(u32, if (selected) 512 else 128), OutputStreamTrace.threads);
             try t.expectEqual(!selected, OutputStreamTrace.cluster);

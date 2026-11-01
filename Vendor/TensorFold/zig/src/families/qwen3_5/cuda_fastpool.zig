@@ -33,6 +33,8 @@ pub const Pool = struct {
 
     /// `bytes` out of the first kept piece with room (the pieces are kept fastest first), 256-byte aligned.
     pub fn alloc(p: *Pool, bytes: usize) ?u64 {
+        // Avoid overflowing alignment for an oversized request.
+        if (bytes > piece) return null;
         const len = std.mem.alignForward(usize, bytes, alignment);
         for (p.ptr[0..p.n], p.used[0..p.n]) |base, *used| if (used.* + len <= piece) {
             const at = base + used.*;
@@ -53,6 +55,7 @@ fn piecesFor(sizes: []const usize) usize {
     var used: [most]usize = undefined;
     var n: usize = 0;
     next: for (sizes) |s| {
+        if (s > piece) return most + 1;
         const len = std.mem.alignForward(usize, s, alignment);
         if (len > piece) return most + 1;
         for (used[0..n]) |*u| if (u.* + len <= piece) {
@@ -191,6 +194,7 @@ test "fastpool: pieces counted the way alloc fills them" {
     try t.expectEqual(@as(usize, 3), piecesFor(&.{ 89 * m, 89 * m, 89 * m }));
     try t.expectEqual(@as(usize, 2), piecesFor(&.{ 70 * m, 70 * m, 25 * m })); // the 25 goes back into the first
     try t.expectEqual(@as(usize, most + 1), piecesFor(&.{piece + 1}));
+    try t.expectEqual(@as(usize, most + 1), piecesFor(&.{std.math.maxInt(usize)}));
     var p: Pool = .{ .d = undefined };
     p.ptr[0] = 1 << 32;
     p.ptr[1] = 2 << 32;
@@ -201,5 +205,6 @@ test "fastpool: pieces counted the way alloc fills them" {
     try t.expectEqual(@as(?u64, 2 << 32), p.alloc(70 * m));
     try t.expectEqual(@as(?u64, (1 << 32) + 70 * m), p.alloc(25 * m));
     try t.expectEqual(@as(?u64, null), p.alloc(piece));
+    try t.expectEqual(@as(?u64, null), p.alloc(std.math.maxInt(usize)));
     try t.expectEqual(@as(?usize, 123 * 1024), memFree("MemTotal: 9 kB\nMemFree:   123 kB\nMemAvailable: 999 kB\n"));
 }
