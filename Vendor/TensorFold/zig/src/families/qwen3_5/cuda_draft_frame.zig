@@ -230,10 +230,20 @@ fn head(d: anytype, rows: usize) !?u64 {
     const a = d.logits; // rows x 98,304, then rows x 320, then the packed rows x 98,592
     const b = a + rows * first.n * 2;
     const out = b + rows * tail.n * 2;
+    const skip = spans[1][0] - tail_tile;
+    // the verify head's 2-bit sieve, when it is on, takes the first span: the frame's four best ids a row from its
+    // 2-bit scan and the exact logits of every 8-id group that can hold them, written packed into out (the rest -inf);
+    // the tail span as before (TF_DRAFT_SIEVE=0: both spans' full projections)
+    if (e.sieve) |*sv| if (d.c.topk == 4 and sv.spans(rows, spans[0][1] / 64)) {
+        try sv.spanTop4(e.stream, d.x, d.xs, q, rows, spans[0][1] / 64, out, span_width);
+        try e.project(layers.Proj{ .a4 = tail }, d.x, d.xs, b, rows, false, 0, false);
+        const m: cuda.abi.Memcpy2D = .{ .src = b + skip * 2, .src_pitch = tail.n * 2, .dst = out + first.n * 2, .dst_pitch = span_width * 2, .width = (tail.n - skip) * 2, .height = rows };
+        try e.d.check(e.d.api.cuMemcpy2DAsync_v2(&m, e.stream.handle), "cuMemcpy2DAsync");
+        return out;
+    };
     // d.x and its group sums d.xs are the final norm's (body): both projections read them, no sums launch of their own
     try e.project(layers.Proj{ .a4 = first }, d.x, d.xs, a, rows, false, 0, false);
     try e.project(layers.Proj{ .a4 = tail }, d.x, d.xs, b, rows, false, 0, false);
-    const skip = spans[1][0] - tail_tile;
     const copies = [2]cuda.abi.Memcpy2D{
         .{ .src = a, .src_pitch = first.n * 2, .dst = out, .dst_pitch = span_width * 2, .width = first.n * 2, .height = rows },
         .{ .src = b + skip * 2, .src_pitch = tail.n * 2, .dst = out + first.n * 2, .dst_pitch = span_width * 2, .width = (tail.n - skip) * 2, .height = rows },
