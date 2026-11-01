@@ -352,7 +352,19 @@ const Run = struct {
     }
 
     fn wait(run: *Run) !void {
-        while (!run.done.load(.acquire)) std.Thread.yield() catch {};
+        // A waiter that yields burns a core for the request's whole duration; on GB10 the CPU and the GPU share one
+        // package, so that core's power is the kernels'. Spin only while a launch's latency is in play (a round is
+        // tens of microseconds), then sleep 20 us: the engine thread still feeds the GPU, the waiter stops competing.
+        var spins: usize = 0;
+        while (!run.done.load(.acquire)) {
+            if (spins < 2048) {
+                spins += 1;
+                std.atomic.spinLoopHint();
+            } else {
+                const req: std.c.timespec = .{ .sec = 0, .nsec = 20_000 };
+                _ = std.c.nanosleep(&req, null);
+            }
+        }
         if (run.failed) return error.EngineFailed;
     }
 };
