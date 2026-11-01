@@ -268,7 +268,9 @@ pub const symbols = struct {
     pub const pack_words = "tf_pack_dense";
     pub const pack_scales = "tf_transpose_pad16";
     // dictionary-coded twins (qmm_dict.cuh) and the load-time encoder (affine4_pack.cu)
-    pub const group_dict = "_ZN12tf_qmm_group17group_kernel_dictILi64ELi16ELi64ELi1ELi4ELi8ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
+    pub const group_dict = "_ZN12tf_qmm_group17group_kernel_dictILi64ELi16ELi64ELi1ELi4ELi8ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
+    pub const head_amax = "_ZN12tf_qmm_group17group_kernel_dictILi64ELi16ELi64ELi1ELi4ELi8ELb0ELb0ELb1EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
+    pub const head_merge = "tf_qmm_head_argmax_merge";
     pub const gemv_dict = "tf_lane_gemv_dict";
     pub const gemv_many_dict = "tf_lane_gemv_many_dict";
     pub const dict_mark = "tf_dict_mark";

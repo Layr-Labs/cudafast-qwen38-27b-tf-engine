@@ -513,6 +513,14 @@ pub const Engine = struct {
         try e.run(f, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ ids, e.embed_w, e.embed_s, e.embed_b, out, @as(c_int, @intCast(e.g.hidden)), params });
     }
 
+    fn headArgmax(e: *const Engine, bucket: usize, draws: []const Draw) bool {
+        for (draws) |p| if (p.rule != null) return false;
+        return switch (e.head) {
+            .a4 => |q| e.affine.headArgmaxFits(q, bucket),
+            else => false,
+        };
+    }
+
     /// Logits rows first..first + n's greedy tokens into toks: the highest logit, ties to the lower id.
     fn argmax(e: *Engine, first: usize, n: usize, toks: u64) !void {
         if (n == 0) return;
@@ -630,6 +638,7 @@ pub const Engine = struct {
         };
         shape.hidden = keep == .hidden;
         shape.paged = @import("cuda_attention.zig").hasPages(segs);
+        shape.amax = keep == .draws and e.learning == null and !e.pockets.any() and e.headArgmax(shape.total, keep.draws);
         // a cache of at most GROUP_LEN positions holds fewer keys than that before any row it verifies
         shape.short = for (parts) |p| {
             if (p.cache.cap > @import("cuda_forward.zig").group_len) break false;
@@ -684,7 +693,7 @@ pub const Engine = struct {
             .hidden => try e.stream.synchronize(), // mapped layer inputs are ready before the learner reads them
             .draws => |pk| {
                 const toks = e.tables.ptr + tokens_at;
-                var i: usize = 0; // runs of greedy rows argmaxed together, runs of sampled rows drawn together
+                var i: usize = if (shape.amax) pk.len else 0;
                 while (i < pk.len) {
                     const sampled = pk[i].rule != null;
                     var n: usize = 1;
