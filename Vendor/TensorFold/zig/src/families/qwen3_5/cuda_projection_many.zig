@@ -43,7 +43,9 @@ pub fn projectMany(e: *Engine, ls: []const Proj, x: u64, xs: u64, outs: []const 
         const mixed_attention = rows == 16 and ls.len == 3 and e.affine.pdl and e.affine.cluster_decode and
             cuda.qlinear.splitK(many[0].q.n, k) == 1 and cuda.qlinear.splitK(many[1].q.n, k) > 1 and
             cuda.qlinear.splitK(many[2].q.n, k) > 1 and mixedAttention();
-        if (mixed_attention) try e.affine.decodeAttentionMixed(e.stream, x, xs, many[0..ls.len], rows) else
+        // q, k and v with stream copies take the GDN stream twin (decodeMany) instead of the mixed cluster launch
+        const streamed = e.affine.streamable(many[0..ls.len], @min(A.max_rows, rows - at));
+        if (mixed_attention and !streamed) try e.affine.decodeAttentionMixed(e.stream, x, xs, many[0..ls.len], rows) else
             try e.affine.decodeMany(e.stream, x + at * k * 2, xs + at * (k / 64) * 4, many[0..ls.len], @min(A.max_rows, rows - at));
     }
 }
