@@ -352,7 +352,12 @@ const Run = struct {
     }
 
     fn wait(run: *Run) !void {
-        while (!run.done.load(.acquire)) std.Thread.yield() catch {};
+        // 200 us sleeps instead of yield-spinning a core for the whole request (GB10's CPU and GPU share one package): a
+        // tenth of the wake-ups of 20 us ones, for at most ~0.2 ms once a request; TF_BENCH_WAIT=yield: the yield loop
+        if (!std.mem.eql(u8, std.mem.span(std.c.getenv("TF_BENCH_WAIT") orelse ""), "yield")) {
+            const req: std.c.timespec = .{ .sec = 0, .nsec = 200_000 };
+            while (!run.done.load(.acquire)) _ = std.c.nanosleep(&req, null);
+        } else while (!run.done.load(.acquire)) std.Thread.yield() catch {};
         if (run.failed) return error.EngineFailed;
     }
 };
