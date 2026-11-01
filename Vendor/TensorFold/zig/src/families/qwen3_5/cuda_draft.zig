@@ -159,6 +159,7 @@ pub const Draft = struct {
         try d.pool.append(gpa, ctx);
         d.startup.warmups += profile.elapsed(io, warm_start);
         d.startup.load = profile.elapsed(io, started) - d.startup.reserve - d.startup.warmups;
+        try e.enableOverlap();
         return d;
     }
 
@@ -326,8 +327,26 @@ pub const Draft = struct {
         try d.e.runAfter(d.fns.norm_rope, .{ rows * heads, 1, 1 }, .{ 32, 1, 1 }, .{ x, w, out, @as(c_int, @intCast(heads)), @as(c_int, @intCast(heads * d.c.head_dim)), @as(c_longlong, @intCast(pos0)), d.c.eps, d.c.theta });
     }
 
+    /// `absorbRows`; a prompt's absorb right after its last cut (cuda_engine.zig Overlap) runs on the engine's side
+    /// stream once that cut's last layer is done, while the cut's head runs on, and the engine stream waits for it before
+    /// anything launched after it.
+    fn absorb(d: *Draft, ctx: *Ctx, tap_ring: u64, start: u64, n: usize, rows: ?[]const u32, prompt: bool) !void {
+        const e = d.e;
+        if (!(prompt and e.overlap.tail_pending)) return d.absorbRows(ctx, tap_ring, start, n, rows, prompt);
+        e.overlap.tail_pending = false;
+        const main = e.stream;
+        const side = e.overlap.side.?;
+        try e.d.check(e.d.api.cuStreamWaitEvent(side.handle, e.overlap.tail_done, 0), "cuStreamWaitEvent");
+        e.stream = side;
+        errdefer e.stream = main;
+        try d.absorbRows(ctx, tap_ring, start, n, rows, prompt);
+        e.stream = main;
+        try e.d.check(e.d.api.cuEventRecord(e.overlap.absorb_done, side.handle), "cuEventRecord");
+        try e.d.check(e.d.api.cuStreamWaitEvent(main.handle, e.overlap.absorb_done, 0), "cuStreamWaitEvent");
+    }
+
     /// Target rows [start, start + n) from the tap ring into the context; with `rows`, ring rows start + rows[i].
-    fn absorb(d: *Draft, ctx: *Ctx, tap_ring: u64, start_: u64, n_: usize, rows_: ?[]const u32, prompt: bool) !void {
+    fn absorbRows(d: *Draft, ctx: *Ctx, tap_ring: u64, start_: u64, n_: usize, rows_: ?[]const u32, prompt: bool) !void {
         const previous = d.projection_role;
         defer d.projection_role = previous;
         d.projection_role = if (prompt) .prompt else .live;
@@ -428,7 +447,7 @@ pub const Draft = struct {
         d.drawn = .{ .sampling = it.sampling, .position = it.position };
         defer d.drawn = .{};
         if (it.lanes) |shape| return d.selectLanes(ctx, it.pending, rows, shape);
-        const limit = if (d.c.block == 16) tree.nodes() else 0;
+        const limit = if (grows(d.c.block)) tree.nodes() else 0;
         if (limit > 0) {
             // the whole budget whenever drafts are asked: the block's forward costs the same at any depth
             const n = if (it.depth == 0) 0 else limit;
@@ -490,7 +509,7 @@ pub const Draft = struct {
     fn factsFn(p: *anyopaque) dr.Facts {
         const d = cast(p);
         // TF_NO_TREES=1: chains only (for comparing)
-        return .{ .depth = @intCast(d.c.block - 1), .step_ms = d.step_ms, .prior = &prior, .plain_guard = true, .batched = true, .stream_bytes = d.c.ringBytes() + d.target_taps + d.scratch_one, .trees = platform.c.getenv("TF_NO_TREES") == null, .window_costs = d.costs[0..d.n_costs], .lane_costs = d.costs[0..d.n_costs], .tree_nodes = @intCast(if (d.c.block == 16) tree.nodes() else 0), .cost_probe_min_rows = 16 };
+        return .{ .depth = @intCast(d.c.block - 1), .step_ms = d.step_ms, .prior = &prior, .plain_guard = true, .batched = true, .stream_bytes = d.c.ringBytes() + d.target_taps + d.scratch_one, .trees = platform.c.getenv("TF_NO_TREES") == null, .window_costs = d.costs[0..d.n_costs], .lane_costs = d.costs[0..d.n_costs], .tree_nodes = @intCast(if (grows(d.c.block)) tree.nodes() else 0), .cost_probe_min_rows = 16 };
     }
 
     fn openFn(p: *anyopaque, s: *Stream) anyerror!void {
@@ -622,6 +641,13 @@ test "a drafter config with a zero divisor is refused, and any admitted rank's s
 }
 
 /// Independent runtime controls for qualification against the current eager frame.
+/// Whether a block's holds grow their own best-first trees (cuda_draft_tree.zig grow, tree.nodes() nodes) instead of
+/// the planner's lane trees: block 16, and block 8 (the 27B's pinned drafter: seven rows of candidates, a tree of up to
+/// fifteen nodes over them; TF_NO_TREES / TF_DRAFT_NODES=0 keep chains and lanes).
+pub fn grows(block: usize) bool {
+    return block == 16 or block == 8;
+}
+
 pub fn graphsOff() bool {
     const value = platform.c.getenv("TF_DRAFT_GRAPH") orelse return false;
     return !std.mem.eql(u8, std.mem.span(value), "1");
