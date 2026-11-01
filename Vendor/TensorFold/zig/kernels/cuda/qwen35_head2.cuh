@@ -186,13 +186,19 @@ __device__ __forceinline__ void select(const __nv_bfloat16* __restrict__ L, int 
     for (int pass = 0; pass < 2; ++pass) {
         for (int i = t; i < 256; i += T) hist[i] = 0;
         __syncthreads();
-        for (int c = t; c < V; c += T) {
-            const unsigned k = key16(x[c]);
-            const bool in = pass == 0 || (k >> 8) == prefix;
-            const unsigned bin = pass == 0 ? k >> 8 : (k & 255u);
-            // a warp's lanes with the same bin add once (the logits crowd a few high bins)
-            const unsigned mask = __match_any_sync(__activemask(), in ? bin : 0x100u);
-            if (in && (threadIdx.x & 31) == __ffs(mask) - 1) atomicAdd(&hist[bin], __popc(mask));
+        for (int i = t; i < V / 8; i += T) {
+            const uint4 q = reinterpret_cast<const uint4*>(x)[i];
+            const unsigned short v[8] = {(unsigned short)(q.x & 0xFFFFu), (unsigned short)(q.x >> 16), (unsigned short)(q.y & 0xFFFFu), (unsigned short)(q.y >> 16),
+                                         (unsigned short)(q.z & 0xFFFFu), (unsigned short)(q.z >> 16), (unsigned short)(q.w & 0xFFFFu), (unsigned short)(q.w >> 16)};
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const unsigned k = key16(v[j]);
+                const bool in = pass == 0 || (k >> 8) == prefix;
+                const unsigned bin = pass == 0 ? k >> 8 : (k & 255u);
+                // a warp's lanes with the same bin add once (the logits crowd a few high bins)
+                const unsigned mask = __match_any_sync(__activemask(), in ? bin : 0x100u);
+                if (in && (threadIdx.x & 31) == __ffs(mask) - 1) atomicAdd(&hist[bin], __popc(mask));
+            }
         }
         __syncthreads();
         if (t == 0) {
@@ -217,13 +223,19 @@ __device__ __forceinline__ void select(const __nv_bfloat16* __restrict__ L, int 
     unsigned* pi = PI + static_cast<size_t>(row) * cap;
 #pragma unroll 1
     for (int tie = 0; tie < 2; ++tie) {                           // above the cut first (fewer than K), then the ties
-        for (int c = t; c < V; c += T) {
-            const unsigned k = key16(x[c]);
-            if (tie ? k == cut : k > cut) {
-                const unsigned at = atomicAdd(&s_count, 1u);
-                if (at < static_cast<unsigned>(cap)) {
-                    pv[at] = __bfloat162float(__ushort_as_bfloat16(x[c]));
-                    pi[at] = static_cast<unsigned>(c);
+        for (int i = t; i < V / 8; i += T) {
+            const uint4 q = reinterpret_cast<const uint4*>(x)[i];
+            const unsigned short v[8] = {(unsigned short)(q.x & 0xFFFFu), (unsigned short)(q.x >> 16), (unsigned short)(q.y & 0xFFFFu), (unsigned short)(q.y >> 16),
+                                         (unsigned short)(q.z & 0xFFFFu), (unsigned short)(q.z >> 16), (unsigned short)(q.w & 0xFFFFu), (unsigned short)(q.w >> 16)};
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const unsigned k = key16(v[j]);
+                if (tie ? k == cut : k > cut) {
+                    const unsigned at = atomicAdd(&s_count, 1u);
+                    if (at < static_cast<unsigned>(cap)) {
+                        pv[at] = __bfloat162float(__ushort_as_bfloat16(v[j]));
+                        pi[at] = static_cast<unsigned>(i * 8 + j);
+                    }
                 }
             }
         }
@@ -235,65 +247,83 @@ __device__ __forceinline__ void select(const __nv_bfloat16* __restrict__ L, int 
     }
 }
 
-// The rescore: row blockIdx.x's candidates (PI, n a row) below `first`, 32 a block (8 a warp, one n8 tile), each
-// value recomputed from the 4-bit head with group_kernel_dict's arithmetic: the row tile's A fragments (rows past M
-// zero), the candidate column's two words a lane for each group (the 32 bytes its tile's lanes hold), pairm's codes, the
-// four-step MMA chain from zero, then acc = fma(xs, b, fma(d, s, acc)) group by group, rounded to bf16. PV takes the
-// value the full head's stored logit would widen to.
+constexpr int RS_KG = 80;
 __device__ __forceinline__ void rescore(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
-                                               const uint32_t* __restrict__ w4, const __nv_bfloat162* __restrict__ sbcol,
-                                               int KG, int M,
-                                               float* __restrict__ PV, const unsigned* __restrict__ PI, int n,
-                                               int first) {
+                                        const uint32_t* __restrict__ w4, const __nv_bfloat162* __restrict__ sbcol,
+                                        int KG, int M, float* __restrict__ PV, const unsigned* __restrict__ PI, int n,
+                                        int first) {
+    __shared__ float dsm[RS_KG][32];
+    __shared__ int cols[32];
     const int r = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const int at = blockIdx.y * 32 + warp * 8;                      // this warp's first candidate of row r
-    if (at >= n) return;
+    const int at = blockIdx.y * 32;
+    if (at >= n || KG > RS_KG) return;
     const size_t base = static_cast<size_t>(r) * n + at;
-    // a lane's column (its B fragment's n = lane / 4) and the two columns its accumulators hold ((lane & 3) * 2, + 1)
-    const int pb = lane >> 2, pc = (lane & 3) * 2;
-    auto colOf = [&](int p) -> int {
-        if (at + p >= n) return -1;
-        const unsigned c = PI[base + p];
-        return c < static_cast<unsigned>(first) ? static_cast<int>(c) : -1;
-    };
-    const int cb = colOf(pb), cc0 = colOf(pc), cc1 = colOf(pc + 1);
-    if (__all_sync(0xffffffffu, cb < 0)) return;
-    const int ub = max(cb, 0), u0 = max(cc0, 0), u1 = max(cc1, 0);
-    const uint32_t* wcol = w4 + static_cast<size_t>(ub / 64) * KG * TILE_WORDS + (((ub % 64) / 8) * 32 + (ub % 8) * 4 + (lane & 3)) * 2;
+    if (threadIdx.x < 32) {
+        int c = -1;
+        if (at + lane < n) {
+            const unsigned u = PI[base + lane];
+            if (u < static_cast<unsigned>(first)) c = static_cast<int>(u);
+        }
+        cols[lane] = c;
+    }
+    __syncthreads();
+    bool any = false;
+#pragma unroll
+    for (int i = 0; i < 32; ++i) any = any || cols[i] >= 0;
+    if (!any) return;
     const int g4 = lane >> 2, t4 = lane & 3;
     const bool r0 = g4 < M, r1 = g4 + 8 < M;
     const __nv_bfloat16* x0 = x + static_cast<size_t>(r0 ? g4 : 0) * KG * GS + 2 * t4;
     const __nv_bfloat16* x1 = x + static_cast<size_t>(r1 ? g4 + 8 : 0) * KG * GS + 2 * t4;
-    const __nv_bfloat162* sb0 = sbcol + static_cast<size_t>(u0) * KG;
-    const __nv_bfloat162* sb1 = sbcol + static_cast<size_t>(u1) * KG;
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-#pragma unroll 4
-    for (int g = 0; g < KG; ++g) {
-        const uint32_t w[2] = {wcol[static_cast<size_t>(g) * TILE_WORDS], wcol[static_cast<size_t>(g) * TILE_WORDS + 1]};
-        float d[4];
+    const uint32_t* wcol[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int ub = max(cols[j * 8 + g4], 0);
+        wcol[j] = w4 + static_cast<size_t>(ub / 64) * KG * TILE_WORDS + (((ub % 64) / 8) * 32 + (ub % 8) * 4 + t4) * 2;
+    }
+    const bool mine = (r < 8 ? g4 == r : g4 == r - 8);
+    const int e0 = r < 8 ? 0 : 2;
+    const int per = (KG + 3) / 4, g_lo = warp * per, g_hi = min(KG, g_lo + per);
+#pragma unroll 2
+    for (int g = g_lo; g < g_hi; ++g) {
+        uint32_t a[4][4];
 #pragma unroll
         for (int kt = 0; kt < 4; ++kt) {
             const int k = g * GS + kt * 16;
-            uint32_t a[4];
-            a[0] = r0 ? *reinterpret_cast<const uint32_t*>(x0 + k) : 0u;
-            a[1] = r1 ? *reinterpret_cast<const uint32_t*>(x1 + k) : 0u;
-            a[2] = r0 ? *reinterpret_cast<const uint32_t*>(x0 + k + 8) : 0u;
-            a[3] = r1 ? *reinterpret_cast<const uint32_t*>(x1 + k + 8) : 0u;
-            const uint32_t b0 = pairm(w[kt / 2], (kt & 1) * 8, 0x000F000Fu), b1 = pairm(w[kt / 2], (kt & 1) * 8 + 4, 0x000F000Fu);
-            if (kt == 0) mma0(d, a, b0, b1);
-            else mma(d, a, b0, b1);
+            a[kt][0] = r0 ? *reinterpret_cast<const uint32_t*>(x0 + k) : 0u;
+            a[kt][1] = r1 ? *reinterpret_cast<const uint32_t*>(x1 + k) : 0u;
+            a[kt][2] = r0 ? *reinterpret_cast<const uint32_t*>(x0 + k + 8) : 0u;
+            a[kt][3] = r1 ? *reinterpret_cast<const uint32_t*>(x1 + k + 8) : 0u;
         }
-        const float2 p0 = __bfloat1622float2(sb0[g]), p1 = __bfloat1622float2(sb1[g]);
-        const float sv[2] = {p0.x, p1.x}, bv[2] = {p0.y, p1.y};
-        const float xv[2] = {r0 ? xs[static_cast<size_t>(g4) * KG + g] : 0.0f, r1 ? xs[static_cast<size_t>(g4 + 8) * KG + g] : 0.0f};
 #pragma unroll
-        for (int e = 0; e < 4; ++e) acc[e] = __fmaf_rn(xv[e >> 1], bv[e & 1], __fmaf_rn(d[e], sv[e & 1], acc[e]));
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t w[2] = {wcol[j][static_cast<size_t>(g) * TILE_WORDS], wcol[j][static_cast<size_t>(g) * TILE_WORDS + 1]};
+            float d[4];
+#pragma unroll
+            for (int kt = 0; kt < 4; ++kt) {
+                const uint32_t b0 = pairm(w[kt / 2], (kt & 1) * 8, 0x000F000Fu), b1 = pairm(w[kt / 2], (kt & 1) * 8 + 4, 0x000F000Fu);
+                if (kt == 0) mma0(d, a[kt], b0, b1);
+                else mma(d, a[kt], b0, b1);
+            }
+            if (mine) {
+                dsm[g][j * 8 + t4 * 2] = d[e0];
+                dsm[g][j * 8 + t4 * 2 + 1] = d[e0 + 1];
+            }
+        }
     }
-#pragma unroll
-    for (int e = 0; e < 4; ++e) {
-        const int row = g4 + (e >> 1) * 8, p = pc + (e & 1);
-        const int c = (e & 1) ? cc1 : cc0;
-        if (row == r && c >= 0) PV[base + p] = __bfloat162float(__float2bfloat16_rn(acc[e]));
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        const int c = cols[lane];
+        if (c >= 0) {
+            const __nv_bfloat162* sb = sbcol + static_cast<size_t>(c) * KG;
+            const float* px = xs + static_cast<size_t>(r) * KG;
+            float acc = 0.0f;
+            for (int g = 0; g < KG; ++g) {
+                const float2 p = __bfloat1622float2(sb[g]);
+                acc = __fmaf_rn(px[g], p.y, __fmaf_rn(dsm[g][lane], p.x, acc));
+            }
+            PV[base + lane] = __bfloat162float(__float2bfloat16_rn(acc));
+        }
     }
 }
 
