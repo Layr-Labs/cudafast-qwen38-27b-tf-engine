@@ -24,18 +24,22 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q, 
     for (int r = 0; r < R; ++r)
 #pragma unroll
         for (int i = 0; i < PT; ++i) root[r][i] = st[r * DK + i];
-    if (sg.pn > 0) {
+    // the carried prefix (pn2) first, then the newer one (pn)
+#pragma unroll 1
+    for (int set = 0; set < 2; ++set) {
+        const int pn = set ? sg.pn : sg.pn2;
+        if (pn <= 0) continue;
         Seg prev = sg;
-        prev.log = sg.plog;
+        prev.log = set ? sg.plog : sg.plog2;
         // the kept prefix's rows four at a time: their decays, strengths and keys loaded together, then applied in
         // order with q35_slots's arithmetic
-        for (int j0 = 0; j0 < sg.pn; j0 += 4) {
+        for (int j0 = 0; j0 < pn; j0 += 4) {
             float pg[4];
             float4 pd[4];
             uint2 pk[4];
 #pragma unroll
             for (int u = 0; u < 4; ++u) {
-                if (j0 + u >= sg.pn) break;
+                if (j0 + u >= pn) break;
                 const LogRow l = log_row(geo, prev, layer, j0 + u);
                 pg[u] = l.g[hv];
                 pd[u] = *reinterpret_cast<const float4*>(l.delta + hv * DK + dv0);
@@ -43,7 +47,7 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q, 
             }
 #pragma unroll
             for (int u = 0; u < 4; ++u) {
-                if (j0 + u >= sg.pn) break;
+                if (j0 + u >= pn) break;
                 const float pdr[R] = {pd[u].x, pd[u].y, pd[u].z, pd[u].w};
                 const __nv_bfloat16* kb = reinterpret_cast<const __nv_bfloat16*>(&pk[u]);
 #pragma unroll
@@ -57,6 +61,13 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q, 
             }
         }
     }
+    // a recorded window keeps its own rows in the log: the folded root goes back now, its stores draining under the
+    // steps (the same guarded stores the tail made: root is final after the fold)
+    if (recorded(P) && sg.rows != 1 && (sg.pn > 0 || sg.pn2 > 0) && !sg.skip)
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+#pragma unroll
+            for (int i = 0; i < PT; ++i) st[r * DK + i] = root[r][i];
     if (sg.rows == 1)
 #pragma unroll
         for (int r = 0; r < R; ++r)
@@ -203,14 +214,7 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q, 
         const float tot = spread_sum<R>(pend, dk);
         if ((dk & ((1 << SR) - 1)) == 0) y[((size_t)pend_row * NV + hv) * DK + dv0 + (dk >> SR)] = __float2bfloat16_rn(tot);
     }
-    if (record && sg.rows != 1) {
-        if (sg.pn > 0)
-#pragma unroll
-            for (int r = 0; r < R; ++r)
-#pragma unroll
-                for (int i = 0; i < PT; ++i) st[r * DK + i] = root[r][i];
-        return;
-    }
+    if (record && sg.rows != 1) return;  // the folded root went back before the steps
 #pragma unroll
     for (int r = 0; r < R; ++r)
 #pragma unroll
