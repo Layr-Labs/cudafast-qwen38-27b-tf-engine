@@ -6,7 +6,7 @@ const engine = @import("cuda_engine.zig");
 
 /// Children a node, the selector's weight, the softmax scale, and the nodes a tree takes by default.
 const branch = 12;
-const edge_weight = 0.6;
+const edge_weight = 0.85; // stronger predecessor edge than 0.6: deeper right paths (offline sim on recorded raw drafter rows)
 const scale = 1.5;
 /// A sampled stream's candidates carry the draw's own Gumbel noise at this weight (the 27B engine's draft_tree).
 const noise_weight = 0.7;
@@ -320,4 +320,4 @@ test "best first: a node's children follow it, the cheapest open node first, cha
     for (parents[0..n], 0..) |p, i| try std.testing.expect(p < @as(i32, @intCast(i)));
     for (tokens[0..n], parents[0..n]) |t, p| try std.testing.expectEqual(p >= 0, t >= 10); // row 1's ids under row 0's
 }
-// draw 2 of a97679c8
+// draw 4 of 56286961
