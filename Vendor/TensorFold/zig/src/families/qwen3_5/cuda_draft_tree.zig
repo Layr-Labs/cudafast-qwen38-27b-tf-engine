@@ -321,3 +321,4 @@ test "best first: a node's children follow it, the cheapest open node first, cha
     for (tokens[0..n], parents[0..n]) |t, p| try std.testing.expectEqual(p >= 0, t >= 10); // row 1's ids under row 0's
 }
 // draw 2 of a97679c8
+// draw 2 of 6337ef4
