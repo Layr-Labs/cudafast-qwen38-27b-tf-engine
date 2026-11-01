@@ -199,6 +199,8 @@ pub const Engine = struct {
     n_taps: usize = 0,
     /// During an image prompt chunk's forward: its feature rows (0: none); the chunk's src and positions are staged.
     features: u64 = 0,
+    /// A forward's last wait's event, created on the first forward and re-recorded after (`settle`).
+    settle_ev: cuda.abi.Event = null,
 
     pub const ids_at = Round.ids_at;
     pub const segs_at = Round.segs_at;
@@ -404,6 +406,7 @@ pub const Engine = struct {
         recurrent.shutdown(e);
         if (e.kit) |k| k.deinit(e.gpa);
         e.pockets.deinit();
+        if (e.settle_ev) |ev| _ = e.d.api.cuEventDestroy_v2(ev);
         var it = e.graphs.valueIterator();
         while (it.next()) |x| x.deinit();
         e.graphs.deinit(e.gpa);
@@ -598,6 +601,19 @@ pub const Engine = struct {
         for (parts) |p| if (p.images != null and record) return error.InvalidQwenImages;
     }
 
+    /// A forward's last wait: record one blocking-sync event in the engine stream and wait for it instead of
+    /// `cuStreamSynchronize`, whose waiter spins a core for the whole round. On GB10 the CPU and the GPU share one
+    /// power budget, so a spinning engine core is taken out of the GPU's clocks through every round it should be
+    /// streaming weights. The event is created once and re-recorded: no allocation per round, and a wake is one
+    /// interrupt — a few microseconds of a round of tens of milliseconds. Wait mode only: no launch, value, order or
+    /// rounding changes.
+    fn settle(e: *Engine) !void {
+        if (e.settle_ev == null)
+            try e.d.check(e.d.api.cuEventCreate(&e.settle_ev, cuda.abi.event_disable_timing | cuda.abi.event_blocking_sync), "cuEventCreate");
+        try e.d.check(e.d.api.cuEventRecord(e.settle_ev, e.stream.handle), "cuEventRecord");
+        try e.d.check(e.d.api.cuEventSynchronize(e.settle_ev), "cuEventSynchronize");
+    }
+
     /// One forward over `parts`' windows, with every input admitted before an unkept verify is settled.
     pub fn forward(e: *Engine, parts: []const Part, ids: []const u32, keep: Keep) !void {
         try e.admit(parts, ids, keep);
@@ -722,7 +738,7 @@ pub const Engine = struct {
         }
         for (parts) |p| p.cache.advanced(p.rows, record);
         switch (keep) {
-            .hidden => try e.stream.synchronize(), // mapped layer inputs are ready before the learner reads them
+            .hidden => try e.settle(), // mapped layer inputs are ready before the learner reads them
             .draws => |pk| {
                 const toks = e.tables.ptr + tokens_at;
                 var i: usize = if (shape.amax) pk.len else 0; // amax: the graph's head wrote every row's token
@@ -736,14 +752,14 @@ pub const Engine = struct {
                     i += n;
                 }
                 try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(e.host_logits.bytes.ptr, toks, total * 4, e.stream.handle), "cuMemcpyDtoHAsync");
-                try e.stream.synchronize();
+                try e.settle();
                 @memcpy(e.tokens[0..total], e.host_logits.slice(u32)[0..total]);
                 if (shape.amax) if (e.sieve) |*sv| sv.after();
             },
             .logits, .last => {
                 const out = e.host_logits.bytes[0 .. heads * g.vocab * 2];
                 try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(out.ptr, e.logits, out.len, e.stream.handle), "cuMemcpyDtoHAsync");
-                try e.stream.synchronize();
+                try e.settle();
                 // the chunk is done: its persisting lines turn normal, so decode has all of L2
                 if (prompt and e.l2_persist > 0) _ = e.d.api.cuCtxResetPersistingL2Cache();
                 if (keep == .last) @memcpy(parts[0].cache.logits, e.rowLogits(0));
