@@ -80,7 +80,8 @@ pub fn total(s: Shape) usize {
     t += s.layers * (2 * aligned(s.hidden * 2) + packedBytes(s.q_width, s.hidden) + 2 * packedBytes(s.kv_width, s.hidden) + packedBytes(s.hidden, s.q_width) +
         2 * aligned(s.head_dim * 2) + 2 * packedBytes(s.intermediate, s.hidden) + packedBytes(s.hidden, s.intermediate) + 2 * packedBytes(s.dynamic, s.hidden) + 2 * aligned(4 * s.hidden * 2) +
         2 * aligned(Affine4.layout(s.intermediate, s.hidden).words) + aligned(Affine4.layout(s.hidden, s.intermediate).words) +
-        aligned(Affine4.layout(s.hidden, s.q_width).words)); // the o projection's stream view (oStream)
+        aligned(Affine4.layout(s.hidden, s.q_width).words) + // the o projection's stream view (oStream)
+        aligned(Affine4.layout(s.q_width, s.hidden).words) + 2 * aligned(Affine4.layout(s.kv_width, s.hidden).words)); // q/k/v's (attnStream)
     return t;
 }
 
@@ -212,6 +213,13 @@ fn oStream() bool {
     return !std.mem.eql(u8, std.mem.span(v), "0");
 }
 
+/// TF_DRAFT_ATTN_STREAM=0: the drafter's q, k and v keep the cluster tile; otherwise they get K-major views and a
+/// frame's q/k/v launch runs the GDN stream twin (the same per-element chains, as the target's attention streams).
+fn attnStream() bool {
+    const v = @import("sys").c.getenv("TF_DRAFT_ATTN_STREAM") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
+
 /// A bf16 (n, k) tensor quantized and packed through `stage` into the drafter's arena.
 fn linear(gpa: std.mem.Allocator, e: *Engine, stage: *DeviceBuffer, w: *Weights, ck: *core.Checkpoint, name: []const u8, n: usize, k: usize) !Affine4 {
     const t = try ck.expect(name, .bf16, &.{ n, k });
@@ -243,6 +251,15 @@ fn linear(gpa: std.mem.Allocator, e: *Engine, stage: *DeviceBuffer, w: *Weights,
         const pack = try e.mods[3].function("tf_pack_kmajor");
         const words = l.npad * k / 8;
         try e.run(pack, .{ (words + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ out.w, out.stream_w, @as(c_int, @intCast(k / 64)), @as(c_int, @intCast(l.npad / 64)) });
+    } else if (e.affine.gdn_stream16_fn != null and k == 5120 and n % 256 == 0 and (n == 1024 or n == 4096 or n == 5120) and attnStream()) {
+        // the attention q, k and v (one input, k = hidden): a K-major view, so a frame's q/k/v launch takes the GDN
+        // stream twin as the target's attention does (Affine4Kernels.streamable); a tensor past the arena's room keeps none
+        out.stream_w = w.alloc(l.words) catch 0;
+        if (out.stream_w != 0) {
+            const pack = try e.mods[3].function("tf_pack_kmajor");
+            const words = l.npad * k / 8;
+            try e.run(pack, .{ (words + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ out.w, out.stream_w, @as(c_int, @intCast(k / 64)), @as(c_int, @intCast(l.npad / 64)) });
+        }
     }
     // the drafter's scales and biases dictionary-coded as the target's (TF_DRAFT_DICT=0 keeps them uncoded); its
     // biases are each group's minimum, so the joint pairs outnumber a pair table and the separate coding serves
