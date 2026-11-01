@@ -2,6 +2,10 @@
 
 Each release's page on GitHub has its notes and measurements. See [the 1.0.0 release notes](RELEASE-NOTES-1.0.0.md) for the native binary's supported models and migration details.
 
+## Unreleased
+
+- CUDA DFlash screened-head rescoring loads activation rows and scales only for the output row. Frames above 16 rows use the existing exact-span projection.
+
 ## 1.1.6
 
 - DeepSeek-V4.1 (experimental): a tool call in the model's spaced DSML spelling now comes back in `tool_calls`, streamed and whole, instead of in the reply's text, and a lone DSML opener inside a `<tool_call>` no longer crashes the parser; the `TF_DSV41_ASSETS` refusal names the file boot actually opens (`engram-token-map.bin`) (#1324).

@@ -236,8 +236,8 @@ __device__ __forceinline__ void select(const __nv_bfloat16* __restrict__ L, int 
 }
 
 // The rescore: row blockIdx.x's candidates (PI, n a row) below `first`, 32 a block (8 a warp, one n8 tile), each
-// value recomputed from the 4-bit head with group_kernel_dict's arithmetic: the row tile's A fragments (rows past M
-// zero), the candidate column's two words a lane for each group (the 32 bytes its tile's lanes hold), pairm's codes, the
+// value recomputed from the 4-bit head with group_kernel_dict's arithmetic: only the output row's A fragments are
+// live; all lanes retain the candidate column's two words for each group, pairm's codes, and the
 // four-step MMA chain from zero, then acc = fma(xs, b, fma(d, s, acc)) group by group, rounded to bf16. PV takes the
 // value the full head's stored logit would widen to.
 __device__ __forceinline__ void rescore(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
@@ -261,7 +261,7 @@ __device__ __forceinline__ void rescore(const __nv_bfloat16* __restrict__ x, con
     const int ub = max(cb, 0), u0 = max(cc0, 0), u1 = max(cc1, 0);
     const uint32_t* wcol = w4 + static_cast<size_t>(ub / 64) * KG * TILE_WORDS + (((ub % 64) / 8) * 32 + (ub % 8) * 4 + (lane & 3)) * 2;
     const int g4 = lane >> 2, t4 = lane & 3;
-    const bool r0 = g4 < M, r1 = g4 + 8 < M;
+    const bool r0 = g4 < M && g4 == r, r1 = g4 + 8 < M && g4 + 8 == r;
     const __nv_bfloat16* x0 = x + static_cast<size_t>(r0 ? g4 : 0) * KG * GS + 2 * t4;
     const __nv_bfloat16* x1 = x + static_cast<size_t>(r1 ? g4 + 8 : 0) * KG * GS + 2 * t4;
     const __nv_bfloat162* sb0 = sbcol + static_cast<size_t>(u0) * KG;
@@ -283,7 +283,8 @@ __device__ __forceinline__ void rescore(const __nv_bfloat16* __restrict__ x, con
             if (kt == 0) mma0(d, a, b0, b1);
             else mma(d, a, b0, b1);
         }
-        const float2 p0 = __bfloat1622float2(sb0[g]), p1 = __bfloat1622float2(sb1[g]);
+        const float2 p0 = r0 || r1 ? __bfloat1622float2(sb0[g]) : float2{0.0f, 0.0f};
+        const float2 p1 = r0 || r1 ? __bfloat1622float2(sb1[g]) : float2{0.0f, 0.0f};
         const float sv[2] = {p0.x, p1.x}, bv[2] = {p0.y, p1.y};
         const float xv[2] = {r0 ? xs[static_cast<size_t>(g4) * KG + g] : 0.0f, r1 ? xs[static_cast<size_t>(g4 + 8) * KG + g] : 0.0f};
 #pragma unroll
