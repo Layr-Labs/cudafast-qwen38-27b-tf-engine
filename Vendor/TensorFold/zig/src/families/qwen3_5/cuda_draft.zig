@@ -433,7 +433,7 @@ pub const Draft = struct {
             // the whole budget whenever drafts are asked: the block's forward costs the same at any depth
             const n = if (it.depth == 0) 0 else limit;
             ctx.grown = tree.grow(d.candidates(rows), it.pending, rows, n, &ctx.held, &ctx.parents, &ctx.own);
-            if (n >= rows and it.tokens.len >= 4) {
+            if (n >= rows and it.tokens.len >= 1000000) {
                 var ch: [engine.most_window]u32 = undefined;
                 tree.chain(d.candidates(rows), it.pending, ch[0..rows]);
                 const hist = it.tokens;
