@@ -18,7 +18,7 @@ const most = 1200;
 /// Free memory left beside the candidates for what the load allocates after the copies (the drafter, the sessions).
 const keep_free: usize = 8 << 30;
 /// Timed reads of each candidate (after one untimed read); a candidate ranks by its median.
-const passes = 5;
+const passes = 9;
 const probe_ctas = 136;
 const stage_bytes = 128 * 16;
 /// Each probe CTA's slab: whole 2 KB stages.
