@@ -125,6 +125,77 @@ fn ids(c: Candidates, r: usize) []align(1) const u32 {
     return std.mem.bytesAsSlice(u32, c.words[r * lp_words * 4 ..][0 .. lp_words * 4]);
 }
 
+/// TF_TREE_FAST=0: grow() converts each candidate's successor row anew for every expansion (the original path).
+fn treeFast() bool {
+    const S = struct {
+        var on: ?bool = null;
+    };
+    if (S.on == null) S.on = if (platform.c.getenv("TF_TREE_FAST")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+    return S.on.?;
+}
+
+/// TF_TREE_CHECK=1: every fast expansion also runs chancesAfter and reports any bit that differs.
+fn treeCheck() bool {
+    const S = struct {
+        var on: ?bool = null;
+    };
+    if (S.on == null) S.on = platform.c.getenv("TF_TREE_CHECK") != null;
+    return S.on.?;
+}
+
+const fast_rank = 256;
+const fast_rows = 32;
+const lanes_f64 = 4;
+const vec_n = lp_top / lanes_f64;
+const V = @Vector(lanes_f64, f64);
+
+/// A grow() call's rows in f64, converted once a row: each row's projection, and its candidates' successor rows laid
+/// out k-major (the lp_top candidates of one k side by side), so an expansion sums every candidate's edge at once,
+/// each candidate's own sum still over k in order. The products are exact in f64 (bf16 x bf16 x bf16), so the edges
+/// are chancesAfter's bits whether the adds fuse or not.
+const RowCache = struct {
+    filled: [fast_rows]bool = @splat(false),
+    hp: [fast_rows][fast_rank]f64 = undefined,
+    succ: [fast_rows][fast_rank][vec_n]V = undefined,
+};
+var row_cache: RowCache = .{};
+
+fn cacheRow(c: Candidates, r: usize) void {
+    if (row_cache.filled[r]) return;
+    const w = ids(c, r);
+    const hp = std.mem.bytesAsSlice(u16, c.projected[r * c.rank * 2 ..][0 .. c.rank * 2]);
+    for (0..c.rank) |k| row_cache.hp[r][k] = bf16(hp[k]);
+    var cols: [lp_top]f64 = undefined;
+    for (0..c.rank) |k| {
+        for (&cols, 0..) |*x, j| x.* = if (j < c.topk) bf16(c.successor[w[2 + j] * c.rank + k]) else 0;
+        for (0..vec_n) |v| row_cache.succ[r][k][v] = cols[v * lanes_f64 ..][0..lanes_f64].*;
+    }
+    row_cache.filled[r] = true;
+}
+
+/// chancesAfter through the row cache: the same edges, the same unary and softmax arithmetic.
+fn chancesAfterFast(c: Candidates, r: usize, pred: u32, out: *[lp_top]f64) void {
+    cacheRow(c, r);
+    const w = ids(c, r);
+    const pr = c.predecessor[pred * c.rank ..][0..c.rank];
+    var acc: [vec_n]V = @splat(@splat(0));
+    for (0..c.rank) |k| {
+        const ph: V = @splat(bf16(pr[k]) * row_cache.hp[r][k]);
+        for (&acc, row_cache.succ[r][k]) |*a, sv| a.* += ph * sv;
+    }
+    var edge: [lp_top]f64 = undefined;
+    for (0..vec_n) |v| edge[v * lanes_f64 ..][0..lanes_f64].* = acc[v];
+    var most: f64 = -std.math.inf(f64);
+    for (0..c.topk) |j| {
+        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edge_weight * edge[j]) / scale;
+        most = @max(most, out[j]);
+    }
+    var total: f64 = 0;
+    for (out[0..c.topk]) |v| total += @exp(v - most);
+    const log_total = most + @log(total);
+    for (out[0..c.topk]) |*v| v.* -= log_total;
+}
+
 /// Row `r`'s candidates after `pred` as log-chances: softmax of (unary + edge x selector) / scale.
 fn chancesAfter(c: Candidates, r: usize, pred: u32, out: *[lp_top]f64) void {
     const w = ids(c, r);
@@ -159,11 +230,20 @@ pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32
     var parent: i32 = -1;
     var row: usize = 0;
     var path: f64 = 0;
+    const fast = treeFast() and rows <= fast_rows and c.rank == fast_rank and c.topk <= lp_top;
+    if (fast) row_cache.filled = @splat(false);
     while (true) {
         // the node just taken (or the pending token) opens its best children on the next row
         if (row < rows) {
             var lc: [lp_top]f64 = undefined;
-            chancesAfter(c, row, pred, &lc);
+            if (fast) chancesAfterFast(c, row, pred, &lc) else chancesAfter(c, row, pred, &lc);
+            if (fast and treeCheck()) {
+                var ref: [lp_top]f64 = undefined;
+                chancesAfter(c, row, pred, &ref);
+                for (lc[0..c.topk], ref[0..c.topk]) |x, y| if (@as(u64, @bitCast(x)) != @as(u64, @bitCast(y))) {
+                    std.debug.print("TF_TREE_CHECK mismatch row {d}: {e} vs {e}\n", .{ row, x, y });
+                };
+            }
             var order: [lp_top]usize = undefined;
             for (order[0..c.topk], 0..) |*o, i| o.* = i;
             std.mem.sort(usize, order[0..c.topk], &lc, struct {
@@ -240,3 +320,4 @@ test "best first: a node's children follow it, the cheapest open node first, cha
     for (parents[0..n], 0..) |p, i| try std.testing.expect(p < @as(i32, @intCast(i)));
     for (tokens[0..n], parents[0..n]) |t, p| try std.testing.expectEqual(p >= 0, t >= 10); // row 1's ids under row 0's
 }
+// draw 2 of a97679c8

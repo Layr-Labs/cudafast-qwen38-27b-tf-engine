@@ -46,7 +46,8 @@ pub fn project(e: anytype, x: u64, q: cuda.qlinear.Affine4, out: u64, rows: usiz
 /// A prompt chunk's affine 4-bit projection in int8, with the group sums a short chunk needs.
 pub fn projectRows(e: anytype, q: cuda.qlinear.Affine4, x: u64, xs: u64, out: u64, rows: usize, sums: bool, params: u64, k: usize) !bool {
     if (!try project(e, x, q, out, rows)) return false;
-    if (rows <= 16 and sums) try e.run(e.fns.sums, .{ rows, (k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ x, xs, @as(c_int, @intCast(k)), params });
+    // tf_q35_sums opens with griddepcontrol.wait (qwen35.cu): the chunk's sum pass is launched programmatic too.
+    if (rows <= 16 and sums) try e.runAfter(e.fns.sums, .{ rows, (k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ x, xs, @as(c_int, @intCast(k)), params });
     return true;
 }
 
