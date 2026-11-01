@@ -152,6 +152,7 @@ pub const Engine = struct {
     x: u64,
     r: u64,
     xs: u64,
+    gdn_count: u64 = 0, // a (window, value head)'s arrivals for the lean scans' fused gdn_post (qwen35_slots_lean.cuh)
     qkv: u64,
     z: u64,
     a: u64,
@@ -471,6 +472,8 @@ pub const Engine = struct {
         e.qkv = try t.alloc(R * g.convWidth() * 2);
         inline for (.{ "gate", "up", "act" }) |name| @field(e, name) = try t.alloc(R * g.intermediate * 2);
         e.xs = try t.alloc(R * (@max(g.intermediate, wide) / 64) * 4);
+        // the fused gdn_post's arrival counts, one a (window, value head); zeroed before the first forward
+        e.gdn_count = try t.alloc(Round.max_segs * g.v_heads * 4);
         inline for (.{ "a", "b", "beta" }) |name| @field(e, name) = try t.alloc(R * g.v_heads * 2);
         e.g_ = try t.alloc(R * g.v_heads * 4);
         e.qraw = try t.alloc(R * 2 * g.attnWidth() * 2);
@@ -761,6 +764,19 @@ pub const Engine = struct {
         // qwen35_slots.cuh: up to four slots scan two value rows a warp, so a block covers eight
         const rows_a_warp: usize = if (record and (slot_count == 3 or slot_count == 35 or slot_count == 37 or slot_count == 38)) 4 else if (record and slot_count <= 4) 2 else 1;
         try e.runAfter(scan, .{ 1, geometry.dk / (4 * rows_a_warp), e.g.v_heads * segments }, .{ 32, 4, 1 }, .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, input, layer, e.y, e.tables.ptr + params_at });
+    }
+
+    /// Whether a recorded window's scan of `slot_count` also runs the layer's gdn_post: the early lean scans (37, 38;
+    /// TF_FUSED_GDN_POST=0: gdn_post launches after the scan, as before).
+    pub fn fusedPost(slot_count: u8) bool {
+        return (slot_count == 37 or slot_count == 38) and scanEarlyOn() and !envOff("TF_FUSED_GDN_POST");
+    }
+
+    /// deltaScan's lean scan (37, 38) with the layer's gdn_post on each (window, value head)'s last CTA
+    /// (qwen35_slots_lean.cuh q35_lean_post): gdn_post's arguments after the scan's.
+    pub fn leanScanPost(e: *Engine, slot_count: u8, segments: usize, layer: c_int, norm_w: u64, sums: u64) !void {
+        const scan = if (slot_count == 37) e.fns.gdn_lean_2_post else e.fns.gdn_lean_3_post;
+        try e.runAfter(scan, .{ 1, geometry.dk / 16, e.g.v_heads * segments }, .{ 32, 4, 1 }, .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, e.tables.ptr + Round.steps_at, layer, e.y, e.tables.ptr + params_at, e.z, norm_w, e.g.eps, e.mix, sums, e.gdn_count });
     }
 
     /// The launches of a forward of `shape`, from the embedding to the kept rows' logits (captured once a shape).
