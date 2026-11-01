@@ -688,7 +688,7 @@ test "output stream: original slices require a prepared view and the native sixt
         var q4: cuda.qlinear.Affine4 = .{ .w = 10, .stream_w = 100, .s = 20, .b = 30, .n = 5120, .npad = 5120, .k = k };
         for ([_]usize{ 1, 15, 16, 32 }) |rows| {
             try e.affine.cluster(e.stream, 1000, 2000, q4, 3000, rows, 4);
-            const selected = rows == 16;
+            const selected = rows <= 16; // narrow windows take the stream too (affine4_kernels.zig narrow16)
             try t.expectEqual(@as(usize, if (selected) (if (k == 6144) 21 else 20) else 3), OutputStreamTrace.id);
             try t.expectEqual(@as(u32, if (selected) 512 else 128), OutputStreamTrace.threads);
             try t.expectEqual(!selected, OutputStreamTrace.cluster);
