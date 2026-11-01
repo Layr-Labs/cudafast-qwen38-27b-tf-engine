@@ -24,7 +24,7 @@ const lp_top = 20;
 pub const Config = @import("cuda_draft_config.zig").Config;
 pub const frame = @import("cuda_draft_frame.zig");
 pub const memory = @import("cuda_draft_memory.zig");
-const Fns = struct { gather_taps: cuda.Function, gather_rows: cuda.Function, dyn_conv: cuda.Function, norm_rope: cuda.Function, ring_put: cuda.Function, attn: cuda.Function, dyn_conv_batch: cuda.Function, norm_rope_batch: cuda.Function, norm_rope_qk_batch: cuda.Function, mask_rows: cuda.Function, attn_partial: cuda.Function, attn_partial_rows4: cuda.Function, attn_merge: cuda.Function };
+const Fns = struct { gather_taps: cuda.Function, gather_rows: cuda.Function, dyn_conv: cuda.Function, norm_rope: cuda.Function, ring_put: cuda.Function, attn: cuda.Function, dyn_conv_batch: cuda.Function, norm_rope_batch: cuda.Function, norm_rope_qk_batch: cuda.Function, mask_rows: cuda.Function, attn_partial: cuda.Function, attn_partial_rows4: cuda.Function, attn_merge: cuda.Function, head2_pack: cuda.Function, head2_screen: cuda.Function, head2_select: cuda.Function, head2_rescore: cuda.Function };
 
 /// qwen35_draft.cu's TapRows.
 const TapRows = extern struct { n: c_int, rows: [engine.most_window]c_int };
@@ -57,6 +57,8 @@ pub const Draft = struct {
     mod: cuda.Module,
     fns: Fns,
     scratch: DeviceBuffer,
+    /// The span head's 2-bit screen (cuda_draft_frame.zig head2): codes, screen scales, exact column scales (null: off).
+    head2: ?DeviceBuffer = null,
     selection_base: usize = 0,
     drawn: struct { sampling: ?lanes.Sampling = null, position: u64 = 0 } = .{},
     segments: u64 = 0,
@@ -137,6 +139,8 @@ pub const Draft = struct {
         _ = try d.layout(true);
         d.staged = try cuda.HostBuffer.alloc(e.d, try frame.stagedBytes(c.rank));
         errdefer d.staged.free();
+        d.head2 = try frame.head2Init(d);
+        errdefer if (d.head2) |*h| h.free();
         // the first context, and a hold timed on it (the quickest of several: the first ones pay the driver's stalls)
         const ctx = try d.create();
         errdefer d.drop(ctx);
@@ -186,6 +190,7 @@ pub const Draft = struct {
         for (d.pool.items) |ctx| d.drop(ctx);
         d.pool.deinit(d.gpa);
         d.staged.free();
+        if (d.head2) |*h| h.free();
         d.scratch.free();
         d.w.deinit(d.gpa);
         d.mod.unload();
