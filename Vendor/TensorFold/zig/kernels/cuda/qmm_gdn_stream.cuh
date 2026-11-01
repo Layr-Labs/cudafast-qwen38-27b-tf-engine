@@ -19,6 +19,14 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
     constexpr int NT = T::NT;
     extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, wn = tid >> 5;
+#if __CUDA_ARCH__ >= 1200
+    __shared__ __align__(8) uint64_t weight_barriers[STAGES];
+    if (tid == 0)
+#pragma unroll
+        for (int s = 0; s < STAGES; ++s)
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" :: "r"(smem(&weight_barriers[s])) : "memory");
+    __syncthreads();
+#endif
     const int KG = K / GS;
     auto stage = [&](int s) { return buf + s * T::STAGE; };
     const int rows = min(16, M);
@@ -67,9 +75,21 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
         unsigned char* p = stage(s);
         const unsigned char* wb = reinterpret_cast<const unsigned char*>(P.w) +
                                   static_cast<size_t>(n0 / 64) * TILE_BYTES + (n0 % 64) * GS / 2;
+#if __CUDA_ARCH__ >= 1200
+        if (tid == 0) {
+            const uint32_t barrier = smem(&weight_barriers[s]);
+            const auto* src = wb + static_cast<size_t>(g) * (npad / 64) * TILE_BYTES;
+            asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;\n"
+                         :: "r"(barrier), "n"(T::W) : "memory");
+            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+            asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
+                         :: "r"(smem(p + T::X)), "l"(src), "n"(T::W), "r"(barrier) : "memory");
+        }
+#else
 #pragma unroll
         for (int j = 0; j < WC; ++j)
             if (wok[j]) cp16(p + wdst[j], wb + woff[j] + static_cast<size_t>(g) * (npad/64) * TILE_BYTES);
+#endif
         if constexpr (DICT) {
             // the CTA's tiles' index windows: tile n0 / 64 + c / 16, chunk c % 16, from each group's 64-byte line
             const int step = qmm_dict::dict_step(P.npad);
@@ -131,6 +151,17 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
     grid_launch();
     for (int it = 0; it < items; ++it) {
         wait<STAGES - 2>();
+#if __CUDA_ARCH__ >= 1200
+        if (tid == 0) {
+            const uint32_t barrier = smem(&weight_barriers[it % STAGES]);
+            const uint32_t phase = (it / STAGES) & 1;
+            asm volatile("{ .reg .pred ready;\n"
+                         "wait_weight:\n"
+                         "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 ready, [%0], %1;\n"
+                         "@!ready bra wait_weight;\n"
+                         "}\n" :: "r"(barrier), "r"(phase) : "memory");
+        }
+#endif
         __syncthreads();
         const int next = it + STAGES - 1;
         if (next < items) {
@@ -238,6 +269,13 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
         }
         after(it);
     }
+#if __CUDA_ARCH__ >= 1200
+    __syncthreads();
+    if (tid == 0)
+#pragma unroll
+        for (int s = 0; s < STAGES; ++s)
+            asm volatile("mbarrier.inval.shared::cta.b64 [%0];\n" :: "r"(smem(&weight_barriers[s])) : "memory");
+#endif
 }
 
 
