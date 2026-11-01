@@ -75,7 +75,11 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 // one recorded window of 2+ rows: gdn_pre logged its tails, conv_commit would only return
                 if (!(record and nseg == 1 and total > 1)) try e.runAfter(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
                 if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else try e.deltaScan(record, shape.slots, nseg, layer);
-                try e.runAfter(e.fns.gdn_post, .{ 1, g.v_heads, post_blocks }, .{ 32, post_rows, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums });
+                // a prompt chunk: eight rows a warp, their loads in flight together (TF_PROMPT_ILP=0: a row a warp)
+                if (prompt and total > 16 and promptIlpOn())
+                    try e.runAfter(e.fns.gdn_post_ilp, .{ 1, g.v_heads, (total + 31) / 32 }, .{ 32, 4, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums })
+                else
+                    try e.runAfter(e.fns.gdn_post, .{ 1, g.v_heads, post_blocks }, .{ 32, post_rows, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums });
                 try e.projAgain(m.out, e.mix, e.r, total, prompt);
                 di += 1;
             },
@@ -127,7 +131,13 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     // the merge with the gate and the gated rows' group sums, attn_gate's bits
                     try launchAfter(e, e.fns.attn_merge_gate, sig.attn_merge_gate, .{ g.q_heads, total, 1 }, .{ 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.qraw, e.mix, sums });
                 }
-                if (prompt and nseg == 1 and (g.q_heads / g.kv_heads) % 2 == 0) try launchAfter(e, e.fns.attn_gate, sig.attn_gate, .{ (total * aw + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.y, e.qraw, e.mix, @as(c_int, @intCast(total)), t_params, sums });
+                // a prompt chunk without group sums: eight entries a thread (TF_PROMPT_ILP=0: an entry a thread)
+                if (prompt and nseg == 1 and (g.q_heads / g.kv_heads) % 2 == 0) {
+                    if (sums == 0 and aw % 8 == 0 and promptIlpOn())
+                        try e.runAfter(e.fns.attn_gate8, .{ (total * aw / 8 + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.y, e.qraw, e.mix, @as(c_int, @intCast(total)), t_params })
+                    else
+                        try launchAfter(e, e.fns.attn_gate, sig.attn_gate, .{ (total * aw + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.y, e.qraw, e.mix, @as(c_int, @intCast(total)), t_params, sums });
+                }
                 if (e.learning) |k| try k.gated(i, e.mix, total);
                 try e.projAgain(m.o, e.mix, e.r, total, prompt);
                 ai += 1;
@@ -169,10 +179,17 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
         // a captured forward's first layer is a graph of its own (cuda_engine.zig's cutCapture)
         if (i == 0) try e.cutCapture();
     }
-    try finish(e, total, heads, shape.hidden);
+    try finish(e, total, heads, shape.hidden, if (@hasField(@TypeOf(shape), "amax")) shape.amax else false);
 }
 
 /// TF_GDN_ROWS4=0: 16..64-row windows keep one row warp a block in tf_q35_gdn_pre.
+/// TF_PROMPT_ILP=0: a prompt chunk keeps gdn_post's and attn_gate's one-row (one-entry) launches.
+/// Draw 3 of this tree.
+fn promptIlpOn() bool {
+    const v = @import("sys").c.getenv("TF_PROMPT_ILP") orelse return true;
+    return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
+}
+
 fn postRows2On() bool {
     const v = @import("sys").c.getenv("TF_POST_ROWS2") orelse return true;
     return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
@@ -216,7 +233,7 @@ fn sharedSized(e: *E.Engine, f: cuda.Function, comptime s: sig.Sig, grid: [3]usi
 }
 
 /// Layer inputs are already kept; hidden reads need neither the final norm nor the vocabulary head.
-pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool) !void {
+pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool, amax: bool) !void {
     if (hidden) return;
     const g = e.g;
     if (e.learning == null and heads < total) {
@@ -226,6 +243,12 @@ pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool) !void {
     } else {
         try e.norm(true, e.final_norm, total);
         if (e.learning) |k| try k.final(e.h, total);
+        if (@hasField(@TypeOf(e.*), "head_amax")) if (amax) {
+            // a greedy verify: the norm wrote the rows' group sums (projAgain's input); the head's tile writes each
+            // row's best a tile and the merge each row's token (cuda_engine.zig forward then skips its argmax)
+            const x = e.x + (total - heads) * g.hidden * 2;
+            return e.affine.headArgmax(e.stream, x, e.xs, e.head.a4, e.head_amax, heads, e.tables.ptr + @import("cuda_round.zig").tokens_at);
+        };
         if (@hasDecl(@TypeOf(e.*), "projAgain"))
             try e.projAgain(e.head, e.x + (total - heads) * g.hidden * 2, e.logits, heads, false)
         else
