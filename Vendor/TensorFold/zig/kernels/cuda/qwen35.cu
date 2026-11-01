@@ -459,31 +459,14 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_chain(Geo geo, cons
     for (int i = 0; i < PT; i++) st[i] = state[i];
 }
 
-// out = bf16(silu(z) * bf16(w * rmsnorm(y))) per value head; blockDim.y independent row warps, at most four.
-extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post(Geo geo, const __nv_bfloat16* __restrict__ Y0, const __nv_bfloat16* __restrict__ Z0,
-                                                                   const __nv_bfloat16* __restrict__ NW, float eps, __nv_bfloat16* __restrict__ OUT0,
-                                                                   const int* __restrict__ P, float* __restrict__ XS0) {
-    __shared__ __align__(16) __nv_bfloat16 row_done[4][DK];
-    __nv_bfloat16* done = row_done[threadIdx.y];
-    const int lane = threadIdx.x, hv = blockIdx.y;
-    release_next();
-    // ahead of the wait: the layer's norm weights (static); after it, this forward's rows. The loads move, the
-    // arithmetic does not
-    constexpr int PER0 = DK / 32;
-    const uint2 nw = *reinterpret_cast<const uint2*>(plain(NW) + lane * PER0);
-    asm volatile("" ::"r"(nw.x), "r"(nw.y));  // the load issues before the wait (keep4's rule)
-    await_prior();
-    const __nv_bfloat16* Y = after_wait(Y0);
-    const __nv_bfloat16* Z = after_wait(Z0);
-    __nv_bfloat16* OUT = after_wait(OUT0);
-    float* XS = after_wait(XS0);
-    const size_t m = blockIdx.z * blockDim.y + threadIdx.y;
-    if (past_rows(P, m)) return;
+// gdn_post's row m of value head hv, a warp: out = bf16(silu(z) * bf16(w * rmsnorm(y))), then the row's group sums when
+// XS is set. nw, yw and zw are the lane's four norm weights, y and z values; done is the warp's staging row.
+__device__ __forceinline__ void q35_post_row(Geo geo, uint2 nw, uint2 yw, uint2 zw, __nv_bfloat16* OUT, float* XS,
+                                             float eps, size_t m, int hv, __nv_bfloat16* done) {
+    const int lane = threadIdx.x;
     const size_t W = (size_t)geo.nv * DK;
     constexpr int PER = DK / 32;
     const size_t at = m * W + hv * DK + lane * PER;
-    const uint2 yw = *reinterpret_cast<const uint2*>(Y + at);
-    const uint2 zw = *reinterpret_cast<const uint2*>(Z + at);
     const __nv_bfloat16* yp = reinterpret_cast<const __nv_bfloat16*>(&yw);
     const __nv_bfloat16* zp = reinterpret_cast<const __nv_bfloat16*>(&zw);
     const __nv_bfloat16* wp = reinterpret_cast<const __nv_bfloat16*>(&nw);
@@ -508,6 +491,32 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post(Geo geo, const
     if (XS == nullptr) return;
     __syncwarp();
     if (lane < DK / 64) XS[m * (W / 64) + hv * (DK / 64) + lane] = group_sum(done + lane * 64);
+}
+
+// out = bf16(silu(z) * bf16(w * rmsnorm(y))) per value head; blockDim.y independent row warps, at most four.
+extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post(Geo geo, const __nv_bfloat16* __restrict__ Y0, const __nv_bfloat16* __restrict__ Z0,
+                                                                   const __nv_bfloat16* __restrict__ NW, float eps, __nv_bfloat16* __restrict__ OUT0,
+                                                                   const int* __restrict__ P, float* __restrict__ XS0) {
+    __shared__ __align__(16) __nv_bfloat16 row_done[4][DK];
+    __nv_bfloat16* done = row_done[threadIdx.y];
+    const int lane = threadIdx.x, hv = blockIdx.y;
+    release_next();
+    // ahead of the wait: the layer's norm weights (static); after it, this forward's rows. The loads move, the
+    // arithmetic does not
+    constexpr int PER0 = DK / 32;
+    const uint2 nw = *reinterpret_cast<const uint2*>(plain(NW) + lane * PER0);
+    asm volatile("" ::"r"(nw.x), "r"(nw.y));  // the load issues before the wait (keep4's rule)
+    await_prior();
+    const __nv_bfloat16* Y = after_wait(Y0);
+    const __nv_bfloat16* Z = after_wait(Z0);
+    __nv_bfloat16* OUT = after_wait(OUT0);
+    float* XS = after_wait(XS0);
+    const size_t m = blockIdx.z * blockDim.y + threadIdx.y;
+    if (past_rows(P, m)) return;
+    const size_t at = m * ((size_t)geo.nv * DK) + hv * DK + lane * PER0;
+    const uint2 yw = *reinterpret_cast<const uint2*>(Y + at);
+    const uint2 zw = *reinterpret_cast<const uint2*>(Z + at);
+    q35_post_row(geo, nw, yw, zw, OUT, XS, eps, m, hv, done);
 }
 
 // A prompt chunk's tf_q35_gdn_post with RPW rows a warp: every row's y and z load before any row computes; each row's
@@ -686,6 +695,51 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_attn_gate8(Geo geo, con
     *reinterpret_cast<uint4*>(OUT + i) = ow;
 }
 
+// A partial written earlier in this grid (L2: ld.global.cg past the CTA's L1) or by an earlier kernel (a plain load).
+template <bool L2>
+__device__ __forceinline__ float merge_part(const float* p) {
+    if constexpr (L2) return __ldcg(p);
+    else return *p;
+}
+
+// tf_q35_attn_merge_gate's (row m, query head qh) on a warp (lane: its lane); done is the warp's staging row.
+template <bool L2>
+__device__ __forceinline__ void q35_merge_gate_row(Geo geo, const float* PM, const float* PL, const float* PO, const Seg* segs,
+                                                   const int* rowseg, const Ancestor* rowanc, const __nv_bfloat16* QRAW,
+                                                   __nv_bfloat16* OUT, float* XS, size_t m, int qh, int lane, __nv_bfloat16* done) {
+    constexpr int DPL = HD / 32;
+    const int QH = geo.qh;
+    const int keys = segs[rowseg[m]].len + rows_seen(rowanc[m]);
+    const int ck = chunk_keys(keys), nch = (keys + ck - 1) / ck;
+    const size_t base = (m * QH + qh) * MAXCH;
+    float mx = -INFINITY;
+    for (int c = 0; c < nch; c++)
+        if (merge_part<L2>(PL + base + c) > 0.0f) mx = fmaxf(mx, merge_part<L2>(PM + base + c));
+    float lsum = 0.0f, acc[DPL];
+#pragma unroll
+    for (int i = 0; i < DPL; i++) acc[i] = 0.0f;
+    for (int c = 0; c < nch; c++) {
+        const float pl = merge_part<L2>(PL + base + c);
+        if (!(pl > 0.0f)) continue;
+        const float e = __expf(merge_part<L2>(PM + base + c) - mx);
+        lsum = fmaf(pl, e, lsum);
+#pragma unroll
+        for (int i = 0; i < DPL; i++) acc[i] = fmaf(merge_part<L2>(PO + (base + c) * HD + lane * DPL + i), e, acc[i]);
+    }
+    const size_t W = (size_t)QH * HD;
+#pragma unroll
+    for (int i = 0; i < DPL; i++) {
+        const int d = lane * DPL + i;
+        const __nv_bfloat16 y = __float2bfloat16_rn(acc[i] / lsum);
+        const float gate = bf(QRAW[m * 2 * W + qh * 2 * HD + HD + d]);
+        const float s = rbf(1.0f / (1.0f + expf(-gate)));
+        OUT[m * W + qh * HD + d] = done[d] = __float2bfloat16_rn(bf(y) * s);
+    }
+    if (XS == nullptr) return;
+    __syncwarp();
+    if (lane < HD / 64) XS[m * (W / 64) + qh * (HD / 64) + lane] = group_sum(done + lane * 64);
+}
+
 // tf_q35_attn_merge then tf_q35_attn_gate in one warp a (row, query head): the merge's bf16 output gated as attn_gate
 // does, and the head's four 64-entry group sums of the gated row, each as block_sums adds them (null XS: none).
 extern "C" __global__ void __launch_bounds__(32) tf_q35_attn_merge_gate(Geo geo, const float* __restrict__ PM0, const float* __restrict__ PL0,
@@ -702,39 +756,8 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35_attn_merge_gate(Geo geo,
     const __nv_bfloat16* QRAW = after_wait(QRAW0);
     __nv_bfloat16* OUT = after_wait(OUT0);
     float* XS = after_wait(XS0);
-    constexpr int DPL = HD / 32;
-    const int QH = geo.qh;
-    const int lane = threadIdx.x, qh = blockIdx.x;
     if (past_rows(P, blockIdx.y)) return;
-    const size_t m = blockIdx.y;
-    const int keys = segs[rowseg[m]].len + rows_seen(rowanc[m]);
-    const int ck = chunk_keys(keys), nch = (keys + ck - 1) / ck;
-    const size_t base = (m * QH + qh) * MAXCH;
-    float mx = -INFINITY;
-    for (int c = 0; c < nch; c++)
-        if (PL[base + c] > 0.0f) mx = fmaxf(mx, PM[base + c]);
-    float lsum = 0.0f, acc[DPL];
-#pragma unroll
-    for (int i = 0; i < DPL; i++) acc[i] = 0.0f;
-    for (int c = 0; c < nch; c++) {
-        if (!(PL[base + c] > 0.0f)) continue;
-        const float e = __expf(PM[base + c] - mx);
-        lsum = fmaf(PL[base + c], e, lsum);
-#pragma unroll
-        for (int i = 0; i < DPL; i++) acc[i] = fmaf(PO[(base + c) * HD + lane * DPL + i], e, acc[i]);
-    }
-    const size_t W = (size_t)QH * HD;
-#pragma unroll
-    for (int i = 0; i < DPL; i++) {
-        const int d = lane * DPL + i;
-        const __nv_bfloat16 y = __float2bfloat16_rn(acc[i] / lsum);
-        const float gate = bf(QRAW[m * 2 * W + qh * 2 * HD + HD + d]);
-        const float s = rbf(1.0f / (1.0f + expf(-gate)));
-        OUT[m * W + qh * HD + d] = done[d] = __float2bfloat16_rn(bf(y) * s);
-    }
-    if (XS == nullptr) return;
-    __syncwarp();
-    if (lane < HD / 64) XS[m * (W / 64) + qh * (HD / 64) + lane] = group_sum(done + lane * 64);
+    q35_merge_gate_row<false>(geo, PM, PL, PO, segs, rowseg, rowanc, QRAW, OUT, XS, blockIdx.y, blockIdx.x, threadIdx.x, done);
 }
 
 // tf_q35_head_norm of a (row, head) on threads 0-63, then tf_q35_rope's rotation of it: a query head's into Qn, a key
@@ -841,12 +864,10 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_attn_partial(Geo geo, c
 
 // tf_q35_attn_partial for row pairs (attn_two): a block a (row pair, chunk, key head), each chunk's stream-key tiles
 // loaded once for both rows; a 2..64-row window's rows of short streams (cuda_forward.zig), bits as attn_partial's.
-extern "C" __global__ void __launch_bounds__(128) tf_q35_attn_pair(Geo geo, const __nv_bfloat16* __restrict__ Q0, const Seg* __restrict__ segs,
-                                                                     const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
-                                                                     const int* __restrict__ P, float scale,
-                                                                     float* __restrict__ PM0, float* __restrict__ PL0, float* __restrict__ PO0) {
-    release_next();
-    await_prior();
+__device__ __forceinline__ void q35_attn_pair(Geo geo, const __nv_bfloat16* __restrict__ Q0, const Seg* __restrict__ segs,
+                                              const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
+                                              const int* __restrict__ P, float scale,
+                                              float* __restrict__ PM0, float* __restrict__ PL0, float* __restrict__ PO0) {
     const __nv_bfloat16* Q = after_wait(Q0);
     float* PM = after_wait(PM0);
     float* PL = after_wait(PL0);
@@ -877,6 +898,55 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_attn_pair(Geo geo, cons
         if (!first) __syncthreads();
         first = false;
         tf_q35_tc::attn_two<tf_q35_tc::Bf16Tiles1<128>>({attn_tiles, nullptr, nullptr, nullptr}, geo, Q, segs, rowseg, rowanc, layer, P, scale, PM, PL, PO, c);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(128) tf_q35_attn_pair(Geo geo, const __nv_bfloat16* __restrict__ Q0, const Seg* __restrict__ segs,
+                                                                     const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
+                                                                     const int* __restrict__ P, float scale,
+                                                                     float* __restrict__ PM0, float* __restrict__ PL0, float* __restrict__ PO0) {
+    release_next();
+    await_prior();
+    q35_attn_pair(geo, Q0, segs, rowseg, rowanc, layer, P, scale, PM0, PL0, PO0);
+}
+
+// tf_q35_attn_pair with tf_q35_attn_merge_gate on each (row pair, key head)'s last chunk CTA (TF_FUSED_MERGE=0: the merge
+// launches after the partials): a short stream's window, whose partials attn_pair alone writes. The last of the pair's
+// gridDim.y chunk CTAs to arrive (count, returned to zero by that CTA) merges and gates the pair's rows of the key
+// head's query heads, a warp a (row, query head), with the merge's row (q35_merge_gate_row): the same bits.
+extern "C" __global__ void __launch_bounds__(128) tf_q35_attn_pair_merge(Geo geo, const __nv_bfloat16* __restrict__ Q0, const Seg* __restrict__ segs,
+                                                                           const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
+                                                                           const int* __restrict__ P, float scale,
+                                                                           float* __restrict__ PM0, float* __restrict__ PL0, float* __restrict__ PO0,
+                                                                           const __nv_bfloat16* __restrict__ QRAW0, __nv_bfloat16* __restrict__ OUT0,
+                                                                           float* __restrict__ XS0, unsigned* __restrict__ count) {
+    __shared__ __align__(16) __nv_bfloat16 done_rows[4][HD];
+    __shared__ int last;
+    release_next();
+    await_prior();
+    q35_attn_pair(geo, Q0, segs, rowseg, rowanc, layer, P, scale, PM0, PL0, PO0);
+    __threadfence();  // this CTA's partials, then its arrival
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned* c = count + (size_t)blockIdx.z * gridDim.x + blockIdx.x;
+        last = atomicAdd(c, 1u) == gridDim.y - 1;
+        if (last) *c = 0;  // every chunk CTA of the pair has arrived
+    }
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    const float* PM = after_wait(PM0);
+    const float* PL = after_wait(PL0);
+    const float* PO = after_wait(PO0);
+    const __nv_bfloat16* QRAW = after_wait(QRAW0);
+    __nv_bfloat16* OUT = after_wait(OUT0);
+    float* XS = after_wait(XS0);
+    const int G = geo.qh / geo.kvh, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    for (int it = warp; it < 2 * G; it += 4) {
+        const int m = 2 * (int)blockIdx.x + it / G;
+        if (past_rows(P, m)) continue;
+        q35_merge_gate_row<true>(geo, PM, PL, PO, segs, rowseg, rowanc, QRAW, OUT, XS, m, (int)blockIdx.z * G + it % G, lane, done_rows[warp]);
+        __syncwarp();  // the group sums' reads of the staging row before the next item's stores
     }
 }
 

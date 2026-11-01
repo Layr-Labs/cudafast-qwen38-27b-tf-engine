@@ -74,6 +74,8 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 // a prompt chunk: the chain convolves the value heads and takes their decay and strength in its stages,
                 // so gdn_pre runs the q and k heads and conv_commit follows the chain (TF_CHAIN_CONV=0: as before)
                 const conv_in_chain = prompt and nseg == 1 and !record and chainConvOn();
+                // a recorded window's early lean scan runs the layer's gdn_post on each head's last CTA
+                const fused_post = record and !prompt and E.Engine.fusedPost(shape.slots);
                 const pre_heads = if (conv_in_chain) 2 * g.k_heads else 2 * g.k_heads + g.v_heads;
                 try e.runAfter(e.fns.gdn_pre, .{ 1, pre_heads, pre_blocks }, .{ 32, pre_rows, 1 }, .{ geo, e.qkv, t_segs, t_rows, t_par, layer, m.conv, e.a, e.b, m.a_log, m.dt_bias, e.q, e.k, e.v, e.g_, e.beta, t_params });
                 // one recorded window of 2+ rows: gdn_pre logged its tails, conv_commit would only return
@@ -82,9 +84,9 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 if (conv_in_chain) {
                     try @import("cuda_prompt.zig").deltaConv(e, di, total, m);
                     if (commit) try e.runAfter(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
-                } else if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else try e.deltaScan(record, shape.slots, nseg, layer);
+                } else if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else if (fused_post) try e.leanScanPost(shape.slots, nseg, layer, m.norm, sums) else try e.deltaScan(record, shape.slots, nseg, layer);
                 // a prompt chunk: eight rows a warp, their loads in flight together (TF_PROMPT_ILP=0: a row a warp)
-                if (prompt and total > 16 and promptIlpOn())
+                if (fused_post) {} else if (prompt and total > 16 and promptIlpOn())
                     try e.runAfter(e.fns.gdn_post_ilp, .{ 1, g.v_heads, (total + 31) / 32 }, .{ 32, 4, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums })
                 else
                     try e.runAfter(e.fns.gdn_post, .{ 1, g.v_heads, post_blocks }, .{ 32, post_rows, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums });
@@ -123,13 +125,17 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     const args = .{ geo, e.qn, t_segs, t_rows, t_anc, @as(c_int, ai), t_params, @as(f32, 1.0 / 16.0), e.pm, e.pl, e.po };
                     const groups = (total + 64 / group - 1) / (64 / group);
                     const rows_args = .{ geo, e.qn, t_segs, t_rows, t_anc, @as(c_int, ai), t_params, @as(f32, 1.0 / 16.0), @as(c_int, @intCast(total)), e.pm, e.pl, e.po };
+                    // a short window's row pairs: the merge runs on each pair's last chunk block (TF_FUSED_MERGE=0: launched after)
+                    const merged = !e.kv8 and record and total >= 2 and 2 * group <= 16 and pairOn() and shape.short and fusedMergeOn();
                     if (e.kv8) {
                         try launch(e, e.fp8.attn_partial, sig.attn_partial8, .{ total, max_chunks, g.kv_heads }, .{ 128, 1, 1 }, args);
                         try launch(e, e.fp8.attn_rows, sig.attn_rows8, .{ groups, max_chunks, g.kv_heads }, .{ 256, 1, 1 }, rows_args);
                     } else {
                         // a 2..64-row window: row pairs share each chunk's stream-key tiles (attn_pair, the same bits);
                         // TF_ATTN_PAIR=0 keeps attn_partial's block a row
-                        if (record and total >= 2 and 2 * group <= 16 and pairOn())
+                        if (merged)
+                            try sharedSized(e, e.fns.attn_pair_merge, sig.attn_pair_merge, .{ (total + 1) / 2, partial_chunks, g.kv_heads }, 128, attn_tile, args ++ .{ e.qraw, e.mix, sums, e.merge_count })
+                        else if (record and total >= 2 and 2 * group <= 16 and pairOn())
                             try sharedSized(e, e.fns.attn_pair, sig.attn_pair, .{ (total + 1) / 2, partial_chunks, g.kv_heads }, 128, attn_tile, args)
                         else
                             try sharedSized(e, e.fns.attn_partial, sig.attn_partial, .{ total, partial_chunks, g.kv_heads }, 128, attn_tile, args);
@@ -137,7 +143,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                         if (!shape.short) try shared(e, e.fns.attn_rows, sig.attn_rows, .{ groups, max_chunks, g.kv_heads }, 256, rows_args);
                     }
                     // the merge with the gate and the gated rows' group sums, attn_gate's bits
-                    try launchAfter(e, e.fns.attn_merge_gate, sig.attn_merge_gate, .{ g.q_heads, total, 1 }, .{ 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.qraw, e.mix, sums });
+                    if (!merged) try launchAfter(e, e.fns.attn_merge_gate, sig.attn_merge_gate, .{ g.q_heads, total, 1 }, .{ 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.qraw, e.mix, sums });
                 }
                 // a prompt chunk without group sums: eight entries a thread (TF_PROMPT_ILP=0: an entry a thread)
                 if (prompt and nseg == 1 and (g.q_heads / g.kv_heads) % 2 == 0) {
@@ -214,6 +220,12 @@ fn rows4On() bool {
 }
 
 /// TF_ATTN_PAIR=0: 2..64-row windows keep tf_q35_attn_partial (a block a row).
+/// TF_FUSED_MERGE=0: attn_merge_gate launches after attn_pair, as before.
+fn fusedMergeOn() bool {
+    const v = @import("sys").c.getenv("TF_FUSED_MERGE") orelse return true;
+    return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
+}
+
 fn pairOn() bool {
     const v = @import("sys").c.getenv("TF_ATTN_PAIR") orelse return true;
     return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
