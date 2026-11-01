@@ -228,7 +228,7 @@ extern "C" __global__ void __launch_bounds__(64) tf_q35_sums(const __nv_bfloat16
 }
 
 // Conv, silu, q/k norms, decay and write: blockDim.y independent row warps per head, taps from the parents.
-extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_pre(Geo geo, const __nv_bfloat16* __restrict__ QKV0, const Seg* __restrict__ segs,
+extern "C" __global__ void __launch_bounds__(256) tf_q35_gdn_pre(Geo geo, const __nv_bfloat16* __restrict__ QKV0, const Seg* __restrict__ segs,
                                                                   const int* __restrict__ rowseg, const int* __restrict__ rowpar, int layer,
                                                                   const __nv_bfloat16* __restrict__ CW,
                                                                   const __nv_bfloat16* __restrict__ Ain0, const __nv_bfloat16* __restrict__ Bin0,
@@ -457,11 +457,11 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_chain(Geo geo, cons
     for (int i = 0; i < PT; i++) st[i] = state[i];
 }
 
-// out = bf16(silu(z) * bf16(w * rmsnorm(y))) per value head; blockDim.y independent row warps, at most four.
-extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post(Geo geo, const __nv_bfloat16* __restrict__ Y0, const __nv_bfloat16* __restrict__ Z0,
+// out = bf16(silu(z) * bf16(w * rmsnorm(y))) per value head; blockDim.y independent row warps, at most eight.
+extern "C" __global__ void __launch_bounds__(256) tf_q35_gdn_post(Geo geo, const __nv_bfloat16* __restrict__ Y0, const __nv_bfloat16* __restrict__ Z0,
                                                                    const __nv_bfloat16* __restrict__ NW, float eps, __nv_bfloat16* __restrict__ OUT0,
                                                                    const int* __restrict__ P, float* __restrict__ XS0) {
-    __shared__ __align__(16) __nv_bfloat16 row_done[4][DK];
+    __shared__ __align__(16) __nv_bfloat16 row_done[8][DK];
     __nv_bfloat16* done = row_done[threadIdx.y];
     const int lane = threadIdx.x, hv = blockIdx.y;
     release_next();
@@ -644,12 +644,12 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35_attn_merge_gate(Geo geo,
 
 // tf_q35_head_norm of a (row, head) on threads 0-63, then tf_q35_rope's rotation of it: a query head's into Qn, a key
 // head's with its value into the cache slot. Grid (rows, query heads + key heads), HD threads.
-template <typename Store>
+template <typename Store, bool EARLY = false>
 __device__ __forceinline__ void norm_rope_rows(const Geo& geo, const __nv_bfloat16* __restrict__ QRAW, const __nv_bfloat16* __restrict__ KRAW,
                                                const __nv_bfloat16* __restrict__ WQ, const __nv_bfloat16* __restrict__ WK,
                                                __nv_bfloat16* __restrict__ Qn, const __nv_bfloat16* __restrict__ Vr, const Seg* __restrict__ segs,
                                                const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, const int* __restrict__ P,
-                                               const int* __restrict__ M, float eps, Store store) {
+                                               const int* __restrict__ M, float eps, Store store, uint2 wpre = make_uint2(0, 0)) {
     __shared__ float sums[2];
     __shared__ __align__(16) __nv_bfloat16 xs[HD];
     const int QH = geo.qh, KVH = geo.kvh;
@@ -676,7 +676,9 @@ __device__ __forceinline__ void norm_rope_rows(const Geo& geo, const __nv_bfloat
 #pragma unroll
         for (int i = 0; i < 4; i++) {
             const int d = 4 * t + i;
-            xs[d] = __float2bfloat16_rn(bf(W[d]) * (v[i] * inv));
+            // EARLY: the head's norm weights were read before the wait (the same values)
+            const __nv_bfloat16 wd = EARLY ? reinterpret_cast<const __nv_bfloat16*>(&wpre)[i] : W[d];
+            xs[d] = __float2bfloat16_rn(bf(wd) * (v[i] * inv));
         }
     }
     __syncthreads();
@@ -695,8 +697,16 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm_rope(Geo geo, cons
                                                                      const Ancestor* __restrict__ rowanc, int layer, const int* __restrict__ P,
                                                                      const int* __restrict__ M, float eps) {
     release_next();
+    // ahead of the wait: the head's norm weights (static); after it, this forward's rows. The loads move, the
+    // arithmetic does not
+    uint2 wv = make_uint2(0, 0);
+    if (threadIdx.x < 64) {
+        const __nv_bfloat16* W = blockIdx.y < (unsigned)geo.qh ? WQ : WK;
+        wv = *reinterpret_cast<const uint2*>(plain(W) + 4 * threadIdx.x);
+        asm volatile("" ::"r"(wv.x), "r"(wv.y));  // issued before the wait (keep4's rule)
+    }
     await_prior();
-    norm_rope_rows(geo, after_wait(QRAW), after_wait(KRAW), WQ, WK, after_wait(Qn), after_wait(Vr), segs, rowseg, rowanc, P, M, eps, StoreBf16{layer, geo.kvh});
+    norm_rope_rows<StoreBf16, true>(geo, after_wait(QRAW), after_wait(KRAW), WQ, WK, after_wait(Qn), after_wait(Vr), segs, rowseg, rowanc, P, M, eps, StoreBf16{layer, geo.kvh}, wv);
 }
 
 #include "qwen35_rows.cuh"
