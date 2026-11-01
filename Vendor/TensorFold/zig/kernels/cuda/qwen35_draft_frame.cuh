@@ -12,22 +12,33 @@ extern "C" __global__ void tf_q35d_dyn_conv_batch(const __nv_bfloat16* __restric
     const __nv_bfloat16* DYN = after_wait(DYN0);
     const __nv_bfloat16* RES = after_wait(RES0);
     __nv_bfloat16* OUT = after_wait(OUT0);
-    const int t = blockIdx.x;
-    const int groups = D / group;
-    // grid (rows, channel blocks): a thread a channel, so a 16-row window fills the device instead of 16 blocks
-    for (int c = blockIdx.y * blockDim.x + threadIdx.x; c < D; c += gridDim.y * blockDim.x) {
-        const int g = c / group;
-        float total = 0.0f;
-#pragma unroll
-        for (int l = 0; l < 2; l++) {
-            if (t % block_rows - l < 0) continue;
-            const float x = bf(X[(size_t)(t - l) * D + c]);
-            total = rbf(total + rbf(bf(BASE[(branch * 2 + l) * D + c]) * x));
-            total = rbf(total + rbf(bf(DYN[(size_t)t * (4 * groups) + (branch * 2 + l) * groups + g]) * x));
+    __shared__ __nv_bfloat16 taps[2][64], window[5][64];
+    const int first = blockIdx.x * 4;
+    const int t = first + threadIdx.y;
+    const int c = blockIdx.y * 64 + threadIdx.x;
+    const int lane = threadIdx.x;
+    if (c < D) {
+        window[threadIdx.y + 1][lane] = X[(size_t)t * D + c];
+        if (threadIdx.y == 0) {
+            taps[0][lane] = BASE[(branch * 2) * D + c];
+            taps[1][lane] = BASE[(branch * 2 + 1) * D + c];
+            if (first % block_rows != 0) window[0][lane] = X[(size_t)(first - 1) * D + c];
         }
-        if (RES != nullptr) total = rbf(total + bf(RES[(size_t)t * D + c]));
-        OUT[(size_t)t * D + c] = __float2bfloat16_rn(total);
     }
+    __syncthreads();
+    if (c >= D) return;
+    const int groups = D / group;
+    const int g = c / group;
+    float total = 0.0f;
+#pragma unroll
+    for (int l = 0; l < 2; l++) {
+        if (t % block_rows - l < 0) continue;
+        const float x = bf(window[threadIdx.y + 1 - l][lane]);
+        total = rbf(total + rbf(bf(taps[l][lane]) * x));
+        total = rbf(total + rbf(bf(DYN[(size_t)t * (4 * groups) + (branch * 2 + l) * groups + g]) * x));
+    }
+    if (RES != nullptr) total = rbf(total + bf(RES[(size_t)t * D + c]));
+    OUT[(size_t)t * D + c] = __float2bfloat16_rn(total);
 }
 
 extern "C" __global__ void __launch_bounds__(32) tf_q35d_norm_rope_batch(const __nv_bfloat16* __restrict__ X0, const __nv_bfloat16* __restrict__ W,
@@ -72,17 +83,20 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35d_norm_rope_qk_batch(cons
         const __nv_bfloat16* __restrict__ XK0, const __nv_bfloat16* __restrict__ WK, __nv_bfloat16* __restrict__ OUTK0,
         int kv_heads, int rows, const DraftSegment* segments, int block_rows, float eps, float theta) {
     release_next();
+    const int qb = rows * q_heads;
+    const bool isq = blockIdx.x < qb;
+    const __nv_bfloat16* W = isq ? WQ : WK;
+    asm volatile("" : "+l"(W));
+    const uint2 wv = *reinterpret_cast<const uint2*>(W + 4 * threadIdx.x);
+    asm volatile("" ::"r"(wv.x), "r"(wv.y));
     await_prior();
     const __nv_bfloat16* XQ = after_wait(XQ0);
     __nv_bfloat16* OUTQ = after_wait(OUTQ0);
     const __nv_bfloat16* XK = after_wait(XK0);
     __nv_bfloat16* OUTK = after_wait(OUTK0);
-    const int qb = rows * q_heads;
-    const bool isq = blockIdx.x < qb;
     const int bx = isq ? blockIdx.x : blockIdx.x - qb;
     const int heads = isq ? q_heads : kv_heads;
     const __nv_bfloat16* X = isq ? XQ : XK;
-    const __nv_bfloat16* W = isq ? WQ : WK;
     __nv_bfloat16* OUT = isq ? OUTQ : OUTK;
     const int head = bx % heads;
     const size_t m = bx / heads;
@@ -97,8 +111,9 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35d_norm_rope_qk_batch(cons
     acc = warp_sum(acc);
     const float inv = rsqrtf(acc / (float)HD + eps);
     float n[4];
+    const __nv_bfloat16* wb = reinterpret_cast<const __nv_bfloat16*>(&wv);
 #pragma unroll
-    for (int i = 0; i < 4; i++) n[i] = rbf(rbf(v[i] * inv) * bf(W[4 * t + i]));
+    for (int i = 0; i < 4; i++) n[i] = rbf(rbf(v[i] * inv) * bf(wb[i]));
     const float pos = (float)(segments[m / block_rows].position + (long long)(m % block_rows));
     __nv_bfloat16* out = OUT + (m * heads + head) * HD;
 #pragma unroll

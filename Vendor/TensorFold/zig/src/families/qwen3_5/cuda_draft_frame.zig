@@ -57,7 +57,7 @@ fn launch(d: anytype, f: cuda.Function, comptime s: sig.Sig, grid: [3]usize, blo
     return d.e.runAfter(f, grid, block, args);
 }
 fn conv(d: anytype, x: u64, base: u64, res: u64, out: u64, rows: usize, branch: c_int) !void {
-    try d.e.runAfter(d.fns.dyn_conv_batch, .{ rows, (d.c.hidden + 255) / 256, 1 }, .{ 256, 1, 1 }, .{ x, d.dyn, base, res, out, @as(c_int, @intCast(d.c.hidden)), @as(c_int, @intCast(d.c.group)), branch, @as(c_int, @intCast(d.c.block)) });
+    try d.e.runAfter(d.fns.dyn_conv_batch, .{ rows / 4, (d.c.hidden + 63) / 64, 1 }, .{ 64, 4, 1 }, .{ x, d.dyn, base, res, out, @as(c_int, @intCast(d.c.hidden)), @as(c_int, @intCast(d.c.group)), branch, @as(c_int, @intCast(d.c.block)) });
 }
 fn ropeQk(d: anytype, xq: u64, wq: u64, outq: u64, xk: u64, wk: u64, outk: u64, rows: usize) !void {
     const c = d.c;
