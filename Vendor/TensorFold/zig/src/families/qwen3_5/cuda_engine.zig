@@ -90,6 +90,54 @@ pub const FirstWindow = struct {
     }
 };
 
+/// The attention layers' q/k/v words, which stream every decode round from the arena: each projection's words in
+/// screen order (TF_FASTPOOL_ATTN=0: none).
+fn attnWords(e: anytype, comptime each: anytype, ctx: anytype) void {
+    if (envOff("TF_FASTPOOL_ATTN")) return;
+    for (e.layers) |*layer| switch (layer.mixer) {
+        .attention => |*m| for ([_]*@TypeOf(m.q){ &m.q, &m.k, &m.v }) |p| switch (p.*) {
+            .a4 => |*q| each(q, ctx),
+            else => {},
+        },
+        else => {},
+    };
+}
+
+/// The attention words' copy sizes, after `n` sizes already in `out`; the count added.
+fn attnCopySizes(e: anytype, out: []usize) usize {
+    const Ctx = struct { out: []usize, n: usize = 0 };
+    var c: Ctx = .{ .out = out };
+    attnWords(e, struct {
+        fn add(q: *cuda.qlinear.Affine4, t: *Ctx) void {
+            if (t.n == t.out.len) return;
+            t.out[t.n] = q.npad * q.k / 2;
+            t.n += 1;
+        }
+    }.add, &c);
+    return c.n;
+}
+
+/// The attention words copied into the screened pieces after the verify panels and streams, each projection's `w`
+/// moved to its copy (the same words, so no value changes); a projection with no room left keeps the arena's.
+fn placeAttnCopies(e: anytype, pool: *fast_placement.Pool) !void {
+    const Ctx = struct { e: @TypeOf(e), pool: *fast_placement.Pool, failed: bool = false };
+    var c: Ctx = .{ .e = e, .pool = pool };
+    attnWords(e, struct {
+        fn move(q: *cuda.qlinear.Affine4, t: *Ctx) void {
+            if (t.failed) return;
+            const bytes = q.npad * q.k / 2;
+            const dst = t.pool.alloc(bytes) orelse return;
+            t.e.d.check(t.e.d.api.cuMemcpyDtoDAsync_v2(dst, q.w, bytes, t.e.stream.handle), "cuMemcpyDtoDAsync") catch {
+                t.failed = true;
+                return;
+            };
+            q.w = dst;
+        }
+    }.move, &c);
+    if (c.failed) return error.FastPoolCopy;
+    try e.stream.synchronize();
+}
+
 pub const Engine = struct {
     rec_scratch: recurrent.Pool,
     startup: profile.Times = .{},
@@ -152,6 +200,7 @@ pub const Engine = struct {
     x: u64,
     r: u64,
     xs: u64,
+    gdn_count: u64 = 0, // a (window, value head)'s arrivals for the lean scans' fused gdn_post (qwen35_slots_lean.cuh)
     qkv: u64,
     z: u64,
     a: u64,
@@ -354,16 +403,18 @@ pub const Engine = struct {
         const streams = gb10 and g.hidden == 5120 and g.layers == 64 and g.experts == 0 and g.pocket == 0 and (output_stream or gdn_stream);
         // the decode copies on the fastest pieces of free memory (cuda_fastpool.zig); TF_FASTPOOL=0 keeps one buffer each
         if (gb10 and (panels or streams) and !envOff("TF_FASTPOOL")) {
-            var sizes: [2 * 64 + 6 * 64]usize = undefined;
+            var sizes: [2 * 64 + 6 * 64 + 3 * 64]usize = undefined;
             var n: usize = 0;
             if (panels) n += verify_weight_layout.copySizes(e, sizes[n..]);
             if (streams) n += projection_stream_layout.copySizes(e, gdn_stream, output_stream, sizes[n..]);
+            n += attnCopySizes(e, sizes[n..]);
             sponge.free(); // the screen takes its candidates out of all the free memory
             e.fast = fast_placement.screen(d, e.stream, try e.mods[3].function("tf_fastpool_read"), sizes[0..n]);
         }
         if (panels) e.verify_weights = try verify_weight_layout.prepare(e, single);
         errdefer if (e.verify_weights) |*b| b.free();
         if (streams) e.projection_streams = try projection_stream_layout.prepare(e, gdn_stream, output_stream);
+        if (e.fast) |*pool| try placeAttnCopies(e, pool);
         if (e.mo) |*m| try m.reserveParts(e);
         try @import("cuda_engine_tail.zig").finish(e, io, started);
         return e;
@@ -471,6 +522,8 @@ pub const Engine = struct {
         e.qkv = try t.alloc(R * g.convWidth() * 2);
         inline for (.{ "gate", "up", "act" }) |name| @field(e, name) = try t.alloc(R * g.intermediate * 2);
         e.xs = try t.alloc(R * (@max(g.intermediate, wide) / 64) * 4);
+        // the fused gdn_post's arrival counts, one a (window, value head); zeroed before the first forward
+        e.gdn_count = try t.alloc(Round.max_segs * g.v_heads * 4);
         inline for (.{ "a", "b", "beta" }) |name| @field(e, name) = try t.alloc(R * g.v_heads * 2);
         e.g_ = try t.alloc(R * g.v_heads * 4);
         e.qraw = try t.alloc(R * 2 * g.attnWidth() * 2);
@@ -761,6 +814,19 @@ pub const Engine = struct {
         // qwen35_slots.cuh: up to four slots scan two value rows a warp, so a block covers eight
         const rows_a_warp: usize = if (record and (slot_count == 3 or slot_count == 35 or slot_count == 37 or slot_count == 38)) 4 else if (record and slot_count <= 4) 2 else 1;
         try e.runAfter(scan, .{ 1, geometry.dk / (4 * rows_a_warp), e.g.v_heads * segments }, .{ 32, 4, 1 }, .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, input, layer, e.y, e.tables.ptr + params_at });
+    }
+
+    /// Whether a recorded window's scan of `slot_count` also runs the layer's gdn_post: the early lean scans (37, 38;
+    /// TF_FUSED_GDN_POST=0: gdn_post launches after the scan, as before).
+    pub fn fusedPost(slot_count: u8) bool {
+        return (slot_count == 37 or slot_count == 38) and scanEarlyOn() and !envOff("TF_FUSED_GDN_POST");
+    }
+
+    /// deltaScan's lean scan (37, 38) with the layer's gdn_post on each (window, value head)'s last CTA
+    /// (qwen35_slots_lean.cuh q35_lean_post): gdn_post's arguments after the scan's.
+    pub fn leanScanPost(e: *Engine, slot_count: u8, segments: usize, layer: c_int, norm_w: u64, sums: u64) !void {
+        const scan = if (slot_count == 37) e.fns.gdn_lean_2_post else e.fns.gdn_lean_3_post;
+        try e.runAfter(scan, .{ 1, geometry.dk / 16, e.g.v_heads * segments }, .{ 32, 4, 1 }, .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, e.tables.ptr + Round.steps_at, layer, e.y, e.tables.ptr + params_at, e.z, norm_w, e.g.eps, e.mix, sums, e.gdn_count });
     }
 
     /// The launches of a forward of `shape`, from the embedding to the kept rows' logits (captured once a shape).
