@@ -158,6 +158,60 @@ pub fn screen(d: *const cuda.Driver, stream: cuda.Stream, probe: cuda.Function, 
     return pool;
 }
 
+/// The decode reads the pool does not otherwise own, in the order `holdRest` places them: every attention layer's q, k
+/// and v words (a round streams them once each) and the vocabulary head's words, which are larger than a piece and so
+/// keep the arena's own placement. These sat in the weight arena, which the screen never ranked.
+pub fn restSizes(e: anytype, out: []usize) usize {
+    var n: usize = 0;
+    restAdd(&e.head, out, &n);
+    for (e.layers) |*l| {
+        if (l.mixer != .attention) continue;
+        restAdd(&l.mixer.attention.q, out, &n);
+        restAdd(&l.mixer.attention.k, out, &n);
+        restAdd(&l.mixer.attention.v, out, &n);
+    }
+    return n;
+}
+
+/// `p`'s immutable 4-bit words' size, when it has words to place in one piece.
+fn restAdd(p: anytype, out: []usize, n: *usize) void {
+    if (p.* != .a4 or p.a4.w == 0 or n.* >= out.len) return;
+    const bytes = p.a4.npad * p.a4.k / 2;
+    if (bytes > piece) return; // larger than a piece: it keeps the words it was loaded with
+    out[n.*] = bytes;
+    n.* += 1;
+}
+
+/// One read's words in the pool: the copy holds the same words, so every kernel that reads them computes the same value.
+fn place(pool: *Pool, stream: cuda.Stream, src: u64, bytes: usize) ?u64 {
+    const at = pool.alloc(bytes) orelse return null;
+    if (pool.d.api.cuMemcpyDtoDAsync_v2(at, src, bytes, stream.handle) != cuda.abi.success) return null;
+    return at;
+}
+
+/// Places those reads in the pieces `screen` kept, in `restSizes` order, and points each projection at its copy; a
+/// projection the pieces have no room for keeps the words it was loaded with.
+pub fn holdRest(e: anytype, sizes: []const usize) void {
+    if (e.fast) |*pool| {
+        var i: usize = 0;
+        holdAdd(pool, e.stream, &e.head, sizes, &i);
+        for (e.layers) |*l| {
+            if (l.mixer != .attention) continue;
+            holdAdd(pool, e.stream, &l.mixer.attention.q, sizes, &i);
+            holdAdd(pool, e.stream, &l.mixer.attention.k, sizes, &i);
+            holdAdd(pool, e.stream, &l.mixer.attention.v, sizes, &i);
+        }
+    }
+}
+
+fn holdAdd(pool: *Pool, stream: cuda.Stream, p: anytype, sizes: []const usize, i: *usize) void {
+    if (p.* != .a4 or p.a4.w == 0 or i.* >= sizes.len) return;
+    const bytes = p.a4.npad * p.a4.k / 2;
+    if (bytes > piece or bytes != sizes[i.*]) return;
+    if (place(pool, stream, p.a4.w, bytes)) |at| p.a4.w = at;
+    i.* += 1;
+}
+
 fn read(path: [:0]const u8, buf: []u8) ?[]const u8 {
     const rc = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
     if (linux.errno(rc) != .SUCCESS) return null;
