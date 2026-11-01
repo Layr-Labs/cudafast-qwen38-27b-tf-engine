@@ -10,7 +10,7 @@ const edge_weight = 0.6;
 const scale = 1.5;
 /// A sampled stream's candidates carry the draw's own Gumbel noise at this weight (the 27B engine's draft_tree).
 const noise_weight = 0.7;
-const default_nodes = 15;
+const default_nodes = 29;
 const lp_top = 20;
 const lp_words = 3 + 2 * lp_top;
 
