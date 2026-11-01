@@ -13,7 +13,6 @@ pub const attn_tiles = 4 * 32 * 512;
 /// tf_q35_attn_partial's one key and value tile (Bf16Tiles1), and the chunk blocks it launches a (row, key head):
 /// each takes every partial_chunks-th of the MAXCH chunks, so a short stream's rows dispatch no idle blocks.
 const attn_tile = attn_tiles / 2;
-const partial_chunks = 12;
 /// qwen35_attn_tc.cuh's GROUP_LEN: a stream at least this long has its rows on tf_q35_attn_rows.
 pub const group_len = 8192;
 const ids_at = E.Engine.ids_at;
@@ -33,6 +32,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     const g = e.g;
     const total: usize = shape.total;
     const nseg: usize = shape.nseg;
+    const partial_chunks: usize = shape.partial_chunks;
     const record = shape.record;
     const prompt = shape.prompt;
     const heads: usize = if (record) total else 1;
@@ -169,7 +169,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
         // a captured forward's first layer is a graph of its own (cuda_engine.zig's cutCapture)
         if (i == 0) try e.cutCapture();
     }
-    try finish(e, total, heads, shape.hidden);
+    try finish(e, total, heads, shape.hidden, shape.amax);
 }
 
 /// TF_GDN_ROWS4=0: 16..64-row windows keep one row warp a block in tf_q35_gdn_pre.
@@ -216,7 +216,7 @@ fn sharedSized(e: *E.Engine, f: cuda.Function, comptime s: sig.Sig, grid: [3]usi
 }
 
 /// Layer inputs are already kept; hidden reads need neither the final norm nor the vocabulary head.
-pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool) !void {
+pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool, amax: bool) !void {
     if (hidden) return;
     const g = e.g;
     if (e.learning == null and heads < total) {
@@ -226,6 +226,10 @@ pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool) !void {
     } else {
         try e.norm(true, e.final_norm, total);
         if (e.learning) |k| try k.final(e.h, total);
+        if (@hasField(@TypeOf(e.*), "affine")) if (amax) {
+            const x = e.x + (total - heads) * g.hidden * 2;
+            return e.affine.headArgmax(e.stream, x, e.xs, e.head.a4, e.logits, heads, e.tables.ptr + @import("cuda_round.zig").tokens_at);
+        };
         if (@hasDecl(@TypeOf(e.*), "projAgain"))
             try e.projAgain(e.head, e.x + (total - heads) * g.hidden * 2, e.logits, heads, false)
         else

@@ -182,10 +182,10 @@ pub const Engine = struct {
     /// The kept rows' device draws, when forward was given them.
     tokens: [most_verify]u32 = undefined,
     /// The captured forwards by shape (`Shape.key`): the launches from the embedding to the head.
-    graphs: std.AutoHashMapUnmanaged(u32, cuda.graph.Exec) = .empty,
+    graphs: std.AutoHashMapUnmanaged(u64, cuda.graph.Exec) = .empty,
     /// A captured forward's first layer as a graph of its own (keyed as `graphs`): launched first, it starts the GPU
     /// while the host still launches the larger rest, whose launch would otherwise leave the GPU idle until it returns.
-    heads: std.AutoHashMapUnmanaged(u32, cuda.graph.Exec) = .empty,
+    heads: std.AutoHashMapUnmanaged(u64, cuda.graph.Exec) = .empty,
     cut_armed: bool = false,
     cut_head: ?cuda.graph.Exec = null,
     /// A drafter's tapped layers (`setTaps`): each row's residual after them lands in its stream's tap ring.
@@ -513,6 +513,14 @@ pub const Engine = struct {
         try e.run(f, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ ids, e.embed_w, e.embed_s, e.embed_b, out, @as(c_int, @intCast(e.g.hidden)), params });
     }
 
+    fn headArgmax(e: *const Engine, bucket: usize, draws: []const Draw) bool {
+        for (draws) |p| if (p.rule != null) return false;
+        return switch (e.head) {
+            .a4 => |q| e.affine.headArgmaxFits(q, bucket),
+            else => false,
+        };
+    }
+
     /// Logits rows first..first + n's greedy tokens into toks: the highest logit, ties to the lower id.
     fn argmax(e: *Engine, first: usize, n: usize, toks: u64) !void {
         if (n == 0) return;
@@ -630,6 +638,12 @@ pub const Engine = struct {
         };
         shape.hidden = keep == .hidden;
         shape.paged = @import("cuda_attention.zig").hasPages(segs);
+        if (record and !e.kv8 and !shape.paged) {
+            var max_keys: usize = 0;
+            for (parts) |p| max_keys = @max(max_keys, p.cache.len + p.rows);
+            shape.partial_chunks = Shape.attentionChunks(max_keys);
+        }
+        shape.amax = keep == .draws and e.learning == null and !e.pockets.any() and e.headArgmax(shape.total, keep.draws);
         // a cache of at most GROUP_LEN positions holds fewer keys than that before any row it verifies
         shape.short = for (parts) |p| {
             if (p.cache.cap > @import("cuda_forward.zig").group_len) break false;
@@ -684,7 +698,7 @@ pub const Engine = struct {
             .hidden => try e.stream.synchronize(), // mapped layer inputs are ready before the learner reads them
             .draws => |pk| {
                 const toks = e.tables.ptr + tokens_at;
-                var i: usize = 0; // runs of greedy rows argmaxed together, runs of sampled rows drawn together
+                var i: usize = if (shape.amax) pk.len else 0;
                 while (i < pk.len) {
                     const sampled = pk[i].rule != null;
                     var n: usize = 1;
@@ -744,7 +758,7 @@ pub const Engine = struct {
 };
 
 test "dense read cost: hidden and slot variants have distinct graph keys" {
-    var seen: [32]u32 = undefined;
+    var seen: [32]u64 = undefined;
     var n: usize = 0;
     for ([_]u8{ 1, 2, 3, 4, 8, 16, 35, 37, 38 }) |slots| {
         for ([_]bool{ false, true }) |hidden| {
