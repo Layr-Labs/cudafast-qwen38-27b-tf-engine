@@ -361,8 +361,18 @@ using namespace qmm_dict;
 constexpr int GROUP_PAIR_SMEM = 14592;
 constexpr int GROUP_PAIR_SMEM_ONE = 32768;
 
+// The greedy rule of tf_q35_argmax_slices/merge: the highest value (never NaN or -inf), ties to the lowest id.
+__device__ __forceinline__ void amax_take(float v, int i, float& best, int& id) {
+    if (v > best || (v == best && i < id)) {
+        best = v;
+        id = i;
+    }
+}
+
 // group_kernel with dictionary-coded scales and biases (dict_lanes): no swapped or spread tiles.
-template <int GS, int BM, int BN, int WM, int WN, int STAGES, bool F32, bool SKIP = false>
+// AMAX (the greedy head): in place of the bf16 logits, each row's best bf16 logit of the tile and its id, written to
+// out as float PV[M][tiles] then int PI[M][tiles]; the same values the stored logits would hold, the same rule.
+template <int GS, int BM, int BN, int WM, int WN, int STAGES, bool F32, bool SKIP = false, bool AMAX = false>
 __global__ void __launch_bounds__(WM * WN * 32) group_kernel_dict(
         const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs, const __grid_constant__ Parts parts,
         int M, int K, int ldx, int rows_t, int C) {
@@ -656,6 +666,50 @@ __global__ void __launch_bounds__(WM * WN * 32) group_kernel_dict(
 #endif
     }
     if (!live) return;
+    if constexpr (AMAX) {
+        static_assert(!F32 && WM == 1 && BM == 16 && I == 1, "one m16 row tile, the warps across the tile's columns");
+        // a thread's two rows (lane / 4 and + 8), its columns in increasing order: the strict > keeps the lowest id
+        float best[2] = {__int_as_float(0xff800000), __int_as_float(0xff800000)};
+        int id[2] = {0x7fffffff, 0x7fffffff};
+#pragma unroll
+        for (int j = 0; j < J; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int h = e >> 1;
+                const int col = n0 + wn * (BN / WN) + j * 8 + (lane & 3) * 2 + (e & 1);
+                const int row = m0 + (lane >> 2) + h * 8;
+                const float v = __bfloat162float(__float2bfloat16_rn(acc[0][j][e]));  // the stored logit's value
+                if (row < M && col < N && v > best[h]) {
+                    best[h] = v;
+                    id[h] = col;
+                }
+            }
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+#pragma unroll
+            for (int m = 1; m <= 2; m <<= 1)
+                amax_take(__shfl_xor_sync(0xffffffffu, best[h], m), __shfl_xor_sync(0xffffffffu, id[h], m), best[h], id[h]);
+        float* wv = reinterpret_cast<float*>(buf);   // the stages are drained (wait<0> and the barrier above)
+        int* wi = reinterpret_cast<int*>(buf + WN * 16 * 4);
+        if ((lane & 3) == 0)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                wv[wn * 16 + (lane >> 2) + h * 8] = best[h];
+                wi[wn * 16 + (lane >> 2) + h * 8] = id[h];
+            }
+        __syncthreads();
+        if (tid < 16 && m0 + tid < M) {
+            float b = __int_as_float(0xff800000);
+            int k = 0x7fffffff;
+#pragma unroll
+            for (int w = 0; w < WN; ++w) amax_take(wv[w * 16 + tid], wi[w * 16 + tid], b, k);
+            float* pv = reinterpret_cast<float*>(P.out);
+            int* pi = reinterpret_cast<int*>(pv + static_cast<size_t>(M) * P.tiles);
+            pv[static_cast<size_t>(m0 + tid) * P.tiles + tile] = b;
+            pi[static_cast<size_t>(m0 + tid) * P.tiles + tile] = k;
+        }
+        return;
+    }
 #pragma unroll
     for (int i = 0; i < I; ++i)
 #pragma unroll
@@ -932,6 +986,34 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_pair(const __nv_bfl
 // MMA chains, fmas and sums, each scale and bias decoded from its dictionary index (dict_lanes).
 template __global__ void tf_qmm_group::group_kernel_dict<64, 16, 64, 1, 4, 8, false>(
     const __nv_bfloat16* __restrict__, const float* __restrict__, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
+// The greedy verify head: the same tile, each row's best of its 64 columns in place of the logits.
+template __global__ void tf_qmm_group::group_kernel_dict<64, 16, 64, 1, 4, 8, false, false, true>(
+    const __nv_bfloat16* __restrict__, const float* __restrict__, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
+
+// The head's per-tile bests (PV, PI: rows x tiles) into each row's greedy token, the slices' merge rule. Grid (rows),
+// 256 threads; with PDL it waits for the head's grid.
+extern "C" __global__ void __launch_bounds__(256) tf_qmm_head_argmax_merge(const float* __restrict__ PV,
+        const int* __restrict__ PI, int tiles, unsigned* __restrict__ TOK) {
+    qmm_frag::grid_wait();
+    __shared__ float bv[8];
+    __shared__ int bi[8];
+    float best = __int_as_float(0xff800000);
+    int id = 0x7fffffff;
+    const size_t at = static_cast<size_t>(blockIdx.x) * tiles;
+    for (int s = threadIdx.x; s < tiles; s += blockDim.x) tf_qmm_group::amax_take(PV[at + s], PI[at + s], best, id);
+#pragma unroll
+    for (int m = 16; m; m >>= 1)
+        tf_qmm_group::amax_take(__shfl_xor_sync(0xffffffffu, best, m), __shfl_xor_sync(0xffffffffu, id, m), best, id);
+    if ((threadIdx.x & 31) == 0) {
+        bv[threadIdx.x >> 5] = best;
+        bi[threadIdx.x >> 5] = id;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int w = 1; w < 8; w++) tf_qmm_group::amax_take(bv[w], bi[w], best, id);
+        TOK[blockIdx.x] = static_cast<unsigned>(id);
+    }
+}
 
 extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_pair_dict(const __nv_bfloat16* __restrict__ x,
         const float* __restrict__ xs, const __grid_constant__ tf_qmm_group::Parts parts, __nv_bfloat16* __restrict__ act,
@@ -941,4 +1023,5 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_pair_dict(const __n
 
 #include "qmm_mlp_single_dict.cuh"
 #include "qmm_mlp_compact_pair.cuh"
-#include "qmm_mlp_single32.cuh"
+
+#include "qmm_stream32.cuh"

@@ -7,10 +7,12 @@ const engine = @import("cuda_engine.zig");
 /// Children a node, the selector's weight, the softmax scale, and the nodes a tree takes by default.
 const branch = 12;
 const edge_weight = 0.6;
-const scale = 1.5;
+const scale = 1.0;
+/// Added to a node's path cost per row: a wide tree spends slightly fewer nodes deep in one line.
+const depth_cost = 0.2;
 /// A sampled stream's candidates carry the draw's own Gumbel noise at this weight (the 27B engine's draft_tree).
 const noise_weight = 0.7;
-const default_nodes = 15;
+const default_nodes = 31;
 const lp_top = 20;
 const lp_words = 3 + 2 * lp_top;
 
@@ -174,7 +176,7 @@ pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32
             const w = ids(c, row);
             for (order[0..@min(branch, c.topk)]) |j| {
                 if (!std.math.isFinite(lc[j]) or n_open == open.len) break;
-                open[n_open] = .{ .cost = path - lc[j], .parent = parent, .token = w[2 + j], .row = row, .own = lc[j] };
+                open[n_open] = .{ .cost = path - lc[j] + depth_cost, .parent = parent, .token = w[2 + j], .row = row, .own = lc[j] };
                 n_open += 1;
             }
         }

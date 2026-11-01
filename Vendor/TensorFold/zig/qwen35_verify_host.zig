@@ -390,6 +390,10 @@ const PackTrace = struct {
         touched = ptr == 0x100000 and value == 0 and n == bytes;
         return 0;
     }
+    /// projection_stream_layout.prepare zeroes its buffer on the engine stream (ordered before the packs)
+    fn memsetAsync(ptr: cuda.abi.DevicePtr, value: u8, n: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+        return memset(ptr, value, n);
+    }
     fn sync(_: cuda.abi.Stream) callconv(.c) cuda.abi.Result { synced = true; return 0; }
     fn launch(_: cuda.abi.Function, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, args: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
         const a = args.?;
@@ -751,6 +755,7 @@ test "projection streams: weight-only views cover all roles without replacing or
     d.api.cuMemAlloc_v2 = PackTrace.alloc;
     d.api.cuMemFree_v2 = PackTrace.free;
     d.api.cuMemsetD8_v2 = PackTrace.memset;
+    d.api.cuMemsetD8Async = PackTrace.memsetAsync;
     d.api.cuModuleGetFunction = Resolve.get;
     d.api.cuFuncSetAttribute = Resolve.attribute;
     d.api.cuStreamSynchronize = PackTrace.sync;
