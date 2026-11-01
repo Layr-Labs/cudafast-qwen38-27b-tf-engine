@@ -169,6 +169,49 @@ struct Bf16Tiles1 {
     __device__ float key_scale(int) const { return 1.0f; }
 };
 
+// Bf16Tiles1's one key region and one value region (the same bytes and footprint, so two blocks still fit an SM), each
+// copied as its own cp.async group: a pass waits for its keys only, scores them while its values land, and the next
+// pass's keys are copied into the key region once every warp has read this pass's (attn_two_kv).
+template <int THREADS>
+struct Bf16TilesKV {
+    static constexpr int TILE = TK * CH, PER = TILE / THREADS;
+    TileStore s;
+    const __nv_bfloat16 *K, *V;
+    __device__ Bf16TilesKV(TileStore store, const Seg& sg, int layer, int kvh) : s(store) {
+        K = reinterpret_cast<const __nv_bfloat16*>(sg.kv) + (size_t)layer * 2 * kvh * sg.cap * HD;
+        V = K + (size_t)kvh * sg.cap * HD;
+    }
+    // this thread's PER cache rows of the tile from t0 (Bf16Tiles1::fetch's rows; -1: zeros), for its keys and values
+    template <class Row>
+    __device__ void rows(int t0, Row row, int (&r)[PER]) const {
+#pragma unroll
+        for (int i = 0; i < PER; i++) r[i] = row(t0 + (int)(threadIdx.x + THREADS * i) / CH);
+    }
+    __device__ void fetch_keys(const int (&r)[PER]) {
+#pragma unroll
+        for (int i = 0; i < PER; i++) {
+            const int at = threadIdx.x + THREADS * i, u = at / CH, chunk = at % CH;
+            const size_t from = (size_t)(r[i] < 0 ? 0 : r[i]) * HD + chunk * 8;
+            qmm_frag::cp16z(s.kt + swz(u, chunk), K + from, r[i] >= 0);
+        }
+        qmm_frag::commit();
+    }
+    __device__ void fetch_values(const int (&r)[PER]) {
+#pragma unroll
+        for (int i = 0; i < PER; i++) {
+            const int at = threadIdx.x + THREADS * i, u = at / CH, chunk = at % CH;
+            const size_t from = (size_t)(r[i] < 0 ? 0 : r[i]) * HD + chunk * 8;
+            qmm_frag::cp16z(s.kt + TILE + swz(u, chunk), V + from, r[i] >= 0);
+        }
+        qmm_frag::commit();
+    }
+    __device__ const uint4* keys() const { return s.kt; }
+    __device__ const uint4* values() const { return s.kt + TILE; }
+    __device__ float kscale(int) const { return 1.0f; }
+    __device__ float vscale(int) const { return 1.0f; }
+    __device__ float key_scale(int) const { return 1.0f; }
+};
+
 // Whether a tile store has one buffer (its next tile fetched after a tile's values are read).
 template <class T, class = void> struct one_buffer { static constexpr bool value = false; };
 template <class T> struct one_buffer<T, decltype((void)T::single)> { static constexpr bool value = T::single; };
@@ -515,6 +558,248 @@ __device__ __forceinline__ void attn_two(TileStore store, Geo geo, const __nv_bf
                 if (!inb) { o[n][2] = keep[n][2]; o[n][3] = keep[n][3]; }
             }
         }
+    }
+    const int lj = line < G ? 0 : (line < 2 * G ? 1 : -1);
+    if (part8 == 0 && lj >= 0 && (lj == 0 ? w0 : w1)) {
+        const size_t at = (lj == 0 ? b0 : b1) + (line - lj * G) * MAXCH;
+        PM[at] = mx;
+        PL[at] = l;
+    }
+    const bool oa = ja >= 0 && (ja == 0 ? w0 : w1), ob = jb >= 0 && (jb == 0 ? w0 : w1);
+    const size_t pa_at = (ja == 1 ? b1 : b0) + (g - (ja == 1 ? G : 0)) * MAXCH, pb_at = (jb == 1 ? b1 : b0) + (g + 8 - (jb == 1 ? G : 0)) * MAXCH;
+#pragma unroll
+    for (int n = 0; n < 8; n++) {
+        const int d = 8 * (8 * warp + n) + 2 * qd;
+        if (oa) *reinterpret_cast<float2*>(PO + pa_at * HD + d) = make_float2(o[n][0], o[n][1]);
+        if (ob) *reinterpret_cast<float2*>(PO + pb_at * HD + d) = make_float2(o[n][2], o[n][3]);
+    }
+}
+
+// attn_two with its keys and values copied as separate groups (Bf16TilesKV): the same passes, tiles, mma operands and
+// order, softmax steps and partials; only where each tile's copies are issued and awaited differs.
+template <class Tiles>
+__device__ __forceinline__ void attn_two_kv(TileStore store, Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
+                                         const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
+                                         const int* __restrict__ P, float scale,
+                                         float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO, int c) {
+    __shared__ __align__(16) uint4 qs[16 * CH];
+    __shared__ float st[16][TK + 1];
+    __shared__ __align__(16) __nv_bfloat16 pt[16][TK + 8];
+    __shared__ float alpha[16];
+    const int QH = geo.qh, KVH = geo.kvh, G = QH / KVH;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, qd = lane & 3;
+    const size_t m0 = 2 * (size_t)blockIdx.x;
+    const int h = blockIdx.z;
+    if (c >= MAXCH || 2 * G > 16) return;
+    // row j of the pair (scalars, not arrays: no local memory): whether it has keys in chunk c, its stream, ancestry,
+    // [k0, k1) and partials' base
+    bool w0 = false, w1 = false;
+    int sg0 = 0, sg1 = 0, ck0 = 0, ck1 = 0, a0 = 0, a1 = 0, e0 = 0, e1 = 0;
+    Ancestor an0{0ull, 0u, 0u}, an1{0ull, 0u, 0u};
+    size_t b0 = 0, b1 = 0;
+    auto prep = [&](size_t m, bool& w, int& sgi, int& ck, int& k0, int& k1, Ancestor& an, size_t& base) {
+        if (past_rows(P, (int)m)) return;
+        const Seg sg = segs[rowseg[m]];
+        if (sg.len >= GROUP_LEN) return;  // a long stream's rows: attn_rows
+        sgi = rowseg[m];
+        an = rowanc[m];
+        const int keys = sg.len + rows_seen(an);
+        ck = chunk_keys(keys);
+        k0 = c * ck;
+        k1 = min(k0 + ck, keys);
+        base = (m * QH + (size_t)h * G) * MAXCH + c;
+        if (k0 >= k1) {
+            if (tid < G) {
+                PM[base + tid * MAXCH] = -INFINITY;
+                PL[base + tid * MAXCH] = 0.0f;
+            }
+            return;
+        }
+        w = true;
+    };
+    prep(m0, w0, sg0, ck0, a0, e0, an0, b0);
+    prep(m0 + 1, w1, sg1, ck1, a1, e1, an1, b1);
+    if (!w0 && !w1) return;
+    const bool pair = w0 && w1 && sg0 == sg1 && ck0 == ck1;
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        const int i = tid + 128 * j, line = i / CH, chunk = i % CH;
+        const int r = line < G ? 0 : 1, l = line - r * G;
+        uint4 w = make_uint4(0u, 0u, 0u, 0u);
+        if (line < 2 * G && (r == 0 ? w0 : w1)) w = *reinterpret_cast<const uint4*>(Q + ((m0 + r) * QH + (size_t)h * G + l) * HD + chunk * 8);
+        qs[swz(line, chunk)] = w;
+    }
+    __syncthreads();
+    uint32_t qa[HD / 16][4];
+#pragma unroll
+    for (int k = 0; k < HD / 16; k++) qmm_frag::ldmatrix4(qa[k], qs + swz(lane % 16, 2 * k + lane / 16));
+    float o[8][4];
+#pragma unroll
+    for (int n = 0; n < 8; n++) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
+    float mx = -INFINITY, l = 0.0f;  // the line tid / 8's running max and sum
+    const int line = tid >> 3, part8 = tid & 7;
+    // the row of line g and of line g + 8 (this thread's score and output lines), -1 past 2G
+    const int ja = g < G ? 0 : (g < 2 * G ? 1 : -1), jb = g + 8 < G ? 0 : (g + 8 < 2 * G ? 1 : -1);
+    const Seg s0 = segs[sg0], s1 = segs[sg1];
+    Tiles tiles0(store, s0, layer, KVH), tiles1(store, s1, layer, KVH);
+    // the passes: a pair's tiles from k0 (a stream-key tile once, a window tile once a row); else each working row's
+    int t = pair ? a0 : (w0 ? a0 : a1);
+    int r = pair ? 0 : (w0 ? 0 : 1);  // a pair: the row of a window tile's next pass; else the row in progress
+    const int kend = pair ? max(e0, e1) : 0;
+    // attn_two's loop control, one pass ahead: the next pass's tile and keys (-1 the stream's, j row j's), false past the last
+    auto next = [&](int& pt0, int& pm) -> bool {
+        for (;;) {
+            if (pair) {
+                if (t >= kend) return false;
+                if (t + TK <= s0.len) {
+                    pt0 = t;
+                    pm = -1;
+                    t += TK;
+                } else if (r == 0) {
+                    r = 1;
+                    if (t >= e0) continue;
+                    pt0 = t;
+                    pm = 0;
+                } else {
+                    r = 0;
+                    pt0 = t;
+                    t += TK;
+                    if (pt0 >= e1) continue;
+                    pm = 1;
+                }
+            } else {
+                if (t >= (r == 0 ? e0 : e1)) {
+                    if (r == 0 && w1) {
+                        r = 1;
+                        t = a1;
+                        continue;
+                    }
+                    return false;
+                }
+                pt0 = t;
+                pm = r;
+                t += TK;
+            }
+            return true;
+        }
+    };
+    // a pass's key tk's cache row, attn_two's fetch rows (-1: past the row's keys, zeros)
+    auto rowof = [&](int pm, int tk) -> int {
+        const Seg& sp = pm == 1 ? s1 : s0;
+        const int pk1 = pm == 1 ? e1 : e0;
+        const Ancestor& pan = pm == 1 ? an1 : an0;
+        if (pm < 0) return h * sp.cap + tk;
+        return tk < pk1 ? h * sp.cap + (tk < sp.len ? tk : sp.len + seen_row(pan, tk - sp.len)) : -1;
+    };
+    // cp.async groups, in commit order: K(0); then each pass p commits V(p) and, if a pass follows, K(p + 1). Every
+    // pass waits K(p) (wait 1: only V(p) may be in flight) and later V(p) (wait 1 with K(p + 1) committed, else 0);
+    // the last pass drains the queue, so a chunk leaves no copy in flight. A tile's keys and values share one row list.
+    int qt = 0, qm = 0;  // the pass after the current one: its tile and keys
+    bool more = next(qt, qm);
+    int rc[Tiles::PER], rq[Tiles::PER];  // the current and the next pass's cache rows
+    if (more) {
+        Tiles& tq = qm == 1 ? tiles1 : tiles0;
+        tq.rows(qt, [&](int tk) -> int { return rowof(qm, tk); }, rc);
+        tq.fetch_keys(rc);
+    }
+    while (more) {
+        const int pt0 = qt, pm = qm;  // the pass's tile and keys: -1 the stream's (both rows), j row j's
+        more = next(qt, qm);
+        const unsigned rows = pm < 0 ? 3u : 1u << pm;
+        Tiles& tiles = pm == 1 ? tiles1 : tiles0;
+        Tiles& tq = qm == 1 ? tiles1 : tiles0;
+        __syncthreads();  // every warp read the previous pass's values and weights: the value region is free
+        tiles.fetch_values(rc);
+        // the next pass's rows here, where the ancestor walks reconverge at a barrier before the softmax's shuffles
+        if (more) tq.rows(qt, [&](int tk) -> int { return rowof(qm, tk); }, rq);
+        qmm_frag::wait<1>();  // this thread's copies of this pass's keys landed
+        __syncthreads();      // and every thread's
+        const uint4* kt = tiles.keys();
+        const uint4* vt = tiles.values();
+        const bool ina = ja >= 0 && (rows >> ja & 1u), inb = jb >= 0 && (rows >> jb & 1u);
+        const int ka = ina ? (ja == 0 ? e0 : e1) : 0, kb = inb ? (jb == 0 ? e0 : e1) : 0;
+        {  // scores: warp w the tile's keys 8 w on, every line
+            float s[4];
+#pragma unroll
+            for (int k = 0; k < HD / 16; k++) {
+                uint32_t b[2];
+                qmm_frag::ldmatrix2(b, kt + swz(8 * warp + lane % 8, 2 * k + (lane >> 3 & 1)));
+                if (k == 0) qmm_frag::mma0(s, qa[k], b[0], b[1]);
+                else qmm_frag::mma(s, qa[k], b[0], b[1]);
+            }
+            const int u = 8 * warp + 2 * qd;
+            st[g][u] = ina && pt0 + u < ka ? s[0] * tiles.kscale(u) * scale : -INFINITY;
+            st[g][u + 1] = ina && pt0 + u + 1 < ka ? s[1] * tiles.kscale(u + 1) * scale : -INFINITY;
+            st[g + 8][u] = inb && pt0 + u < kb ? s[2] * tiles.kscale(u) * scale : -INFINITY;
+            st[g + 8][u + 1] = inb && pt0 + u + 1 < kb ? s[3] * tiles.kscale(u + 1) * scale : -INFINITY;
+        }
+        __syncthreads();  // every warp's scores are in st and its key reads are done: the key region is free
+        if (more) tq.fetch_keys(rq);
+        {  // attn_one's softmax step; a masked line's scores are all -inf: its max, sum and alpha (1) are unchanged
+            const int hf = part8 >> 2, qq = part8 & 3;
+            float sv[4], tm = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                sv[j] = st[line][16 * hf + 2 * qq + (j & 1) + 8 * (j >> 1)];
+                tm = fmaxf(tm, sv[j]);
+            }
+#pragma unroll
+            for (int x = 1; x < 8; x *= 2) tm = fmaxf(tm, __shfl_xor_sync(0xffffffffu, tm, x));
+            const bool act = tm != -INFINITY;
+            const float nm = act ? fmaxf(mx, tm) : mx;
+            const float a = act ? (mx == -INFINITY ? 0.0f : texp(mx - nm)) : 1.0f;
+            float ps = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const int u = 16 * hf + 2 * qq + (j & 1) + 8 * (j >> 1);
+                const float p = act && sv[j] != -INFINITY ? texp(sv[j] - nm) : 0.0f;
+                pt[line][u] = __float2bfloat16_rn(p * tiles.vscale(u));
+                ps += p;
+            }
+#pragma unroll
+            for (int x = 1; x < 8; x *= 2) ps += __shfl_xor_sync(0xffffffffu, ps, x);
+            l = fmaf(l, a, ps);
+            mx = nm;
+            if (part8 == 0) alpha[line] = a;
+        }
+        if (more) qmm_frag::wait<1>();  // this thread's copies of this pass's values landed (the next keys may not have)
+        else qmm_frag::wait<0>();
+        __syncthreads();  // every thread's values, weights and alphas
+        {  // values: warp w the dims 64 w on, every line; a masked line's outputs as they were
+            float keep[8][4];
+#pragma unroll
+            for (int n = 0; n < 8; n++)
+#pragma unroll
+                for (int i = 0; i < 4; i++) keep[n][i] = o[n][i];
+            const float x0 = alpha[g], x1 = alpha[g + 8];
+#pragma unroll
+            for (int n = 0; n < 8; n++) {
+                o[n][0] *= x0;
+                o[n][1] *= x0;
+                o[n][2] *= x1;
+                o[n][3] *= x1;
+            }
+            const int mt = lane >> 3;
+#pragma unroll
+            for (int j = 0; j < TK / 16; j++) {
+                uint32_t pa[4];
+                qmm_frag::ldmatrix4(pa, &pt[lane % 16][16 * j + 8 * (lane / 16)]);
+#pragma unroll
+                for (int n = 0; n < 8; n += 2) {
+                    uint32_t b[4];
+                    ldmatrix4t(b, vt + swz(16 * j + 8 * (mt % 2) + lane % 8, 8 * warp + n + mt / 2));
+                    qmm_frag::mma(o[n], pa, b[0], b[1]);
+                    qmm_frag::mma(o[n + 1], pa, b[2], b[3]);
+                }
+            }
+#pragma unroll
+            for (int n = 0; n < 8; n++) {
+                if (!ina) { o[n][0] = keep[n][0]; o[n][1] = keep[n][1]; }
+                if (!inb) { o[n][2] = keep[n][2]; o[n][3] = keep[n][3]; }
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < Tiles::PER; i++) rc[i] = rq[i];
     }
     const int lj = line < G ? 0 : (line < 2 * G ? 1 : -1);
     if (part8 == 0 && lj >= 0 && (lj == 0 ? w0 : w1)) {

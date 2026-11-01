@@ -24,7 +24,7 @@ const lp_top = 20;
 pub const Config = @import("cuda_draft_config.zig").Config;
 pub const frame = @import("cuda_draft_frame.zig");
 pub const memory = @import("cuda_draft_memory.zig");
-const Fns = struct { gather_taps: cuda.Function, gather_rows: cuda.Function, dyn_conv: cuda.Function, norm_rope: cuda.Function, ring_put: cuda.Function, attn: cuda.Function, dyn_conv_batch: cuda.Function, norm_rope_batch: cuda.Function, norm_rope_qk_batch: cuda.Function, mask_rows: cuda.Function, attn_partial: cuda.Function, attn_partial_rows4: cuda.Function, attn_merge: cuda.Function };
+const Fns = struct { gather_taps: cuda.Function, gather_rows: cuda.Function, dyn_conv: cuda.Function, norm_rope: cuda.Function, ring_put: cuda.Function, attn: cuda.Function, dyn_conv_batch: cuda.Function, norm_rope_batch: cuda.Function, norm_rope_qk_batch: cuda.Function, mask_rows: cuda.Function, attn_partial: cuda.Function, attn_partial_rows4: cuda.Function, attn_merge: cuda.Function, head2_pack: cuda.Function, head2_screen: cuda.Function, head2_select: cuda.Function, head2_rescore: cuda.Function };
 
 /// qwen35_draft.cu's TapRows.
 const TapRows = extern struct { n: c_int, rows: [engine.most_window]c_int };
@@ -45,6 +45,13 @@ pub const Ctx = struct {
     scanned: usize = 0,
     wide: bool = false,
     outside: usize = 0, // the stream's tokens so far outside the draft spans (frame.scan)
+    // the stream's verified trees (wideGuard): its rounds and kept rows, the rounds that offered more than 15 nodes and
+    // their kept rows past row 15; `narrow` once those rows no longer pay for the wider window
+    rounds: u32 = 0,
+    kept_rows: u32 = 0,
+    wide_rounds: u32 = 0,
+    wide_extra: u32 = 0,
+    narrow: bool = false,
 };
 
 pub const Draft = struct {
@@ -57,6 +64,8 @@ pub const Draft = struct {
     mod: cuda.Module,
     fns: Fns,
     scratch: DeviceBuffer,
+    /// The span head's 2-bit screen (cuda_draft_frame.zig head2): codes, screen scales, exact column scales (null: off).
+    head2: ?DeviceBuffer = null,
     selection_base: usize = 0,
     drawn: struct { sampling: ?lanes.Sampling = null, position: u64 = 0 } = .{},
     segments: u64 = 0,
@@ -137,6 +146,8 @@ pub const Draft = struct {
         _ = try d.layout(true);
         d.staged = try cuda.HostBuffer.alloc(e.d, try frame.stagedBytes(c.rank));
         errdefer d.staged.free();
+        d.head2 = try frame.head2Init(d);
+        errdefer if (d.head2) |*h| h.free();
         // the first context, and a hold timed on it (the quickest of several: the first ones pay the driver's stalls)
         const ctx = try d.create();
         errdefer d.drop(ctx);
@@ -155,6 +166,7 @@ pub const Draft = struct {
         try d.pool.append(gpa, ctx);
         d.startup.warmups += profile.elapsed(io, warm_start);
         d.startup.load = profile.elapsed(io, started) - d.startup.reserve - d.startup.warmups;
+        try e.enableOverlap();
         return d;
     }
 
@@ -186,6 +198,7 @@ pub const Draft = struct {
         for (d.pool.items) |ctx| d.drop(ctx);
         d.pool.deinit(d.gpa);
         d.staged.free();
+        if (d.head2) |*h| h.free();
         d.scratch.free();
         d.w.deinit(d.gpa);
         d.mod.unload();
@@ -321,8 +334,26 @@ pub const Draft = struct {
         try d.e.runAfter(d.fns.norm_rope, .{ rows * heads, 1, 1 }, .{ 32, 1, 1 }, .{ x, w, out, @as(c_int, @intCast(heads)), @as(c_int, @intCast(heads * d.c.head_dim)), @as(c_longlong, @intCast(pos0)), d.c.eps, d.c.theta });
     }
 
+    /// `absorbRows`; a prompt's absorb right after its last cut (cuda_engine.zig Overlap) runs on the engine's side
+    /// stream once that cut's last layer is done, while the cut's head runs on, and the engine stream waits for it before
+    /// anything launched after it.
+    fn absorb(d: *Draft, ctx: *Ctx, tap_ring: u64, start: u64, n: usize, rows: ?[]const u32, prompt: bool) !void {
+        const e = d.e;
+        if (!(prompt and e.overlap.tail_pending)) return d.absorbRows(ctx, tap_ring, start, n, rows, prompt);
+        e.overlap.tail_pending = false;
+        const main = e.stream;
+        const side = e.overlap.side.?;
+        try e.d.check(e.d.api.cuStreamWaitEvent(side.handle, e.overlap.tail_done, 0), "cuStreamWaitEvent");
+        e.stream = side;
+        errdefer e.stream = main;
+        try d.absorbRows(ctx, tap_ring, start, n, rows, prompt);
+        e.stream = main;
+        try e.d.check(e.d.api.cuEventRecord(e.overlap.absorb_done, side.handle), "cuEventRecord");
+        try e.d.check(e.d.api.cuStreamWaitEvent(main.handle, e.overlap.absorb_done, 0), "cuStreamWaitEvent");
+    }
+
     /// Target rows [start, start + n) from the tap ring into the context; with `rows`, ring rows start + rows[i].
-    fn absorb(d: *Draft, ctx: *Ctx, tap_ring: u64, start_: u64, n_: usize, rows_: ?[]const u32, prompt: bool) !void {
+    fn absorbRows(d: *Draft, ctx: *Ctx, tap_ring: u64, start_: u64, n_: usize, rows_: ?[]const u32, prompt: bool) !void {
         const previous = d.projection_role;
         defer d.projection_role = previous;
         d.projection_role = if (prompt) .prompt else .live;
@@ -423,7 +454,8 @@ pub const Draft = struct {
         d.drawn = .{ .sampling = it.sampling, .position = it.position };
         defer d.drawn = .{};
         if (it.lanes) |shape| return d.selectLanes(ctx, it.pending, rows, shape);
-        const limit = if (d.c.block == 16) tree.nodes() else 0;
+        const limit = if (d.c.block == 16) d.wideGuard(ctx, tree.nodes()) else 0;
+        tree.narrowed = limit > 0 and limit <= 15;
         if (limit > 0) {
             // the whole budget whenever drafts are asked: the block's forward costs the same at any depth
             const n = if (it.depth == 0) 0 else limit;
@@ -435,6 +467,7 @@ pub const Draft = struct {
                 var best_pos: usize = 0;
                 var best_hist: usize = 0;
                 var best_draft: usize = 0;
+                const copy_min = copyMin();
                 var idx = hist.len - 1;
                 while (idx > 0) {
                     idx -= 1;
@@ -443,13 +476,13 @@ pub const Draft = struct {
                     while (hm <= idx and hm < 64 and hist[idx - hm] == hist[hist.len - 1 - hm]) hm += 1;
                     var dm: usize = 0;
                     while (dm < rows and idx + 1 + dm < hist.len and hist[idx + 1 + dm] == ch[dm]) dm += 1;
-                    if (dm >= 3 and hm + dm >= 6 and (hm + dm > best_hist + best_draft or (hm + dm == best_hist + best_draft and dm > best_draft))) {
+                    if (dm >= copy_min and hm + dm >= 6 and (hm + dm > best_hist + best_draft or (hm + dm == best_hist + best_draft and dm > best_draft))) {
                         best_pos = idx;
                         best_hist = hm;
                         best_draft = dm;
                     }
                 }
-                if (best_draft >= 3 and best_hist + best_draft >= 6) {
+                if (best_draft >= copy_min and best_hist + best_draft >= 6) {
                     const avail = hist.len - (best_pos + 1);
                     const copy_rows: usize = if (best_draft >= 10 and avail > rows) @min(@as(usize, 31), avail) else rows;
                     for (0..copy_rows) |r| {
@@ -465,6 +498,37 @@ pub const Draft = struct {
             d.select(ctx, it.pending, rows);
             ctx.held_n = @min(it.depth, rows);
         }
+    }
+
+    /// A context copy replaces the grown tree only when the draft chain matches the history for at least this many tokens
+    /// (TF_COPY_MIN=n; default copy_min_default). From 10 on, only the long matches that copy past the block's rows.
+    fn copyMin() usize {
+        const S = struct {
+            var n: ?usize = null;
+        };
+        if (S.n == null) S.n = if (platform.c.getenv("TF_COPY_MIN")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch copy_min_default else copy_min_default;
+        return S.n.?;
+    }
+
+    /// A stream's node budget: `nodes`, or 15 once its wide rounds' kept rows past row 15 (an upper bound of what the
+    /// wider tree adds) fall clearly below the wider window's extra cost in the stream's own tokens, after `wide_probe` wide
+    /// rounds (window costs from the engine's table; TF_WIDE_GUARD=0: always `nodes`).
+    fn wideGuard(d: *const Draft, ctx: *Ctx, nodes: usize) usize {
+        if (nodes <= narrow_nodes or !guardOn()) return nodes;
+        if (ctx.narrow) return narrow_nodes;
+        if (ctx.wide_rounds < wide_probe or ctx.rounds == 0) return nodes;
+        var c16: f64 = 0;
+        var cw: f64 = 0;
+        for (d.costs[0..d.n_costs]) |c| {
+            if (c.width == narrow_nodes + 1) c16 = c.ms;
+            if (c.width == nodes + 1) cw = c.ms;
+        }
+        if (c16 <= 0 or cw <= c16) return nodes;
+        const per_round = @as(f64, @floatFromInt(ctx.kept_rows)) / @as(f64, @floatFromInt(ctx.rounds));
+        const extra = @as(f64, @floatFromInt(ctx.wide_extra)) / @as(f64, @floatFromInt(ctx.wide_rounds));
+        // a round's extra cost, in the stream's tokens: (cw - c16) / (c16 / per_round)
+        if (extra * c16 < guard_margin * (cw - c16) * per_round) ctx.narrow = true;
+        return if (ctx.narrow) narrow_nodes else nodes;
     }
 
     // the Drafter contract
@@ -490,6 +554,7 @@ pub const Draft = struct {
 
     fn openFn(p: *anyopaque, s: *Stream) anyerror!void {
         const d = cast(p);
+        tree.narrowed = false;
         if (d.streams.contains(s)) return error.StreamOpen;
         if (d.ring_of) |r| if (r.ring(r.ctx, s)) |ptr| { // the lane's run holds it: a context borrowing it
             const ctx = try d.gpa.create(Ctx);
@@ -515,6 +580,12 @@ pub const Draft = struct {
                 for (prefix[0..@min(it.follow.len, prefix.len)], 0..) |*x, i| x.* = @intCast(i);
                 const kept = it.rows orelse prefix[0..@min(it.follow.len, prefix.len)];
                 d.landing.observeTree(it.stream.sampling != null, ctx.parents[0..ctx.grown], ctx.own[0..ctx.grown], it.offered, kept);
+                ctx.rounds += 1;
+                ctx.kept_rows += @intCast(kept.len);
+                if (it.offered > narrow_nodes) {
+                    ctx.wide_rounds += 1;
+                    for (kept) |r| ctx.wide_extra += @intFromBool(r > narrow_nodes);
+                }
             }
             ctx.grown = 0;
             // the target's features: its ring, `offset` the first row's position (cuda_native.zig's featuresFn)
@@ -571,6 +642,7 @@ pub const Draft = struct {
 
     fn releaseFn(p: *anyopaque, s: *Stream) void {
         const d = cast(p);
+        tree.narrowed = false;
         if (d.streams.fetchRemove(s)) |kv| {
             if (d.streams.count() == 0) d.landing = .{};
             if (kv.value.ring.borrowed) return d.gpa.destroy(kv.value); // its lane's run goes back with the lane
@@ -578,6 +650,19 @@ pub const Draft = struct {
         }
     }
 };
+
+/// The wide-tree guard (Draft.wideGuard): a stream's narrow budget, and the wide rounds it verifies before judging them.
+const narrow_nodes = 15;
+/// A stream narrows only when its extra rows fall clearly below the window's extra cost (the table prices empty context).
+const guard_margin = 1.0;
+const wide_probe = 12;
+fn guardOn() bool {
+    const v = platform.c.getenv("TF_WIDE_GUARD") orelse return false;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
+
+/// A context copy's least matched draft tokens (Draft.copyMin, TF_COPY_MIN): 10, only the long matches (the record: 3).
+const copy_min_default: usize = 10;
 
 /// Acceptance by depth until a stream has its own (the reference's chat text: measured, see the commit).
 const prior = [_]f64{ 0.75, 0.65, 0.58, 0.52, 0.47, 0.43, 0.4, 0.37, 0.35, 0.33, 0.31, 0.29, 0.28, 0.27, 0.26 };

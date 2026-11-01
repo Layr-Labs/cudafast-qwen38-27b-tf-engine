@@ -10,7 +10,7 @@ const edge_weight = 0.6;
 const scale = 1.5;
 /// A sampled stream's candidates carry the draw's own Gumbel noise at this weight (the 27B engine's draft_tree).
 const noise_weight = 0.7;
-const default_nodes = 15;
+const default_nodes = 31; // verify windows of up to 32 rows: the 17..32-row twins (qmm_stream32.cuh) price them near 16 rows
 const lp_top = 20;
 const lp_words = 3 + 2 * lp_top;
 
@@ -39,6 +39,26 @@ pub fn nodes() usize {
     if (platform.c.getenv("TF_NO_TREES") != null) return 0;
     const n = if (platform.c.getenv("TF_DRAFT_NODES")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch default_nodes else default_nodes;
     return @min(n, engine.most_window - 1);
+}
+
+/// Whether the stream being verified grows at most 15 nodes: its wide-tree guard narrowed it (the drafter sets this before
+/// each verify and clears it with the stream), or the budget is 15 nodes or fewer. Only then do the target's 2..16-row
+/// window variants run (carried and lean slot scans, gdn_pre's and gdn_post's row warps a block, attention row pairs);
+/// with the 31-node budget a verified window of 16 rows or fewer keeps the dispatch and the cost the 32-row twins were
+/// priced against. The variants compute the same bits, so this changes no output. TF_LEAN16_GATE=0: the variants at
+/// any budget.
+pub var narrowed: bool = false;
+
+pub fn lean16() bool {
+    return narrowed or nodes() <= 15 or !leanGate();
+}
+
+fn leanGate() bool {
+    const S = struct {
+        var on: ?bool = null;
+    };
+    if (S.on == null) S.on = if (platform.c.getenv("TF_LEAN16_GATE")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+    return S.on.?;
 }
 
 /// Offered tree nodes (parent row kept) and landed ones by own log-chance in half-nat bins, greedy then every round's.

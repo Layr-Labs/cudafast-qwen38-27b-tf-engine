@@ -70,6 +70,7 @@ pub const Fns = struct {
     rope: cuda.Function,
     attn_partial: cuda.Function,
     attn_pair: cuda.Function,
+    attn_pair_kv: cuda.Function,
     attn_rows: cuda.Function,
     attn_partial_paged: cuda.Function,
     attn_partial_contiguous: cuda.Function,

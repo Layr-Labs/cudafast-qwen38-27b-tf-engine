@@ -272,6 +272,8 @@ pub const symbols = struct {
     // the greedy verify head: the dictionary tile's per-tile row bests (AMAX), then their merge into tokens
     pub const head_amax = "_ZN12tf_qmm_group17group_kernel_dictILi64ELi16ELi64ELi1ELi4ELi8ELb0ELb0ELb1EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
     pub const head_merge = "tf_qmm_head_argmax_merge";
+    // the 32-row twin of decode()'s dictionary cluster tile (qmm_stream32.cuh): verify32's, for 17 to 32-row windows
+    pub const verify32_dict = "_ZN12tf_qmm_group17group_kernel_dictILi64ELi32ELi64ELi1ELi4ELi5ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
     pub const gemv_dict = "tf_lane_gemv_dict";
     pub const gemv_many_dict = "tf_lane_gemv_many_dict";
     pub const dict_mark = "tf_dict_mark";
@@ -321,6 +323,12 @@ pub const prefill_n64_smem: u32 = 56064; // Tile<64, 128, 64, 2, 4, 3>::SMEM
 pub const prefill22_smem: u32 = 41984; // Tile<64, 128, 128, 2, 2, 2>::SMEM
 /// A dictionary twin's shared memory past its stages: one group's decoded scales and biases, then the part's table.
 pub const dict_dec: u32 = 256; // qmm_dict.cuh DICT_DEC
+pub const gdn32_smem: u32 = 26880; // qmm_stream32.cuh G32<256>::SMEM (tf_qmm_gdn_twin32)
+pub const out32_smem: u32 = 35840;
+pub const lane32_smem: u32 = 32640; // qmm_stream32.cuh G32<64, 5>::SMEM (tf_qmm_lane32 / _dict)
+/// The 32-row twins' shared pair-table room (qmm_stream32.cuh ROOM: two CTAs an SM): larger tables are read in place.
+pub const gdn32_pair_tab_max: u32 = 22272;
+pub const lane32_pair_tab_max: u32 = 14592; // qmm_stream32.cuh OBytes (tf_qmm_output_stream32 / prefetch32 / _dict)
 pub const dict_tab_max: u32 = 10240; // tables past this stay uncoded: each twin keeps its original's CTAs an SM on GB10
 pub const dict_bits_max: u32 = 12;
 /// A code's layout bit: its indices lie group-major ([k / 64][npad / 64][16 * bits]) for tf_qmm_mlp_single16's K-major

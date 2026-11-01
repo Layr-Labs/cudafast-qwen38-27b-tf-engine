@@ -29,6 +29,12 @@ pub const single_dict_dec: u32 = 512;
 /// Gate's and up's tables at most for the twin to keep tf_qmm_mlp_single16's two CTAs an SM (GB10: 100 KiB an SM,
 /// 1 KiB of it reserved a CTA), so its 68 CTAs stay one wave; a layer past it keeps the original kernel.
 pub const single_tab_max: u32 = 102400 / 2 - 1024 - single_smem - single_dict_dec;
+/// tf_qmm_mlp_twin32 (qmm_stream32.cuh): tf_qmm_mlp_single16 on 17 to 32 rows, eight warps a CTA; its stages, the
+/// inputs of both m16 row tiles and eight warps' pass values, then (the dictionary twin) gate's and up's tables.
+pub const twin32_smem: u32 = 41216 + 1024;
+pub const twin32_tab_max: u32 = 102400 / 2 - 1024 - twin32_smem;
+/// tf_qmm_mlp_twin32_pair: its stages and inputs, then eight warps' four passes' values (no table in shared memory)
+pub const twin32_pair_smem: u32 = 45312 + 4096; // each stage holds its group's inputs (qmm_stream32.cuh MBytes2)
 
 pub const Kernels = struct {
     pair_fn: Function,
@@ -40,6 +46,12 @@ pub const Kernels = struct {
     dict_fn: ?Function = null, // GB10: tf_qmm_mlp_pair's twin, taken when gate and up are both coded (tile-major)
     compact_pair_fn: ?Function = null,
     single_dict_fn: ?Function = null, // tf_qmm_mlp_single16's, when both are coded on the K-major panel's layout
+    // tf_qmm_mlp_single16's 32-row twins (qmm_stream32.cuh), on the same K-major panels; TF_STREAM32=0: none loaded
+    twin32_fn: ?Function = null, // tf_qmm_mlp_twin32: verify windows of 17 to 32 rows on tf_qmm_mlp_single16's panel
+    twin32_dict_fn: ?Function = null, // its dictionary twin
+    twin32_pair_fn: ?Function = null, // ... on pair-coded gate and up (both)
+    twin32_mixed_fn: ?Function = null, // ... one pair-coded, one value-coded
+    twin32_half_fn: ?Function = null, // tf_qmm_mlp_half32_pair: both pair-coded, on 136 half CTAs (TF_MLP32_HALF=0: off)
 
     /// From the loaded qmm_group module; `pdl` as the decode tiles' launches (GB10).
     pub fn resolve(group_mod: module.Module, pdl: bool) !Kernels {
@@ -83,6 +95,8 @@ pub const Kernels = struct {
     /// act (rows, n) = bf16(silu(x through gate) * (x through up)), x's group sums in xs; act's group sums into as.
     pub fn pair(kk: *const Kernels, s: Stream, x: u64, xs: u64, gate: Affine4, up: Affine4, act: u64, as: u64, rows: usize) !void {
         if (!fits(gate, up) or rows == 0) return error.InputMismatch;
+        if (rows > 16 and rows <= 32 and gate.n == 17408 and gate.k == 5120 and gate.verify_w != 0 and up.verify_w != 0 and
+            kk.kmajor_single and kk.twin32_fn != null) return kk.pair32(s, x, xs, gate, up, act, as, rows);
         if (rows > 16 and rows <= 32 and gate.n == 17408 and gate.k == 5120 and gate.verify_w != 0 and up.verify_w != 0)
             if (kk.single32_fn) |fw| {
                 const sdict32 = kk.single32_dict_fn != null and coded(gate, up, true) and singleTab(gate) + singleTab(up) <= single_tab_max;
@@ -117,7 +131,7 @@ pub const Kernels = struct {
         const major = rows <= 16 and gate.n == 17408 and gate.k == 5120 and
             gate.verify_w != 0 and up.verify_w != 0 and kk.kmajor_fn != null;
         const single = major and kk.kmajor_single;
-        const compact = single and rows == 16 and kk.single_dict_fn != null and kk.compact_pair_fn != null and coded(gate, up, true) and
+        const compact = single and kk.single_dict_fn != null and kk.compact_pair_fn != null and coded(gate, up, true) and
             qlinear.pairCode(gate.code) and qlinear.pairCode(up.code);
         const tiles = gate.n / @as(usize, if (compact) 128 else if (single) 256 else if (major) 128 else 64);
         // the twins: tf_qmm_mlp_pair's (npad carries the code) and tf_qmm_mlp_single16's (first carries it; npad
@@ -152,4 +166,44 @@ pub const Kernels = struct {
         const shared: u32 = if (compact) compact_pair_smem else if (sdict) single_smem + single_dict_dec + singleTab(gate) + singleTab(up) else if (single) single_smem else if (major) kmajor_smem else if (dict) smem + qlinear.dict_dec + @max(gate.tabBytes(), up.tabBytes()) else smem;
         try launch_.launch(f, .{ .grid = .{ .x = @intCast(@as(usize, if (single) 1 else 2) * rows_t * tiles) }, .block = .{ .x = 128 }, .shared = shared, .cluster = if (single) null else .{ .x = 2 }, .pdl = kk.pdl }, s, &g);
     }
+
+    /// pair()'s tf_qmm_mlp_single16 launch on 17 to 32 rows: tf_qmm_mlp_twin32, both m16 row tiles off one panel stream.
+    fn pair32(kk: *const Kernels, s: Stream, x: u64, xs: u64, gate: Affine4, up: Affine4, act: u64, as: u64, rows: usize) !void {
+        const sdict = kk.twin32_dict_fn != null and coded(gate, up, true) and singleTab(gate) + singleTab(up) <= twin32_tab_max;
+        const tiles = gate.n / 256;
+        var parts: qlinear.Parts = std.mem.zeroes(qlinear.Parts);
+        for ([2]Affine4{ gate, up }, parts.p[0..2]) |q, *p| p.* = .{
+            .w = q.verify_w,
+            .scales = if (sdict) q.sb else q.s,
+            .biases = if (sdict) q.tab else q.b,
+            .out = 0,
+            .n = @intCast(q.n),
+            .npad = @intCast(q.npad),
+            .sk = 1,
+            .tiles = @intCast(tiles),
+            .first = if (sdict) @bitCast(q.code & ~qlinear.dict_kmajor) else 0,
+        };
+        parts.count = 2;
+        var g: launch_.Args = .{};
+        g.add(x);
+        g.add(xs);
+        g.add(parts);
+        g.add(act);
+        g.add(as);
+        for ([_]usize{ rows, gate.k, gate.k, 1 }) |v| g.add(@as(c_int, @intCast(v)));
+        const shared: u32 = if (sdict) twin32_smem + singleTab(gate) + singleTab(up) else twin32_smem;
+        const g_pair = gate.code >> 18 & 0x1FFF == 0;
+        const u_pair = up.code >> 18 & 0x1FFF == 0;
+        const twin = if (!sdict) kk.twin32_fn.? else if (g_pair and u_pair) kk.twin32_pair_fn.? else if (g_pair or u_pair) kk.twin32_mixed_fn.? else kk.twin32_dict_fn.?;
+        const shared32: u32 = if (sdict and g_pair and u_pair) twin32_pair_smem else shared;
+        if (sdict and g_pair and u_pair and kk.twin32_half_fn != null) {
+            try launch_.launch(kk.twin32_half_fn.?, .{ .grid = .{ .x = @intCast(2 * tiles) }, .block = .{ .x = 128 }, .shared = half32_pair_smem, .pdl = kk.pdl }, s, &g);
+            return;
+        }
+        try launch_.launch(twin, .{ .grid = .{ .x = @intCast(tiles) }, .block = .{ .x = 256 }, .shared = shared32, .pdl = kk.pdl }, s, &g);
+    }
 };
+
+/// tf_qmm_mlp_half32_pair (qmm_stream32.cuh): two stages (a group's four 64-column tiles of words, both pair index runs,
+/// the 32 row sums and both m16 row tiles' inputs), then four warps' two passes' values; three CTAs an SM
+pub const half32_pair_smem: u32 = 25856 + 1024;
