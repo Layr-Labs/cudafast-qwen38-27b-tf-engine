@@ -176,7 +176,8 @@ __device__ __forceinline__ unsigned key16(unsigned short b) { return (b & 0x8000
 // the K-th largest value's key, then every column above it and the ties at it while room lasts (at most cap), into PV
 // (values) and PI (columns) at cap a row; unused slots -inf with an id past every column.
 __device__ __forceinline__ void select(const __nv_bfloat16* __restrict__ L, int V, int ldo, int K, int cap,
-                                       float* __restrict__ PV, unsigned* __restrict__ PI) {
+                                       float* __restrict__ PV, unsigned* __restrict__ PI, unsigned* __restrict__ keys,
+                                       unsigned short* __restrict__ ranks, unsigned* __restrict__ count, int slots) {
     __shared__ unsigned hist[256];
     __shared__ unsigned s_bin, s_above, s_count;
     const int row = blockIdx.x, t = threadIdx.x, T = blockDim.x;
@@ -233,27 +234,25 @@ __device__ __forceinline__ void select(const __nv_bfloat16* __restrict__ L, int 
         pv[at] = __int_as_float(0xff800000);
         pi[at] = 0xFFFFFFFFu;
     }
+    for (int h = row * T + t; h < slots; h += gridDim.x * T) keys[h] = 0xFFFFFFFFu;
+    for (int h = t; h < slots; h += T) ranks[static_cast<size_t>(h) * gridDim.x + row] = 0xFFFFu;
+    if (row == 0 && t == 0) *count = 0;
 }
 
-// The rescore: row blockIdx.x's candidates (PI, n a row) below `first`, 32 a block (8 a warp, one n8 tile), each
-// value recomputed from the 4-bit head with group_kernel_dict's arithmetic: the row tile's A fragments (rows past M
-// zero), the candidate column's two words a lane for each group (the 32 bytes its tile's lanes hold), pairm's codes, the
-// four-step MMA chain from zero, then acc = fma(xs, b, fma(d, s, acc)) group by group, rounded to bf16. PV takes the
-// value the full head's stored logit would widen to.
+// One m16 tile serves every row that selected a union column; the original PI rank owns its output slot.
 __device__ __forceinline__ void rescore(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
                                                const uint32_t* __restrict__ w4, const __nv_bfloat162* __restrict__ sbcol,
                                                int KG, int M,
-                                               float* __restrict__ PV, const unsigned* __restrict__ PI, int n,
-                                               int first) {
-    const int r = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const int at = blockIdx.y * 32 + warp * 8;                      // this warp's first candidate of row r
-    if (at >= n) return;
-    const size_t base = static_cast<size_t>(r) * n + at;
-    // a lane's column (its B fragment's n = lane / 4) and the two columns its accumulators hold ((lane & 3) * 2, + 1)
+                                               float* __restrict__ PV, const unsigned* __restrict__ keys,
+                                               const unsigned short* __restrict__ ranks, const unsigned* __restrict__ columns,
+                                               const unsigned* __restrict__ count, int n, int first) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int at = blockIdx.x * 32 + warp * 8, size = *count;
+    if (at >= size) return;
     const int pb = lane >> 2, pc = (lane & 3) * 2;
     auto colOf = [&](int p) -> int {
-        if (at + p >= n) return -1;
-        const unsigned c = PI[base + p];
+        if (at + p >= size) return -1;
+        const unsigned c = keys[columns[at + p]];
         return c < static_cast<unsigned>(first) ? static_cast<int>(c) : -1;
     };
     const int cb = colOf(pb), cc0 = colOf(pc), cc1 = colOf(pc + 1);
@@ -293,7 +292,11 @@ __device__ __forceinline__ void rescore(const __nv_bfloat16* __restrict__ x, con
     for (int e = 0; e < 4; ++e) {
         const int row = g4 + (e >> 1) * 8, p = pc + (e & 1);
         const int c = (e & 1) ? cc1 : cc0;
-        if (row == r && c >= 0) PV[base + p] = __bfloat162float(__float2bfloat16_rn(acc[e]));
+        if (row < M && c >= 0) {
+            const unsigned rank = ranks[static_cast<size_t>(columns[at + p]) * M + row];
+            if (rank < static_cast<unsigned>(n))
+                PV[static_cast<size_t>(row) * n + rank] = __bfloat162float(__float2bfloat16_rn(acc[e]));
+        }
     }
 }
 
@@ -312,12 +315,43 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35d_head2_screen(const __n
 }
 
 extern "C" __global__ void __launch_bounds__(1024) tf_q35d_head2_select(const __nv_bfloat16* __restrict__ L, int V,
-        int ldo, int K, int cap, float* __restrict__ PV, unsigned* __restrict__ PI) {
-    tf_q35d_head2::select(L, V, ldo, K, cap, PV, PI);
+        int ldo, int K, int cap, float* __restrict__ PV, unsigned* __restrict__ PI, unsigned* __restrict__ keys,
+        unsigned short* __restrict__ ranks, unsigned* __restrict__ count, int slots) {
+    tf_q35d_head2::select(L, V, ldo, K, cap, PV, PI, keys, ranks, count, slots);
 }
+
+extern "C" __global__ void __launch_bounds__(256) tf_q35d_head2_union(const unsigned* __restrict__ PI,
+        int n, int M, int first, unsigned* __restrict__ keys, unsigned short* __restrict__ ranks, int slots) {
+    const int at = blockIdx.x * blockDim.x + threadIdx.x;
+    if (at >= M * n) return;
+    const unsigned col = PI[at];
+    if (col >= static_cast<unsigned>(first)) return;
+    unsigned h = (col * 2654435761u) & (slots - 1);
+    for (;;) {
+        const unsigned prior = atomicCAS(keys + h, 0xFFFFFFFFu, col);
+        if (prior == 0xFFFFFFFFu || prior == col) break;
+        h = (h + 1) & (slots - 1);
+    }
+    ranks[static_cast<size_t>(h) * M + at / n] = static_cast<unsigned short>(at % n);
+}
+
+extern "C" __global__ void __launch_bounds__(256) tf_q35d_head2_collect(const unsigned* __restrict__ keys,
+        unsigned* __restrict__ columns, unsigned* __restrict__ count, int slots) {
+    const int h = blockIdx.x * blockDim.x + threadIdx.x, lane = threadIdx.x & 31;
+    const bool live = h < slots && keys[h] != 0xFFFFFFFFu;
+    const unsigned mask = __ballot_sync(0xFFFFFFFFu, live);
+    if (mask == 0) return;
+    const int leader = __ffs(mask) - 1;
+    unsigned base = 0;
+    if (lane == leader) base = atomicAdd(count, __popc(mask));
+    base = __shfl_sync(0xFFFFFFFFu, base, leader);
+    if (live) columns[base + __popc(mask & ((1u << lane) - 1u))] = h;
+}
+
 
 extern "C" __global__ void __launch_bounds__(128) tf_q35d_head2_rescore(const __nv_bfloat16* __restrict__ x,
         const float* __restrict__ xs, const uint32_t* __restrict__ w4, const __nv_bfloat162* __restrict__ sbcol, int KG,
-        int M, float* __restrict__ PV, const unsigned* __restrict__ PI, int n, int first) {
-    tf_q35d_head2::rescore(x, xs, w4, sbcol, KG, M, PV, PI, n, first);
+        int M, float* __restrict__ PV, const unsigned* __restrict__ keys, const unsigned short* __restrict__ ranks,
+        const unsigned* __restrict__ columns, const unsigned* __restrict__ count, int n, int first) {
+    tf_q35d_head2::rescore(x, xs, w4, sbcol, KG, M, PV, keys, ranks, columns, count, n, first);
 }

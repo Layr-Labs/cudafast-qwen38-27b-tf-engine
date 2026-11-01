@@ -145,7 +145,7 @@ fn body(d: anytype, n: usize, narrow_: bool) !?u64 {
     }
     try d.norm(masked, d.w.final_norm, d.x, rows);
     const spanned = if (narrow_) try head(d, rows) else try full(d, rows);
-    if (spanned != null and d.head2 != null)
+    if (spanned != null and head2For(d, rows) != null)
         try topkScreened(d, spanned.?, rows)
     else
         try e.draws.topkRows(e.stream, spanned orelse d.logits, if (spanned != null) span_width else c.vocab, @intCast(c.topk), d.parts, d.words, rows);
@@ -230,6 +230,37 @@ fn narrow(contexts: []const *draft.Ctx) bool {
     return true;
 }
 
+fn head2For(d: anytype, rows: usize) ?cuda.DeviceBuffer {
+    return if (rows > 0 and rows <= 16) d.head2 else null;
+}
+
+const Head2Work = struct { keys: u64, ranks: u64, columns: u64, count: u64, slots: usize };
+
+fn head2Work(base: u64, rows: usize) Head2Work {
+    const slots = std.math.ceilPowerOfTwo(usize, 2 * rows * head2_cap) catch unreachable;
+    const ranks = base + slots * 4;
+    const columns = ranks + slots * rows * 2;
+    return .{ .keys = base, .ranks = ranks, .columns = columns, .count = columns + rows * head2_cap * 4, .slots = slots };
+}
+
+test "screened head union fits its owned scratch and rejects wider frames" {
+    var driver: cuda.Driver = undefined;
+    var d = .{ .head2 = @as(?cuda.DeviceBuffer, .{ .d = &driver, .ptr = 4096, .len = 64 }) };
+    for (1..17) |rows| {
+        try std.testing.expectEqual(d.head2.?.ptr, head2For(&d, rows).?.ptr);
+        const w = head2Work(4096, rows);
+        try std.testing.expect(w.slots >= 2 * rows * head2_cap and w.slots <= 32768);
+        try std.testing.expect(w.slots & (w.slots - 1) == 0);
+        try std.testing.expect(w.keys + w.slots * 4 <= w.ranks);
+        try std.testing.expect(w.ranks + w.slots * rows * 2 <= w.columns);
+        try std.testing.expect(w.columns + rows * head2_cap * 4 <= w.count);
+        try std.testing.expect(w.count + 4 <= 4096 + rows * head2_first * 2);
+    }
+    for ([_]usize{ 0, 17, 30, max_streams * 15 }) |rows| try std.testing.expectEqual(null, head2For(&d, rows));
+    d.head2 = null;
+    try std.testing.expectEqual(null, head2For(&d, 15));
+}
+
 /// The rows' draft logits over the spans' columns, packed in d.logits after the two projections (null: not this head).
 fn head(d: anytype, rows: usize) !?u64 {
     const e = d.e;
@@ -245,7 +276,7 @@ fn head(d: anytype, rows: usize) !?u64 {
     const b = a + rows * first.n * 2;
     const out = b + rows * tail.n * 2;
     const skip = spans[1][0] - tail_tile;
-    if (d.head2) |h2| {
+    if (head2For(d, rows)) |h2| {
         // the first span's columns screened straight into the packed rows; the tail exact, as below
         try screen(d, h2, rows, out);
         try e.project(layers.Proj{ .a4 = tail }, d.x, d.xs, b, rows, false, 0, false);
@@ -344,6 +375,7 @@ fn topkScreened(d: anytype, logits: u64, rows: usize) !void {
     const n: usize = head2_cap;
     const pv = d.parts;
     const pi = d.parts + rows * n * 4;
+    const work = head2Work(d.logits, rows);
     var a: cuda.Args = .{};
     a.add(logits);
     a.add(@as(c_int, @intCast(span_width)));
@@ -352,17 +384,30 @@ fn topkScreened(d: anytype, logits: u64, rows: usize) !void {
     a.add(@as(c_int, @intCast(n)));
     a.add(pv);
     a.add(pi);
+    for ([_]u64{ work.keys, work.ranks, work.count }) |v| a.add(v);
+    a.add(@as(c_int, @intCast(work.slots)));
     try cuda.launch.launch(d.fns.head2_select, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, e.stream, &a);
+    var u: cuda.Args = .{};
+    u.add(pi);
+    for ([_]usize{ n, rows, head2_first }) |v| u.add(@as(c_int, @intCast(v)));
+    u.add(work.keys);
+    u.add(work.ranks);
+    u.add(@as(c_int, @intCast(work.slots)));
+    try cuda.launch.launch(d.fns.head2_union, .{ .grid = .{ .x = @intCast((rows * n + 255) / 256) }, .block = .{ .x = 256 } }, e.stream, &u);
+    var collect: cuda.Args = .{};
+    for ([_]u64{ work.keys, work.columns, work.count }) |v| collect.add(v);
+    collect.add(@as(c_int, @intCast(work.slots)));
+    try cuda.launch.launch(d.fns.head2_collect, .{ .grid = .{ .x = @intCast((work.slots + 255) / 256) }, .block = .{ .x = 256 } }, e.stream, &collect);
     const sb = h2.ptr + head2_tiles * kg * 256 * 4 + head2_tiles * kg * 64 * 4;
     var r: cuda.Args = .{};
     for ([_]u64{ d.x, d.xs, q.w, sb }) |v| r.add(v);
     r.add(@as(c_int, @intCast(kg)));
     r.add(@as(c_int, @intCast(rows)));
     r.add(pv);
-    r.add(pi);
+    for ([_]u64{ work.keys, work.ranks, work.columns, work.count }) |v| r.add(v);
     r.add(@as(c_int, @intCast(n)));
     r.add(@as(c_int, @intCast(head2_first)));
-    try cuda.launch.launch(d.fns.head2_rescore, .{ .grid = .{ .x = @intCast(rows), .y = @intCast((n + 31) / 32) }, .block = .{ .x = 128 } }, e.stream, &r);
+    try cuda.launch.launch(d.fns.head2_rescore, .{ .grid = .{ .x = @intCast((rows * n + 31) / 32) }, .block = .{ .x = 128 } }, e.stream, &r);
     var m: cuda.Args = .{};
     m.add(pv);
     m.add(pi);
