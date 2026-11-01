@@ -644,12 +644,12 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35_attn_merge_gate(Geo geo,
 
 // tf_q35_head_norm of a (row, head) on threads 0-63, then tf_q35_rope's rotation of it: a query head's into Qn, a key
 // head's with its value into the cache slot. Grid (rows, query heads + key heads), HD threads.
-template <typename Store>
+template <typename Store, bool EARLY = false>
 __device__ __forceinline__ void norm_rope_rows(const Geo& geo, const __nv_bfloat16* __restrict__ QRAW, const __nv_bfloat16* __restrict__ KRAW,
                                                const __nv_bfloat16* __restrict__ WQ, const __nv_bfloat16* __restrict__ WK,
                                                __nv_bfloat16* __restrict__ Qn, const __nv_bfloat16* __restrict__ Vr, const Seg* __restrict__ segs,
                                                const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, const int* __restrict__ P,
-                                               const int* __restrict__ M, float eps, Store store) {
+                                               const int* __restrict__ M, float eps, Store store, uint2 wpre = make_uint2(0, 0)) {
     __shared__ float sums[2];
     __shared__ __align__(16) __nv_bfloat16 xs[HD];
     const int QH = geo.qh, KVH = geo.kvh;
@@ -676,7 +676,8 @@ __device__ __forceinline__ void norm_rope_rows(const Geo& geo, const __nv_bfloat
 #pragma unroll
         for (int i = 0; i < 4; i++) {
             const int d = 4 * t + i;
-            xs[d] = __float2bfloat16_rn(bf(W[d]) * (v[i] * inv));
+            const __nv_bfloat16 wd = EARLY ? reinterpret_cast<const __nv_bfloat16*>(&wpre)[i] : W[d];
+            xs[d] = __float2bfloat16_rn(bf(wd) * (v[i] * inv));
         }
     }
     __syncthreads();
@@ -695,8 +696,15 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm_rope(Geo geo, cons
                                                                      const Ancestor* __restrict__ rowanc, int layer, const int* __restrict__ P,
                                                                      const int* __restrict__ M, float eps) {
     release_next();
+    // arithmetic does not
+    uint2 wv = make_uint2(0, 0);
+    if (threadIdx.x < 64) {
+        const __nv_bfloat16* W = blockIdx.y < (unsigned)geo.qh ? WQ : WK;
+        wv = *reinterpret_cast<const uint2*>(plain(W) + 4 * threadIdx.x);
+        asm volatile("" ::"r"(wv.x), "r"(wv.y));
+    }
     await_prior();
-    norm_rope_rows(geo, after_wait(QRAW), after_wait(KRAW), WQ, WK, after_wait(Qn), after_wait(Vr), segs, rowseg, rowanc, P, M, eps, StoreBf16{layer, geo.kvh});
+    norm_rope_rows<StoreBf16, true>(geo, after_wait(QRAW), after_wait(KRAW), WQ, WK, after_wait(Qn), after_wait(Vr), segs, rowseg, rowanc, P, M, eps, StoreBf16{layer, geo.kvh}, wv);
 }
 
 #include "qwen35_rows.cuh"
