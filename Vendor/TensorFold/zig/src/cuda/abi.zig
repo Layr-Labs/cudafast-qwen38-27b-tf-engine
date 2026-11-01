@@ -178,6 +178,20 @@ const CPtr = ?*const anyopaque;
 const Params = ?[*]?*anyopaque;
 
 /// Each field is the exact exported symbol, so the ABI is the one that symbol version documents.
+/// CUmemLocation, CUmemAllocationProp (32 bytes) and CUmemAccessDesc, as cuda.h lays them out.
+pub const MemLocation = extern struct { type: c_int, id: c_int };
+pub const MemAllocationProp = extern struct {
+    type: c_int, // CU_MEM_ALLOCATION_TYPE_PINNED = 1
+    requested_handle_types: c_int = 0,
+    location: MemLocation, // CU_MEM_LOCATION_TYPE_DEVICE = 1, the device ordinal
+    win32_handle_meta_data: ?*anyopaque = null,
+    compression_type: u8 = 0,
+    gpu_direct_rdma_capable: u8 = 0,
+    usage: u16 = 0,
+    reserved: [4]u8 = @splat(0),
+};
+pub const MemAccessDesc = extern struct { location: MemLocation, flags: c_int }; // CU_MEM_ACCESS_FLAGS_PROT_READWRITE = 3
+
 pub const Api = struct {
     cuInit: *const fn (c_uint) callconv(.c) R,
     cuDriverGetVersion: *const fn (*c_int) callconv(.c) R,
@@ -196,6 +210,15 @@ pub const Api = struct {
     cuCtxSetLimit: *const fn (c_int, usize) callconv(.c) R,
     cuCtxResetPersistingL2Cache: *const fn () callconv(.c) R,
     cuMemGetInfo_v2: *const fn (*usize, *usize) callconv(.c) R,
+    // virtual memory management (cuda_fastpool.zig's chunked placement)
+    cuMemGetAllocationGranularity: *const fn (*usize, *const MemAllocationProp, c_int) callconv(.c) R,
+    cuMemCreate: *const fn (*u64, usize, *const MemAllocationProp, c_ulonglong) callconv(.c) R,
+    cuMemRelease: *const fn (u64) callconv(.c) R,
+    cuMemAddressReserve: *const fn (*DevicePtr, usize, usize, DevicePtr, c_ulonglong) callconv(.c) R,
+    cuMemAddressFree: *const fn (DevicePtr, usize) callconv(.c) R,
+    cuMemMap: *const fn (DevicePtr, usize, usize, u64, c_ulonglong) callconv(.c) R,
+    cuMemUnmap: *const fn (DevicePtr, usize) callconv(.c) R,
+    cuMemSetAccess: *const fn (DevicePtr, usize, *const MemAccessDesc, usize) callconv(.c) R,
     cuMemAlloc_v2: *const fn (*DevicePtr, usize) callconv(.c) R,
     cuMemFree_v2: *const fn (DevicePtr) callconv(.c) R,
     cuMemHostAlloc: *const fn (*Ptr, usize, c_uint) callconv(.c) R,
