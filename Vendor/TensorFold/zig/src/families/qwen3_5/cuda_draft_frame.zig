@@ -210,9 +210,12 @@ pub fn scan(ctx: *draft.Ctx, toks: []const u32) void {
     ctx.wide = ctx.outside * wide_share > ctx.scanned;
 }
 
-/// Whether every stream's tokens so far keep to the spans (a warmup's or standalone hold's context reads none).
+/// Every frame reads the head's span rows: the draft vocabulary is exactly those rows, so the whole-vocabulary
+/// fallback projected 149,728 head rows per frame that no draft in `d.parts` can name. A stream whose tokens leave
+/// the span (draft.scan's count) keeps the span head too: its own out-of-span tokens still index the span columns
+/// it proposes from, and the verify leg accepts or rejects the same tokens either way.
 fn narrow(contexts: []const *draft.Ctx) bool {
-    for (contexts) |ctx| if (ctx.wide) return false;
+    _ = contexts;
     return true;
 }
 
