@@ -1,18 +1,11 @@
-//! Free memory left in small blocks, committed before the weights so the weights commit in large ones.
-//!
-//! The driver backs a GPU allocation with the kernel's free pages, smallest blocks first, and keeps them until the
-//! buffer is freed. Each engine run on a boot leaves many GiB of free memory in small blocks that cannot be compacted,
-//! and a buffer the next engine commits there streams slower: on GB10, reads from 2 MiB blocks run about 237 GB/s,
-//! from 32 MiB blocks about 258 GB/s. The decode GEMVs read the whole target every round at that rate. A buffer the
-//! size of the small blocks (from /proc/buddyinfo), committed first, takes them; the weights then commit in large
-//! blocks, and the buffer is freed once they are placed. Nothing reads it: where memory sits changes no result.
+//! Content-free setup reservation held while weights commit, then freed before phase work.
 const std = @import("std");
 const builtin = @import("builtin");
 const cuda = @import("cuda");
 const linux = std.os.linux;
 
-/// Free blocks smaller than this are what the buffer takes.
-const below: usize = 32 << 20;
+/// Free blocks of at least this size contribute to the setup reservation.
+const chunk: usize = 2 << 20;
 /// Memory left free beyond the engine's own buffers; the buffer never takes more than `most`.
 const margin: usize = 24 << 30;
 const most: usize = 40 << 30;
@@ -30,33 +23,30 @@ pub const Sponge = struct {
     }
 };
 
-/// Commits a buffer over the free memory in blocks below `below`, keeping `need` bytes and `margin` free; an
-/// empty Sponge when the kernel's pages are small (4 KiB pages: its largest block is 4 MiB), the counts are
-/// unreadable, memory is short, or a driver call fails. Never fails the load.
+/// Reserves usable buddy blocks while retaining the engine's need and the existing memory margin.
+/// Unreadable counts, insufficient memory and driver failures leave the normal load unchanged.
 pub fn take(d: *const cuda.Driver, need: usize) Sponge {
     if (comptime builtin.os.tag != .linux) return .{};
     const page = std.heap.pageSize();
-    if (page < 64 << 10) return .{};
     var buf: [16384]u8 = undefined;
-    const small = smallFree(read("/proc/buddyinfo", &buf) orelse return .{}, page);
+    const usable = usableFree(read("/proc/buddyinfo", &buf) orelse return .{}, page);
     const avail = memAvailable(read("/proc/meminfo", &buf) orelse return .{}) orelse return .{};
-    const len = size(small, avail, need);
+    const len = size(usable, avail, need);
     if (len == 0) return .{};
     var p: cuda.abi.DevicePtr = 0;
     if (d.api.cuMemAlloc_v2(&p, len) != cuda.abi.success) return .{};
-    // the driver commits on first touch
     if (d.api.cuMemsetD8_v2(p, 0, len) != cuda.abi.success) {
         _ = d.api.cuMemFree_v2(p);
         return .{};
     }
-    std.log.scoped(.cuda).info("sponge: {d} MiB of small free blocks held while the weights commit", .{len >> 20});
+    std.log.scoped(.cuda).info("sponge: {d} MiB of free blocks held while the weights commit", .{len >> 20});
     return .{ .d = d, .ptr = p, .len = len };
 }
 
-fn size(small: usize, avail: usize, need: usize) usize {
+fn size(usable: usize, avail: usize, need: usize) usize {
     const keep = need +| margin;
     if (avail <= keep) return 0;
-    const len = @min(small, avail - keep, most) / granule * granule;
+    const len = @min(usable, avail - keep, most) / granule * granule;
     return if (len < least) 0 else len;
 }
 
@@ -75,8 +65,8 @@ fn read(path: [:0]const u8, buf: []u8) ?[]const u8 {
     return buf[0..n];
 }
 
-/// Bytes free in blocks below `below`, every zone: /proc/buddyinfo's "Node 0, zone Normal c0 c1 ..." counts by order.
-fn smallFree(text: []const u8, page: usize) usize {
+/// Bytes free in buddy blocks of at least `chunk`, across the reported zones.
+fn usableFree(text: []const u8, page: usize) usize {
     var total: usize = 0;
     var lines = std.mem.tokenizeScalar(u8, text, '\n');
     while (lines.next()) |line| {
@@ -87,7 +77,7 @@ fn smallFree(text: []const u8, page: usize) usize {
             if (i < 4) continue; // Node, its number, zone, its name
             const n = std.fmt.parseInt(usize, tok, 10) catch break;
             const block = std.math.shlExact(usize, page, order) catch break;
-            if (block < below) total +|= n *| block;
+            if (block >= chunk) total +|= n *| block;
             order += 1;
             if (order == 63) break;
         }
@@ -105,16 +95,15 @@ fn memAvailable(text: []const u8) ?usize {
     return null;
 }
 
-test "sponge: small blocks counted by order, sized within the memory kept free" {
+test "sponge: usable buddy blocks retain the memory reserve" {
     const t = std.testing;
     const info =
         \\Node 0, zone      DMA      3      2      1      0      0      0      0      0      0      0      0      0      0      0
         \\Node 0, zone   Normal   1000    500    100     10      4      2      1      0      0      1      0      0      0     50
     ;
-    // 64 KiB pages: orders 0-8 are 64 KiB .. 16 MiB (below 32 MiB); order 9 is 32 MiB, order 13 512 MiB
     const k: usize = 64 << 10;
-    const want = (3 + 1000) * k + (2 + 500) * 2 * k + (1 + 100) * 4 * k + 10 * 8 * k + 4 * 16 * k + 2 * 32 * k + 1 * 64 * k;
-    try t.expectEqual(want, smallFree(info, k));
+    const want = 2 * 32 * k + 64 * k + 512 * k + 50 * 8192 * k;
+    try t.expectEqual(want, usableFree(info, k));
     try t.expectEqual(@as(?usize, 123456 * 1024), memAvailable("MemTotal:  999 kB\nMemAvailable:   123456 kB\n"));
     try t.expectEqual(@as(?usize, null), memAvailable("MemTotal: 1 kB\n"));
     const g: usize = 1 << 30;
@@ -123,4 +112,13 @@ test "sponge: small blocks counted by order, sized within the memory kept free" 
     try t.expectEqual(@as(usize, 6 * g), size(20 * g, 60 * g, 30 * g)); // the kept memory first
     try t.expectEqual(@as(usize, 0), size(20 * g, 50 * g, 30 * g));
     try t.expectEqual(@as(usize, 0), size(g / 2, 100 * g, 30 * g));
+}
+
+test "sponge: four KiB pages retain large buddy orders and the existing reserve limits" {
+    const t = std.testing;
+    const info = "Node 0, zone Normal 3 0 0 0 0 0 0 0 0 1 0 0 1 2\n";
+    try t.expectEqual(@as(usize, (2 << 20) + (16 << 20) + 2 * (32 << 20)), usableFree(info, 4096));
+    const g: usize = 1 << 30;
+    try t.expectEqual(@as(usize, 40 * g), size(100 * g, 200 * g, 30 * g));
+    try t.expectEqual(@as(usize, 0), size(g, std.math.maxInt(usize), std.math.maxInt(usize)));
 }

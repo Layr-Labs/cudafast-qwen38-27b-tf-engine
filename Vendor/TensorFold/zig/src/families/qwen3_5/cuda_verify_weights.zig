@@ -23,6 +23,7 @@ pub fn prepare(e: anytype, single: bool) !?cuda.DeviceBuffer {
     var buffer = try cuda.DeviceBuffer.alloc(e.d, bytes);
     errdefer buffer.free();
     errdefer cuda.completion.drain(e.d, e.stream, "verify weight packing failed before draining");
+    try buffer.fill8(0, e.stream.handle);
     var at: usize = 0;
     for (e.layers) |*layer| switch (layer.mlp) {
         .dense => |*mlp| for ([_]@TypeOf(&mlp.gate){ &mlp.gate, &mlp.up }) |p| switch (p.*) {

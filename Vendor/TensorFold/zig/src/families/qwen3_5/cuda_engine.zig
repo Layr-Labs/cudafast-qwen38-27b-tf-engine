@@ -253,7 +253,6 @@ pub const Engine = struct {
         // an EXL3 checkpoint's weights are sized by a dry run of its loader (trellis widths come from the tensors)
         const wbytes = if (g.exl3) try x3w.measure(e, &ck) else weights.total(g);
         const arena_bytes = wbytes + try e.scratch(.measure);
-        // the small free blocks earlier engines left, held while the weights commit in large ones (cuda_sponge.zig)
         var sponge = @import("cuda_sponge.zig").take(d, arena_bytes);
         defer sponge.free();
         e.arena = try DeviceBuffer.alloc(d, arena_bytes);
