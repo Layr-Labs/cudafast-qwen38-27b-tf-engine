@@ -77,6 +77,7 @@ pub fn stageBytes(s: Shape) usize {
 /// Device bytes of everything `load` packs.
 pub fn total(s: Shape) usize {
     var t = packedBytes(s.hidden, s.taps * s.hidden) + packedBytes(s.rank, s.hidden) + 2 * aligned(s.hidden * 2);
+    t += aligned(Affine4.layout(s.hidden, s.taps * s.hidden).words); // the fc projection's stream view (fcStream)
     t += s.layers * (2 * aligned(s.hidden * 2) + packedBytes(s.q_width, s.hidden) + 2 * packedBytes(s.kv_width, s.hidden) + packedBytes(s.hidden, s.q_width) +
         2 * aligned(s.head_dim * 2) + 2 * packedBytes(s.intermediate, s.hidden) + packedBytes(s.hidden, s.intermediate) + 2 * packedBytes(s.dynamic, s.hidden) + 2 * aligned(4 * s.hidden * 2) +
         2 * aligned(Affine4.layout(s.intermediate, s.hidden).words) + aligned(Affine4.layout(s.hidden, s.intermediate).words) +
@@ -104,6 +105,7 @@ fn quantize(gpa: std.mem.Allocator, w: []align(1) const u16, n: usize, k: usize)
     errdefer gpa.free(scales);
     const biases = try gpa.alloc(u16, n * groups);
     errdefer gpa.free(biases);
+    const refit = refitOn();
     for (0..n) |r| {
         for (0..groups) |g| {
             const row = w[r * k + g * 64 ..][0..64];
@@ -115,7 +117,7 @@ fn quantize(gpa: std.mem.Allocator, w: []align(1) const u16, n: usize, k: usize)
                 hi = @max(hi, x);
             }
             var fit = [2]f32{ (hi - lo) / 15.0, lo };
-            fit = leastSquares(row, fit);
+            if (refit) fit = leastSquares(row, fit);
             const scale = toBf16(fit[0]);
             const bias = toBf16(fit[1]);
             scales[r * groups + g] = scale;
@@ -134,6 +136,18 @@ fn quantize(gpa: std.mem.Allocator, w: []align(1) const u16, n: usize, k: usize)
         }
     }
     return .{ .words = words, .scales = scales, .biases = biases };
+}
+
+/// The least-squares refit of each group's scale and bias below (on by default). TF_REFIT=0 keeps every group's min/max
+/// scale and bias (the drafter's quantization before the refit); TF_REFIT=1 forces it on. Read once a quantize call.
+const refit_default = true;
+
+fn refitOn() bool {
+    const v = @import("sys").c.getenv("TF_REFIT") orelse return refit_default;
+    const s = std.mem.span(v);
+    if (std.mem.eql(u8, s, "0")) return false;
+    if (std.mem.eql(u8, s, "1")) return true;
+    return refit_default;
 }
 
 /// A group's (scale, bias) improved by alternating code assignment and a least-squares line fit; kept only where the
@@ -212,6 +226,14 @@ fn oStream() bool {
     return !std.mem.eql(u8, std.mem.span(v), "0");
 }
 
+/// TF_DRAFT_FC_STREAM=0: fc (n = hidden, k = the five taps' 25600) keeps the cluster tile; otherwise it gets a K-major
+/// view and its windows (the rows a round accepts) run tf_qmm_output_stream16 as the down projection's do (the same
+/// four K slices, summed in order).
+fn fcStream() bool {
+    const v = @import("sys").c.getenv("TF_DRAFT_FC_STREAM") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
+
 /// A bf16 (n, k) tensor quantized and packed through `stage` into the drafter's arena.
 fn linear(gpa: std.mem.Allocator, e: *Engine, stage: *DeviceBuffer, w: *Weights, ck: *core.Checkpoint, name: []const u8, n: usize, k: usize) !Affine4 {
     const t = try ck.expect(name, .bf16, &.{ n, k });
@@ -238,7 +260,7 @@ fn linear(gpa: std.mem.Allocator, e: *Engine, stage: *DeviceBuffer, w: *Weights,
         const pack = try e.mods[3].function("tf_pack_kmajor");
         const words = l.npad * k / 8;
         try e.run(pack, .{ (words + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ out.w, out.verify_w, @as(c_int, @intCast(k / 64)), @as(c_int, @intCast(l.npad / 64)) });
-    } else if (e.affine.stream16_fns[0] != null and n == 5120 and (k == 17408 or (k == 4096 and oStream()))) {
+    } else if (e.affine.stream16_fns[0] != null and n == 5120 and (k == 17408 or (k == 4096 and oStream()) or (k == 25600 and fcStream()))) {
         out.stream_w = try w.alloc(l.words);
         const pack = try e.mods[3].function("tf_pack_kmajor");
         const words = l.npad * k / 8;

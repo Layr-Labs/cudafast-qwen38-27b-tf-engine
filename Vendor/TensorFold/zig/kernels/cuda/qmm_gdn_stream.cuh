@@ -1,6 +1,7 @@
 // Native grouped-input MMA and slice order, with one wider word-only K-major stream per CTA.
 #pragma once
 #include "qmm_dict.cuh"
+#include "qwen35.cuh"
 namespace tf_qmm_gdn_stream {
 using namespace tf_qmm_group;
 template<int GS,int BN,int STAGES>using GemvTile=qmm_frag::LaneTile<GS,16,BN,1,4,STAGES>;
@@ -19,6 +20,14 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
     constexpr int NT = T::NT;
     extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, wn = tid >> 5;
+#if __CUDA_ARCH__ >= 1200
+    __shared__ __align__(8) uint64_t weight_barriers[STAGES];
+    if (tid == 0)
+#pragma unroll
+        for (int s = 0; s < STAGES; ++s)
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" :: "r"(smem(&weight_barriers[s])) : "memory");
+    __syncthreads();
+#endif
     const int KG = K / GS;
     auto stage = [&](int s) { return buf + s * T::STAGE; };
     const int rows = min(16, M);
@@ -67,9 +76,21 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
         unsigned char* p = stage(s);
         const unsigned char* wb = reinterpret_cast<const unsigned char*>(P.w) +
                                   static_cast<size_t>(n0 / 64) * TILE_BYTES + (n0 % 64) * GS / 2;
+#if __CUDA_ARCH__ >= 1200
+        if (tid == 0) {
+            const uint32_t barrier = smem(&weight_barriers[s]);
+            const auto* src = wb + static_cast<size_t>(g) * (npad / 64) * TILE_BYTES;
+            asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;\n"
+                         :: "r"(barrier), "n"(T::W) : "memory");
+            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+            asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
+                         :: "r"(smem(p + T::X)), "l"(src), "n"(T::W), "r"(barrier) : "memory");
+        }
+#else
 #pragma unroll
         for (int j = 0; j < WC; ++j)
             if (wok[j]) cp16(p + wdst[j], wb + woff[j] + static_cast<size_t>(g) * (npad/64) * TILE_BYTES);
+#endif
         if constexpr (DICT) {
             // the CTA's tiles' index windows: tile n0 / 64 + c / 16, chunk c % 16, from each group's 64-byte line
             const int step = qmm_dict::dict_step(P.npad);
@@ -131,6 +152,17 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
     grid_launch();
     for (int it = 0; it < items; ++it) {
         wait<STAGES - 2>();
+#if __CUDA_ARCH__ >= 1200
+        if (tid == 0) {
+            const uint32_t barrier = smem(&weight_barriers[it % STAGES]);
+            const uint32_t phase = (it / STAGES) & 1;
+            asm volatile("{ .reg .pred ready;\n"
+                         "wait_weight:\n"
+                         "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 ready, [%0], %1;\n"
+                         "@!ready bra wait_weight;\n"
+                         "}\n" :: "r"(barrier), "r"(phase) : "memory");
+        }
+#endif
         __syncthreads();
         const int next = it + STAGES - 1;
         if (next < items) {
@@ -238,6 +270,13 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
         }
         after(it);
     }
+#if __CUDA_ARCH__ >= 1200
+    __syncthreads();
+    if (tid == 0)
+#pragma unroll
+        for (int s = 0; s < STAGES; ++s)
+            asm volatile("mbarrier.inval.shared::cta.b64 [%0];\n" :: "r"(smem(&weight_barriers[s])) : "memory");
+#endif
 }
 
 
@@ -295,6 +334,174 @@ __device__ __forceinline__ void body_dict(const __nv_bfloat16* x,const float* xs
     if(which<2){if(coded)tile<256,0,true>(x,xs,p,t,M,K,ldx);else tile<256,0>(x,xs,p,t,M,K,ldx);}
     else{if(coded)tile<64,0,true>(x,xs,p,t,M,K,ldx);else tile<64,0>(x,xs,p,t,M,K,ldx);}
 }
+
+// tf_q35_gdn_pre's arguments for the twin that runs it (cuda_forward.zig preFused): the rows' segments, the rows' stream and
+// parent, the layer, its convolution weights, decay and step parameters, the outputs and the forward's counts. Laid out as
+// cuda/affine4_kernels.zig's GdnPre.
+struct PreArgs {
+    tf_q35::Geo geo;
+    const tf_q35::Seg* segs;
+    const int* rowseg;
+    const int* rowpar;
+    const __nv_bfloat16* cw;
+    const float* alog;
+    const __nv_bfloat16* dt;
+    __nv_bfloat16* q;
+    __nv_bfloat16* k;
+    __nv_bfloat16* v;
+    float* g;
+    __nv_bfloat16* beta;
+    const int* params;
+    int layer;
+    int pad;
+};
+
+// tf_q35_gdn_pre's work for one q, k or v head of DK channels (a warp, four channels a lane), split in two so a warp
+// issues every row's loads before any row's arithmetic: pre_weights (the head's convolution weights), pre_taps (row w's
+// four tap rows: this launch's qkv rows through rowpar, or the stream's tail through Seg.conv; the rows gdn_pre reads),
+// pre_out (the logged tail of a recorded window, then gdn_pre's convolution, SiLU, norm and roundings in its order and its
+// stores). A value head's decay and strength are written by the a and b parts (pre_decay, pre_beta).
+__device__ __forceinline__ void pre_weights(const PreArgs& A, int head, int lane, uint2 (&ww)[tf_q35::TAPS]) {
+    using namespace tf_q35;
+    constexpr int PER = DK / 32;
+    static_assert(PER == 4 && TAPS == 4, "a tap's channels and a channel's taps are one uint2");
+    const int cl = head * DK + lane * PER;
+#pragma unroll
+    for (int tap = 0; tap < TAPS; tap++) ww[tap] = *reinterpret_cast<const uint2*>(A.cw + (size_t)cl * TAPS + tap * PER);
+}
+
+__device__ __forceinline__ void pre_taps(const PreArgs& A, const __nv_bfloat16* __restrict__ QKV, int w, int head, int lane,
+                                         uint2 (&xw)[tf_q35::TAPS]) {
+    using namespace tf_q35;
+    const Geo geo = A.geo;
+    const int C = geo.conv();
+    const Seg sg = A.segs[A.rowseg[w]];
+    const __nv_bfloat16* CS = reinterpret_cast<const __nv_bfloat16*>(sg.conv) + (size_t)A.layer * geo.conv_rows();
+    const int cl = head * DK + lane * (DK / 32);
+#pragma unroll
+    for (int tap = 0; tap < TAPS; tap++) {
+        const int at = back(A.rowpar, w, TAPS - 1 - tap);
+        xw[tap] = at >= 0 ? *reinterpret_cast<const uint2*>(QKV + (size_t)at * C + cl)
+                          : *reinterpret_cast<const uint2*>(CS + (size_t)(-1 - at) * C + cl);
+    }
+}
+
+__device__ __forceinline__ void pre_out(const PreArgs& A, int w, int head, int lane, const uint2 (&ww)[tf_q35::TAPS],
+                                        const uint2 (&xw)[tf_q35::TAPS]) {
+    using namespace tf_q35;
+    const Geo geo = A.geo;
+    const int NK = geo.nk, NV = geo.nv, C = geo.conv();
+    const bool isq = head < NK, isk = !isq && head < 2 * NK;
+    constexpr int PER = DK / 32;
+    const int cl = head * DK + lane * PER;
+    if (A.params != nullptr && A.params[4] != 0) {  // qwen35.cu's recorded(P): the row's tail after it, logged
+        const Seg sg = A.segs[A.rowseg[w]];
+        __nv_bfloat16* tail = log_row(geo, sg, A.layer, w - sg.row0).conv;
+#pragma unroll
+        for (int tap = 1; tap < TAPS; tap++) *reinterpret_cast<uint2*>(tail + (size_t)(tap - 1) * C + cl) = xw[tap];
+    }
+    const __nv_bfloat16* cw = reinterpret_cast<const __nv_bfloat16*>(ww);
+    float vals[PER];
+#pragma unroll
+    for (int j = 0; j < PER; j++) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int tap = 0; tap < TAPS; tap++) acc += bf(cw[j * TAPS + tap]) * bf(reinterpret_cast<const __nv_bfloat16*>(&xw[tap])[j]);
+        const float conv = rbf(acc);
+        const float sig = rbf(1.0f / (1.0f + expf(-conv)));
+        vals[j] = rbf(conv * sig);
+    }
+    if (isq || isk) {
+        float ss = 0.0f;
+#pragma unroll
+        for (int j = 0; j < PER; j++) ss += vals[j] * vals[j];
+        ss = warp_sum(ss);
+        const float inv = rsqrtf(ss / (float)DK + (1e-6f / (float)DK));
+        const float scale = isq ? rbf(1.0f / (float)DK) : rbf(rsqrtf((float)DK));
+        __nv_bfloat16* out = isq ? A.q + ((size_t)w * NK + head) * DK : A.k + ((size_t)w * NK + head - NK) * DK;
+        uint2 ow;
+        __nv_bfloat16* op = reinterpret_cast<__nv_bfloat16*>(&ow);
+#pragma unroll
+        for (int j = 0; j < PER; j++) op[j] = __float2bfloat16_rn(scale * rbf(vals[j] * inv));
+        *reinterpret_cast<uint2*>(out + lane * PER) = ow;
+    } else {
+        const int hv = head - 2 * NK;
+        uint2 vw;
+        __nv_bfloat16* vp = reinterpret_cast<__nv_bfloat16*>(&vw);
+#pragma unroll
+        for (int j = 0; j < PER; j++) vp[j] = __float2bfloat16_rn(vals[j]);
+        *reinterpret_cast<uint2*>(A.v + ((size_t)w * NV + hv) * DK + lane * PER) = vw;
+    }
+}
+
+// tf_q35_gdn_pre's decay of each row's value heads from the a projection this launch just stored (its lane 0's arithmetic).
+__device__ __forceinline__ void pre_decay(const PreArgs& A, const __nv_bfloat16* __restrict__ Ain, int M) {
+    using namespace tf_q35;
+    const int NV = A.geo.nv;
+    for (int i = threadIdx.x; i < M * NV; i += blockDim.x) {
+        const int w = i / NV, hv = i % NV;
+        if (past_rows(A.params, w)) continue;
+        const float s = rbf(bf(Ain[w * NV + hv]) + bf(A.dt[hv]));
+        const float sp = rbf(fmaxf(s, 0.0f) + logf(1.0f + expf(-fabsf(s))));
+        A.g[w * NV + hv] = expf(-expf(A.alog[hv]) * sp);
+    }
+}
+
+// tf_q35_gdn_pre's strength of each row's value heads from the b projection this launch just stored.
+__device__ __forceinline__ void pre_beta(const PreArgs& A, const __nv_bfloat16* __restrict__ Bin, int M) {
+    using namespace tf_q35;
+    const int NV = A.geo.nv;
+    for (int i = threadIdx.x; i < M * NV; i += blockDim.x) {
+        const int w = i / NV, hv = i % NV;
+        if (past_rows(A.params, w)) continue;
+        A.beta[w * NV + hv] = __float2bfloat16_rn(1.0f / (1.0f + expf(-bf(Bin[w * NV + hv]))));
+    }
+}
+
+// tile() and then, on the qkv rows it stored (KIND 1), the a rows (2) or the b rows (3), gdn_pre's work for the window.
+// The tile's stores are made visible to the CTA by the barrier; gdn_pre's other inputs were final before the launch.
+template<int BN,bool DICT,int KIND>
+__device__ __forceinline__ void tile_pre(const __nv_bfloat16* x,const float* xs,const tf_qmm_group::Part p,int t,int M,int K,int ldx,const PreArgs& A){
+#if __CUDA_ARCH__ >= 900
+    // the tail's static inputs hinted into L2 while the tile streams: its two heads' convolution weights (2 KB) and the
+    // first row's stream tail rows of those channels (a hint only: every value is read where gdn_pre reads it)
+    if constexpr(KIND==1)if(threadIdx.x==0){
+        const auto* cw=A.cw+size_t(2*t*tf_q35::DK)*tf_q35::TAPS;
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], 2048;" :: "l"(cw) : "memory");
+        const tf_q35::Seg sg=A.segs[A.rowseg[0]];
+        const auto* cs=reinterpret_cast<const __nv_bfloat16*>(sg.conv)+size_t(A.layer)*A.geo.conv_rows()+size_t(2*t*tf_q35::DK);
+#pragma unroll
+        for(int r=0;r<tf_q35::TAPS-1;++r)asm volatile("cp.async.bulk.prefetch.L2.global [%0], 512;" :: "l"(cs+size_t(r)*A.geo.conv()) : "memory");
+    }
+#endif
+    tile<BN,0,DICT>(x,xs,p,t,M,K,ldx);
+    __syncthreads();
+    const auto* out=reinterpret_cast<const __nv_bfloat16*>(p.out);
+    if constexpr(KIND==1){
+        // the tile's 256 channels are two whole heads (q, k and v heads are DK wide and start on multiples of 256): warp
+        // w takes head 2 t + w % 2 and rows w / 2, w / 2 + 2, ...; every row's loads go out before any row's arithmetic
+        const int lane=threadIdx.x&31,warp=threadIdx.x>>5,rows=min(M,16),head=2*t+(warp&1);
+        uint2 ww[tf_q35::TAPS],xw[8][tf_q35::TAPS];
+        pre_weights(A,head,lane,ww);
+#pragma unroll
+        for(int i=0;i<8;++i){const int w=(warp>>1)+2*i;if(w<rows&&!tf_q35::past_rows(A.params,w))pre_taps(A,out,w,head,lane,xw[i]);}
+#pragma unroll
+        for(int i=0;i<8;++i){const int w=(warp>>1)+2*i;if(w<rows&&!tf_q35::past_rows(A.params,w))pre_out(A,w,head,lane,ww,xw[i]);}
+    }else if constexpr(KIND==2)pre_decay(A,out,min(M,16));
+    else pre_beta(A,out,min(M,16));
+}
+
+// body_dict() with gdn_pre's work in the parts' tails: qkv (part 0) its heads, a (part 2) the decays, b (part 3) the strengths.
+__device__ __forceinline__ void body_dict_pre(const __nv_bfloat16* x,const float* xs,const tf_qmm_group::Parts& parts,int M,int K,int ldx,const PreArgs& A){
+    int which=0;
+#pragma unroll
+    for(int i=1;i<4;++i)if(int(blockIdx.x)>=parts.p[i].first)which=i;
+    const auto p=parts.p[which];int t=int(blockIdx.x)-p.first;const bool coded=p.tiles>0;
+    if(which==0){if(coded)tile_pre<256,true,1>(x,xs,p,t,M,K,ldx,A);else tile_pre<256,false,1>(x,xs,p,t,M,K,ldx,A);}
+    else if(which==1){if(coded)tile<256,0,true>(x,xs,p,t,M,K,ldx);else tile<256,0>(x,xs,p,t,M,K,ldx);}
+    else if(which==2){if(coded)tile_pre<64,true,2>(x,xs,p,t,M,K,ldx,A);else tile_pre<64,false,2>(x,xs,p,t,M,K,ldx,A);}
+    else{if(coded)tile_pre<64,true,3>(x,xs,p,t,M,K,ldx,A);else tile_pre<64,false,3>(x,xs,p,t,M,K,ldx,A);}
+}
 }
 
 extern "C" __global__ void __launch_bounds__(128) tf_qmm_gdn_stream16(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
@@ -303,6 +510,11 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_gdn_stream16(const __nv
 // tf_qmm_gdn_stream16 with its dictionary-coded parts' index windows: the same loads, MMA chains, fmas and sums.
 extern "C" __global__ void __launch_bounds__(128) tf_qmm_gdn_stream16_dict(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
     tf_qmm_gdn_stream::body_dict(x,xs,parts,M,K,ldx);
+}
+// tf_qmm_gdn_stream16_dict that also does tf_q35_gdn_pre's work for its window: each part's projection as there, then
+// the qkv tiles' heads (convolution, SiLU, norms, q/k/v and the logged tail), the a part's decays and the b part's strengths.
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_gdn_stream16_dict_pre(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx,const __grid_constant__ tf_qmm_gdn_stream::PreArgs pre){
+    tf_qmm_gdn_stream::body_dict_pre(x,xs,parts,M,K,ldx,pre);
 }
 
 namespace tf_qmm_gdn_rows32 {

@@ -76,5 +76,31 @@ pub fn prepare(e: anytype, single: bool) !?cuda.DeviceBuffer {
             e.mlp_pair.single32_dict_fn = f32d;
         }
     }
+    // tf_qmm_mlp_single16's 32-row twins (qmm_stream32.cuh) on the same panels, taken ahead of the kernels above for 17 to
+    // 32-row windows; TF_STREAM32=0 loads none (those windows keep the kernels above)
+    const wide = @import("sys").c.getenv("TF_STREAM32");
+    if (single and !(wide != null and @import("std").mem.eql(u8, @import("std").mem.span(wide.?), "0"))) {
+        const f = try e.mods[0].function("tf_qmm_mlp_twin32");
+        try f.allowDynamicShared(cuda.mlp_pair.twin32_smem);
+        e.mlp_pair.twin32_fn = f;
+        if (e.mlp_pair.single_dict_fn != null) {
+            const fd = try e.mods[0].function("tf_qmm_mlp_twin32_dict");
+            try fd.allowDynamicShared(cuda.mlp_pair.twin32_smem + 2 * cuda.qlinear.dict_tab_max);
+            e.mlp_pair.twin32_dict_fn = fd;
+            const fp = try e.mods[0].function("tf_qmm_mlp_twin32_pair");
+            try fp.allowDynamicShared(cuda.mlp_pair.twin32_pair_smem);
+            e.mlp_pair.twin32_pair_fn = fp;
+            // pair-coded gate and up on 136 half CTAs, three an SM; TF_MLP32_HALF=0 keeps tf_qmm_mlp_twin32_pair
+            const half = @import("sys").c.getenv("TF_MLP32_HALF");
+            if (!(half != null and @import("std").mem.eql(u8, @import("std").mem.span(half.?), "0"))) {
+                const fh = try e.mods[0].function("tf_qmm_mlp_half32_pair");
+                try fh.allowDynamicShared(cuda.mlp_pair.half32_pair_smem);
+                e.mlp_pair.twin32_half_fn = fh;
+            }
+            const fm = try e.mods[0].function("tf_qmm_mlp_twin32_mixed");
+            try fm.allowDynamicShared(cuda.mlp_pair.twin32_smem + 2 * cuda.qlinear.dict_tab_max);
+            e.mlp_pair.twin32_mixed_fn = fm;
+        }
+    }
     return buffer;
 }

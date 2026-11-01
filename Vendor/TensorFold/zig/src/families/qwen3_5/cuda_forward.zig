@@ -4,6 +4,7 @@ const cuda = @import("cuda");
 const sig = @import("cuda_signatures.zig");
 const hooks = @import("cuda_learn_hooks.zig");
 const geometry = @import("cuda_geometry.zig");
+const draft_tree = @import("cuda_draft_tree.zig");
 const head_dim = geometry.head_dim;
 const max_chunks = 64;
 /// Prompt experts keep the shipped arithmetic boundary, independently of verification capacity.
@@ -39,10 +40,13 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     // Independent prompt rows share a block; decode keeps one warp per row. A 16..64-row window's gdn_pre rows share
     // blocks too (four row warps a block: its warps are independent, the same bits); TF_GDN_ROWS4=0 keeps one warp a
     // block there. gdn_post keeps a warp a block in windows (four a block measured slower).
-    const pre_rows: usize = if ((prompt and total > 16) or (total >= 8 and rows4On())) 4 else if (total >= 2 and rows4On()) 2 else 1;
+    // a verified window of 16 rows or fewer takes the 2..16-row variants (gdn_pre's and gdn_post's row warps a block,
+    // attention row pairs) only while the stream grows at most 15 nodes (cuda_draft_tree.lean16); prompt chunks as before
+    const lean_floor: usize = if (!record or draft_tree.lean16()) 1 else 16;
+    const pre_rows: usize = if ((prompt and total > 16) or (total > lean_floor and total >= 8 and rows4On())) 4 else if (total > lean_floor and total >= 2 and rows4On()) 2 else 1;
     const pre_blocks = (total + pre_rows - 1) / pre_rows;
     // gdn_post's decode windows: two independent row warps a block from 2 rows, as gdn_pre's (TF_POST_ROWS2=0: one)
-    const post_rows: usize = if (prompt and total > 16) 4 else if (total >= 2 and postRows2On()) 2 else 1;
+    const post_rows: usize = if (prompt and total > 16) 4 else if (total > lean_floor and total >= 2 and postRows2On()) 2 else 1;
     const post_blocks = (total + post_rows - 1) / post_rows;
     const t_ids = e.tables.ptr + ids_at;
     const t_segs = e.tables.ptr + segs_at;
@@ -69,13 +73,15 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
         switch (l.mixer) {
             .delta => |m| {
                 const layer: c_int = @intCast(di);
-                try e.projMany(&.{ m.qkv, m.z, m.a, m.b }, e.x, &.{ e.qkv, e.z, e.a, e.b }, total, prompt);
+                // a recorded window of up to 16 rows: the GDN twin also runs gdn_pre's work in its tiles' tails (preFused)
+                const fused = record and e.learning == null and try preFused(e, m, total, .{ .geo = .{ geo.hid, geo.nk, geo.nv, geo.qh, geo.kvh, geo.nl }, .segs = t_segs, .rowseg = t_rows, .rowpar = t_par, .cw = m.conv, .alog = m.a_log, .dt = m.dt_bias, .q = e.q, .k = e.k, .v = e.v, .g = e.g_, .beta = e.beta, .params = t_params, .layer = layer });
+                if (!fused) try e.projMany(&.{ m.qkv, m.z, m.a, m.b }, e.x, &.{ e.qkv, e.z, e.a, e.b }, total, prompt);
                 if (e.learning) |k| try k.delta(i, e.qkv, e.z, e.b, e.a, total);
                 // a prompt chunk: the chain convolves the value heads and takes their decay and strength in its stages,
                 // so gdn_pre runs the q and k heads and conv_commit follows the chain (TF_CHAIN_CONV=0: as before)
                 const conv_in_chain = prompt and nseg == 1 and !record and chainConvOn();
                 const pre_heads = if (conv_in_chain) 2 * g.k_heads else 2 * g.k_heads + g.v_heads;
-                try e.runAfter(e.fns.gdn_pre, .{ 1, pre_heads, pre_blocks }, .{ 32, pre_rows, 1 }, .{ geo, e.qkv, t_segs, t_rows, t_par, layer, m.conv, e.a, e.b, m.a_log, m.dt_bias, e.q, e.k, e.v, e.g_, e.beta, t_params });
+                if (!fused) try e.runAfter(e.fns.gdn_pre, .{ 1, pre_heads, pre_blocks }, .{ 32, pre_rows, 1 }, .{ geo, e.qkv, t_segs, t_rows, t_par, layer, m.conv, e.a, e.b, m.a_log, m.dt_bias, e.q, e.k, e.v, e.g_, e.beta, t_params });
                 // one recorded window of 2+ rows: gdn_pre logged its tails, conv_commit would only return
                 const commit = !(record and nseg == 1 and total > 1);
                 if (commit and !conv_in_chain) try e.runAfter(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
@@ -128,8 +134,11 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                         try launch(e, e.fp8.attn_rows, sig.attn_rows8, .{ groups, max_chunks, g.kv_heads }, .{ 256, 1, 1 }, rows_args);
                     } else {
                         // a 2..64-row window: row pairs share each chunk's stream-key tiles (attn_pair, the same bits);
-                        // TF_ATTN_PAIR=0 keeps attn_partial's block a row
-                        if (record and total >= 2 and 2 * group <= 16 and pairOn())
+                        // TF_ATTN_PAIR=0 keeps attn_partial's block a row; attn_pair_kv (TF_ATTN_KV=0: attn_pair) copies a
+                        // tile's keys and values as separate groups, the next keys during a pass's softmax and values
+                        if (record and total >= 2 and total > lean_floor and 2 * group <= 16 and pairOn() and kvOn())
+                            try sharedSized(e, e.fns.attn_pair_kv, sig.attn_pair_kv, .{ (total + 1) / 2, partial_chunks, g.kv_heads }, 128, attn_tile, args)
+                        else if (record and total >= 2 and total > lean_floor and 2 * group <= 16 and pairOn())
                             try sharedSized(e, e.fns.attn_pair, sig.attn_pair, .{ (total + 1) / 2, partial_chunks, g.kv_heads }, 128, attn_tile, args)
                         else
                             try sharedSized(e, e.fns.attn_partial, sig.attn_partial, .{ total, partial_chunks, g.kv_heads }, 128, attn_tile, args);
@@ -190,6 +199,25 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     try finish(e, total, heads, shape.hidden, if (@hasField(@TypeOf(shape), "amax")) shape.amax else false);
 }
 
+/// The GDN layer's qkv, z, a and b of a recorded window on the 16-row dictionary twin that also runs tf_q35_gdn_pre's work
+/// (affine4_kernels.zig decodeManyPre): false, and nothing launched, when that twin does not take the window; then the
+/// caller projects and runs gdn_pre as before. TF_GDN_PRE_FUSED=0 always keeps the separate launch.
+fn preFused(e: *E.Engine, m: anytype, total: usize, pre: cuda.qlinear.Affine4Kernels.GdnPre) !bool {
+    if (!preFusedOn()) return false;
+    if (m.qkv != .a4 or m.z != .a4 or m.a != .a4 or m.b != .a4) return false;
+    const A = cuda.qlinear.Affine4Kernels;
+    const outs = [4]A.Out{ .{ .q = m.qkv.a4, .out = e.qkv }, .{ .q = m.z.a4, .out = e.z }, .{ .q = m.a.a4, .out = e.a }, .{ .q = m.b.a4, .out = e.b } };
+    if (!e.affine.gdnPreFits(&outs, total)) return false;
+    try e.affine.decodeManyPre(e.stream, e.x, e.xs, &outs, total, pre);
+    return true;
+}
+
+/// TF_GDN_PRE_FUSED=1: gdn_pre's work in the twin's tails (off by default: the separate launch under PDL is quicker).
+fn preFusedOn() bool {
+    const v = @import("sys").c.getenv("TF_GDN_PRE_FUSED") orelse return false;
+    return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
+}
+
 /// TF_CHAIN_CONV=0: a prompt chunk's gdn_pre keeps the value heads and the chain reads its v, g and beta.
 fn chainConvOn() bool {
     const v = @import("sys").c.getenv("TF_CHAIN_CONV") orelse return true;
@@ -216,6 +244,12 @@ fn rows4On() bool {
 /// TF_ATTN_PAIR=0: 2..64-row windows keep tf_q35_attn_partial (a block a row).
 fn pairOn() bool {
     const v = @import("sys").c.getenv("TF_ATTN_PAIR") orelse return true;
+    return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
+}
+
+/// TF_ATTN_KV=0: attn_pair's windows keep tf_q35_attn_pair (a tile's keys and values in one group, awaited at once).
+fn kvOn() bool {
+    const v = @import("sys").c.getenv("TF_ATTN_KV") orelse return true;
     return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
 }
 
@@ -248,6 +282,8 @@ fn sharedSized(e: *E.Engine, f: cuda.Function, comptime s: sig.Sig, grid: [3]usi
 /// Layer inputs are already kept; hidden reads need neither the final norm nor the vocabulary head.
 pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool, amax: bool) !void {
     if (hidden) return;
+    // an armed prompt cut (cuda_engine.zig Overlap): the drafter's prompt absorb may start once the last layer is done
+    if (@hasField(@TypeOf(e.*), "overlap")) if (e.overlap.armed) try e.overlapTail();
     const g = e.g;
     if (e.learning == null and heads < total) {
         try e.normTail(e.final_norm, total, heads);
