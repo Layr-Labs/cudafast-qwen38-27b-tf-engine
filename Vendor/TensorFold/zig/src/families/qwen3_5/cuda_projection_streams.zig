@@ -67,6 +67,16 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
         break :blk f;
     };
     try out.allowDynamicShared(35328);
+    // the 17-32-row twins (qmm_output_stream32.cuh), coded twin with the table past the stages
+    const down32 = try e.mods[0].function("tf_qmm_output_stream32");
+    const out32 = try e.mods[0].function("tf_qmm_output_prefetch32");
+    try down32.allowDynamicShared(cuda.qlinear.out32_smem);
+    try out32.allowDynamicShared(cuda.qlinear.out32_smem);
+    const dict32: ?cuda.Function = if (e.affine.dict == null) null else blk: {
+        const f = try e.mods[0].function("tf_qmm_output_stream32_dict");
+        try f.allowDynamicShared(cuda.qlinear.out32_smem + @as(u32, @max(cuda.qlinear.dict_tab_max, cuda.qlinear.out_pair_tab_max)));
+        break :blk f;
+    };
     var buffer: ?cuda.DeviceBuffer = null;
     if (e.fast == null) {
         buffer = try cuda.DeviceBuffer.alloc(e.d, bytes);
@@ -105,6 +115,8 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     };
     if (output) e.affine.stream16_fns = .{ down, out };
     if (output) e.affine.stream16_dict_fn = down_dict;
+    if (output) e.affine.stream32_fns = .{ down32, out32 };
+    if (output) e.affine.stream32_dict_fn = dict32;
     if (input) {
         e.affine.gdn_stream16_fn = grouped;
         e.affine.gdn_stream16_dict_fn = grouped_dict;

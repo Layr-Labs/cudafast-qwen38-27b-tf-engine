@@ -35,6 +35,14 @@ pub fn projectMany(e: *Engine, ls: []const Proj, x: u64, xs: u64, outs: []const 
     var many: [A.segs_max]A.Out = undefined;
     if (wide) {
         for (ls, outs, many[0..ls.len]) |l, out, *m| m.* = .{ .q = l.a4, .out = out };
+        // a GDN layer's four input projections take their 32-row stream twin: one weight pass, coded tables, the bits
+        // of decode() a row (affine4_kernels.zig decodeMany)
+        if (e.affine.streamable(many[0..ls.len], rows)) return e.affine.decodeMany(e.stream, x, xs, many[0..ls.len], rows);
+        // attention's Q, K and V in one cluster launch, as the 16-row window's mixed launch
+        const mixed32 = ls.len == 3 and e.affine.pdl and e.affine.cluster_decode and
+            cuda.qlinear.splitK(many[0].q.n, k) == 1 and cuda.qlinear.splitK(many[1].q.n, k) > 1 and
+            cuda.qlinear.splitK(many[2].q.n, k) > 1 and mixedAttention();
+        if (mixed32) return e.affine.decodeAttentionMixed32(e.stream, x, xs, many[0..ls.len], rows);
         return e.affine.verifyMany32(e.stream, x, xs, many[0..ls.len], rows);
     }
     var at: usize = 0;

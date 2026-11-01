@@ -272,6 +272,7 @@ pub const symbols = struct {
     // the greedy verify head: the dictionary tile's per-tile row bests (AMAX), then their merge into tokens
     pub const head_amax = "_ZN12tf_qmm_group17group_kernel_dictILi64ELi16ELi64ELi1ELi4ELi8ELb0ELb0ELb1EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
     pub const head_merge = "tf_qmm_head_argmax_merge";
+    pub const verify32_dict = "_ZN12tf_qmm_group17group_kernel_dictILi64ELi32ELi64ELi1ELi4ELi5ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
     pub const gemv_dict = "tf_lane_gemv_dict";
     pub const gemv_many_dict = "tf_lane_gemv_many_dict";
     pub const dict_mark = "tf_dict_mark";
@@ -331,6 +332,7 @@ pub const dict_pair_max: u32 = 8191;
 /// The lane twins' (lane_gemv.cu) and gdn_stream16 twin's (qmm_gdn_stream.cuh) shared pair-table room at two CTAs an SM.
 pub const lane_pair_tab_max: u32 = 14592;
 pub const out16_smem: u32 = 35328;
+pub const out32_smem: u32 = 4 * 3 * (32 * 128 + 2048 + 256 + 32 * 4); // qmm_output_stream32.cuh: four slices, three stages
 pub const out_pair_tab_max: u32 = 14336;
 pub const gdn_pair_tab_max: u32 = 26496;
 /// group_kernel_dict's (qmm_group.cu GROUP_PAIR_SMEM, GROUP_PAIR_SMEM_ONE): two CTAs an SM in a cluster launch; any

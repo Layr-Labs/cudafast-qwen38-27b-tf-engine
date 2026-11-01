@@ -979,6 +979,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_pair(const __nv_bfl
 #include "qmm_mlp_single.cuh"
 
 #include "qmm_output_stream.cuh"
+#include "qmm_output_stream32.cuh"
 
 #include "qmm_gdn_stream.cuh"
 
@@ -1014,6 +1015,9 @@ extern "C" __global__ void __launch_bounds__(256) tf_qmm_head_argmax_merge(const
         TOK[blockIdx.x] = static_cast<unsigned>(id);
     }
 }
+// cluster32's twin (verify_fn's 32-row tile, five stages): both m16 row tiles on each dequantized fragment, coded tables.
+template __global__ void tf_qmm_group::group_kernel_dict<64, 32, 64, 1, 4, 5, false>(
+    const __nv_bfloat16* __restrict__, const float* __restrict__, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
 
 extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_pair_dict(const __nv_bfloat16* __restrict__ x,
         const float* __restrict__ xs, const __grid_constant__ tf_qmm_group::Parts parts, __nv_bfloat16* __restrict__ act,
@@ -1023,4 +1027,5 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_pair_dict(const __n
 
 #include "qmm_mlp_single_dict.cuh"
 #include "qmm_mlp_compact_pair.cuh"
+#include "qmm_mlp_compact_pair32.cuh"
 #include "qmm_mlp_single32.cuh"
