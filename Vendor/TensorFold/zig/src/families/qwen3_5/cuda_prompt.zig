@@ -11,18 +11,19 @@ pub const smem: u32 = 49152;
 const fp8_smem: u32 = 98304;
 const block_rows = 64;
 
-pub const Fns = struct { bf16: cuda.Function, fp8: cuda.Function, chain: cuda.Function };
+pub const Fns = struct { bf16: cuda.Function, fp8: cuda.Function, chain: cuda.Function, chain_conv: cuda.Function };
 
 pub const symbols = struct {
     pub const bf16 = "_ZN20tf_prefill_attention13hpattn_kernelILi256ELi4ELi1ELi1EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiifi";
     pub const fp8 = "_ZN20tf_prefill_attention14hpattn8_kernelILi256ELi8ELi2ELi2EEEvPK13__nv_bfloat16PKhS5_PKfS7_PS1_iiiiifi";
     pub const chain = "_ZN14tf_gdn_prefill12chain_kernelI13__nv_bfloat16S1_Li64ELi16EEEvPKT_S4_PKS1_PKfPKT0_S8_PfPS1_iii";
+    pub const chain_conv = "tf_gdn_chain_conv";
 };
 /// gdn_prefill.cu's value rows a block (two threads a row).
 const chain_rows = 64;
 
 pub fn resolve(attention: cuda.Module, gdn: cuda.Module) !Fns {
-    const f: Fns = .{ .bf16 = try attention.function(symbols.bf16), .fp8 = try attention.function(symbols.fp8), .chain = try gdn.function(symbols.chain) };
+    const f: Fns = .{ .bf16 = try attention.function(symbols.bf16), .fp8 = try attention.function(symbols.fp8), .chain = try gdn.function(symbols.chain), .chain_conv = try gdn.function(symbols.chain_conv) };
     try f.bf16.allowDynamicShared(smem);
     try f.fp8.allowDynamicShared(fp8_smem);
     return f;
@@ -74,4 +75,19 @@ pub fn delta(e: *E.Engine, layer: usize, rows: usize) !void {
     for ([_]usize{ rows, g.k_heads, g.v_heads }) |v| a.add(@as(c_int, @intCast(v)));
     const cfg: cuda.Config = .{ .grid = .{ .x = @intCast(g.v_heads), .y = @intCast(geometry.dk / chain_rows) }, .block = .{ .x = 2 * chain_rows } };
     try cuda.launch.launch(e.prompt_attn.chain, cfg, e.stream, &a);
+}
+
+/// `delta` with the value heads' convolution, decay and strength done in the chain's stages (gdn_prefill.cu's
+/// tf_gdn_chain_conv, tf_q35_gdn_pre's bits): gdn_pre ran for the q and k heads only, and the stream's convolution
+/// tail is still the one before the chunk (conv_commit runs after).
+pub fn deltaConv(e: *E.Engine, layer: usize, rows: usize, m: anytype) !void {
+    const g = e.g;
+    const sg = std.mem.bytesToValue(Seg, e.staged.bytes[E.Engine.segs_at..][0..@sizeOf(Seg)]);
+    const state = sg.rec + layer * g.v_heads * geometry.dk * geometry.dk * 4;
+    const tail = sg.conv + layer * g.convBytes();
+    var a: cuda.Args = .{};
+    for ([_]u64{ e.q, e.k, e.qkv, m.conv, tail, e.tables.ptr + E.Engine.rowpar_at, e.a, e.b, m.a_log, m.dt_bias, state, e.y }) |v| a.add(v);
+    for ([_]usize{ rows, g.k_heads, g.v_heads }) |v| a.add(@as(c_int, @intCast(v)));
+    const cfg: cuda.Config = .{ .grid = .{ .x = @intCast(g.v_heads), .y = @intCast(geometry.dk / chain_rows) }, .block = .{ .x = 2 * chain_rows } };
+    try cuda.launch.launch(e.prompt_attn.chain_conv, cfg, e.stream, &a);
 }
