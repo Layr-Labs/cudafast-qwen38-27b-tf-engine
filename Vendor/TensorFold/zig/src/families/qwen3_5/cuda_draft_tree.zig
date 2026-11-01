@@ -6,7 +6,22 @@ const engine = @import("cuda_engine.zig");
 
 /// Children a node, the selector's weight, the softmax scale, and the nodes a tree takes by default.
 const branch = 12;
-const edge_weight = 0.6;
+const branch_max = 20;
+/// Children a node opens: `branch`, widened by TF_DRAFT_BRANCH (<= branch_max, the open[] bound).
+fn branchWidth() usize {
+    const v = platform.c.getenv("TF_DRAFT_BRANCH") orelse return branch;
+    const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return branch;
+    return @min(branch_max, if (n == 0) branch else n);
+}
+/// A predecessor's landing chance times this weights its edges against deeper paths (jungjipdo's 71b343b measured
+/// 0.6 (the crown value): 0.85 measured -1.6% on the official pool and loses at low acceptance;
+/// TF_EDGE_WEIGHT overrides, as a percent).
+fn edgeWeight() f64 {
+    if (@import("sys").c.getenv("TF_EDGE_WEIGHT")) |v| {
+        if (std.fmt.parseInt(i32, std.mem.span(v), 10)) |pct| return @as(f64, @floatFromInt(pct)) / 100.0 else |_| {}
+    }
+    return 0.6;
+}
 const scale = 1.5;
 /// A sampled stream's candidates carry the draw's own Gumbel noise at this weight (the 27B engine's draft_tree).
 const noise_weight = 0.7;
@@ -187,7 +202,7 @@ fn chancesAfterFast(c: Candidates, r: usize, pred: u32, out: *[lp_top]f64) void 
     for (0..vec_n) |v| edge[v * lanes_f64 ..][0..lanes_f64].* = acc[v];
     var most: f64 = -std.math.inf(f64);
     for (0..c.topk) |j| {
-        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edge_weight * edge[j]) / scale;
+        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edgeWeight() * edge[j]) / scale;
         most = @max(most, out[j]);
     }
     var total: f64 = 0;
@@ -211,7 +226,7 @@ fn chancesAfter(c: Candidates, r: usize, pred: u32, out: *[lp_top]f64) void {
         for (edge[0..c.topk], succ[0..c.topk]) |*e, row| e.* += ph * bf16(row[k]);
     }
     for (0..c.topk) |j| {
-        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edge_weight * edge[j]) / scale;
+        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edgeWeight() * edge[j]) / scale;
         most = @max(most, out[j]);
     }
     var total: f64 = 0;
@@ -223,8 +238,9 @@ fn chancesAfter(c: Candidates, r: usize, pred: u32, out: *[lp_top]f64) void {
 /// Up to `most` nodes best first: the open node of least path cost next (ties by parent, token, row); the count grown.
 pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32, parents: []i32, own: []f64) usize {
     const Open = struct { cost: f64, parent: i32, token: u32, row: usize, own: f64 };
-    var open: [branch * (engine.most_window + 1)]Open = undefined;
+    var open: [branch_max * (engine.most_window + 1)]Open = undefined;
     var n_open: usize = 0;
+    const br = branchWidth();
     var count: usize = 0;
     var pred = pending;
     var parent: i32 = -1;
@@ -252,7 +268,7 @@ pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32
                 }
             }.more);
             const w = ids(c, row);
-            for (order[0..@min(branch, c.topk)]) |j| {
+            for (order[0..@min(br, c.topk)]) |j| {
                 if (!std.math.isFinite(lc[j]) or n_open == open.len) break;
                 open[n_open] = .{ .cost = path - lc[j], .parent = parent, .token = w[2 + j], .row = row, .own = lc[j] };
                 n_open += 1;

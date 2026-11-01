@@ -107,7 +107,8 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     try launch(e, e.fp8.rope, sig.rope, .{ total, g.q_heads + g.kv_heads, 1 }, .{ head_dim, 1, 1 }, .{ geo, e.qn, e.kn, e.vraw, t_segs, t_rows, t_anc, @as(c_int, ai), t_params, mpos });
                 } else {
                     // both head norms and the rope in one launch: a block a (row, head), each normed head rotated in place
-                    try launchAfter(e, e.fns.norm_rope, sig.norm_rope, .{ total, g.q_heads + g.kv_heads, 1 }, .{ head_dim, 1, 1 }, .{ geo, e.qraw, e.kraw, m.q_norm, m.k_norm, e.qn, e.vraw, t_segs, t_rows, t_anc, @as(c_int, ai), t_params, mpos, @as(f32, g.eps) });
+                    // each rotary pair turned once (TF_ROPE_ONCE=0: `rotate` an output, the pair's angle twice)
+                    try launchAfter(e, if (ropeOnceOn()) e.fns.norm_rope_once else e.fns.norm_rope, sig.norm_rope, .{ total, g.q_heads + g.kv_heads, 1 }, .{ head_dim, 1, 1 }, .{ geo, e.qraw, e.kraw, m.q_norm, m.k_norm, e.qn, e.vraw, t_segs, t_rows, t_anc, @as(c_int, ai), t_params, mpos, @as(f32, g.eps) });
                 }
                 if (tail and i == e.layers.len - 1) {
                     try @import("cuda_prompt_tail.zig").run(e, @intCast(ai), total);
@@ -184,8 +185,9 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
         if (shape.taps) for (e.taps[0..e.n_taps], 0..) |t, ti| if (t == i) {
             try e.runAfter(e.fns.tap, .{ total, (g.hidden + 2047) / 2048, 1 }, .{ 256, 1, 1 }, .{ e.h, e.r, t_segs, t_rows, @as(c_int, @intCast(ti)), @as(c_int, @intCast(g.hidden)), t_params });
         };
-        // a captured forward's first layer is a graph of its own (cuda_engine.zig's cutCapture)
-        if (i == 0) try e.cutCapture();
+        // a captured forward's first layer is a graph of its own, and a further cut every `TF_GRAPH_CHOP`
+        // layers after it: segments whose launches the GPU's own progress hides (cuda_engine.zig's cutCapture)
+        if (i == 0 or (E.Engine.graph_chop() > 0 and i % E.Engine.graph_chop() == 0)) try e.cutCapture();
     }
     try finish(e, total, heads, shape.hidden, if (@hasField(@TypeOf(shape), "amax")) shape.amax else false);
 }
@@ -193,6 +195,12 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
 /// TF_CHAIN_CONV=0: a prompt chunk's gdn_pre keeps the value heads and the chain reads its v, g and beta.
 fn chainConvOn() bool {
     const v = @import("sys").c.getenv("TF_CHAIN_CONV") orelse return true;
+    return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
+}
+
+/// TF_ROPE_ONCE=0: the norm+rope kernel keeps `rotate` an output (each rotary pair's angle twice).
+fn ropeOnceOn() bool {
+    const v = @import("sys").c.getenv("TF_ROPE_ONCE") orelse return true;
     return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
 }
 

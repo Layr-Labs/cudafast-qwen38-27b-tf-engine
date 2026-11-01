@@ -180,6 +180,10 @@ pub const Engine = struct {
     head_amax: u64, // a greedy verify head's per-tile bests: max rows of 64-id tiles (f32, i32; Shape.amax)
     head_argmax: bool, // TF_HEAD_ARGMAX=0: greedy verify rows keep their logits and the argmax launches
     sieve: ?cuda.head_sieve.HeadSieve = null, // a greedy verify head on the 2-bit sieve (TF_HEAD_SIEVE=0: the full head)
+    /// The next prompt forward's last row may take its token from the sieve (cuda_prefill.zig sets it for a plain
+    /// greedy stream's final chunk; TF_PROMPT_SIEVE=0: never); prompt_sieved: that forward did.
+    prompt_greedy: bool = false,
+    prompt_sieved: bool = false,
     picks: u64, // drawRows' slice scratch: most_verify rows of cuda.sample.Draws.row_scratch
     // per-forward tables (ids, segments, rows' segment, parent and ancestors, the draws' rules) staged in pinned memory
     tables: DeviceBuffer,
@@ -194,13 +198,55 @@ pub const Engine = struct {
     heads: std.AutoHashMapUnmanaged(u32, cuda.graph.Exec) = .empty,
     cut_armed: bool = false,
     cut_head: ?cuda.graph.Exec = null,
+    /// Whether the capture in progress also takes mid cuts: a shape's FIRST capture stays a single graph (a window
+    /// meets ~9 shapes once each; segmenting them all costs more instantiate/upload than their single use repays),
+    /// and from its second sighting the shape re-captures segmented (the hot shapes recur 10-30x a window).
+    mids_armed: bool = false,
+    /// How many times each captured shape has been asked for (`graphs` keys).
+    uses: std.AutoHashMapUnmanaged(u32, usize) = .empty,
+    /// A captured forward's further cuts (every `graph_chop` layers after the first): the segments between the
+    /// head and the rest, keyed as `graphs` and launched in order. Each cut keeps a segment small enough that
+    /// its cuGraphLaunch returns before the GPU reaches the segment's end, so the host's per-node launch cost
+    /// (about 1.4 us a kernel on a 637-kernel verify graph) never leaves the GPU waiting at a round's start.
+    mids: std.AutoHashMapUnmanaged(u32, []cuda.graph.Exec) = .empty,
+    /// The cuts collected during the capture in progress (moved into `mids` when the capture ends).
+    cut_mids: [graph_cuts_max]cuda.graph.Exec = undefined,
+    n_cut_mids: usize = 0,
     /// A drafter's tapped layers (`setTaps`): each row's residual after them lands in its stream's tap ring.
     taps: [8]u32 = undefined,
     n_taps: usize = 0,
     /// During an image prompt chunk's forward: its feature rows (0: none); the chunk's src and positions are staged.
     features: u64 = 0,
 
-    pub const ids_at = Round.ids_at;
+    
+/// TF_TIMING=1 helper: monotonic ms since t0 (engine has no io handle; posix clock).
+fn msSince(t0: i64) f64 {
+    var ts: @import("sys").c.timespec = undefined;
+    if (@import("sys").c.clock_gettime(@import("sys").c.CLOCK.MONOTONIC, &ts) != 0) return 0;
+    const ns: f64 = @floatFromInt(@as(i128, ts.sec) * 1_000_000_000 + ts.nsec);
+    return (ns - @as(f64, @floatFromInt(t0))) / 1e6;
+}
+fn nowNs() i64 {
+    var ts: @import("sys").c.timespec = undefined;
+    if (@import("sys").c.clock_gettime(@import("sys").c.CLOCK.MONOTONIC, &ts) != 0) return 0;
+    return @intCast(@as(i128, ts.sec) * 1_000_000_000 + ts.nsec);
+}
+pub const graph_cuts_max = 12;
+
+/// TF_GRAPH_CHOP: cut a captured verify forward into a segment every this-many layers (0: only the first-layer
+/// cut, as before). The verify graph's launch cost is host-side per node; segments hide it under each other.
+///
+/// The default is 0: the mid cuts were measured three times on fresh windows and cost more than they hide
+/// (-0.31%, -0.58%, and -0.41% median over 4 ABBA pairs, 3/4 pairs, CI -1.81..+1.00). The per-round
+/// launch/instantiate cost of nine segments plus the pipeline bubble at each boundary outweighs the
+/// ~0.9 ms of host launch it removes, and the host already runs far enough ahead that the GPU does not
+/// wait at a round's start. TF_GRAPH_CHOP=8 restores the segmented replay.
+pub fn graph_chop() usize {
+    const v = @import("sys").c.getenv("TF_GRAPH_CHOP") orelse return 0;
+    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0;
+}
+
+pub const ids_at = Round.ids_at;
     pub const segs_at = Round.segs_at;
     pub const rowseg_at = Round.rowseg_at;
     pub const rowpar_at = Round.rowpar_at;
@@ -501,10 +547,16 @@ pub const Engine = struct {
 
     /// While a forward is captured: the work so far becomes the head graph and the capture goes on for the rest.
     pub fn cutCapture(e: *Engine) !void {
-        if (!e.cut_armed or e.cut_head != null) return;
+        if (!e.cut_armed) return;
+        if (e.cut_head != null and !e.mids_armed) return;
+        if (e.cut_head == null and e.n_cut_mids == graph_cuts_max) return;
         var head = try cuda.graph.endCapture(e.stream);
         defer head.deinit();
-        e.cut_head = try head.instantiate();
+        const exec = try head.instantiate();
+        if (e.cut_head == null) e.cut_head = exec else {
+            e.cut_mids[e.n_cut_mids] = exec;
+            e.n_cut_mids += 1;
+        }
         try cuda.graph.beginCapture(e.stream, .thread_local);
     }
 
@@ -601,6 +653,8 @@ pub const Engine = struct {
     /// One forward over `parts`' windows, with every input admitted before an unkept verify is settled.
     pub fn forward(e: *Engine, parts: []const Part, ids: []const u32, keep: Keep) !void {
         try e.admit(parts, ids, keep);
+        for (parts) |p| p.cache.first = null;
+        e.prompt_sieved = false;
         const g = e.g;
         const total = ids.len;
         const record = keep != .last;
@@ -609,6 +663,8 @@ pub const Engine = struct {
         const prompt = !record;
         // the tables
         const st = e.staged.bytes;
+        var _v0: i64 = 0;
+        if (@import("sys").c.getenv("TF_TIMING") != null) _v0 = nowNs();
         @memcpy(std.mem.bytesAsSlice(u32, st[ids_at..][0 .. total * 4]), ids);
         @memset(st[ids_at + total * 4 .. ids_at + max_rows * 4], 0); // a bucket's padding rows read token 0
         const segs = std.mem.bytesAsSlice(Seg, st[segs_at..][0 .. parts.len * @sizeOf(Seg)]);
@@ -616,6 +672,7 @@ pub const Engine = struct {
         // (tree_slots.carried: one slot fewer, -2 steps); TF_CARRIED=0 restores build's plans
         const carry = record and total > 1 and !envOff("TF_CARRIED");
         const slot_peak = try Round.buildCarried(st, parts, record, carry);
+        if (@import("sys").c.getenv("TF_TIMING") != null) std.debug.print("[timing] vbuild {d:.2} ms\n", .{msSince(_v0)});
         for (parts) |p| {
             try p.cache.settle(e);
             // a pending kept prefix rides in this forward's slot scan only when its log half survives `prepare`
@@ -653,6 +710,7 @@ pub const Engine = struct {
             @memcpy(std.mem.bytesAsSlice(i32, st[src_at..][0 .. total * 4]), im.src[p0..][0..total]);
             Round.stageImageTables(st, im, p0, total);
         }
+        if (@import("sys").c.getenv("TF_TIMING") != null) std.debug.print("[timing] vtables {d:.2} ms\n", .{msSince(_v0)});
         try e.tables.uploadAsync(0, st[0..if (images != null) tables_len else src_at], e.stream.handle); // text: as before
         // carried plans of 2..32 rows (at most 3 slots) scan four value rows a warp on qwen35_slots_lean.cuh (slots_3's
         // arithmetic, its addressing hoisted; 2 slots where they suffice); TF_SLOTS_LEAN=0 keeps prior dispatch
@@ -691,14 +749,27 @@ pub const Engine = struct {
             try e.body(shape);
         } else {
             const gop = try e.graphs.getOrPut(e.gpa, shape.key());
-            if (!gop.found_existing) {
+            const seen = e.uses.get(shape.key()) orelse 0;
+            try e.uses.put(e.gpa, shape.key(), seen + 1);
+            const recap = gop.found_existing and !e.mids.contains(shape.key()) and seen >= 1 and graph_chop() > 0;
+            if (@import("sys").c.getenv("TF_TIMING") != null) std.debug.print("[timing] shape_key {d} new={d} recap={d}\n", .{ shape.key(), @intFromBool(!gop.found_existing), @intFromBool(recap) });
+            if (!gop.found_existing or recap) {
+                if (recap) {
+                    // the single graph this shape first captured as pays its own instantiate again; the segmented
+                    // capture replaces it for every later use
+                    gop.value_ptr.deinit();
+                }
                 errdefer _ = e.graphs.remove(shape.key());
                 // captured, nothing runs: the replay below is this shape's first run
                 e.cut_armed = true;
+                e.mids_armed = seen >= 1 and graph_chop() > 0;
+                e.n_cut_mids = 0;
                 defer {
                     e.cut_armed = false;
                     if (e.cut_head) |*h| h.deinit();
                     e.cut_head = null;
+                    for (e.cut_mids[0..e.n_cut_mids]) |*m| m.deinit();
+                    e.n_cut_mids = 0;
                 }
                 try cuda.graph.beginCapture(e.stream, .thread_local);
                 e.body(shape) catch |err| {
@@ -709,15 +780,35 @@ pub const Engine = struct {
                 var captured = try cuda.graph.endCapture(e.stream);
                 defer captured.deinit();
                 gop.value_ptr.* = try captured.instantiate();
+                if (e.n_cut_mids > 0) {
+                    const mids = try e.gpa.dupe(cuda.graph.Exec, e.cut_mids[0..e.n_cut_mids]);
+                    e.mids.put(e.gpa, shape.key(), mids) catch |err| {
+                        for (mids) |*m| m.deinit();
+                        e.gpa.free(mids);
+                        return err;
+                    };
+                    e.n_cut_mids = 0;
+                }
+                // one device-side preparation per graph: without it every launch of this shape walks
+                // the whole node list host-side (a 637-kernel verify graph costs ~1.1 ms a launch,
+                // which the round's GPU start waits on); cuGraphUpload pays that once
+                if (!envOff("TF_GRAPH_UPLOAD")) {
+                    try gop.value_ptr.upload(e.stream);
+                    if (e.cut_head) |h| try h.upload(e.stream);
+                    if (e.mids.get(shape.key())) |ms| for (ms) |m| try m.upload(e.stream);
+                }
                 if (e.cut_head) |h| {
+                    var prior: ?cuda.graph.Exec = if (e.heads.getPtr(shape.key())) |oh| oh.* else null; // a recap's old head
                     e.heads.put(e.gpa, shape.key(), h) catch |err| {
                         gop.value_ptr.deinit();
                         return err;
                     };
+                    if (prior) |*oh| oh.deinit();
                     e.cut_head = null;
                 }
             }
             if (e.heads.get(shape.key())) |h| try h.launchOn(e.stream);
+            if (e.mids.get(shape.key())) |ms| for (ms) |m| try m.launchOn(e.stream);
             try gop.value_ptr.launchOn(e.stream);
         }
         for (parts) |p| p.cache.advanced(p.rows, record);
@@ -740,7 +831,25 @@ pub const Engine = struct {
                 @memcpy(e.tokens[0..total], e.host_logits.slice(u32)[0..total]);
                 if (shape.amax) if (e.sieve) |*sv| sv.after();
             },
-            .logits, .last => {
+            .logits, .last => if (keep == .last and e.prompt_sieved) {
+                // the sieve wrote the row's token (cuda_prompt_tail.zig): 4 bytes back instead of the row's logits
+                const toks = e.tables.ptr + tokens_at;
+                const check = promptSieveCheck();
+                const row = e.host_logits.bytes[0 .. g.vocab * 2];
+                const tok = e.host_logits.bytes[g.vocab * 2 .. g.vocab * 2 + 4];
+                try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(tok.ptr, toks, 4, e.stream.handle), "cuMemcpyDtoHAsync");
+                if (check) try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(row.ptr, e.logits, row.len, e.stream.handle), "cuMemcpyDtoHAsync");
+                try e.stream.synchronize();
+                if (prompt and e.l2_persist > 0) _ = e.d.api.cuCtxResetPersistingL2Cache();
+                const sieved = std.mem.bytesToValue(u32, tok[0..4]);
+                if (check) {
+                    // TF_PROMPT_SIEVE=check: the full head ran too; its host draw is the token, the sieve's is compared
+                    @memcpy(parts[0].cache.logits, e.rowLogits(0));
+                    const full = try @import("draw.zig").draw(std.heap.page_allocator, parts[0].cache.logits, null, 0, &.{});
+                    std.debug.print("[prompt sieve] check token sieve {d} full {d} {s}\n", .{ sieved, full, if (sieved == full) "match" else "MISMATCH" });
+                    parts[0].cache.first = full;
+                } else parts[0].cache.first = sieved;
+            } else {
                 const out = e.host_logits.bytes[0 .. heads * g.vocab * 2];
                 try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(out.ptr, e.logits, out.len, e.stream.handle), "cuMemcpyDtoHAsync");
                 try e.stream.synchronize();
@@ -800,6 +909,16 @@ test "dense read cost: hidden and slot variants have distinct graph keys" {
 }
 
 /// An engine A/B switch: true when `name` is set to "0".
+/// TF_PROMPT_SIEVE=0: a prompt's first token always from the full head; =check: both, compared (the full head's kept).
+pub fn promptSieveOn() bool {
+    return !envOff("TF_PROMPT_SIEVE");
+}
+
+fn promptSieveCheck() bool {
+    const v = @import("sys").c.getenv("TF_PROMPT_SIEVE") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "check");
+}
+
 fn envOff(name: [*:0]const u8) bool {
     const v = @import("sys").c.getenv(name) orelse return false;
     return std.mem.eql(u8, std.mem.span(v), "0");

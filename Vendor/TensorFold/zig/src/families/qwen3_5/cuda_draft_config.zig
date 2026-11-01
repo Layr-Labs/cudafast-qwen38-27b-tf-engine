@@ -3,6 +3,13 @@ const std = @import("std");
 const engine = @import("cuda_engine.zig");
 const max_rows = engine.max_rows;
 const lp_top = 20;
+/// A row's candidates for the tree: the manifest's selector top-k, widened by TF_DRAFT_TOPK (the words hold lp_top).
+/// Breadth is the only free acceptance lever: a wider row offers the target's token more often at no extra rows.
+fn topkWidth(manifest: usize) usize {
+    const v = @import("sys").c.getenv("TF_DRAFT_TOPK") orelse return manifest;
+    const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return manifest;
+    return @min(lp_top, if (n == 0) manifest else n);
+}
 pub const Config = struct {
     hidden: usize,
     intermediate: usize,
@@ -67,7 +74,7 @@ pub const Config = struct {
             .window = try int(o, "sliding_window"),
             .group = try int(d.object, "conv_group_size"),
             .rank = try int(d.object, "selector_rank"),
-            .topk = try int(d.object, "selector_top_k"),
+            .topk = topkWidth(try int(d.object, "selector_top_k")),
             .eps = @floatCast(try num(o, "rms_norm_eps")),
             .theta = @floatCast(try num((o.get("rope_parameters") orelse return error.BadDraftConfig).object, "rope_theta")),
             .taps = @splat(0),
