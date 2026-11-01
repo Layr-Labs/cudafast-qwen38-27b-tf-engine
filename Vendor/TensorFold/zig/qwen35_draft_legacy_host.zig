@@ -167,7 +167,7 @@ test "Draft frames: paired MLP keeps input sums live and passes disjoint output 
     l.down = .{ .w = 1, .s = 2, .b = 3, .n = 5120, .k = 17408, .npad = 5120 };
     for ([_]usize{ 1, 8, 16 }) |rows| {
         MlpRecord.reset();
-        try q.draft.frame.mlp(&d, l, rows);
+        try q.draft.frame.mlp(&d, l, rows, null);
         try T.expectEqual(@as(usize, 1), MlpRecord.sums);
         try T.expectEqual(@as(usize, 1), MlpRecord.pairs);
         try T.expectEqual(@as(usize, 0), MlpRecord.activations);
@@ -175,14 +175,14 @@ test "Draft frames: paired MLP keeps input sums live and passes disjoint output 
         try T.expectEqual(d.gate, MlpRecord.down_sums);
     }
     MlpRecord.reset();
-    try q.draft.frame.mlp(&d, l, 32);
+    try q.draft.frame.mlp(&d, l, 32, null);
     try T.expectEqual(@as(usize, 0), MlpRecord.pairs);
     try T.expectEqual(@as(usize, 1), MlpRecord.activations);
     try T.expectEqual(@as(usize, 2), MlpRecord.downs);
     try T.expectEqual(d.xs + 16 * (17408 / 64) * 4, MlpRecord.down_sums);
     _ = setenv("TF_DRAFT_MLP_PAIR", "0", 1);
     MlpRecord.reset();
-    try q.draft.frame.mlp(&d, l, 16);
+    try q.draft.frame.mlp(&d, l, 16, null);
     try T.expectEqual(@as(usize, 0), MlpRecord.pairs);
     try T.expectEqual(@as(usize, 1), MlpRecord.activations);
     try T.expectEqual(d.xs, MlpRecord.down_sums);
