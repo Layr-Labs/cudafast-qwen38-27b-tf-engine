@@ -7,7 +7,7 @@ const engine = @import("cuda_engine.zig");
 /// Children a node, the selector's weight, the softmax scale, and the nodes a tree takes by default.
 const branch = 12;
 const edge_weight = 0.6;
-const scale = 1.5;
+const scale = 2.0;
 /// A sampled stream's candidates carry the draw's own Gumbel noise at this weight (the 27B engine's draft_tree).
 const noise_weight = 0.7;
 const default_nodes = 15;
