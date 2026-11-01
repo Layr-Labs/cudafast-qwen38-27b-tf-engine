@@ -626,6 +626,11 @@ pub fn graphsOff() bool {
     const value = platform.c.getenv("TF_DRAFT_GRAPH") orelse return false;
     return !std.mem.eql(u8, std.mem.span(value), "1");
 }
+/// TF_GRAPH_UPLOAD=0: the frame's captured graphs launch without their one-time device preparation.
+pub fn graphUploadOff() bool {
+    const value = platform.c.getenv("TF_GRAPH_UPLOAD") orelse return false;
+    return std.mem.eql(u8, std.mem.span(value), "0");
+}
 pub fn liveGroups() bool {
     const value = platform.c.getenv("TF_DRAFT_GROUP_LIVE") orelse return true;
     return std.mem.eql(u8, std.mem.span(value), "1");
