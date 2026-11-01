@@ -43,6 +43,9 @@ pub const Kernels = struct {
     slots: usize,
     /// Native MLP, two-row normal/split projection, and three-row grouped projection.
     persistent_fns: [4]?Function = @splat(null),
+    /// Cooperative dynamic work queues: MLP, output projection, grouped input projections.
+    queue_fns: [3]?Function = @splat(null),
+    queue_slots: [3]usize = @splat(0),
 
     /// From a loaded qmm_prefill module, on a device of `sms` SMs.
     pub fn resolve(prefill_mod: module.Module, sms: usize) !Kernels {
@@ -66,11 +69,18 @@ pub const Kernels = struct {
                 try kernel.allowDynamicShared(smem);
                 dest.* = kernel;
             }
+            const qnames = [_][:0]const u8{ "tf_qmm_prompt_queue_mlp", "tf_qmm_prompt_queue_output", "tf_qmm_prompt_queue_input" };
+            for (qnames, &result.queue_fns, &result.queue_slots) |name, *dest, *resident| {
+                const kernel = try prefill_mod.function(name);
+                try kernel.allowDynamicShared(smem);
+                dest.* = kernel;
+                resident.* = @max(1, try kernel.occupancy(threads, smem)) * sms;
+            }
         }
         return result;
     }
 
-    fn persistent(kk: *const Kernels, f: Function, s: Stream, x: u64, parts: Parts, act: u64, rows: usize, k: usize, group: usize, full_cols: c_int, blocks: usize) !void {
+    fn persistent(_: *const Kernels, f: Function, cooperative: bool, live_slots: usize, s: Stream, x: u64, parts: Parts, act: u64, rows: usize, k: usize, group: usize, full_cols: c_int, blocks: usize) !void {
         var g: launch_.Args = .{};
         g.add(x);
         g.add(parts);
@@ -79,11 +89,20 @@ pub const Kernels = struct {
         g.add(full_cols);
         g.add(@as(c_int, @intCast(blocks)));
         g.add(@as(c_int, 1));
-        try launch_.launch(f, .{ .grid = .{ .x = @intCast(@min(blocks, kk.slots)) }, .block = .{ .x = threads }, .shared = smem }, s, &g);
+        try launch_.launch(f, .{ .grid = .{ .x = @intCast(@min(blocks, live_slots)) }, .block = .{ .x = threads }, .shared = smem, .cooperative = cooperative }, s, &g);
     }
 
     fn persistentRows(kk: *const Kernels, rows: usize) bool {
         return kk.slots == 96 and rows >= 256;
+    }
+
+    /// TF_PROMPT_QUEUE=0: static; =1 (default): output/input only; =2: all three families.
+    fn queueMode() u8 {
+        const v = std.c.getenv("TF_PROMPT_QUEUE") orelse return 1;
+        const z = std.mem.span(v);
+        if (std.mem.eql(u8, z, "0")) return 0;
+        if (std.mem.eql(u8, z, "1")) return 1;
+        return 2;
     }
 
     fn outputRole(outs: []const Out) bool {
@@ -128,8 +147,11 @@ pub const Kernels = struct {
         g.add(act);
         for ([_]usize{ rows, k, k, group }) |v| g.add(@as(c_int, @intCast(v)));
         const blocks = rows_t * (gate.n / 64);
-        if (kk.slots == 96 and blocks > kk.slots and gate.n == 17408 and gate.k == 5120) if (kk.persistent_fns[0]) |f|
-            return kk.persistent(f, s, x, parts, act, rows, k, group, -1, blocks);
+        if (kk.slots == 96 and blocks > kk.slots and gate.n == 17408 and gate.k == 5120) {
+            const queued = queueMode() >= 2 and kk.queue_fns[0] != null;
+            if (if (queued) kk.queue_fns[0] else kk.persistent_fns[0]) |f|
+                return kk.persistent(f, queued, if (queued) kk.queue_slots[0] else kk.slots, s, x, parts, act, rows, k, group, -1, blocks);
+        }
         try launch_.launch(kk.mlp_fn, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = threads }, .shared = smem }, s, &g);
     }
 
@@ -153,7 +175,9 @@ pub const Kernels = struct {
                 var parts: Parts = std.mem.zeroes(Parts);
                 parts.count = 1;
                 parts.p[0] = part;
-                return kk.persistent(f, s, x, parts, 0, rows, k, group, @intCast(full_cols), blocks);
+                const queued = queueMode() >= 1 and kk.queue_fns[1] != null;
+                const chosen = if (queued) kk.queue_fns[1].? else f;
+                return kk.persistent(chosen, queued, if (queued) kk.queue_slots[1] else kk.slots, s, x, parts, 0, rows, k, group, @intCast(full_cols), blocks);
             };
             return launch_.launch(kk.split_fn, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = threads }, .shared = smem }, s, &g);
         };
@@ -166,8 +190,12 @@ pub const Kernels = struct {
         }
         parts.count = @intCast(outs.len);
         const selected: ?usize = if (outputRole(outs)) 1 else if (recurrentRole(outs)) 3 else null;
-        if (kk.persistentRows(rows) and blocks > kk.slots) if (selected) |index| if (kk.persistent_fns[index]) |f|
-            return kk.persistent(f, s, x, parts, 0, rows, k, group, -1, blocks);
+        if (kk.persistentRows(rows) and blocks > kk.slots) if (selected) |index| if (kk.persistent_fns[index]) |f| {
+            // the queue entry point runs the three-row grouped body (index 3); index 1 keeps its static two-row kernel
+            const queued = index == 3 and queueMode() >= 1 and kk.queue_fns[2] != null;
+            const chosen = if (queued) kk.queue_fns[2].? else f;
+            return kk.persistent(chosen, queued, if (queued) kk.queue_slots[2] else kk.slots, s, x, parts, 0, rows, k, group, -1, blocks);
+        };
         var g: launch_.Args = .{};
         g.add(x);
         g.add(parts);

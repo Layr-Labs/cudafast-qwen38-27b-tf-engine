@@ -3,12 +3,27 @@
 namespace tf_qmm_persistent {
 using namespace tf_qmm_prefill;
 
+// The queue entry point's work counter: module storage of its own, reset by CTA 0 before the grid sync.
+__device__ unsigned queue_counter;
+
 template<int BM,int WM,bool MLP,bool SPLIT>
-__global__ void __launch_bounds__(WM*128) kernel(const __nv_bfloat16* __restrict__ x,
-        const __grid_constant__ ManyParts parts,__nv_bfloat16* __restrict__ act,
-        int M,int K,int ldx,int group,int full_cols,int total,int rotate) {
+__device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,
+        const ManyParts& parts,__nv_bfloat16* __restrict__ act,
+        int M,int K,int ldx,int group,int full_cols,int total,int rotate,bool queue) {
     constexpr int BN=128, STAGES=2;
-    for(int work=blockIdx.x;work<total;work+=gridDim.x){
+    // Dynamic mode: a cooperative grid claims ascending work numbers from queue_counter.
+    __shared__ int next_work;
+    if(queue){
+        if(blockIdx.x==0 && threadIdx.x==0)queue_counter=0u;
+        cooperative_groups::this_grid().sync();
+    }
+    // Thread 0 claims; the barrier publishes the claim and orders it after the previous tile's last shared read.
+    auto claim=[&]()->int{
+        if(threadIdx.x==0)next_work=(int)atomicAdd(&queue_counter,1u);
+        __syncthreads();
+        return next_work;
+    };
+    for(int work=queue?claim():(int)blockIdx.x;work<total;work=queue?claim():work+(int)gridDim.x){
         int tile=work;
         // Rotate row assignment between complete cohorts so short rows do
         // not remain assigned to the same persistent workers each iteration.
@@ -52,5 +67,12 @@ __global__ void __launch_bounds__(WM*128) kernel(const __nv_bfloat16* __restrict
         // reads the preceding tile. Each native tile already waits for copies.
         __syncthreads();
     }
+}
+
+template<int BM,int WM,bool MLP,bool SPLIT>
+__global__ void __launch_bounds__(WM*128) kernel(const __nv_bfloat16* __restrict__ x,
+        const __grid_constant__ ManyParts parts,__nv_bfloat16* __restrict__ act,
+        int M,int K,int ldx,int group,int full_cols,int total,int rotate){
+    body<BM,WM,MLP,SPLIT>(x,parts,act,M,K,ldx,group,full_cols,total,rotate,false);
 }
 } // namespace tf_qmm_persistent

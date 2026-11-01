@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <cooperative_groups.h>
 
 #include "qmm_frag.cuh"
 
@@ -190,3 +191,16 @@ template __global__ void tf_qmm_persistent::kernel<128,1,true,false>(const __nv_
 template __global__ void tf_qmm_persistent_rows2::kernel<128,1,false,false>(const __nv_bfloat16* __restrict__, const __grid_constant__ tf_qmm_prefill::ManyParts, __nv_bfloat16* __restrict__, int,int,int,int,int,int,int);
 template __global__ void tf_qmm_persistent_rows2::kernel<128,1,false,true>(const __nv_bfloat16* __restrict__, const __grid_constant__ tf_qmm_prefill::ManyParts, __nv_bfloat16* __restrict__, int,int,int,int,int,int,int);
 template __global__ void tf_qmm_persistent_rows3::kernel<128,1,false,false>(const __nv_bfloat16* __restrict__, const __grid_constant__ tf_qmm_prefill::ManyParts, __nv_bfloat16* __restrict__, int,int,int,int,int,int,int);
+// Cooperative queue entry points. Arithmetic remains in the same tile bodies.
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_queue_mlp(const __nv_bfloat16* x,
+        const __grid_constant__ tf_qmm_prefill::ManyParts parts,__nv_bfloat16* act,int M,int K,int ldx,int group,int full_cols,int total,int rotate){
+    tf_qmm_persistent::body<128,1,true,false>(x,parts,act,M,K,ldx,group,full_cols,total,rotate,true);
+}
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_queue_output(const __nv_bfloat16* x,
+        const __grid_constant__ tf_qmm_prefill::ManyParts parts,__nv_bfloat16* act,int M,int K,int ldx,int group,int full_cols,int total,int rotate){
+    tf_qmm_persistent_rows2::body<128,1,false,true>(x,parts,act,M,K,ldx,group,full_cols,total,rotate,true);
+}
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_queue_input(const __nv_bfloat16* x,
+        const __grid_constant__ tf_qmm_prefill::ManyParts parts,__nv_bfloat16* act,int M,int K,int ldx,int group,int full_cols,int total,int rotate){
+    tf_qmm_persistent_rows3::body<128,1,false,false>(x,parts,act,M,K,ldx,group,full_cols,total,rotate,true);
+}
