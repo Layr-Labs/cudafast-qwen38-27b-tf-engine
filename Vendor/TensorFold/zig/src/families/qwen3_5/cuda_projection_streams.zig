@@ -28,7 +28,22 @@ fn size(p: layers.Proj) usize {
     return q.npad * q.k / 2;
 }
 
-/// Existing views remain available to every other projection role and row count.
+/// The streams' sizes in the order `prepare` places them (for the fast pool's screen); returns how many.
+pub fn copySizes(e: anytype, input: bool, output: bool, out: []usize) usize {
+    var n: usize = 0;
+    for (e.layers) |*layer| for (candidates(layer, input, output)) |maybe| {
+        if (maybe) |p| {
+            const nbytes = size(p.*);
+            if (nbytes == 0) continue;
+            out[n] = nbytes;
+            n += 1;
+        }
+    };
+    return n;
+}
+
+/// Existing views remain available to every other projection role and row count. With the engine's fast pool the
+/// streams are placed in its pieces and nothing is returned.
 pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     var bytes: usize = 0;
     for (e.layers) |*layer| for (candidates(layer, input, output)) |maybe| { if (maybe) |p| { bytes += size(p.*); } };
@@ -52,30 +67,40 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
         break :blk f;
     };
     try out.allowDynamicShared(35328);
-    var buffer = try cuda.DeviceBuffer.alloc(e.d, bytes);
-    errdefer buffer.free();
-    try buffer.fill8(0, null);
+    var buffer: ?cuda.DeviceBuffer = null;
+    if (e.fast == null) {
+        buffer = try cuda.DeviceBuffer.alloc(e.d, bytes);
+    }
+    errdefer if (buffer) |*b| b.free();
+    if (buffer) |b| try b.fill8(0, null);
     errdefer cuda.completion.drain(e.d, e.stream, "projection stream packing failed before draining");
+    // each stream's place: one buffer back to back, or the fast pool's pieces (committed when it screened them)
+    var places: [6 * 64]u64 = undefined;
+    var count: usize = 0;
     var at: usize = 0;
     for (e.layers) |*layer| for (candidates(layer, input, output)) |maybe| {
         if (maybe) |p| {
             const nbytes = size(p.*);
             if (nbytes == 0) continue;
+            if (count == places.len) return error.TooManyStreams;
+            const dst = if (e.fast) |*pool| (pool.alloc(nbytes) orelse return error.FastPoolShort) else buffer.?.ptr + at;
+            places[count] = dst;
+            count += 1;
             const q = p.a4;
             const words = q.npad * q.k / 8;
             try e.run(pack, .{ (words + 255) / 256, 1, 1 }, .{ 256, 1, 1 },
-                .{ q.w, buffer.ptr + at, @as(c_int, @intCast(q.k / 64)), @as(c_int, @intCast(q.npad / 64)) });
+                .{ q.w, dst, @as(c_int, @intCast(q.k / 64)), @as(c_int, @intCast(q.npad / 64)) });
             at += nbytes;
         }
     };
     try e.stream.synchronize();
-    at = 0;
+    count = 0;
     for (e.layers) |*layer| for (candidates(layer, input, output)) |maybe| {
         if (maybe) |p| {
             const nbytes = size(p.*);
             if (nbytes == 0) continue;
-            p.a4.stream_w = buffer.ptr + at;
-            at += nbytes;
+            p.a4.stream_w = places[count];
+            count += 1;
         }
     };
     if (output) e.affine.stream16_fns = .{ down, out };
