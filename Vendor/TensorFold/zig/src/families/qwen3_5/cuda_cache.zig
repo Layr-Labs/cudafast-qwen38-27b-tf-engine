@@ -165,6 +165,9 @@ pub const Cache = struct {
     /// Positions the newest forward wrote up to: a tap ring holds them until the next forward, whatever `keep` lands.
     written: usize = 0,
     logits: []u16,
+    /// A greedy prompt pass's first token from the screened head (cuda_prompt_tail.zig), when it took that path: `logits`
+    /// then holds nothing for this position. Cleared by the next forward.
+    first: ?u32 = null,
     /// The newest verify window, until its path is kept: where it started, its rows.
     last: ?struct { start: usize, rows: usize } = null,
     /// A kept prefix of the newest window (rows 0..pend-1) whose recurrence replay the next recorded slot scan folds.

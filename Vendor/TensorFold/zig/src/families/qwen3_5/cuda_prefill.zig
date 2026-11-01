@@ -132,6 +132,13 @@ fn chunk(self: anytype, stream: *lanes.Stream, f: *Fill) !bool {
     const cache = try self.cacheOf(stream);
     var images: ?E.Images = if (f.media) |m| .{ .features = m.features.ptr, .src = m.src, .pos = m.pos } else null;
     const end = nextCut(ids.len, stream.chunks, f.at);
+    // the prompt's last cut with a drafter attached: its head overlaps the drafter's prompt absorb (cuda_engine.zig Overlap)
+    if (end == ids.len and stream.drafts) self.e.overlap.armed = self.e.overlap.on;
+    // the final chunk of a plain greedy stream (no sampling, log probabilities, grammar or images): its first token may
+    // come from the screened head (cuda_prompt_tail.zig)
+    self.e.prompt_greedy = end == ids.len and stream.sampling == null and stream.logprobs == null and
+        stream.prompt_logprobs == null and stream.grammar == null and f.media == null and E.promptH3On();
+    defer self.e.prompt_greedy = false;
     try self.e.forward(&.{.{ .cache = cache, .rows = end - f.at, .images = if (images) |*im| im else null }}, ids[f.at..end], .last);
     f.at = end;
     stream.fill_at.store(@intCast(end), .monotonic);
