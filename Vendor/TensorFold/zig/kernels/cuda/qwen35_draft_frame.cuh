@@ -5,13 +5,16 @@ constexpr int DRAFT_CHUNKS = 9;
 
 extern "C" __global__ void tf_q35d_dyn_conv_batch(const __nv_bfloat16* __restrict__ X0, const __nv_bfloat16* __restrict__ DYN0,
                                               const __nv_bfloat16* __restrict__ BASE, const __nv_bfloat16* __restrict__ RES0,
-                                              __nv_bfloat16* __restrict__ OUT0, int D, int group, int branch, int block_rows) {
+                                              __nv_bfloat16* __restrict__ OUT0, int D, int group, int branch, int block_rows,
+                                              float* __restrict__ XS0) {
     release_next();
     await_prior();
     const __nv_bfloat16* X = after_wait(X0);
     const __nv_bfloat16* DYN = after_wait(DYN0);
     const __nv_bfloat16* RES = after_wait(RES0);
     __nv_bfloat16* OUT = after_wait(OUT0);
+    float* XS = after_wait(XS0);
+    __shared__ __nv_bfloat16 done[256];
     const int t = blockIdx.x;
     const int groups = D / group;
     // grid (rows, channel blocks): a thread a channel, so a 16-row window fills the device instead of 16 blocks
@@ -26,7 +29,19 @@ extern "C" __global__ void tf_q35d_dyn_conv_batch(const __nv_bfloat16* __restric
             total = rbf(total + rbf(bf(DYN[(size_t)t * (4 * groups) + (branch * 2 + l) * groups + g]) * x));
         }
         if (RES != nullptr) total = rbf(total + bf(RES[(size_t)t * D + c]));
-        OUT[(size_t)t * D + c] = __float2bfloat16_rn(total);
+        const __nv_bfloat16 out = __float2bfloat16_rn(total);
+        OUT[(size_t)t * D + c] = out;
+        if (XS != nullptr) done[threadIdx.x] = out;
+    }
+    if (XS != nullptr) {
+        __syncthreads();
+        const int first = blockIdx.y * 256 + threadIdx.x * 64;
+        if (threadIdx.x < 4 && first + 64 <= D) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 64; ++i) sum += bf(done[threadIdx.x * 64 + i]);
+            XS[(size_t)t * (D / 64) + first / 64] = sum;
+        }
     }
 }
 
