@@ -254,6 +254,7 @@ pub const Linear = struct {
 /// The affine-4 entry points; verify32 is pending compiler and device qualification.
 pub const symbols = struct {
     pub const group = "_ZN12tf_qmm_group12group_kernelILi64ELi16ELi64ELi1ELi4ELi8ELb0ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
+    pub const group_col128 = "_ZN12tf_qmm_group12group_kernelILi64ELi16ELi128ELi1ELi4ELi5ELb0ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
     pub const verify32 = "_ZN12tf_qmm_group12group_kernelILi64ELi32ELi64ELi1ELi4ELi5ELb0ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
     pub const verify64 = "_ZN12tf_qmm_group12group_kernelILi64ELi64ELi64ELi1ELi4ELi4ELb0ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
     pub const verify128 = "_ZN12tf_qmm_group12group_kernelILi64ELi128ELi64ELi1ELi4ELi3ELb0ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
@@ -269,6 +270,7 @@ pub const symbols = struct {
     pub const pack_scales = "tf_transpose_pad16";
     // dictionary-coded twins (qmm_dict.cuh) and the load-time encoder (affine4_pack.cu)
     pub const group_dict = "_ZN12tf_qmm_group17group_kernel_dictILi64ELi16ELi64ELi1ELi4ELi8ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
+    pub const group_dict_col128 = "_ZN12tf_qmm_group17group_kernel_dictILi64ELi16ELi128ELi1ELi4ELi5ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
     pub const gemv_dict = "tf_lane_gemv_dict";
     pub const gemv_many_dict = "tf_lane_gemv_many_dict";
     pub const dict_mark = "tf_dict_mark";
@@ -309,6 +311,7 @@ comptime {
 }
 
 pub const group_smem: u32 = 35328; // LaneTile<64, 16, 64, 1, 4, 8>::SMEM
+pub const group_col128_smem: u32 = 33600;
 pub const verify_smem: u32 = 32640; // LaneTile<64, 32, 64, 1, 4, 5>::SMEM
 pub const verify64_smem: u32 = 43008; // LaneTile<64, 64, 64, 1, 4, 4>::SMEM
 pub const verify128_smem: u32 = 57600; // LaneTile<64, 128, 64, 1, 4, 3>::SMEM

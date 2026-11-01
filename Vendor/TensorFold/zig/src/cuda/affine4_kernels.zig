@@ -130,6 +130,7 @@ pub const Affine4Kernels = struct {
     pub const Out = struct { q: Affine4, out: u64 };
 
     group_fn: Function,
+    col128_fns: [2]?Function = @splat(null),
     stream16_fns: [2]?Function = @splat(null),
     stream16_dict_fn: ?Function = null, // tf_qmm_output_stream16 on a dictionary-coded down projection
     gdn_stream16_dict_fn: ?Function = null, // tf_qmm_gdn_stream16 with its dictionary-coded parts
@@ -190,6 +191,7 @@ pub const Affine4Kernels = struct {
         a.gemv_blocks = @max(1, try a.gemv_fn.occupancy(128, group_smem)) * sms;
         a.pdl = gb10;
         a.stream16_fns = @splat(null);
+        a.col128_fns = @splat(null);
         a.stream16_dict_fn = null;
         a.gdn_stream16_dict_fn = null;
         a.gdn_stream16_fn = null;
@@ -204,6 +206,10 @@ pub const Affine4Kernels = struct {
         a.narrow = if (gb10) try Split.initFor(d, 1) else null;
         a.dict = null;
         if (gb10) {
+            a.col128_fns[0] = try group_mod.function(symbols.group_col128);
+            a.col128_fns[1] = try group_mod.function(symbols.group_dict_col128);
+            try a.col128_fns[0].?.allowDynamicShared(linear.group_col128_smem);
+            try a.col128_fns[1].?.allowDynamicShared(linear.group_col128_smem + linear.dict_dec + @max(linear.dict_tab_max, linear.group_pair_tab_one));
             var t: DictKernels = undefined;
             t.group = try group_mod.function(symbols.group_dict);
             t.gemv = try gemv_mod.function(symbols.gemv_dict);
@@ -825,10 +831,15 @@ pub const Affine4Kernels = struct {
             const shared = if (dict) linear.out16_smem + q.tabBytesUpTo(linear.out_pair_tab_max) else linear.out16_smem;
             return launch_.launch(if (dict) a.stream16_dict_fn.? else stream_fn.?, .{ .grid = .{ .x = 80 }, .block = .{ .x = 512 }, .shared = shared, .pdl = a.pdl }, s, &g);
         }
-        const tiles = (q.n + 63) / 64;
+        const old_tiles = (q.n + 63) / 64;
         const rows_t = (rows + 15) / 16;
-        const clusters = rows_t * tiles; // one part: the cluster is its sk K slices of one tile
-        const dict = a.coded(q) and clusters * sk >= a.sms;
+        const dict = a.coded(q) and rows_t * old_tiles * sk >= a.sms;
+        const col128_fn = if (a.pdl and rows > 0 and rows <= max_rows and sk == 1 and
+            q.n >= 65536 and q.n % 128 == 0) a.col128_fns[@intFromBool(dict)] else null;
+        const col128 = col128_fn != null;
+        const tiles = if (col128) q.n / 128 else old_tiles;
+        const clusters = rows_t * tiles;
+        const smem = if (col128) linear.group_col128_smem else group_smem;
         var parts: Parts = std.mem.zeroes(Parts);
         parts.count = 1;
         parts.p[0] = groupPart(q, dict, out, sk, tiles, 0);
@@ -840,11 +851,11 @@ pub const Affine4Kernels = struct {
         const cfg: launch_.Config = .{
             .grid = .{ .x = u(clusters * sk) },
             .block = .{ .x = 128 },
-            .shared = if (dict) group_smem + linear.dict_dec + q.tabBytesUpTo(if (sk > 1) linear.group_pair_tab_max else linear.group_pair_tab_one) else group_smem,
+            .shared = if (dict) smem + linear.dict_dec + q.tabBytesUpTo(if (sk > 1) linear.group_pair_tab_max else linear.group_pair_tab_one) else smem,
             .cluster = if (sk > 1) .{ .x = u(sk) } else null,
             .pdl = a.pdl,
         };
-        try launch_.launch(if (dict) a.dict.?.group else a.group_fn, cfg, s, &g);
+        try launch_.launch(if (col128) col128_fn.? else if (dict) a.dict.?.group else a.group_fn, cfg, s, &g);
     }
 
     /// qmm.prefill_matmul (tile 0): weights rounded once to bf16, one fp32 chain over K; bf16 out.
