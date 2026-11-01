@@ -230,8 +230,9 @@ fn head(d: anytype, rows: usize) !?u64 {
     const a = d.logits; // rows x 98,304, then rows x 320, then the packed rows x 98,592
     const b = a + rows * first.n * 2;
     const out = b + rows * tail.n * 2;
-    try draft.precision.project(e, layers.Proj{ .a4 = first }, d.x, d.xs, a, rows, .proposal, draft.precision.dflash_projection_prompt_cutoff);
-    try draft.precision.project(e, layers.Proj{ .a4 = tail }, d.x, d.xs, b, rows, .proposal, draft.precision.dflash_projection_prompt_cutoff);
+    // d.x and its group sums d.xs are the final norm's (body): both projections read them, no sums launch of their own
+    try e.project(layers.Proj{ .a4 = first }, d.x, d.xs, a, rows, false, 0, false);
+    try e.project(layers.Proj{ .a4 = tail }, d.x, d.xs, b, rows, false, 0, false);
     const skip = spans[1][0] - tail_tile;
     const copies = [2]cuda.abi.Memcpy2D{
         .{ .src = a, .src_pitch = first.n * 2, .dst = out, .dst_pitch = span_width * 2, .width = first.n * 2, .height = rows },
@@ -241,8 +242,8 @@ fn head(d: anytype, rows: usize) !?u64 {
     return out;
 }
 
-/// The rows' draft logits over the whole vocabulary, in d.logits.
+/// The rows' draft logits over the whole vocabulary, in d.logits (over the final norm's d.x and d.xs, as head's).
 fn full(d: anytype, rows: usize) !?u64 {
-    try draft.precision.project(d.e, d.e.head, d.x, d.xs, d.logits, rows, .proposal, draft.precision.dflash_projection_prompt_cutoff);
+    try d.e.project(d.e.head, d.x, d.xs, d.logits, rows, false, 0, false);
     return null;
 }

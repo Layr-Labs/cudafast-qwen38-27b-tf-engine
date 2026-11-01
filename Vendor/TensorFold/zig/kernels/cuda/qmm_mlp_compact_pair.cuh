@@ -98,6 +98,9 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     for (int it = 0; it < per; ++it) {
         wait<0>();
         __syncthreads();
+        const int next = it + 1;
+        if (next < per) { load_x(next % STAGES, next); load_w(next % STAGES, next); }
+        commit();
         const unsigned char* p = stage(it % STAGES);
         const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
         const uint32_t* pk = reinterpret_cast<const uint32_t*>(p + T::X + T::W + mrun);
@@ -136,9 +139,6 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
             xv[i][0] = px[row];
             xv[i][1] = px[row + 8];
         }
-        const int next = it + 1;
-        if (next < per) { load_x(next % STAGES, next); load_w(next % STAGES, next); }
-        commit();
         float d[I][J][4];
 #pragma unroll
         for (int kt = 0; kt < GS / 16; ++kt) {
