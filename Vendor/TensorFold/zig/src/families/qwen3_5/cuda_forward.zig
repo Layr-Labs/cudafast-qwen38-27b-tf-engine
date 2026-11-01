@@ -116,8 +116,11 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                         try launch(e, e.fp8.attn_rows, sig.attn_rows8, .{ groups, max_chunks, g.kv_heads }, .{ 256, 1, 1 }, rows_args);
                     } else {
                         // a 2..64-row window: row pairs share each chunk's stream-key tiles (attn_pair, the same bits);
-                        // TF_ATTN_PAIR=0 keeps attn_partial's block a row
-                        if (record and total >= 2 and 2 * group <= 16 and pairOn())
+                        // TF_ATTN_PAIR=0 keeps attn_partial's block a row; attn_pair_kv (TF_ATTN_KV=0: attn_pair) copies a
+                        // tile's keys and values as separate groups, the next keys during a pass's softmax and values
+                        if (record and total >= 2 and 2 * group <= 16 and pairOn() and kvOn())
+                            try sharedSized(e, e.fns.attn_pair_kv, sig.attn_pair_kv, .{ (total + 1) / 2, partial_chunks, g.kv_heads }, 128, attn_tile, args)
+                        else if (record and total >= 2 and 2 * group <= 16 and pairOn())
                             try sharedSized(e, e.fns.attn_pair, sig.attn_pair, .{ (total + 1) / 2, partial_chunks, g.kv_heads }, 128, attn_tile, args)
                         else
                             try sharedSized(e, e.fns.attn_partial, sig.attn_partial, .{ total, partial_chunks, g.kv_heads }, 128, attn_tile, args);
@@ -186,6 +189,12 @@ fn rows4On() bool {
 /// TF_ATTN_PAIR=0: 2..64-row windows keep tf_q35_attn_partial (a block a row).
 fn pairOn() bool {
     const v = @import("sys").c.getenv("TF_ATTN_PAIR") orelse return true;
+    return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
+}
+
+/// TF_ATTN_KV=0: attn_pair's windows keep tf_q35_attn_pair (a tile's keys and values in one group, awaited at once).
+fn kvOn() bool {
+    const v = @import("sys").c.getenv("TF_ATTN_KV") orelse return true;
     return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
 }
 
