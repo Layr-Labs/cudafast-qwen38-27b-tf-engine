@@ -14,7 +14,14 @@ fn candidates(layer: *layers.Layer, input: bool, output: bool) [6]?*layers.Proj 
                 list[2] = &m.qkv; list[3] = &m.z; list[4] = &m.a; list[5] = &m.b;
             }
         },
-        .attention => |*m| { if (output) list[1] = &m.o; },
+        .attention => |*m| {
+            if (output) list[1] = &m.o;
+            // q (with its gate half), k and v of one input: the stream twin of the attention's mixed cluster launch
+            if (input and m.q == .a4 and m.k == .a4 and m.v == .a4 and m.q.outputs() == 12288 and m.k.outputs() == 1024 and
+                m.v.outputs() == 1024 and m.q.inputs() == 5120 and m.k.inputs() == 5120 and m.v.inputs() == 5120) {
+                list[2] = &m.q; list[3] = &m.k; list[4] = &m.v;
+            }
+        },
     }
     return list;
 }
@@ -23,7 +30,7 @@ fn size(p: layers.Proj) usize {
     if (p != .a4) return 0;
     const q = p.a4;
     const out = q.n == 5120 and (q.k == 6144 or q.k == 17408) and cuda.qlinear.splitK(q.n, q.k) == 4;
-    const in = q.k == 5120 and (q.n == 10240 or q.n == 6144 or q.n == 48);
+    const in = q.k == 5120 and (q.n == 10240 or q.n == 6144 or q.n == 48 or q.n == 12288 or q.n == 1024);
     if (!out and !in) return 0;
     return q.npad * q.k / 2;
 }
