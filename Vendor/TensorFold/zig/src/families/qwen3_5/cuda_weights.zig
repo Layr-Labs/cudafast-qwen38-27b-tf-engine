@@ -99,6 +99,20 @@ pub fn total(g: Geometry) usize {
     return t;
 }
 
+/// At most what the decode views copy out of the arena after the load (verify_weight_layout's gate/up panels and
+/// projection_stream_layout's streams take the packed words of some 4-bit layer projections): every 4-bit layer
+/// projection's packed words.
+pub fn viewBytes(g: Geometry) usize {
+    if (g.kinds.modelopt or g.moe()) return 0;
+    var t: usize = 0;
+    for (0..g.layers) |i| for (slots(g, i)) |slot| {
+        if (servedBits(g.bits.of(i, slot)) != 4) continue;
+        const nk = shape(g, slot);
+        t += aligned(Affine4.layout(nk[0], nk[1]).words);
+    };
+    return t;
+}
+
 /// The largest projection's bytes as stored: the staging buffer the load packs each one from (and widens through).
 pub fn stageBytes(g: Geometry) usize {
     if (g.kinds.modelopt) {
