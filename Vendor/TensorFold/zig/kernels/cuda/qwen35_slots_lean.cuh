@@ -3,13 +3,17 @@
 // output and log bases fixed before the loop, a row a stride further), a lane's four value-row entries one 8-byte
 // load, the record's lane predicates and log strides computed once.
 #pragma once
-template <int SLOTS>
-__device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q, const __nv_bfloat16* k,
-        const __nv_bfloat16* v, const float* g, const __nv_bfloat16* beta, const Seg* segs,
-        const SlotStep* steps, int layer, __nv_bfloat16* y, const int* P) {
+// EARLY: the window's state and its first four kept rows' records load before griddepcontrol.wait. No kernel of this
+// forward writes either before this scan (a layer's state is written only by its own scan, at its end; the kept rows'
+// records were written before the forward), so the values are the same and the loads overlap the kernels before.
+template <int SLOTS, bool EARLY>
+__device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q0, const __nv_bfloat16* k0,
+        const __nv_bfloat16* v0, const float* g0, const __nv_bfloat16* beta0, const Seg* segs,
+        const SlotStep* steps, int layer, __nv_bfloat16* y0, const int* P) {
     constexpr int R = 4;
     __shared__ float4 kept[4][SLOTS * R * 32];
     const int NK = geo.nk, NV = geo.nv;
+    if (!EARLY) await_prior();
     if (past_windows(P, blockIdx.z / NV)) return;
     const int hv = blockIdx.z % NV, hk = hv / (NV / NK);
     const Seg sg = segs[blockIdx.z / NV];
@@ -24,26 +28,44 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q, 
     for (int r = 0; r < R; ++r)
 #pragma unroll
         for (int i = 0; i < PT; ++i) root[r][i] = st[r * DK + i];
-    if (sg.pn > 0) {
-        Seg prev = sg;
-        prev.log = sg.plog;
-        // the kept prefix's rows four at a time: their decays, strengths and keys loaded together, then applied in
-        // order with q35_slots's arithmetic
-        for (int j0 = 0; j0 < sg.pn; j0 += 4) {
-            float pg[4];
-            float4 pd[4];
-            uint2 pk[4];
+    float pg[4];
+    float4 pd[4];
+    uint2 pk[4];
+    // the kept rows four at a time: their decays, strengths and keys loaded together, then applied in order with
+    // q35_slots's arithmetic; the carried prefix (pn2) first, then the newer one (pn). When EARLY, the first group of
+    // the first non-empty prefix (rows logged by earlier rounds) is loaded before the wait.
+    auto load_kept = [&](const Seg& prev, int pn, int j0) {
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            if (j0 + u >= pn) break;
+            const LogRow l = log_row(geo, prev, layer, j0 + u);
+            pg[u] = l.g[hv];
+            pd[u] = *reinterpret_cast<const float4*>(l.delta + hv * DK + dv0);
+            pk[u] = *reinterpret_cast<const uint2*>(l.k + hk * DK + PT * dk);
+        }
+    };
+    Seg prev2 = sg, prev1 = sg;
+    prev2.log = sg.plog2;
+    prev1.log = sg.plog;
+    const int first_set = sg.pn2 > 0 ? 0 : 1;
+    if (EARLY && (sg.pn2 > 0 || sg.pn > 0)) load_kept(first_set ? prev1 : prev2, first_set ? sg.pn : sg.pn2, 0);
+    if (EARLY) await_prior();
+    const __nv_bfloat16* q = after_wait(q0);
+    const __nv_bfloat16* k = after_wait(k0);
+    const __nv_bfloat16* v = after_wait(v0);
+    const float* g = after_wait(g0);
+    const __nv_bfloat16* beta = after_wait(beta0);
+    __nv_bfloat16* y = after_wait(y0);
+#pragma unroll 1
+    for (int set = 0; set < 2; ++set) {
+        const int pn = set ? sg.pn : sg.pn2;
+        if (pn <= 0) continue;
+        const Seg& prev = set ? prev1 : prev2;
+        for (int j0 = 0; j0 < pn; j0 += 4) {
+            if (!EARLY || set != first_set || j0 > 0) load_kept(prev, pn, j0);
 #pragma unroll
             for (int u = 0; u < 4; ++u) {
-                if (j0 + u >= sg.pn) break;
-                const LogRow l = log_row(geo, prev, layer, j0 + u);
-                pg[u] = l.g[hv];
-                pd[u] = *reinterpret_cast<const float4*>(l.delta + hv * DK + dv0);
-                pk[u] = *reinterpret_cast<const uint2*>(l.k + hk * DK + PT * dk);
-            }
-#pragma unroll
-            for (int u = 0; u < 4; ++u) {
-                if (j0 + u >= sg.pn) break;
+                if (j0 + u >= pn) break;
                 const float pdr[R] = {pd[u].x, pd[u].y, pd[u].z, pd[u].w};
                 const __nv_bfloat16* kb = reinterpret_cast<const __nv_bfloat16*>(&pk[u]);
 #pragma unroll
@@ -57,6 +79,13 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q, 
             }
         }
     }
+    // a recorded window keeps its own rows in the log: the folded root goes back now, its stores draining under the
+    // steps (the same guarded stores the tail made: root is final after the fold)
+    if (recorded(P) && sg.rows != 1 && (sg.pn > 0 || sg.pn2 > 0) && !sg.skip)
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+#pragma unroll
+            for (int i = 0; i < PT; ++i) st[r * DK + i] = root[r][i];
     if (sg.rows == 1)
 #pragma unroll
         for (int r = 0; r < R; ++r)
@@ -203,25 +232,24 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q, 
         const float tot = spread_sum<R>(pend, dk);
         if ((dk & ((1 << SR) - 1)) == 0) y[((size_t)pend_row * NV + hv) * DK + dv0 + (dk >> SR)] = __float2bfloat16_rn(tot);
     }
-    if (record && sg.rows != 1) {
-        if (sg.pn > 0)
-#pragma unroll
-            for (int r = 0; r < R; ++r)
-#pragma unroll
-                for (int i = 0; i < PT; ++i) st[r * DK + i] = root[r][i];
-        return;
-    }
+    if (record && sg.rows != 1) return;  // the folded root went back before the steps
 #pragma unroll
     for (int r = 0; r < R; ++r)
 #pragma unroll
         for (int i = 0; i < PT; ++i) st[r * DK + i] = state[r][i];
 }
 
+// tf_q35_gdn_lean_N loads its state before the wait (EARLY); tf_q35_gdn_lean_N_late waits first (TF_SCAN_EARLY=0)
 #define TF_Q35_LEAN(N) \
 extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_lean_##N(Geo geo, const __nv_bfloat16* q, \
  const __nv_bfloat16* k, const __nv_bfloat16* v, const float* g, const __nv_bfloat16* beta, const Seg* segs, \
  const SlotStep* steps, int layer, __nv_bfloat16* y, const int* P) { \
-  release_next(); await_prior(); \
-  q35_slots_lean<N>(geo, after_wait(q), after_wait(k), after_wait(v), after_wait(g), after_wait(beta), segs, steps, layer, after_wait(y), P); }
+  release_next(); \
+  q35_slots_lean<N, true>(geo, q, k, v, g, beta, segs, steps, layer, y, P); } \
+extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_lean_##N##_late(Geo geo, const __nv_bfloat16* q, \
+ const __nv_bfloat16* k, const __nv_bfloat16* v, const float* g, const __nv_bfloat16* beta, const Seg* segs, \
+ const SlotStep* steps, int layer, __nv_bfloat16* y, const int* P) { \
+  release_next(); \
+  q35_slots_lean<N, false>(geo, q, k, v, g, beta, segs, steps, layer, y, P); }
 TF_Q35_LEAN(2)
 TF_Q35_LEAN(3)
