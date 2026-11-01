@@ -79,7 +79,8 @@ pub fn total(s: Shape) usize {
     var t = packedBytes(s.hidden, s.taps * s.hidden) + packedBytes(s.rank, s.hidden) + 2 * aligned(s.hidden * 2);
     t += s.layers * (2 * aligned(s.hidden * 2) + packedBytes(s.q_width, s.hidden) + 2 * packedBytes(s.kv_width, s.hidden) + packedBytes(s.hidden, s.q_width) +
         2 * aligned(s.head_dim * 2) + 2 * packedBytes(s.intermediate, s.hidden) + packedBytes(s.hidden, s.intermediate) + 2 * packedBytes(s.dynamic, s.hidden) + 2 * aligned(4 * s.hidden * 2) +
-        2 * aligned(Affine4.layout(s.intermediate, s.hidden).words) + aligned(Affine4.layout(s.hidden, s.intermediate).words));
+        2 * aligned(Affine4.layout(s.intermediate, s.hidden).words) + aligned(Affine4.layout(s.hidden, s.intermediate).words) +
+        aligned(Affine4.layout(s.hidden, s.q_width).words)); // the o projection's stream view (oStream)
     return t;
 }
 
@@ -168,24 +169,6 @@ fn leastSquares(row: []align(1) const u16, start: [2]f32) [2]f32 {
             best = cur;
         }
     }
-    // Search adjacent representable stored values; keep only an improvement under
-    // the same BF16-rounded error used by the base fit. Never alter the target.
-    const scale_bits = toBf16(best[0]);
-    const bias_bits = toBf16(best[1]);
-    for ([_]i32{ -1, 0, 1 }) |ds| {
-        for ([_]i32{ -1, 0, 1 }) |db| {
-            const su = @as(i32, scale_bits) + ds;
-            const bu = @as(i32, bias_bits) + db;
-            if (su < 0 or su > 65535 or bu < 0 or bu > 65535) continue;
-            const candidate = [2]f32{ bf16(@intCast(su)), bf16(@intCast(bu)) };
-            if (!(candidate[0] > 0) or !std.math.isFinite(candidate[0]) or !std.math.isFinite(candidate[1])) continue;
-            const err = groupError(row, candidate);
-            if (err < best_err) {
-                best_err = err;
-                best = candidate;
-            }
-        }
-    }
     return best;
 }
 
@@ -202,6 +185,13 @@ fn groupError(row: []align(1) const u16, fit: [2]f32) f64 {
         err += d * d;
     }
     return err;
+}
+
+/// TF_DRAFT_O_STREAM=0: the o projection (n = hidden, k = 4096) keeps the cluster tile; otherwise it gets a K-major
+/// view and its 16-row windows run tf_qmm_output_stream16 (the same four slices summed in order).
+fn oStream() bool {
+    const v = @import("sys").c.getenv("TF_DRAFT_O_STREAM") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
 }
 
 /// A bf16 (n, k) tensor quantized and packed through `stage` into the drafter's arena.
@@ -230,7 +220,7 @@ fn linear(gpa: std.mem.Allocator, e: *Engine, stage: *DeviceBuffer, w: *Weights,
         const pack = try e.mods[3].function("tf_pack_kmajor");
         const words = l.npad * k / 8;
         try e.run(pack, .{ (words + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ out.w, out.verify_w, @as(c_int, @intCast(k / 64)), @as(c_int, @intCast(l.npad / 64)) });
-    } else if (e.affine.stream16_fns[0] != null and n == 5120 and k == 17408) {
+    } else if (e.affine.stream16_fns[0] != null and n == 5120 and (k == 17408 or (k == 4096 and oStream()))) {
         out.stream_w = try w.alloc(l.words);
         const pack = try e.mods[3].function("tf_pack_kmajor");
         const words = l.npad * k / 8;
