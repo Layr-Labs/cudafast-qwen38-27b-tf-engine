@@ -16,7 +16,7 @@ pub const piece: usize = 96 << 20;
 /// Candidates at most (about 112 GiB).
 const most = 1200;
 /// Free memory left beside the candidates for what the load allocates after the copies (the drafter, the sessions).
-const keep_free: usize = 8 << 30;
+const keep_free: usize = 4 << 30;
 /// Timed reads of each candidate (after one untimed read); a candidate ranks by its median.
 const passes = 5;
 const probe_ctas = 136;
