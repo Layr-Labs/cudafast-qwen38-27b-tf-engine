@@ -30,10 +30,14 @@ __device__ __forceinline__ void q35_slots16_ready(Geo geo, const __nv_bfloat16* 
     for (int r = 0; r < R; ++r)
 #pragma unroll
         for (int i = 0; i < PT; ++i) root[r][i] = st[r * DK + i];
-    if (sg.pn > 0) {
+    // the carried prefix (pn2) first, then the newer one (pn), each with apply's arithmetic, row by row
+#pragma unroll 1
+    for (int set = 0; set < 2; ++set) {
+        const int pn = set ? sg.pn : sg.pn2;
+        if (pn <= 0) continue;
         Seg prev = sg;
-        prev.log = sg.plog;
-        for (int j = 0; j < sg.pn; ++j) {
+        prev.log = set ? sg.plog : sg.plog2;
+        for (int j = 0; j < pn; ++j) {
             const LogRow l = log_row(geo, prev, layer, j);
             const float pg = l.g[hv];
 #pragma unroll
@@ -164,7 +168,7 @@ __device__ __forceinline__ void q35_slots16_ready(Geo geo, const __nv_bfloat16* 
         if ((dk & ((1 << SR) - 1)) == 0) y[((size_t)pend_row * NV + hv) * DK + dv0 + (dk >> SR)] = __float2bfloat16_rn(tot);
     }
     if (record && sg.rows != 1) {
-        if (sg.pn > 0)
+        if ((sg.pn > 0 || sg.pn2 > 0) && !sg.skip)
 #pragma unroll
             for (int r = 0; r < R; ++r)
 #pragma unroll
