@@ -20,8 +20,8 @@ __global__ void __launch_bounds__(WM*128) kernel(const __nv_bfloat16* __restrict
         if constexpr(MLP){
             const int2 at=tile_of(tile,M,parts.p[0].n,BM,64,group);
             if(short_tile<BM,WM>(M-at.x))
-                prompt_mlp_tile<64,BM-16*WM,WM,4,STAGES>(x,parts,act,M,K,ldx,at.x,at.y);
-            else prompt_mlp_tile<64,BM,WM,4,STAGES>(x,parts,act,M,K,ldx,at.x,at.y);
+                tf_qmm_rowsdeep0::prompt_mlp_tile<64,BM-16*WM,WM,4,STAGES>(x,parts,act,M,K,ldx,at.x,at.y);
+            else tf_qmm_rowsdeep0::prompt_mlp_tile<64,BM,WM,4,STAGES>(x,parts,act,M,K,ldx,at.x,at.y);
         }else{
             int q=0;
 #pragma unroll
