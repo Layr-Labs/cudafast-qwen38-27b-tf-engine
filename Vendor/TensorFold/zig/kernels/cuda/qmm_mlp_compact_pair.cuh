@@ -124,10 +124,11 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
                 const int c = it * GS + kt * 16 + 2 * (lane & 3);
                 const __nv_bfloat16* a0 = x_ready + static_cast<size_t>(m0 + r) * ldx + c;
                 const __nv_bfloat16* a1 = a0 + 8 * ldx;
-                av[kt][i][0] = compact_load_a(a0);
-                av[kt][i][1] = compact_load_a(a1);
-                av[kt][i][2] = compact_load_a(a0 + 8);
-                av[kt][i][3] = compact_load_a(a1 + 8);
+                const bool ok0 = r < rows, ok1 = r + 8 < rows;
+                av[kt][i][0] = ok0 ? compact_load_a(a0) : 0u;
+                av[kt][i][1] = ok1 ? compact_load_a(a1) : 0u;
+                av[kt][i][2] = ok0 ? compact_load_a(a0 + 8) : 0u;
+                av[kt][i][3] = ok1 ? compact_load_a(a1 + 8) : 0u;
             }
         float xv[I][2];
 #pragma unroll
