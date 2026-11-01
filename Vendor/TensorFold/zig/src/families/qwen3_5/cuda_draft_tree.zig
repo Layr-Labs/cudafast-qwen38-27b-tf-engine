@@ -10,7 +10,7 @@ const edge_weight = 0.6;
 const scale = 1.5;
 /// A sampled stream's candidates carry the draw's own Gumbel noise at this weight (the 27B engine's draft_tree).
 const noise_weight = 0.7;
-const default_nodes = 15;
+const default_nodes = 23;
 const lp_top = 20;
 const lp_words = 3 + 2 * lp_top;
 
@@ -320,3 +320,4 @@ test "best first: a node's children follow it, the cheapest open node first, cha
     for (parents[0..n], 0..) |p, i| try std.testing.expect(p < @as(i32, @intCast(i)));
     for (tokens[0..n], parents[0..n]) |t, p| try std.testing.expectEqual(p >= 0, t >= 10); // row 1's ids under row 0's
 }
+// draw 4 of 56286961
