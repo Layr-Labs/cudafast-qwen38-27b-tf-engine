@@ -43,6 +43,8 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
         if(tid<16){if(tid<rows)cp4(dst+4352+tid*4,xs+size_t(tid)*KG+g);else *reinterpret_cast<float*>(dst+4352+tid*4)=0;}
     };
     if constexpr(DICT)qmm_dict::dict_table<Slices*128>(p,table,threadIdx.x,OUT_PAIR_SMEM);
+
+    grid_launch();
     load_w(0);commit();
 #if __CUDA_ARCH__ >= 900
     if(tid==0) {
@@ -61,7 +63,7 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
         }
     }
 #endif
-    grid_wait();qmm_dict::x_keep_l2(x,rows,K,ldx);load_x(0);commit();grid_launch();
+    grid_wait();qmm_dict::x_keep_l2(x,rows,K,ldx);load_x(0);commit();
     uint32_t mask;asm volatile("mov.b32 %0, 0x000F000F;\n":"=r"(mask));
     float acc[2][4]{};
     const int b_off=DICT?(D.pair?0:16):0;
