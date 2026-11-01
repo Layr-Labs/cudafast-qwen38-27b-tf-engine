@@ -373,9 +373,6 @@ __device__ __forceinline__ void attn_two(TileStore store, Geo geo, const __nv_bf
         qs[swz(line, chunk)] = w;
     }
     __syncthreads();
-    uint32_t qa[HD / 16][4];
-#pragma unroll
-    for (int k = 0; k < HD / 16; k++) qmm_frag::ldmatrix4(qa[k], qs + swz(lane % 16, 2 * k + lane / 16));
     float o[8][4];
 #pragma unroll
     for (int n = 0; n < 8; n++) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
@@ -442,10 +439,11 @@ __device__ __forceinline__ void attn_two(TileStore store, Geo geo, const __nv_bf
             float s[4];
 #pragma unroll
             for (int k = 0; k < HD / 16; k++) {
-                uint32_t b[2];
+                uint32_t a[4], b[2];
+                qmm_frag::ldmatrix4(a, qs + swz(lane % 16, 2 * k + lane / 16));
                 qmm_frag::ldmatrix2(b, kt + swz(8 * warp + lane % 8, 2 * k + (lane >> 3 & 1)));
-                if (k == 0) qmm_frag::mma0(s, qa[k], b[0], b[1]);
-                else qmm_frag::mma(s, qa[k], b[0], b[1]);
+                if (k == 0) qmm_frag::mma0(s, a, b[0], b[1]);
+                else qmm_frag::mma(s, a, b[0], b[1]);
             }
             const int u = 8 * warp + 2 * qd;
             st[g][u] = ina && pt0 + u < ka ? s[0] * tiles.kscale(u) * scale : -INFINITY;
@@ -482,37 +480,37 @@ __device__ __forceinline__ void attn_two(TileStore store, Geo geo, const __nv_bf
             if (part8 == 0) alpha[line] = a;
         }
         __syncthreads();
-        {  // values: warp w the dims 64 w on, every line; a masked line's outputs as they were
-            float keep[8][4];
-#pragma unroll
-            for (int n = 0; n < 8; n++)
-#pragma unroll
-                for (int i = 0; i < 4; i++) keep[n][i] = o[n][i];
+        {
             const float x0 = alpha[g], x1 = alpha[g + 8];
-#pragma unroll
-            for (int n = 0; n < 8; n++) {
-                o[n][0] *= x0;
-                o[n][1] *= x0;
-                o[n][2] *= x1;
-                o[n][3] *= x1;
-            }
             const int mt = lane >> 3;
+            uint32_t pa[TK / 16][4];
 #pragma unroll
-            for (int j = 0; j < TK / 16; j++) {
-                uint32_t pa[4];
-                qmm_frag::ldmatrix4(pa, &pt[lane % 16][16 * j + 8 * (lane / 16)]);
+            for (int j = 0; j < TK / 16; j++)
+                qmm_frag::ldmatrix4(pa[j], &pt[lane % 16][16 * j + 8 * (lane / 16)]);
 #pragma unroll
-                for (int n = 0; n < 8; n += 2) {
+            for (int n = 0; n < 8; n += 2) {
+                float keep[2][4];
+#pragma unroll
+                for (int u = 0; u < 2; u++) {
+#pragma unroll
+                    for (int i = 0; i < 4; i++) keep[u][i] = o[n + u][i];
+                    o[n + u][0] *= x0;
+                    o[n + u][1] *= x0;
+                    o[n + u][2] *= x1;
+                    o[n + u][3] *= x1;
+                }
+#pragma unroll
+                for (int j = 0; j < TK / 16; j++) {
                     uint32_t b[4];
                     ldmatrix4t(b, vt + swz(16 * j + 8 * (mt % 2) + lane % 8, 8 * warp + n + mt / 2));
-                    qmm_frag::mma(o[n], pa, b[0], b[1]);
-                    qmm_frag::mma(o[n + 1], pa, b[2], b[3]);
+                    qmm_frag::mma(o[n], pa[j], b[0], b[1]);
+                    qmm_frag::mma(o[n + 1], pa[j], b[2], b[3]);
                 }
-            }
 #pragma unroll
-            for (int n = 0; n < 8; n++) {
-                if (!ina) { o[n][0] = keep[n][0]; o[n][1] = keep[n][1]; }
-                if (!inb) { o[n][2] = keep[n][2]; o[n][3] = keep[n][3]; }
+                for (int u = 0; u < 2; u++) {
+                    if (!ina) { o[n + u][0] = keep[u][0]; o[n + u][1] = keep[u][1]; }
+                    if (!inb) { o[n + u][2] = keep[u][2]; o[n + u][3] = keep[u][3]; }
+                }
             }
         }
     }
