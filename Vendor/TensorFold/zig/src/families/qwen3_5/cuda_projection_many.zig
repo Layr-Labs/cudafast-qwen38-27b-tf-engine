@@ -35,6 +35,8 @@ pub fn projectMany(e: *Engine, ls: []const Proj, x: u64, xs: u64, outs: []const 
     var many: [A.segs_max]A.Out = undefined;
     if (wide) {
         for (ls, outs, many[0..ls.len]) |l, out, *m| m.* = .{ .q = l.a4, .out = out };
+        if (e.affine.streamable(many[0..ls.len], rows))
+            return e.affine.decodeMany(e.stream, x, xs, many[0..ls.len], rows);
         return e.affine.verifyMany32(e.stream, x, xs, many[0..ls.len], rows);
     }
     var at: usize = 0;
