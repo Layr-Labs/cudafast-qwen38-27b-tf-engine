@@ -599,7 +599,7 @@ test "prompt persistence: target MLP retains canonical parts and passes total ti
         const total = (rows + 127) / 128 * 272;
         try t.expectEqual(@as(u32, @intCast(if (selected) @min(total, 96) else total)), PromptPersistentTrace.grid);
         try t.expectEqual(@as(u32, 128), PromptPersistentTrace.block);
-        try t.expectEqual(@as(u32, 41984), PromptPersistentTrace.shared);
+        try t.expectEqual(@as(u32, 62976), PromptPersistentTrace.shared);
         if (selected) {
             try t.expectEqualSlices(c_int, &.{ @intCast(rows), 5120, 5120, @intCast(@min((rows + 127) / 128, 25)), -1, @intCast(total), 1 }, &PromptPersistentTrace.scalar);
             try t.expectEqual(@as(u64, 3000), PromptPersistentTrace.act);

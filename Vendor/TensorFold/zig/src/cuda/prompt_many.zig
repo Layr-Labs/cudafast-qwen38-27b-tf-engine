@@ -22,6 +22,8 @@ pub const tile_n = 128;
 pub const threads = 128;
 /// Tile<64, 128, 128, 2, 2, 2>::SMEM: two stages of 128 input rows, 128 columns' words, scales and biases.
 pub const smem: u32 = 2 * (128 * 128 + 128 * 32 + 2 * 128 * 2);
+/// The persistent MLP worker's tile (`tf_qmm_persistent`, three stages): the same stage, one more of it.
+pub const smem_mlp: u32 = 3 * (128 * 128 + 128 * 32 + 2 * 128 * 2);
 
 /// qmm_prompt_many.cuh's ManyPart and ManyParts, passed by value.
 pub const Part = extern struct { w: u64, scales: u64, biases: u64, out: u64, n: c_int, npad: c_int, first: c_int };
@@ -61,16 +63,17 @@ pub const Kernels = struct {
                 "_ZN23tf_qmm_persistent_rows26kernelILi128ELi1ELb0ELb1EEEvPK13__nv_bfloat16N14tf_qmm_prefill9ManyPartsEPS1_iiiiiii",
                 "_ZN23tf_qmm_persistent_rows36kernelILi128ELi1ELb0ELb0EEEvPK13__nv_bfloat16N14tf_qmm_prefill9ManyPartsEPS1_iiiiiii",
             };
-            for (names, &result.persistent_fns) |name, *dest| {
+            for (names, 0..) |name, i| {
                 const kernel = try prefill_mod.function(name);
-                try kernel.allowDynamicShared(smem);
-                dest.* = kernel;
+                // every persistent worker runs three stages (qmm_prompt_persist*.cuh)
+                try kernel.allowDynamicShared(smem_mlp);
+                result.persistent_fns[i] = kernel;
             }
         }
         return result;
     }
 
-    fn persistent(kk: *const Kernels, f: Function, s: Stream, x: u64, parts: Parts, act: u64, rows: usize, k: usize, group: usize, full_cols: c_int, blocks: usize) !void {
+    fn persistent(kk: *const Kernels, f: Function, s: Stream, x: u64, parts: Parts, act: u64, rows: usize, k: usize, group: usize, full_cols: c_int, blocks: usize, shared: u32) !void {
         var g: launch_.Args = .{};
         g.add(x);
         g.add(parts);
@@ -79,7 +82,7 @@ pub const Kernels = struct {
         g.add(full_cols);
         g.add(@as(c_int, @intCast(blocks)));
         g.add(@as(c_int, 1));
-        try launch_.launch(f, .{ .grid = .{ .x = @intCast(@min(blocks, kk.slots)) }, .block = .{ .x = threads }, .shared = smem }, s, &g);
+        try launch_.launch(f, .{ .grid = .{ .x = @intCast(@min(blocks, kk.slots)) }, .block = .{ .x = threads }, .shared = shared }, s, &g);
     }
 
     fn persistentRows(kk: *const Kernels, rows: usize) bool {
@@ -129,7 +132,7 @@ pub const Kernels = struct {
         for ([_]usize{ rows, k, k, group }) |v| g.add(@as(c_int, @intCast(v)));
         const blocks = rows_t * (gate.n / 64);
         if (kk.slots == 96 and blocks > kk.slots and gate.n == 17408 and gate.k == 5120) if (kk.persistent_fns[0]) |f|
-            return kk.persistent(f, s, x, parts, act, rows, k, group, -1, blocks);
+            return kk.persistent(f, s, x, parts, act, rows, k, group, -1, blocks, smem_mlp);
         try launch_.launch(kk.mlp_fn, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = threads }, .shared = smem }, s, &g);
     }
 
@@ -153,7 +156,7 @@ pub const Kernels = struct {
                 var parts: Parts = std.mem.zeroes(Parts);
                 parts.count = 1;
                 parts.p[0] = part;
-                return kk.persistent(f, s, x, parts, 0, rows, k, group, @intCast(full_cols), blocks);
+                return kk.persistent(f, s, x, parts, 0, rows, k, group, @intCast(full_cols), blocks, smem_mlp);
             };
             return launch_.launch(kk.split_fn, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = threads }, .shared = smem }, s, &g);
         };
@@ -167,7 +170,7 @@ pub const Kernels = struct {
         parts.count = @intCast(outs.len);
         const selected: ?usize = if (outputRole(outs)) 1 else if (recurrentRole(outs)) 3 else null;
         if (kk.persistentRows(rows) and blocks > kk.slots) if (selected) |index| if (kk.persistent_fns[index]) |f|
-            return kk.persistent(f, s, x, parts, 0, rows, k, group, -1, blocks);
+            return kk.persistent(f, s, x, parts, 0, rows, k, group, -1, blocks, smem_mlp);
         var g: launch_.Args = .{};
         g.add(x);
         g.add(parts);

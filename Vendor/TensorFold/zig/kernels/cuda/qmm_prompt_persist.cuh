@@ -7,7 +7,7 @@ template<int BM,int WM,bool MLP,bool SPLIT>
 __global__ void __launch_bounds__(WM*128) kernel(const __nv_bfloat16* __restrict__ x,
         const __grid_constant__ ManyParts parts,__nv_bfloat16* __restrict__ act,
         int M,int K,int ldx,int group,int full_cols,int total,int rotate) {
-    constexpr int BN=128, STAGES=2;
+    constexpr int BN=128, STAGES=3;
     for(int work=blockIdx.x;work<total;work+=gridDim.x){
         int tile=work;
         // Rotate row assignment between complete cohorts so short rows do
