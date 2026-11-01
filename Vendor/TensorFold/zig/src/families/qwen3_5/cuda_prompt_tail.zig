@@ -5,6 +5,7 @@
 //! (its queries' attention, gate, o projection and MLP) reaches nothing but the last row's logits. So that row
 //! alone runs on: the same kernels at the same arithmetic a row (the prompt GEMM at one row: each element's MMA
 //! chain does not depend on the rows beside it; the attention's row over its own keys), from the row's pointers.
+const std = @import("std");
 const cuda = @import("cuda");
 const E = @import("cuda_engine.zig");
 const prompt = @import("cuda_prompt.zig");
@@ -66,6 +67,16 @@ pub fn run(e: *E.Engine, layer: usize, total: usize) !void {
     try e.prompt_many.mlp(e.stream, x, d.gate.a4, d.up.a4, act, 1);
     try e.prompt_many.prompt(e.stream, act, &.{.{ .q = d.down.a4, .out = r }}, 1);
     try e.runAfter(e.fns.norm, .{ 1, 1, 1 }, .{ 256, 1, 1 }, .{ h, r, e.final_norm, x, g.eps, @as(c_int, @intCast(hid)), params, e.xs });
+    // a plain greedy stream's final chunk: the row's token from the screened head (cuda_head3.zig: the 2-bit screen, the
+    // exact rescore, the certificate and the lowest-id tie) into the token table, no logits (TF_PROMPT_H3=check: the full
+    // head's logits too, compared at the readback)
+    if (e.prompt_greedy) if (e.head3) |*h3| {
+        if (std.mem.eql(u8, std.mem.span(@import("sys").c.getenv("TF_PROMPT_H3") orelse ""), "check"))
+            try e.projAgain(e.head, x, e.logits, 1, false);
+        try h3.run(e.stream, x, e.xs, e.head.a4, 1, e.tables.ptr + @import("cuda_round.zig").tokens_at);
+        e.prompt_h3 = true;
+        return;
+    };
     try e.projAgain(e.head, x, e.logits, 1, false);
 }
 
