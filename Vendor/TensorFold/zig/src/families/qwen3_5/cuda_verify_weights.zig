@@ -20,7 +20,8 @@ pub fn prepare(e: anytype, single: bool) !?cuda.DeviceBuffer {
     const pack = try e.mods[3].function("tf_pack_kmajor");
     const project = try e.mods[0].function(if (single) "tf_qmm_mlp_single16" else "tf_qmm_mlp_pair_kmajor16");
     try project.allowDynamicShared(if (single) cuda.mlp_pair.single_smem else cuda.mlp_pair.kmajor_smem);
-    var buffer = try cuda.DeviceBuffer.alloc(e.d, bytes);
+    // the decode MLP streams these copies every round: placed where they write fastest (cuda_placement.zig)
+    var buffer = try @import("cuda_placement.zig").alloc(e.d, bytes);
     errdefer buffer.free();
     errdefer cuda.completion.drain(e.d, e.stream, "verify weight packing failed before draining");
     var at: usize = 0;

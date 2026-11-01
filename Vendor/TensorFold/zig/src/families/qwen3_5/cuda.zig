@@ -31,6 +31,7 @@ test {
     _ = native;
     _ = @import("cuda_pages.zig");
     _ = @import("cuda_sponge.zig");
+    _ = @import("cuda_placement.zig");
     _ = @import("cuda_pages_init_test.zig");
     _ = @import("cuda_pages_lifetime_test.zig");
 }

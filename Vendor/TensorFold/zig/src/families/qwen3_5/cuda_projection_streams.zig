@@ -52,9 +52,9 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
         break :blk f;
     };
     try out.allowDynamicShared(35328);
-    var buffer = try cuda.DeviceBuffer.alloc(e.d, bytes);
+    // streamed every round: placed where it writes fastest (cuda_placement.zig), zero-filled
+    var buffer = try @import("cuda_placement.zig").alloc(e.d, bytes);
     errdefer buffer.free();
-    try buffer.fill8(0, null);
     errdefer cuda.completion.drain(e.d, e.stream, "projection stream packing failed before draining");
     var at: usize = 0;
     for (e.layers) |*layer| for (candidates(layer, input, output)) |maybe| {
