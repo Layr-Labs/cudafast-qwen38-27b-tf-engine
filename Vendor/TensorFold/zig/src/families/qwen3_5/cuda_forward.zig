@@ -248,6 +248,8 @@ fn sharedSized(e: *E.Engine, f: cuda.Function, comptime s: sig.Sig, grid: [3]usi
 /// Layer inputs are already kept; hidden reads need neither the final norm nor the vocabulary head.
 pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool, amax: bool) !void {
     if (hidden) return;
+    // an armed prompt cut (cuda_engine.zig Overlap): the drafter's prompt absorb may start once the last layer is done
+    if (@hasField(@TypeOf(e.*), "overlap")) if (e.overlap.armed) try e.overlapTail();
     const g = e.g;
     if (e.learning == null and heads < total) {
         try e.normTail(e.final_norm, total, heads);
@@ -260,7 +262,15 @@ pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool, amax: bool) 
             // a greedy verify: the norm wrote the rows' group sums (projAgain's input); the head's tile writes each
             // row's best a tile and the merge each row's token (cuda_engine.zig forward then skips its argmax)
             const x = e.x + (total - heads) * g.hidden * 2;
-            return e.affine.headArgmax(e.stream, x, e.xs, e.head.a4, e.head_amax, heads, e.tables.ptr + @import("cuda_round.zig").tokens_at);
+            const toks = e.tables.ptr + @import("cuda_round.zig").tokens_at;
+            // the 2-bit screen and exact rescore (cuda_head3.zig); a failed certificate reruns this head after the readback
+            if (@hasField(@TypeOf(e.*), "head3")) if (e.head3) |*h3| return h3.run(e.stream, x, e.xs, e.head.a4, heads, toks);
+            // the 2-bit sieve and the listed column groups exactly (head_sieve.zig); check mode runs the full head too
+            if (@hasField(@TypeOf(e.*), "sieve")) if (e.sieve) |*sv| {
+                if (sv.mode == .check) try e.affine.headArgmax(e.stream, x, e.xs, e.head.a4, e.head_amax, heads, toks);
+                return sv.run(e.stream, x, e.xs, e.head.a4, heads, toks);
+            };
+            return e.affine.headArgmax(e.stream, x, e.xs, e.head.a4, e.head_amax, heads, toks);
         };
         if (@hasDecl(@TypeOf(e.*), "projAgain"))
             try e.projAgain(e.head, e.x + (total - heads) * g.hidden * 2, e.logits, heads, false)
