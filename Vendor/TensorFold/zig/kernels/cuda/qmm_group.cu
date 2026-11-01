@@ -339,6 +339,8 @@ __global__ void __launch_bounds__(WM * WN * 32) group_kernel(
 // The instantiations Nemotron's windows launch on sm_121 (tile 2: rows <= 16, bf16 out).
 template __global__ void tf_qmm_group::group_kernel<64, 16, 64, 1, 4, 8, false, false, false, false>(
     const __nv_bfloat16* __restrict__, const float* __restrict__, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
+template __global__ void tf_qmm_group::group_kernel<64, 16, 128, 1, 4, 5, false, false, false, false>(
+    const __nv_bfloat16* __restrict__, const float* __restrict__, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
 
 // Two independent m16 accumulators reuse each weight panel; K groups, fmas and slice sums keep the narrow order.
 template __global__ void tf_qmm_group::group_kernel<64, 32, 64, 1, 4, 5, false, false, false, false>(
@@ -420,8 +422,16 @@ __global__ void __launch_bounds__(WM * WN * 32) group_kernel_dict(
     // the pair-table room: two CTAs an SM for a cluster launch (its CTAs co-scheduled a GPC at a time), a whole
     // table for a launch of single CTAs (one an SM beats reading a large table through L2)
     const int room = C > 1 ? GROUP_PAIR_SMEM : GROUP_PAIR_SMEM_ONE;
-    DictLanes D = dict_lanes<BN, WN>(P, n0, KG, tid);
-    dict_room(D, P, room);
+    static_assert((BN == 64 || BN == 128) && WN == 4);
+    constexpr int PASSES = BN / 64;
+    DictLanes lanes[PASSES];
+#pragma unroll
+    for (int pass = 0; pass < PASSES; ++pass) {
+        const int logical = wn * PASSES + pass;
+        lanes[pass] = dict_lanes<64, 4>(P, n0 + logical / 4 * 64, KG, logical % 4 * 32 + lane);
+        dict_room(lanes[pass], P, room);
+    }
+    const DictLanes& D = lanes[0];
     const bool xsok = tid < rows;
     const float* xssrc = xs + static_cast<size_t>(m0 + min(tid, rows - 1)) * KG;
     auto load_x = [&](int s, int g) {
@@ -436,7 +446,15 @@ __global__ void __launch_bounds__(WM * WN * 32) group_kernel_dict(
 #pragma unroll
         for (int j = 0; j < WC; ++j)
             if (wok[j]) cp16(p + wdst[j], wsrc[j] + static_cast<size_t>(g) * TILE_BYTES);
-        if (D.ok) cp16(p + T::X + T::W + tid * 16, D.src + dict_window(D, g));
+        if constexpr (BN == 64) {
+            if (D.ok) cp16(p + T::X + T::W + tid * 16, D.src + dict_window(D, g));
+        } else if (tid < 16) {
+#pragma unroll
+            for (int chunk = 0; chunk < PASSES; ++chunk)
+                cp16(p + T::X + T::W + chunk * 256 + tid * 16,
+                     reinterpret_cast<const unsigned char*>(P.scales) +
+                     static_cast<size_t>(n0 / 64 + chunk) * KG * D.step + tid * 16 + dict_window(D, g));
+        }
     };
     uint32_t mask;                              // 0x000F000F, opaque to the compiler (kept in a register)
     asm volatile("mov.b32 %0, 0x000F000F;\n" : "=r"(mask));
@@ -484,8 +502,13 @@ __global__ void __launch_bounds__(WM * WN * 32) group_kernel_dict(
                 const unsigned char* p = stage(it % STAGES);
                 const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
                 // the lane's scale or bias, fetched now and stored after the MMAs (a global pair table's latency)
-                const uint32_t dv = SWAP ? dict_fetch(D, p + T::X + T::W, buf + T::SMEM + DICT_DEC, g0 + it)
-                                         : qmm_dict::dict_fetch_raw(D, p + T::X + T::W, buf + T::SMEM + DICT_DEC, g0 + it);
+                uint32_t dv[PASSES];
+#pragma unroll
+                for (int pass = 0; pass < PASSES; ++pass) {
+                    const unsigned char* packed = p + T::X + T::W + (wn * PASSES + pass) / 4 * 256;
+                    dv[pass] = SWAP ? dict_fetch(lanes[pass], packed, buf + T::SMEM + DICT_DEC, g0 + it)
+                                   : qmm_dict::dict_fetch_raw(lanes[pass], packed, buf + T::SMEM + DICT_DEC, g0 + it);
+                }
                 const __nv_bfloat16* ps = reinterpret_cast<const __nv_bfloat16*>(buf + T::SMEM);
                 const float* px = reinterpret_cast<const float*>(p + T::X + T::W + 2 * T::S);
                 uint32_t words[T::NT][GS / 32];
@@ -496,7 +519,7 @@ __global__ void __launch_bounds__(WM * WN * 32) group_kernel_dict(
                         words[j][v] = pw[((wn * T::NT + j) * 32 + lane) * (GS / 32) + v];
                 float d[I][J][4];
                 if constexpr (SWAP) {
-                    dict_put(D, buf + T::SMEM, dv);
+                    dict_put(D, buf + T::SMEM, dv[0]);
                     __syncwarp();
 #pragma unroll
                     for (int kt = 0; kt < GS / 16; ++kt) {
@@ -544,13 +567,15 @@ __global__ void __launch_bounds__(WM * WN * 32) group_kernel_dict(
                             }
                         }
                     }
-                    float sf = 0.0f, bf = 0.0f;
-                    qmm_dict::dict_raw_vals(D, dv, sf, bf);
+                    float sf[PASSES], bf[PASSES];
+#pragma unroll
+                    for (int pass = 0; pass < PASSES; ++pass)
+                        qmm_dict::dict_raw_vals(lanes[pass], dv[pass], sf[pass], bf[pass]);
 #pragma unroll
                     for (int j = 0; j < T::NT; ++j) {
-                        const int c0 = j * 8 + (lane & 3) * 2;
-                        const float sv[2] = {__shfl_sync(0xffffffffu, sf, c0), __shfl_sync(0xffffffffu, sf, c0 + 1)};
-                        const float bv[2] = {__shfl_sync(0xffffffffu, bf, b_off + c0), __shfl_sync(0xffffffffu, bf, b_off + c0 + 1)};
+                        const int pass = j / 2, c0 = (j % 2) * 8 + (lane & 3) * 2;
+                        const float sv[2] = {__shfl_sync(0xffffffffu, sf[pass], c0), __shfl_sync(0xffffffffu, sf[pass], c0 + 1)};
+                        const float bv[2] = {__shfl_sync(0xffffffffu, bf[pass], b_off + c0), __shfl_sync(0xffffffffu, bf[pass], b_off + c0 + 1)};
 #pragma unroll
                         for (int i = 0; i < LIVE; ++i) {
                             const int row = wm * (BM / WM) + i * 16 + (lane >> 2);
@@ -931,6 +956,8 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_pair(const __nv_bfl
 // Dictionary-coded twins of decode()'s cluster tile and tf_qmm_mlp_pair: the same loads,
 // MMA chains, fmas and sums, each scale and bias decoded from its dictionary index (dict_lanes).
 template __global__ void tf_qmm_group::group_kernel_dict<64, 16, 64, 1, 4, 8, false>(
+    const __nv_bfloat16* __restrict__, const float* __restrict__, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
+template __global__ void tf_qmm_group::group_kernel_dict<64, 16, 128, 1, 4, 5, false>(
     const __nv_bfloat16* __restrict__, const float* __restrict__, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
 
 extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_pair_dict(const __nv_bfloat16* __restrict__ x,
