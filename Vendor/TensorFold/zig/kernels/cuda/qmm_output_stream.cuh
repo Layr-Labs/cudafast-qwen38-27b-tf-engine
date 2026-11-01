@@ -42,8 +42,7 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
         cp16z(dst+row*128+swz<8>(row,ch)*16,x+size_t(min(row,rows-1))*ldx+g*64+ch*8,row<rows);
         if(tid<16){if(tid<rows)cp4(dst+4352+tid*4,xs+size_t(tid)*KG+g);else *reinterpret_cast<float*>(dst+4352+tid*4)=0;}
     };
-    if constexpr(DICT)qmm_dict::dict_table<Slices*128>(p,table,threadIdx.x,OUT_PAIR_SMEM);
-    load_w(0);commit();
+    load_w(0);if constexpr(DICT)qmm_dict::dict_table<Slices*128>(p,table,threadIdx.x,OUT_PAIR_SMEM);commit();
 #if __CUDA_ARCH__ >= 900
     if(tid==0) {
 #pragma unroll
@@ -144,7 +143,9 @@ extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_stream16(const _
 }
 // tf_qmm_output_stream16 on a dictionary-coded part: the same loads, MMA chains, fmas and slice-ordered sum.
 extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_stream16_dict(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
-    if(K==6144)tf_qmm_output_stream::body<4,4,0,true>(x,xs,parts,M,K,ldx);
+    // out/o (K = 6144) and the down projection (K = 17408): each slice's next four groups' words and index windows
+    // prefetched into L2 before the wait, while the producing kernel drains (the drafter's o keeps none)
+    if(K==6144||K==17408)tf_qmm_output_stream::body<4,4,0,true>(x,xs,parts,M,K,ldx);
     else tf_qmm_output_stream::body<0,4,0,true>(x,xs,parts,M,K,ldx);
 }
 extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_prefetch16(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
