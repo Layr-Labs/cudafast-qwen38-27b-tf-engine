@@ -56,8 +56,8 @@ fn launch(d: anytype, f: cuda.Function, comptime s: sig.Sig, grid: [3]usize, blo
     sig.check(s, @TypeOf(args));
     return d.e.runAfter(f, grid, block, args);
 }
-fn conv(d: anytype, x: u64, base: u64, res: u64, out: u64, rows: usize, branch: c_int) !void {
-    try d.e.runAfter(d.fns.dyn_conv_batch, .{ rows, (d.c.hidden + 255) / 256, 1 }, .{ 256, 1, 1 }, .{ x, d.dyn, base, res, out, @as(c_int, @intCast(d.c.hidden)), @as(c_int, @intCast(d.c.group)), branch, @as(c_int, @intCast(d.c.block)) });
+fn conv(d: anytype, x: u64, base: u64, res: u64, out: u64, rows: usize, branch: c_int, sums: u64) !void {
+    try d.e.runAfter(d.fns.dyn_conv_batch, .{ rows, (d.c.hidden + 255) / 256, 1 }, .{ 256, 1, 1 }, .{ x, d.dyn, base, res, out, @as(c_int, @intCast(d.c.hidden)), @as(c_int, @intCast(d.c.group)), branch, @as(c_int, @intCast(d.c.block)), sums });
 }
 fn ropeQk(d: anytype, xq: u64, wq: u64, outq: u64, xk: u64, wk: u64, outk: u64, rows: usize) !void {
     const c = d.c;
@@ -87,12 +87,22 @@ pub fn publish(d: anytype, items: []const dr.Hold, contexts: []const *draft.Ctx)
         try d.selectHold(ctx, it);
     }
 }
-/// Reuse the native fused pair while keeping its input sums separate from its output sums.
-pub fn mlp(d: anytype, l: anytype, B: usize) !void {
+fn paired(l: anytype, B: usize) bool {
+    return draft.pairedMlp() and B > 0 and B <= 16 and cuda.mlp_pair.Kernels.fits(l.gate, l.up);
+}
+
+/// Whether the MLP's input conv writes the pair's input sums itself (one 256-channel pass, whole groups a block).
+fn convSums(d: anytype, l: anytype, B: usize) bool {
+    return paired(l, B) and d.c.hidden % 256 == 0 and l.gate.k == d.c.hidden and !std.mem.eql(u8, std.mem.span(@import("sys").c.getenv("TF_DRAFT_CONV_SUMS") orelse ""), "0");
+}
+
+/// Reuse the native fused pair while keeping its input sums separate from its output sums; `summed`: the conv that
+/// wrote xin already wrote its sums into xs.
+pub fn mlp(d: anytype, l: anytype, B: usize, summed: bool) !void {
     const e = d.e;
     const c = d.c;
-    if (draft.pairedMlp() and B > 0 and B <= 16 and cuda.mlp_pair.Kernels.fits(l.gate, l.up)) {
-        try e.runAfter(e.fns.sums, .{ B, (l.gate.k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ d.xin, d.xs, @as(c_int, @intCast(l.gate.k)), @as(u64, 0) });
+    if (paired(l, B)) {
+        if (!summed) try e.runAfter(e.fns.sums, .{ B, (l.gate.k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ d.xin, d.xs, @as(c_int, @intCast(l.gate.k)), @as(u64, 0) });
         // The unused gate buffer has room for the FP32 group sums. Never overwrite xs while pair reads it.
         const act_sums = d.gate;
         try e.mlp_pair.pair(e.stream, d.xin, d.xs, l.gate, l.up, d.act, act_sums, B);
@@ -114,17 +124,18 @@ fn body(d: anytype, n: usize, narrow_: bool) !?u64 {
     for (d.w.layers, 0..) |l, i| {
         try d.norm(d.h, l.input_norm, d.x, B);
         try d.projAgain(l.attn_conv, d.x, d.dyn, B);
-        try conv(d, d.x, l.attn_base, 0, d.xin, B, 0);
+        try conv(d, d.x, l.attn_base, 0, d.xin, B, 0, 0);
         try d.projMany(&.{ l.q, l.k, l.v }, d.xin, &.{ d.qraw, d.kraw, d.vb }, B);
         try ropeQk(d, d.qraw, l.q_norm, d.q, d.kraw, l.k_norm, d.kb, B);
         try attention(d, B, i);
         try d.proj(l.o, d.att, d.o, B);
-        try conv(d, d.o, l.attn_base, d.h, d.h2, B, 1);
+        try conv(d, d.o, l.attn_base, d.h, d.h2, B, 1, 0);
         try d.norm(d.h2, l.post_norm, d.x, B);
         try d.projAgain(l.mlp_conv, d.x, d.dyn, B);
-        try conv(d, d.x, l.mlp_base, 0, d.xin, B, 0);
-        try mlp(d, l, B);
-        try conv(d, d.o, l.mlp_base, d.h2, d.h, B, 1);
+        const summed = convSums(d, l, B);
+        try conv(d, d.x, l.mlp_base, 0, d.xin, B, 0, if (summed) d.xs else 0);
+        try mlp(d, l, B, summed);
+        try conv(d, d.o, l.mlp_base, d.h2, d.h, B, 1, 0);
     }
     const rows = n * (c.block - 1);
     var masked = d.h + c.hidden * 2;
