@@ -72,17 +72,20 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35d_norm_rope_qk_batch(cons
         const __nv_bfloat16* __restrict__ XK0, const __nv_bfloat16* __restrict__ WK, __nv_bfloat16* __restrict__ OUTK0,
         int kv_heads, int rows, const DraftSegment* segments, int block_rows, float eps, float theta) {
     release_next();
+    const int qb = rows * q_heads;
+    const bool isq = blockIdx.x < qb;
+    const __nv_bfloat16* W = isq ? WQ : WK;
+    asm volatile("" : "+l"(W));
+    const uint2 wv = *reinterpret_cast<const uint2*>(W + 4 * threadIdx.x);
+    asm volatile("" ::"r"(wv.x), "r"(wv.y));
     await_prior();
     const __nv_bfloat16* XQ = after_wait(XQ0);
     __nv_bfloat16* OUTQ = after_wait(OUTQ0);
     const __nv_bfloat16* XK = after_wait(XK0);
     __nv_bfloat16* OUTK = after_wait(OUTK0);
-    const int qb = rows * q_heads;
-    const bool isq = blockIdx.x < qb;
     const int bx = isq ? blockIdx.x : blockIdx.x - qb;
     const int heads = isq ? q_heads : kv_heads;
     const __nv_bfloat16* X = isq ? XQ : XK;
-    const __nv_bfloat16* W = isq ? WQ : WK;
     __nv_bfloat16* OUT = isq ? OUTQ : OUTK;
     const int head = bx % heads;
     const size_t m = bx / heads;
@@ -97,8 +100,9 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35d_norm_rope_qk_batch(cons
     acc = warp_sum(acc);
     const float inv = rsqrtf(acc / (float)HD + eps);
     float n[4];
+    const __nv_bfloat16* wb = reinterpret_cast<const __nv_bfloat16*>(&wv);
 #pragma unroll
-    for (int i = 0; i < 4; i++) n[i] = rbf(rbf(v[i] * inv) * bf(W[4 * t + i]));
+    for (int i = 0; i < 4; i++) n[i] = rbf(rbf(v[i] * inv) * bf(wb[i]));
     const float pos = (float)(segments[m / block_rows].position + (long long)(m % block_rows));
     __nv_bfloat16* out = OUT + (m * heads + head) * HD;
 #pragma unroll
