@@ -253,3 +253,55 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_lean_##N##_late(Geo
   q35_slots_lean<N, false>(geo, q, k, v, g, beta, segs, steps, layer, y, P); }
 TF_Q35_LEAN(2)
 TF_Q35_LEAN(3)
+
+__device__ __forceinline__ void q35_lean_post(Geo geo, const Seg* segs, const __nv_bfloat16* y, const __nv_bfloat16* z,
+        const __nv_bfloat16* nw0, float eps, __nv_bfloat16* out, float* xs, unsigned* count, const int* P) {
+    constexpr int RPW = 8;
+    __shared__ __align__(16) __nv_bfloat16 row_done[4][DK];
+    __shared__ int last;
+    if (past_windows(P, blockIdx.z / geo.nv)) return;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        unsigned* c = count + blockIdx.z;
+        last = atomicAdd(c, 1u) == gridDim.y - 1;
+        if (last) *c = 0;
+    }
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    const int hv = blockIdx.z % geo.nv;
+    const Seg sg = segs[blockIdx.z / geo.nv];
+    const uint2 nw = *reinterpret_cast<const uint2*>(nw0 + threadIdx.x * (DK / 32));
+    const size_t W = (size_t)geo.nv * DK;
+    const int lane_at = hv * DK + threadIdx.x * (DK / 32);
+    uint2 yw[RPW], zw[RPW];
+#pragma unroll
+    for (int u = 0; u < RPW; ++u) {
+        const int r = threadIdx.y + 4 * u;
+        if (r >= sg.rows) break;
+        const size_t at = (size_t)(sg.row0 + r) * W + lane_at;
+        yw[u] = __ldcg(reinterpret_cast<const uint2*>(y + at));
+        zw[u] = *reinterpret_cast<const uint2*>(z + at);
+    }
+#pragma unroll
+    for (int u = 0; u < RPW; ++u) {
+        const int r = threadIdx.y + 4 * u;
+        if (r >= sg.rows) break;
+        const int m = sg.row0 + r;
+        if (past_rows(P, m)) continue;
+        q35_post_row(geo, nw, yw[u], zw[u], out, xs, eps, m, hv, row_done[threadIdx.y]);
+        __syncwarp();
+    }
+}
+
+#define TF_Q35_LEAN_POST(N) \
+extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_lean_##N##_post(Geo geo, const __nv_bfloat16* q, \
+ const __nv_bfloat16* k, const __nv_bfloat16* v, const float* g, const __nv_bfloat16* beta, const Seg* segs, \
+ const SlotStep* steps, int layer, __nv_bfloat16* y, const int* P, const __nv_bfloat16* z, const __nv_bfloat16* nw, \
+ float eps, __nv_bfloat16* out, float* xs, unsigned* count) { \
+  release_next(); \
+  q35_slots_lean<N, true>(geo, q, k, v, g, beta, segs, steps, layer, y, P); \
+  q35_lean_post(geo, segs, after_wait(y), after_wait(z), nw, eps, after_wait(out), after_wait(xs), count, P); }
+TF_Q35_LEAN_POST(2)
+TF_Q35_LEAN_POST(3)
