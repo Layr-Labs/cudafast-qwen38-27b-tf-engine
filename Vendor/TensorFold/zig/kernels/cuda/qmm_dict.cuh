@@ -17,8 +17,7 @@ using qmm_frag::cp16;
 // 64-byte line), 256 bytes of slack after the last. The table is the ns distinct scale values, then the nb distinct
 // bias values. A warp's lanes turn its 16 columns' indices back into the bf16 values the (kg, npad) arrays hold, one
 // value a lane, so every fma reads the same scale and bias it reads from those arrays.
-// GB10 reads DRAM in 64-byte pieces: a stage loads the 256 bytes from its group's 64-byte line down, so each piece is
-// fetched whole once and the next group's indices in it come from L2.
+// Index windows start on a 64-byte line; streamed consumers copy only the prefix their decoder reads.
 constexpr int DICT_DEC = 256;                    // shared bytes of one group's decoded scales and biases (bf16, 2 x 64)
 
 constexpr int DICT_PAIR_SMEM = 10240;
@@ -35,6 +34,12 @@ struct DictLanes {
 // The group's 256-byte window: from the 64-byte line its indices start in.
 __device__ __forceinline__ size_t dict_window(const DictLanes& D, int g) {
     return static_cast<size_t>(g) * D.step & ~static_cast<size_t>(63);
+}
+
+// Include the funnel-shift decoder's lookahead word, without extending the original 256-byte window.
+__host__ __device__ constexpr int dict_window_chunks(int step, int g) {
+    const int chunks = (((g * step) & 63) + step + 4 + 15) / 16;
+    return chunks < 16 ? chunks : 16;
 }
 
 __device__ __forceinline__ int dict_bits(int code) { return code & 31; }

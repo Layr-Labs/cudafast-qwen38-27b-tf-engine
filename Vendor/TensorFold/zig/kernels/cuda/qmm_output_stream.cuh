@@ -34,7 +34,7 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
     auto load_w=[&](int it){
         auto* dst=stage(it);const int g=g0+it;
         cp16(dst+2048+tid*16,weight(g)+tid*16);
-        if constexpr(DICT){if(D.ok)cp16(dst+4096+tid*16,D.src+qmm_dict::dict_window(D,g));}
+        if constexpr(DICT){if(D.ok && tid<qmm_dict::dict_window_chunks(D.step,g))cp16(dst+4096+tid*16,D.src+qmm_dict::dict_window(D,g));}
         else if(tid<16){const auto* table=tid<8?p.scales:p.biases;cp16(dst+4096+tid*16,table+size_t(g)*p.npad+n0+(tid%8)*8);}
     };
     auto load_x=[&](int it){
