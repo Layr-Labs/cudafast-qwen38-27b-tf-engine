@@ -52,6 +52,21 @@ pub fn aligned(n: usize) usize {
 /// qwen35.cuh's Geo.
 pub const Geo = extern struct { hid: c_int, nk: c_int, nv: c_int, qh: c_int, kvh: c_int, nl: c_int };
 
+/// The prompt's last cut with a drafter attached (`Engine.enableOverlap`): the cut records `tail_done` once its last layer
+/// has written its rows, launches its head and the logits copy on the engine stream and returns without waiting; the
+/// drafter's prompt absorb runs on `side` after `tail_done` (cuda_draft.zig absorb) and the engine stream waits for
+/// `absorb_done` before anything after it; the host waits for `logits_done` only where it reads the logits (`settleLogits`).
+pub const Overlap = struct {
+    on: bool = false,
+    side: ?cuda.Stream = null,
+    tail_done: cuda.abi.Event = null,
+    absorb_done: cuda.abi.Event = null,
+    logits_done: cuda.abi.Event = null,
+    armed: bool = false, // the next forward is the prompt's last cut (cuda_prefill.zig chunk)
+    tail_pending: bool = false, // tail_done recorded, the drafter's absorb not yet launched
+    logits_pending: ?*Cache = null, // the cache whose logits are in flight
+};
+
 const layers = @import("cuda_layers.zig");
 pub const Proj = layers.Proj;
 pub const Delta = layers.Delta;
@@ -118,6 +133,7 @@ pub const Engine = struct {
     /// L2 set aside for persisting lines (0: none) and, during a prompt chunk's forward, the residual rows' window:
     /// each norm writes the rows it reads a sublayer later, past a projection's weights streaming through L2.
     l2_persist: usize = 0,
+    overlap: Overlap = .{},
     h_window: ?cuda.abi.AccessPolicyWindow = null,
     wide_words: ?DeviceBuffer = null,
     projection_streams: ?DeviceBuffer = null,
@@ -152,6 +168,7 @@ pub const Engine = struct {
     x: u64,
     r: u64,
     xs: u64,
+    gdn_count: u64 = 0, // a (window, value head)'s arrivals for the lean scans' fused gdn_post (qwen35_slots_lean.cuh)
     qkv: u64,
     z: u64,
     a: u64,
@@ -369,6 +386,34 @@ pub const Engine = struct {
         return e;
     }
 
+    /// A drafter attached (cuda_draft.zig init): the prompt's last cut overlaps its head with the drafter's prompt absorb
+    /// on a stream of its own (TF_PROMPT_OVERLAP=0: one stream, the host waiting at the cut's end, as before). The side
+    /// stream runs first: the head's tiles, launched before the absorb, would otherwise all be placed before its GEMMs
+    /// (TF_PROMPT_OVERLAP=2: the default priority).
+    pub fn enableOverlap(e: *Engine) !void {
+        if (e.overlap.on or envOff("TF_PROMPT_OVERLAP")) return;
+        const plain = std.mem.eql(u8, std.mem.span(@import("sys").c.getenv("TF_PROMPT_OVERLAP") orelse "1"), "2");
+        e.overlap.side = if (plain) try cuda.Stream.init(e.d, true) else try cuda.Stream.initPriority(e.d, .highest);
+        for ([_]*cuda.abi.Event{ &e.overlap.tail_done, &e.overlap.absorb_done, &e.overlap.logits_done }) |ev|
+            try e.d.check(e.d.api.cuEventCreate(ev, 2), "cuEventCreate"); // timing disabled
+        e.overlap.on = true;
+    }
+
+    /// finish()'s mark before an armed cut's head: the last layer's rows (and every tapped row) are written.
+    pub fn overlapTail(e: *Engine) !void {
+        try e.d.check(e.d.api.cuEventRecord(e.overlap.tail_done, e.stream.handle), "cuEventRecord");
+        e.overlap.tail_pending = true;
+    }
+
+    /// The logits an armed cut left in flight: waits for their copy, then stores them as forward() does for `.last`.
+    pub fn settleLogits(e: *Engine) !void {
+        const cache = e.overlap.logits_pending orelse return;
+        e.overlap.logits_pending = null;
+        try e.d.check(e.d.api.cuEventSynchronize(e.overlap.logits_done), "cuEventSynchronize");
+        if (e.l2_persist > 0) _ = e.d.api.cuCtxResetPersistingL2Cache();
+        @memcpy(cache.logits, e.rowLogits(0));
+    }
+
     pub fn finishWarm(e: *Engine, io: std.Io, started: i96) !void {
         const warm_start = profile.now(io);
         e.startup = .{ .load = warm_start - started };
@@ -471,6 +516,8 @@ pub const Engine = struct {
         e.qkv = try t.alloc(R * g.convWidth() * 2);
         inline for (.{ "gate", "up", "act" }) |name| @field(e, name) = try t.alloc(R * g.intermediate * 2);
         e.xs = try t.alloc(R * (@max(g.intermediate, wide) / 64) * 4);
+        // the fused gdn_post's arrival counts, one a (window, value head); zeroed before the first forward
+        e.gdn_count = try t.alloc(Round.max_segs * g.v_heads * 4);
         inline for (.{ "a", "b", "beta" }) |name| @field(e, name) = try t.alloc(R * g.v_heads * 2);
         e.g_ = try t.alloc(R * g.v_heads * 4);
         e.qraw = try t.alloc(R * 2 * g.attnWidth() * 2);
@@ -589,6 +636,10 @@ pub const Engine = struct {
 
     /// One forward over `parts`' windows, with every input admitted before an unkept verify is settled.
     pub fn forward(e: *Engine, parts: []const Part, ids: []const u32, keep: Keep) !void {
+        // an armed cut's logits still in flight are stored before anything else runs; a mark nothing used is dropped
+        try e.settleLogits();
+        e.overlap.tail_pending = false;
+        defer e.overlap.armed = false;
         try e.admit(parts, ids, keep);
         const g = e.g;
         const total = ids.len;
@@ -731,10 +782,16 @@ pub const Engine = struct {
             .logits, .last => {
                 const out = e.host_logits.bytes[0 .. heads * g.vocab * 2];
                 try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(out.ptr, e.logits, out.len, e.stream.handle), "cuMemcpyDtoHAsync");
-                try e.stream.synchronize();
-                // the chunk is done: its persisting lines turn normal, so decode has all of L2
-                if (prompt and e.l2_persist > 0) _ = e.d.api.cuCtxResetPersistingL2Cache();
-                if (keep == .last) @memcpy(parts[0].cache.logits, e.rowLogits(0));
+                if (keep == .last and prompt and e.overlap.armed and e.overlap.tail_pending) {
+                    // the prompt's last cut with a drafter: its head runs on while the drafter absorbs (settleLogits)
+                    try e.d.check(e.d.api.cuEventRecord(e.overlap.logits_done, e.stream.handle), "cuEventRecord");
+                    e.overlap.logits_pending = parts[0].cache;
+                } else {
+                    try e.stream.synchronize();
+                    // the chunk is done: its persisting lines turn normal, so decode has all of L2
+                    if (prompt and e.l2_persist > 0) _ = e.d.api.cuCtxResetPersistingL2Cache();
+                    if (keep == .last) @memcpy(parts[0].cache.logits, e.rowLogits(0));
+                }
             },
         }
         recurrent.completed(e);
@@ -761,6 +818,19 @@ pub const Engine = struct {
         // qwen35_slots.cuh: up to four slots scan two value rows a warp, so a block covers eight
         const rows_a_warp: usize = if (record and (slot_count == 3 or slot_count == 35 or slot_count == 37 or slot_count == 38)) 4 else if (record and slot_count <= 4) 2 else 1;
         try e.runAfter(scan, .{ 1, geometry.dk / (4 * rows_a_warp), e.g.v_heads * segments }, .{ 32, 4, 1 }, .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, input, layer, e.y, e.tables.ptr + params_at });
+    }
+
+    /// Whether a recorded window's scan of `slot_count` also runs the layer's gdn_post: the early lean scans (37, 38;
+    /// TF_FUSED_GDN_POST=0: gdn_post launches after the scan, as before).
+    pub fn fusedPost(slot_count: u8) bool {
+        return (slot_count == 37 or slot_count == 38) and scanEarlyOn() and !envOff("TF_FUSED_GDN_POST");
+    }
+
+    /// deltaScan's lean scan (37, 38) with the layer's gdn_post on each (window, value head)'s last CTA
+    /// (qwen35_slots_lean.cuh q35_lean_post): gdn_post's arguments after the scan's.
+    pub fn leanScanPost(e: *Engine, slot_count: u8, segments: usize, layer: c_int, norm_w: u64, sums: u64) !void {
+        const scan = if (slot_count == 37) e.fns.gdn_lean_2_post else e.fns.gdn_lean_3_post;
+        try e.runAfter(scan, .{ 1, geometry.dk / 16, e.g.v_heads * segments }, .{ 32, 4, 1 }, .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, e.tables.ptr + Round.steps_at, layer, e.y, e.tables.ptr + params_at, e.z, norm_w, e.g.eps, e.mix, sums, e.gdn_count });
     }
 
     /// The launches of a forward of `shape`, from the embedding to the kept rows' logits (captured once a shape).

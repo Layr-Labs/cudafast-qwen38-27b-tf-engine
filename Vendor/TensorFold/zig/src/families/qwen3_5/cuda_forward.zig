@@ -74,6 +74,8 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 // a prompt chunk: the chain convolves the value heads and takes their decay and strength in its stages,
                 // so gdn_pre runs the q and k heads and conv_commit follows the chain (TF_CHAIN_CONV=0: as before)
                 const conv_in_chain = prompt and nseg == 1 and !record and chainConvOn();
+                // a recorded window's early lean scan runs the layer's gdn_post on each head's last CTA
+                const fused_post = record and !prompt and E.Engine.fusedPost(shape.slots);
                 const pre_heads = if (conv_in_chain) 2 * g.k_heads else 2 * g.k_heads + g.v_heads;
                 try e.runAfter(e.fns.gdn_pre, .{ 1, pre_heads, pre_blocks }, .{ 32, pre_rows, 1 }, .{ geo, e.qkv, t_segs, t_rows, t_par, layer, m.conv, e.a, e.b, m.a_log, m.dt_bias, e.q, e.k, e.v, e.g_, e.beta, t_params });
                 // one recorded window of 2+ rows: gdn_pre logged its tails, conv_commit would only return
@@ -82,9 +84,9 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 if (conv_in_chain) {
                     try @import("cuda_prompt.zig").deltaConv(e, di, total, m);
                     if (commit) try e.runAfter(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
-                } else if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else try e.deltaScan(record, shape.slots, nseg, layer);
+                } else if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else if (fused_post) try e.leanScanPost(shape.slots, nseg, layer, m.norm, sums) else try e.deltaScan(record, shape.slots, nseg, layer);
                 // a prompt chunk: eight rows a warp, their loads in flight together (TF_PROMPT_ILP=0: a row a warp)
-                if (prompt and total > 16 and promptIlpOn())
+                if (fused_post) {} else if (prompt and total > 16 and promptIlpOn())
                     try e.runAfter(e.fns.gdn_post_ilp, .{ 1, g.v_heads, (total + 31) / 32 }, .{ 32, 4, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums })
                 else
                     try e.runAfter(e.fns.gdn_post, .{ 1, g.v_heads, post_blocks }, .{ 32, post_rows, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums });
@@ -248,6 +250,8 @@ fn sharedSized(e: *E.Engine, f: cuda.Function, comptime s: sig.Sig, grid: [3]usi
 /// Layer inputs are already kept; hidden reads need neither the final norm nor the vocabulary head.
 pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool, amax: bool) !void {
     if (hidden) return;
+    // an armed prompt cut (cuda_engine.zig Overlap): the drafter's prompt absorb may start once the last layer is done
+    if (@hasField(@TypeOf(e.*), "overlap")) if (e.overlap.armed) try e.overlapTail();
     const g = e.g;
     if (e.learning == null and heads < total) {
         try e.normTail(e.final_norm, total, heads);
