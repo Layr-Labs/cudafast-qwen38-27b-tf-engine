@@ -13,12 +13,20 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
                                            int K, int ldx, int items, Map map, float (&acc)[GemvTile<GS, BN, STAGES>::NT][4],
                                            After after) {
     using T = GemvTile<GS, BN, STAGES>;
-    static_assert(!DICT || (FutureGroups == 0 && GS == 64 && BN % 64 == 0 && 2 * T::S == BN / 64 * 256), "coded stages");
+    static_assert(!DICT || (GS == 64 && BN % 64 == 0 && 2 * T::S == BN / 64 * 256), "coded stages");
     const int npad = DICT ? P.tiles : P.npad;
     static_assert(T::MT == 1 && T::THREADS == 128, "one m16 row tile, four column warps");
     constexpr int NT = T::NT;
     extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, wn = tid >> 5;
+#if __CUDA_ARCH__ >= 1200
+    __shared__ __align__(8) uint64_t weight_barriers[STAGES];
+    if (tid == 0)
+#pragma unroll
+        for (int s = 0; s < STAGES; ++s)
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" :: "r"(smem(&weight_barriers[s])) : "memory");
+    __syncthreads();
+#endif
     const int KG = K / GS;
     auto stage = [&](int s) { return buf + s * T::STAGE; };
     const int rows = min(16, M);
@@ -67,9 +75,21 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
         unsigned char* p = stage(s);
         const unsigned char* wb = reinterpret_cast<const unsigned char*>(P.w) +
                                   static_cast<size_t>(n0 / 64) * TILE_BYTES + (n0 % 64) * GS / 2;
+#if __CUDA_ARCH__ >= 1200
+        if (tid == 0) {
+            const uint32_t barrier = smem(&weight_barriers[s]);
+            const auto* src = wb + static_cast<size_t>(g) * (npad / 64) * TILE_BYTES;
+            asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;\n"
+                         :: "r"(barrier), "n"(T::W) : "memory");
+            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+            asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
+                         :: "r"(smem(p + T::X)), "l"(src), "n"(T::W), "r"(barrier) : "memory");
+        }
+#else
 #pragma unroll
         for (int j = 0; j < WC; ++j)
             if (wok[j]) cp16(p + wdst[j], wb + woff[j] + static_cast<size_t>(g) * (npad/64) * TILE_BYTES);
+#endif
         if constexpr (DICT) {
             // the CTA's tiles' index windows: tile n0 / 64 + c / 16, chunk c % 16, from each group's 64-byte line
             const int step = qmm_dict::dict_step(P.npad);
@@ -113,11 +133,23 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
     if(tid==0) {
 #pragma unroll
         for(int g=1;g<=FutureGroups;++g)if(g<items){
-            const auto at=map(g);const auto* w=reinterpret_cast<const unsigned char*>(P.w)+(size_t(at.x)*(P.npad/64)+at.y/64)*TILE_BYTES;
-            const auto* a=P.scales+size_t(at.x)*P.npad+at.y;const auto* b=P.biases+size_t(at.x)*P.npad+at.y;
+            // the group's weight tile (npad: the real column pitch; a coded part's P.npad holds its code), then its
+            // scales and biases, or a coded part's index windows (load_w's addresses: tile at.y / 64 + c, the group's line)
+            const auto at=map(g);const auto* w=reinterpret_cast<const unsigned char*>(P.w)+(size_t(at.x)*(npad/64)+at.y/64)*TILE_BYTES;
             asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(w), "n"(BN*GS/2) : "memory");
-            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(a), "n"(BN*2) : "memory");
-            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(b), "n"(BN*2) : "memory");
+            if constexpr(DICT){
+                const int step=qmm_dict::dict_step(P.npad);
+                const size_t window=static_cast<size_t>(at.x)*step&~static_cast<size_t>(63);
+#pragma unroll
+                for(int c=0;c<BN/64;++c){
+                    const auto* idx=reinterpret_cast<const unsigned char*>(P.scales)+static_cast<size_t>(at.y/64+c)*KG*step+window;
+                    asm volatile("cp.async.bulk.prefetch.L2.global [%0], 256;" :: "l"(idx) : "memory");
+                }
+            }else{
+                const auto* a=P.scales+size_t(at.x)*P.npad+at.y;const auto* b=P.biases+size_t(at.x)*P.npad+at.y;
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(a), "n"(BN*2) : "memory");
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(b), "n"(BN*2) : "memory");
+            }
         }
     }
 #endif
@@ -131,6 +163,17 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
     grid_launch();
     for (int it = 0; it < items; ++it) {
         wait<STAGES - 2>();
+#if __CUDA_ARCH__ >= 1200
+        if (tid == 0) {
+            const uint32_t barrier = smem(&weight_barriers[it % STAGES]);
+            const uint32_t phase = (it / STAGES) & 1;
+            asm volatile("{ .reg .pred ready;\n"
+                         "wait_weight:\n"
+                         "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 ready, [%0], %1;\n"
+                         "@!ready bra wait_weight;\n"
+                         "}\n" :: "r"(barrier), "r"(phase) : "memory");
+        }
+#endif
         __syncthreads();
         const int next = it + STAGES - 1;
         if (next < items) {
@@ -238,6 +281,13 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
         }
         after(it);
     }
+#if __CUDA_ARCH__ >= 1200
+    __syncthreads();
+    if (tid == 0)
+#pragma unroll
+        for (int s = 0; s < STAGES; ++s)
+            asm volatile("mbarrier.inval.shared::cta.b64 [%0];\n" :: "r"(smem(&weight_barriers[s])) : "memory");
+#endif
 }
 
 
@@ -292,8 +342,9 @@ __device__ __forceinline__ void body_dict(const __nv_bfloat16* x,const float* xs
 #pragma unroll
     for(int i=1;i<4;++i)if(int(blockIdx.x)>=parts.p[i].first)which=i;
     const auto p=parts.p[which];int t=int(blockIdx.x)-p.first;const bool coded=p.tiles>0;
-    if(which<2){if(coded)tile<256,0,true>(x,xs,p,t,M,K,ldx);else tile<256,0>(x,xs,p,t,M,K,ldx);}
-    else{if(coded)tile<64,0,true>(x,xs,p,t,M,K,ldx);else tile<64,0>(x,xs,p,t,M,K,ldx);}
+    // coded parts prefetch their next two groups' weight tiles and index windows into L2 before the wait
+    if(which<2){if(coded)tile<256,2,true>(x,xs,p,t,M,K,ldx);else tile<256,0>(x,xs,p,t,M,K,ldx);}
+    else{if(coded)tile<64,2,true>(x,xs,p,t,M,K,ldx);else tile<64,0>(x,xs,p,t,M,K,ldx);}
 }
 }
 
