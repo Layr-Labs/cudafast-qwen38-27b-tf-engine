@@ -13,7 +13,7 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
                                            int K, int ldx, int items, Map map, float (&acc)[GemvTile<GS, BN, STAGES>::NT][4],
                                            After after) {
     using T = GemvTile<GS, BN, STAGES>;
-    static_assert(!DICT || (FutureGroups == 0 && GS == 64 && BN % 64 == 0 && 2 * T::S == BN / 64 * 256), "coded stages");
+    static_assert(!DICT || (GS == 64 && BN % 64 == 0 && 2 * T::S == BN / 64 * 256), "coded stages");
     const int npad = DICT ? P.tiles : P.npad;
     static_assert(T::MT == 1 && T::THREADS == 128, "one m16 row tile, four column warps");
     constexpr int NT = T::NT;
@@ -113,11 +113,21 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
     if(tid==0) {
 #pragma unroll
         for(int g=1;g<=FutureGroups;++g)if(g<items){
-            const auto at=map(g);const auto* w=reinterpret_cast<const unsigned char*>(P.w)+(size_t(at.x)*(P.npad/64)+at.y/64)*TILE_BYTES;
-            const auto* a=P.scales+size_t(at.x)*P.npad+at.y;const auto* b=P.biases+size_t(at.x)*P.npad+at.y;
+            const auto at=map(g);const auto* w=reinterpret_cast<const unsigned char*>(P.w)+(size_t(at.x)*(npad/64)+at.y/64)*TILE_BYTES;
             asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(w), "n"(BN*GS/2) : "memory");
-            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(a), "n"(BN*2) : "memory");
-            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(b), "n"(BN*2) : "memory");
+            if constexpr(DICT){
+                const int step=qmm_dict::dict_step(P.npad);
+                const size_t window=static_cast<size_t>(at.x)*step&~static_cast<size_t>(63);
+#pragma unroll
+                for(int c=0;c<BN/64;++c){
+                    const auto* idx=reinterpret_cast<const unsigned char*>(P.scales)+static_cast<size_t>(at.y/64+c)*KG*step+window;
+                    asm volatile("cp.async.bulk.prefetch.L2.global [%0], 256;" :: "l"(idx) : "memory");
+                }
+            }else{
+                const auto* a=P.scales+size_t(at.x)*P.npad+at.y;const auto* b=P.biases+size_t(at.x)*P.npad+at.y;
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(a), "n"(BN*2) : "memory");
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(b), "n"(BN*2) : "memory");
+            }
         }
     }
 #endif
@@ -292,7 +302,9 @@ __device__ __forceinline__ void body_dict(const __nv_bfloat16* x,const float* xs
 #pragma unroll
     for(int i=1;i<4;++i)if(int(blockIdx.x)>=parts.p[i].first)which=i;
     const auto p=parts.p[which];int t=int(blockIdx.x)-p.first;const bool coded=p.tiles>0;
-    if(which<2){if(coded)tile<256,0,true>(x,xs,p,t,M,K,ldx);else tile<256,0>(x,xs,p,t,M,K,ldx);}
+    // Limit the extra traffic to coded qkv/z projections. The much narrower
+    // gate projections and the uncoded fallback retain the record's policy.
+    if(which<2){if(coded)tile<256,2,true>(x,xs,p,t,M,K,ldx);else tile<256,0>(x,xs,p,t,M,K,ldx);}
     else{if(coded)tile<64,0,true>(x,xs,p,t,M,K,ldx);else tile<64,0>(x,xs,p,t,M,K,ldx);}
 }
 }
