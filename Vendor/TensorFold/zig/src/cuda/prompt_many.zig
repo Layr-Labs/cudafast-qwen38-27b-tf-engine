@@ -22,6 +22,8 @@ pub const tile_n = 128;
 pub const threads = 128;
 /// Tile<64, 128, 128, 2, 2, 2>::SMEM: two stages of 128 input rows, 128 columns' words, scales and biases.
 pub const smem: u32 = 2 * (128 * 128 + 128 * 32 + 2 * 128 * 2);
+pub const mlp_persistent_m = 64;
+pub const mlp_persistent_smem: u32 = 2 * (mlp_persistent_m * 128 + tile_n * 32 + 2 * tile_n * 2);
 
 /// qmm_prompt_many.cuh's ManyPart and ManyParts, passed by value.
 pub const Part = extern struct { w: u64, scales: u64, biases: u64, out: u64, n: c_int, npad: c_int, first: c_int };
@@ -39,7 +41,7 @@ pub const Kernels = struct {
     many_fn: Function,
     mlp_fn: Function,
     split_fn: Function,
-    /// CTAs the device runs at once: two of these tiles an SM.
+    /// Legacy 128-row prompt grid: two CTAs per SM.
     slots: usize,
     /// Native MLP, two-row normal/split projection, and three-row grouped projection.
     persistent_fns: [4]?Function = @splat(null),
@@ -56,21 +58,24 @@ pub const Kernels = struct {
         const disabled = if (std.c.getenv("TF_PROMPT_PERSISTENT")) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
         if (sms == 48 and !disabled) {
             const names = [_][:0]const u8{
-                "_ZN17tf_qmm_persistent6kernelILi128ELi1ELb1ELb0EEEvPK13__nv_bfloat16N14tf_qmm_prefill9ManyPartsEPS1_iiiiiii",
+                "_ZN17tf_qmm_persistent6kernelILi64ELi1ELb1ELb0EEEvPK13__nv_bfloat16N14tf_qmm_prefill9ManyPartsEPS1_iiiiiii",
                 "_ZN23tf_qmm_persistent_rows26kernelILi128ELi1ELb0ELb0EEEvPK13__nv_bfloat16N14tf_qmm_prefill9ManyPartsEPS1_iiiiiii",
                 "_ZN23tf_qmm_persistent_rows26kernelILi128ELi1ELb0ELb1EEEvPK13__nv_bfloat16N14tf_qmm_prefill9ManyPartsEPS1_iiiiiii",
                 "_ZN23tf_qmm_persistent_rows36kernelILi128ELi1ELb0ELb0EEEvPK13__nv_bfloat16N14tf_qmm_prefill9ManyPartsEPS1_iiiiiii",
             };
-            for (names, &result.persistent_fns) |name, *dest| {
+            for (names, &result.persistent_fns, 0..) |name, *dest, index| {
                 const kernel = try prefill_mod.function(name);
-                try kernel.allowDynamicShared(smem);
+                try kernel.allowDynamicShared(if (index == 0) mlp_persistent_smem else smem);
                 dest.* = kernel;
             }
         }
         return result;
     }
 
-    fn persistent(kk: *const Kernels, f: Function, s: Stream, x: u64, parts: Parts, act: u64, rows: usize, k: usize, group: usize, full_cols: c_int, blocks: usize) !void {
+    fn persistent(
+        f: Function, s: Stream, x: u64, parts: Parts, act: u64, rows: usize, k: usize,
+        group: usize, full_cols: c_int, blocks: usize, shared: u32, slots: usize,
+    ) !void {
         var g: launch_.Args = .{};
         g.add(x);
         g.add(parts);
@@ -79,7 +84,7 @@ pub const Kernels = struct {
         g.add(full_cols);
         g.add(@as(c_int, @intCast(blocks)));
         g.add(@as(c_int, 1));
-        try launch_.launch(f, .{ .grid = .{ .x = @intCast(@min(blocks, kk.slots)) }, .block = .{ .x = threads }, .shared = smem }, s, &g);
+        try launch_.launch(f, .{ .grid = .{ .x = @intCast(@min(blocks, slots)) }, .block = .{ .x = threads }, .shared = shared }, s, &g);
     }
 
     fn persistentRows(kk: *const Kernels, rows: usize) bool {
@@ -115,21 +120,26 @@ pub const Kernels = struct {
     pub fn mlp(kk: *const Kernels, s: Stream, x: u64, gate: Affine4, up: Affine4, act: u64, rows: usize) !void {
         if (!mlpFits(gate, up) or rows == 0) return error.InputMismatch;
         const k = gate.k;
-        const rows_t = (rows + tile_m - 1) / tile_m;
-        const band = (32 << 20) / (tile_m * k * 2);
+        const persistent_mlp = kk.slots == 96 and gate.n == 17408 and gate.k == 5120 and
+            kk.persistent_fns[0] != null;
+        const bm: usize = if (persistent_mlp) mlp_persistent_m else tile_m;
+        const rows_t = (rows + bm - 1) / bm;
+        const band = (32 << 20) / (bm * k * 2);
         const group = @max(1, @min(rows_t, band));
         var parts: Parts = std.mem.zeroes(Parts);
         parts.p[0] = .{ .w = gate.w, .scales = gate.s, .biases = gate.b, .out = 0, .n = @intCast(gate.n), .npad = @intCast(gate.npad), .first = 0 };
         parts.p[1] = .{ .w = up.w, .scales = up.s, .biases = up.b, .out = 0, .n = @intCast(up.n), .npad = @intCast(up.npad), .first = 0 };
         parts.count = 2;
+        const blocks = rows_t * (gate.n / 64);
+        if (persistent_mlp)
+            return persistent(
+                kk.persistent_fns[0].?, s, x, parts, act, rows, k, group, -1, blocks, mlp_persistent_smem, kk.slots * 3 / 2,
+            );
         var g: launch_.Args = .{};
         g.add(x);
         g.add(parts);
         g.add(act);
         for ([_]usize{ rows, k, k, group }) |v| g.add(@as(c_int, @intCast(v)));
-        const blocks = rows_t * (gate.n / 64);
-        if (kk.slots == 96 and blocks > kk.slots and gate.n == 17408 and gate.k == 5120) if (kk.persistent_fns[0]) |f|
-            return kk.persistent(f, s, x, parts, act, rows, k, group, -1, blocks);
         try launch_.launch(kk.mlp_fn, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = threads }, .shared = smem }, s, &g);
     }
 
@@ -153,7 +163,9 @@ pub const Kernels = struct {
                 var parts: Parts = std.mem.zeroes(Parts);
                 parts.count = 1;
                 parts.p[0] = part;
-                return kk.persistent(f, s, x, parts, 0, rows, k, group, @intCast(full_cols), blocks);
+                return persistent(
+                    f, s, x, parts, 0, rows, k, group, @intCast(full_cols), blocks, smem, kk.slots,
+                );
             };
             return launch_.launch(kk.split_fn, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = threads }, .shared = smem }, s, &g);
         };
@@ -167,7 +179,7 @@ pub const Kernels = struct {
         parts.count = @intCast(outs.len);
         const selected: ?usize = if (outputRole(outs)) 1 else if (recurrentRole(outs)) 3 else null;
         if (kk.persistentRows(rows) and blocks > kk.slots) if (selected) |index| if (kk.persistent_fns[index]) |f|
-            return kk.persistent(f, s, x, parts, 0, rows, k, group, -1, blocks);
+            return persistent(f, s, x, parts, 0, rows, k, group, -1, blocks, smem, kk.slots);
         var g: launch_.Args = .{};
         g.add(x);
         g.add(parts);

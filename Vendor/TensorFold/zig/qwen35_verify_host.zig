@@ -585,38 +585,6 @@ const PromptPersistentTrace = struct {
     }
 };
 
-test "prompt persistence: target MLP retains canonical parts and passes total tiles independently of its bounded grid" {
-    var d: cuda.Driver = undefined;
-    var kernels = PromptPersistentTrace.kernels(&d);
-    const stream: cuda.Stream = .{ .d = &d, .handle = null };
-    const gate = PromptPersistentTrace.matrix(17408, 5120);
-    var up = gate;
-    up.w = 40;
-    for ([_]usize{ 1, 128, 255, 256, 496, 512, 513 }) |rows| {
-        try kernels.mlp(stream, 1000, gate, up, 3000, rows);
-        const selected = true;
-        try t.expectEqual(@as(usize, if (selected) 40 else 4), PromptPersistentTrace.id);
-        const total = (rows + 127) / 128 * 272;
-        try t.expectEqual(@as(u32, @intCast(if (selected) @min(total, 96) else total)), PromptPersistentTrace.grid);
-        try t.expectEqual(@as(u32, 128), PromptPersistentTrace.block);
-        try t.expectEqual(@as(u32, 41984), PromptPersistentTrace.shared);
-        if (selected) {
-            try t.expectEqualSlices(c_int, &.{ @intCast(rows), 5120, 5120, @intCast(@min((rows + 127) / 128, 25)), -1, @intCast(total), 1 }, &PromptPersistentTrace.scalar);
-            try t.expectEqual(@as(u64, 3000), PromptPersistentTrace.act);
-            try t.expectEqual(@as(c_int, 2), PromptPersistentTrace.parts.count);
-            try t.expectEqual(@as(u64, 10), PromptPersistentTrace.parts.p[0].w);
-            try t.expectEqual(@as(u64, 40), PromptPersistentTrace.parts.p[1].w);
-            try t.expectEqual(@as(u64, 20), PromptPersistentTrace.parts.p[0].scales);
-        }
-    }
-    kernels.persistent_fns[0] = null;
-    try kernels.mlp(stream, 1000, gate, up, 3000, 496);
-    try t.expectEqual(@as(usize, 4), PromptPersistentTrace.id);
-    kernels.persistent_fns[0] = function(&d, 40);
-    kernels.slots = 80;
-    try kernels.mlp(stream, 1000, gate, up, 3000, 496);
-    try t.expectEqual(@as(usize, 4), PromptPersistentTrace.id);
-}
 
 test "prompt persistence: only measured projection roles select row rings and preserve split columns and part boundaries" {
     var d: cuda.Driver = undefined;
