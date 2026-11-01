@@ -243,16 +243,31 @@ pub const Affine4Kernels = struct {
     }
 
     /// The output stream is selectable only for exactly the geometry cluster() handles.
+    /// A decode window the 16-row streams take: exactly 16 rows, or (TF_NARROW_STREAMS, on by default) any narrower
+    /// window. The stream kernels bound their own rows (`min(16, M)`, zero-filled input rows, stores below M), so a
+    /// narrow window reads the streams' coded index windows instead of the tile-major scales and biases.
+    fn spreadOn() bool {
+        const v = @import("sys").c.getenv("TF_GDN_SPREAD") orelse return true;
+        return !std.mem.eql(u8, std.mem.span(v), "0");
+    }
+
+    fn narrow16(rows: usize) bool {
+        if (rows == 16) return true;
+        if (rows == 0 or rows > 16) return false;
+        const v = @import("sys").c.getenv("TF_NARROW_STREAMS") orelse return true;
+        return !std.mem.eql(u8, std.mem.span(v), "0");
+    }
+
     fn streamed(a: *const Affine4Kernels, q: Affine4, rows: usize, sk: usize) bool {
         if (q.stream_w == 0) return false;
         const f = a.stream16_fns[@as(usize, if (q.k == 6144) 1 else 0)];
-        return f != null and rows == 16 and sk == 4 and q.n == 5120 and (q.k == 6144 or q.k == 17408 or q.k == 4096);
+        return f != null and narrow16(rows) and sk == 4 and q.n == 5120 and (q.k == 6144 or q.k == 17408 or q.k == 4096);
     }
 
     /// The existing coded four-slice stream can also consume a 16-row out/o projection.
     /// Keep the ordinary short-lane route whenever its view or kernel is unavailable.
     fn dictOutStream(a: *const Affine4Kernels, q: Affine4, rows: usize, sk: usize) bool {
-        return a.short_lane and a.cluster_decode and rows == 16 and sk == 4 and
+        return a.short_lane and a.cluster_decode and narrow16(rows) and sk == 4 and
             q.n == 5120 and q.npad == 5120 and q.k == 6144 and q.stream_w != 0 and
             a.stream16_fns[1] != null and a.stream16_dict_fn != null and a.coded(q);
     }
@@ -503,10 +518,18 @@ pub const Affine4Kernels = struct {
     /// decode() of each projection of one input; without GB10 one segmented launch, each keeping its split's bits.
     /// On GB10 the K-sliced projections share one lane_gemv launch and the unsliced ones one cluster launch.
     pub fn streamable(a: *const Affine4Kernels, outs: []const Out, rows: usize) bool {
-        const gdn_streamed = rows == 16 or (rows > 16 and rows <= 32 and a.gdn_stream32_fn != null);
+        const gdn_streamed = narrow16(rows) or (rows > 16 and rows <= 32 and a.gdn_stream32_fn != null);
         if (!gdn_streamed or !a.pdl or a.gdn_stream16_fn == null) return false;
         for (outs) |o| if (o.q.k != 5120 or o.q.stream_w == 0) return false;
+        // attention's q (with its gate half), k and v of one input (TF_ATTN_STREAM=0: their mixed cluster launch)
+        if (outs.len == 3 and rows == 16 and attnStreams())
+            return outs[0].q.n == 12288 and outs[1].q.n == 1024 and outs[2].q.n == 1024;
         return outs.len == 4 and outs[0].q.n == 10240 and outs[1].q.n == 6144 and outs[2].q.n == 48 and outs[3].q.n == 48;
+    }
+
+    fn attnStreams() bool {
+        const v = @import("sys").c.getenv("TF_ATTN_STREAM") orelse return true;
+        return !std.mem.eql(u8, std.mem.span(v), "0");
     }
 
     pub fn decodeMany(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, outs: []const Out, rows: usize) !void {
@@ -522,19 +545,28 @@ pub const Affine4Kernels = struct {
                 tab = @max(tab, o.q.tabBytesUpTo(linear.gdn_pair_tab_max));
             };
             var parts: Parts = std.mem.zeroes(Parts);
-            parts.count = 4;
+            parts.count = @intCast(outs.len);
             var first: usize = 0;
             for (outs, 0..) |o, index| {
-                const tiles = if (index < 2) o.q.n / bn else 1;
+                const tiles = if (index < 2) o.q.n / bn else (o.q.n + 63) / 64;
                 const twin = dict and a.coded(o.q);
                 parts.p[index] = .{ .w = o.q.stream_w, .scales = if (twin) o.q.sb else o.q.s, .biases = if (twin) o.q.tab else o.q.b, .out = o.out, .n = int(o.q.n), .npad = if (twin) @bitCast(o.q.code) else int(o.q.npad), .sk = int(splitK(o.q.n,o.q.k)), .tiles = if (dict) (if (twin) int(o.q.npad) else 0) else int(tiles), .first = int(first) };
                 first += tiles;
+            }
+            // three parts: the fourth starts past the grid, so no CTA takes it
+            if (outs.len == 3) {
+                parts.p[3] = parts.p[2];
+                parts.p[3].first = int(first);
             }
             var g: launch_.Args = .{};
             g.add(x); g.add(xs); g.add(parts);
             for ([_]usize{ rows, 5120, 5120 }) |v| g.add(int(v));
             const base: u32 = if (rows32) gdn_stream32_smem else 22656;
-            const shared: u32 = if (dict) base + 4 * @as(u32, @intCast(bn)) + tab else base;
+            // a 16-row launch takes at least the output stream's 35328 bytes (qlinear.out16_smem): two CTAs an SM at most,
+            // so its CTAs spread over GB10's 48 SMs instead of packing four an SM (an allocation only; the kernel reads
+            // and writes the same bytes, the same bits). TF_GDN_SPREAD=0 keeps the packed launch.
+            const raw: u32 = if (dict) base + 4 * @as(u32, @intCast(bn)) + tab else base;
+            const shared: u32 = if (rows32 or !spreadOn()) raw else @max(raw, linear.out16_smem);
             const f = if (dict) dict_fn.? else if (rows32) a.gdn_stream32_fn.? else a.gdn_stream16_fn.?;
             return launch_.launch(f, .{ .grid = .{ .x = u(first) }, .block = .{ .x = 128 }, .shared = shared, .pdl = true }, s, &g);
         }
@@ -851,7 +883,7 @@ pub const Affine4Kernels = struct {
     pub fn cluster(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, q: Affine4, out: u64, rows: usize, sk: usize) !void {
         const stream_fn = if (q.stream_w == 0) null else a.stream16_fns[@as(usize, if (q.k == 6144) 1 else 0)];
         // K = 4096: the drafter's o projection (its stream view only exists when cuda_draft_weights packed it)
-        if (rows == 16 and sk == 4 and q.n == 5120 and (q.k == 6144 or q.k == 17408 or q.k == 4096) and q.stream_w != 0 and stream_fn != null) {
+        if (narrow16(rows) and sk == 4 and q.n == 5120 and (q.k == 6144 or q.k == 17408 or q.k == 4096) and q.stream_w != 0 and stream_fn != null) {
             // A coded down projection, or an eligible out/o projection, streams its index windows.
             const dict = q.npad == 5120 and a.coded(q) and a.stream16_dict_fn != null and
                 (q.k == 17408 or q.k == 4096 or a.dictOutStream(q, rows, sk));

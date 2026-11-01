@@ -5,13 +5,18 @@ constexpr int DRAFT_CHUNKS = 9;
 
 extern "C" __global__ void tf_q35d_dyn_conv_batch(const __nv_bfloat16* __restrict__ X0, const __nv_bfloat16* __restrict__ DYN0,
                                               const __nv_bfloat16* __restrict__ BASE, const __nv_bfloat16* __restrict__ RES0,
-                                              __nv_bfloat16* __restrict__ OUT0, int D, int group, int branch, int block_rows) {
+                                              __nv_bfloat16* __restrict__ OUT0, int D, int group, int branch, int block_rows,
+                                              float* __restrict__ XS0) {
     release_next();
     await_prior();
     const __nv_bfloat16* X = after_wait(X0);
     const __nv_bfloat16* DYN = after_wait(DYN0);
     const __nv_bfloat16* RES = after_wait(RES0);
     __nv_bfloat16* OUT = after_wait(OUT0);
+    // XS (may be null): the rows' 64-group sums of OUT, tf_q35_sums' arithmetic (the host passes it only when the grid
+    // covers D in one pass of 256-channel blocks, four whole groups a block)
+    float* XS = after_wait(XS0);
+    __shared__ __align__(16) __nv_bfloat16 outs[256];
     const int t = blockIdx.x;
     const int groups = D / group;
     // grid (rows, channel blocks): a thread a channel, so a 16-row window fills the device instead of 16 blocks
@@ -26,7 +31,17 @@ extern "C" __global__ void tf_q35d_dyn_conv_batch(const __nv_bfloat16* __restric
             total = rbf(total + rbf(bf(DYN[(size_t)t * (4 * groups) + (branch * 2 + l) * groups + g]) * x));
         }
         if (RES != nullptr) total = rbf(total + bf(RES[(size_t)t * D + c]));
-        OUT[(size_t)t * D + c] = __float2bfloat16_rn(total);
+        const __nv_bfloat16 o = __float2bfloat16_rn(total);
+        OUT[(size_t)t * D + c] = o;
+        if (XS != nullptr) outs[threadIdx.x] = o;
+    }
+    if (XS == nullptr) return;
+    __syncthreads();
+    if (threadIdx.x < 4) {
+        float s = 0.0f;  // group_sum's order: the group's 64 entries in index order
+#pragma unroll
+        for (int j = 0; j < 64; j++) s += bf(outs[threadIdx.x * 64 + j]);
+        XS[(size_t)t * (D / 64) + blockIdx.y * 4 + threadIdx.x] = s;
     }
 }
 
