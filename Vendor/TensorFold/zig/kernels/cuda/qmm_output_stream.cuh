@@ -42,8 +42,9 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
         cp16z(dst+row*128+swz<8>(row,ch)*16,x+size_t(min(row,rows-1))*ldx+g*64+ch*8,row<rows);
         if(tid<16){if(tid<rows)cp4(dst+4352+tid*4,xs+size_t(tid)*KG+g);else *reinterpret_cast<float*>(dst+4352+tid*4)=0;}
     };
+    load_w(0);
     if constexpr(DICT)qmm_dict::dict_table<Slices*128>(p,table,threadIdx.x,OUT_PAIR_SMEM);
-    load_w(0);commit();
+    commit();
 #if __CUDA_ARCH__ >= 900
     if(tid==0) {
 #pragma unroll

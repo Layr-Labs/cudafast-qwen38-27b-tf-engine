@@ -52,6 +52,9 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     const t_params = e.tables.ptr + params_at;
     const geo = e.geo;
     const group = g.q_heads / g.kv_heads;
+    // no layer's pocket is live in a scored forward: its per-layer test then costs one branch a layer, not a scan of
+    // every slot (pockets.add returns for a layer without live neurons, so the launches are the same either way)
+    const pockets_live = e.pockets.any();
 
     try e.embed(t_ids, e.h, total, t_params);
     // the producers of the out, o and down inputs write their group sums; a prompt GEMM past 16 rows needs none
@@ -177,7 +180,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     try e.runAfter(e.fns.mlp_act, .{ (total * g.intermediate + 1023) / 1024, 1, 1 }, .{ 256, 1, 1 }, .{ e.gate, e.up, e.act, n, t_params, @as(c_int, @intCast(g.intermediate)), sums });
                     try e.projAgain(m.down, e.act, e.r, total, prompt);
                 }
-                if (e.mlp) |k| try k.f(k.ctx, i, e.x, e.r, total, e.taught) else try e.pockets.add(e.stream, i, e.x, e.r, total, e.taught);
+                if (e.mlp) |k| try k.f(k.ctx, i, e.x, e.r, total, e.taught) else if (pockets_live) try e.pockets.add(e.stream, i, e.x, e.r, total, e.taught);
             },
             .moe => |m| try e.routedRows(m.router, m.experts, e.x, e.r, total, promptMoe(prompt, total), t_params),
         }
@@ -260,7 +263,13 @@ pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool, amax: bool) 
             // a greedy verify: the norm wrote the rows' group sums (projAgain's input); the head's tile writes each
             // row's best a tile and the merge each row's token (cuda_engine.zig forward then skips its argmax)
             const x = e.x + (total - heads) * g.hidden * 2;
-            return e.affine.headArgmax(e.stream, x, e.xs, e.head.a4, e.head_amax, heads, e.tables.ptr + @import("cuda_round.zig").tokens_at);
+            const toks = e.tables.ptr + @import("cuda_round.zig").tokens_at;
+            // the 2-bit sieve and the listed column groups exactly (head_sieve.zig); check mode runs the full head too
+            if (@hasField(@TypeOf(e.*), "sieve")) if (e.sieve) |*sv| {
+                if (sv.mode == .check) try e.affine.headArgmax(e.stream, x, e.xs, e.head.a4, e.head_amax, heads, toks);
+                return sv.run(e.stream, x, e.xs, e.head.a4, heads, toks);
+            };
+            return e.affine.headArgmax(e.stream, x, e.xs, e.head.a4, e.head_amax, heads, toks);
         };
         if (@hasDecl(@TypeOf(e.*), "projAgain"))
             try e.projAgain(e.head, e.x + (total - heads) * g.hidden * 2, e.logits, heads, false)

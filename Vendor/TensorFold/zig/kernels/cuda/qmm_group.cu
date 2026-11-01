@@ -465,10 +465,10 @@ __global__ void __launch_bounds__(WM * WN * 32) group_kernel_dict(
 #pragma unroll
                 for (int s = 0; s < STAGES; ++s)
                     *reinterpret_cast<uint4*>(stage(s) + c / T::CHUNKS * T::ROW + c % T::CHUNKS * 16) = uint4{};
-        dict_table<T::THREADS>(P, buf + T::SMEM + DICT_DEC, tid, room);
 #pragma unroll
         for (int s = 0; s < STAGES - 1; ++s) {
             if (s < per) load_w(s, g0 + s);
+            if (s == 0) dict_table<T::THREADS>(P, buf + T::SMEM + DICT_DEC, tid, room);
             commit();
         }
         grid_wait();
@@ -829,10 +829,12 @@ __device__ __forceinline__ void mlp_pair_body(const __nv_bfloat16* __restrict__ 
 #pragma unroll
             for (int s = 0; s < STAGES; ++s)
                 *reinterpret_cast<uint4*>(stage(s) + c / T::CHUNKS * T::ROW + c % T::CHUNKS * 16) = uint4{};
-    if constexpr (DICT) dict_table<T::THREADS>(P, buf + T::SMEM + BM * BN * 2 + DICT_DEC, tid);
 #pragma unroll
     for (int s = 0; s < STAGES - 1; ++s) {
         if (s < per) load_w(s, g0 + s);
+        if (s == 0) {
+            if constexpr (DICT) dict_table<T::THREADS>(P, buf + T::SMEM + BM * BN * 2 + DICT_DEC, tid);
+        }
         commit();
     }
     grid_wait();
@@ -1024,3 +1026,5 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_pair_dict(const __n
 #include "qmm_mlp_single_dict.cuh"
 #include "qmm_mlp_compact_pair.cuh"
 #include "qmm_mlp_single32.cuh"
+
+#include "qmm_head_sieve.cuh"
