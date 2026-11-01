@@ -39,6 +39,9 @@ struct Seg {
     int ptok;                 // positions a KV page holds
     int pn;
     unsigned long long plog;
+    int pn2;                  // an older kept prefix the last scan folded without writing back, replayed before pn
+    int skip;                 // 1: fold the prefixes in registers only; the next recorded scan writes the state
+    unsigned long long plog2;
 };
 
 // Seg.kv's element of layer a's key (s 0) or value (s 1) at pos, head h: cap rows a head, or pos's page's row.
