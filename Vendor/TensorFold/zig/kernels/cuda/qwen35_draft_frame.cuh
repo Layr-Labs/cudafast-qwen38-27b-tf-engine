@@ -101,14 +101,20 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35d_norm_rope_qk_batch(cons
     for (int i = 0; i < 4; i++) n[i] = rbf(rbf(v[i] * inv) * bf(W[4 * t + i]));
     const float pos = (float)(segments[m / block_rows].position + (long long)(m % block_rows));
     __nv_bfloat16* out = OUT + (m * heads + head) * HD;
+    float sine[2], cosine[2];
+#pragma unroll
+    for (int i = 0; i < 2; i++) {
+        const int j = 2 * t + i;
+        const float angle = pos * powf(theta, -(float)j / (float)(HD / 2));
+        sincosf(angle, &sine[i], &cosine[i]);
+    }
 #pragma unroll
     for (int i = 0; i < 4; i++) {
         const int d = 4 * t + i;
         const float partner = __shfl_xor_sync(0xffffffffu, n[i], 16);
-        const int j = d < HD / 2 ? d : d - HD / 2;
-        const float angle = pos * powf(theta, -(float)j / (float)(HD / 2));
-        float sn, cs;
-        sincosf(angle, &sn, &cs);
+        const int source = (2 * t + i / 2) & 31;
+        const float sn = __shfl_sync(0xffffffffu, sine[i & 1], source);
+        const float cs = __shfl_sync(0xffffffffu, cosine[i & 1], source);
         out[d] = __float2bfloat16_rn(d < HD / 2 ? n[i] * cs - partner * sn : n[i] * cs + partner * sn);
     }
 }
