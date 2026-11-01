@@ -8,48 +8,56 @@ extern "C" __global__ void tf_q35d_dyn_conv_batch(const __nv_bfloat16* __restric
                                               __nv_bfloat16* __restrict__ OUT0, int D, int group, int branch, int block_rows,
                                               float* __restrict__ XS0) {
     release_next();
-    // ahead of the wait: this thread's first channel's two base taps (static); this frame's rows after it
-    const int c0 = blockIdx.y * blockDim.x + threadIdx.x;
-    float base0[2] = {0.0f, 0.0f};
-    if (c0 < D) {
-        base0[0] = bf(BASE[(branch * 2) * D + c0]);
-        base0[1] = bf(BASE[(branch * 2 + 1) * D + c0]);
+    const int lane = threadIdx.x, r = threadIdx.y;
+    const int first = blockIdx.x * 4, t = first + r;
+    const int c = blockIdx.y * 64 + lane;
+    unsigned short tap0 = 0, tap1 = 0;
+    if (r == 0 && c < D) {
+        tap0 = __bfloat16_as_ushort(BASE[(branch * 2) * D + c]);
+        tap1 = __bfloat16_as_ushort(BASE[(branch * 2 + 1) * D + c]);
     }
-    asm volatile("" ::"f"(base0[0]), "f"(base0[1]));
+    asm volatile("" ::"r"(static_cast<unsigned>(tap0)), "r"(static_cast<unsigned>(tap1)));
     await_prior();
     const __nv_bfloat16* X = after_wait(X0);
     const __nv_bfloat16* DYN = after_wait(DYN0);
     const __nv_bfloat16* RES = after_wait(RES0);
     __nv_bfloat16* OUT = after_wait(OUT0);
-    // XS (may be null): the rows' 64-group sums of OUT, tf_q35_sums' arithmetic (the host passes it only when the grid
-    // covers D in one pass of 256-channel blocks, four whole groups a block)
     float* XS = after_wait(XS0);
-    __shared__ __align__(16) __nv_bfloat16 outs[256];
-    const int t = blockIdx.x;
+    __shared__ __nv_bfloat16 taps[2][64], window[5][64];
+    __shared__ __align__(16) __nv_bfloat16 outs[4][64];
+    if (c < D) {
+        window[r + 1][lane] = X[(size_t)t * D + c];
+        if (r == 0) {
+            taps[0][lane] = __ushort_as_bfloat16(tap0);
+            taps[1][lane] = __ushort_as_bfloat16(tap1);
+            if (first % block_rows != 0) window[0][lane] = X[(size_t)(first - 1) * D + c];
+        }
+    }
+    __syncthreads();
     const int groups = D / group;
-    // grid (rows, channel blocks): a thread a channel, so a 16-row window fills the device instead of 16 blocks
-    for (int c = blockIdx.y * blockDim.x + threadIdx.x; c < D; c += gridDim.y * blockDim.x) {
+    __nv_bfloat16 o = __float2bfloat16_rn(0.0f);
+    if (c < D) {
         const int g = c / group;
         float total = 0.0f;
 #pragma unroll
         for (int l = 0; l < 2; l++) {
             if (t % block_rows - l < 0) continue;
-            const float x = bf(X[(size_t)(t - l) * D + c]);
-            total = rbf(total + rbf((c == c0 ? base0[l] : bf(BASE[(branch * 2 + l) * D + c])) * x));
+            const float x = bf(window[r + 1 - l][lane]);
+            total = rbf(total + rbf(bf(taps[l][lane]) * x));
             total = rbf(total + rbf(bf(DYN[(size_t)t * (4 * groups) + (branch * 2 + l) * groups + g]) * x));
         }
         if (RES != nullptr) total = rbf(total + bf(RES[(size_t)t * D + c]));
-        const __nv_bfloat16 o = __float2bfloat16_rn(total);
+        o = __float2bfloat16_rn(total);
         OUT[(size_t)t * D + c] = o;
-        if (XS != nullptr) outs[threadIdx.x] = o;
     }
     if (XS == nullptr) return;
+    outs[r][lane] = o;
     __syncthreads();
-    if (threadIdx.x < 4) {
-        float s = 0.0f;  // group_sum's order: the group's 64 entries in index order
+    if (lane == 0 && blockIdx.y < D / 64) {
+        float s = 0.0f;
 #pragma unroll
-        for (int j = 0; j < 64; j++) s += bf(outs[threadIdx.x * 64 + j]);
-        XS[(size_t)t * (D / 64) + blockIdx.y * 4 + threadIdx.x] = s;
+        for (int j = 0; j < 64; j++) s += bf(outs[r][j]);
+        XS[(size_t)t * (D / 64) + blockIdx.y] = s;
     }
 }
 
