@@ -6,7 +6,8 @@ __device__ __forceinline__ uint32_t compact_load_a(const __nv_bfloat16* p) {
     asm volatile("ld.global.ca.b32 %0, [%1];" : "=r"(word) : "l"(p) : "memory");
     return word;
 }
-
+// STAGES buffers of (weights, index windows, input sums); STAGES - 1 groups ahead of the one computed. The per-group
+// MMA chain, fma order, activation and group sums are the same at every depth: only the buffering changes.
 template <int STAGES = 2, int BN = 256, bool KMAJOR = true>
 __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
                                               const Parts& parts, __nv_bfloat16* __restrict__ act,
@@ -18,7 +19,8 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
                SMEM = STAGES * STAGE };
     };
     constexpr int PASSES = BN / WN / 32;
-    static_assert(T::SMEM == 17536, "compact pair pipeline footprint");
+    static_assert(T::STAGE == 8768 && T::SMEM == STAGES * 8768, "compact pair pipeline footprint");
+    static_assert(STAGES >= 2, "at least one group in flight");
     constexpr int I = T::MT, J = T::NT;
     extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -27,7 +29,6 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     const Part P = parts.p[rank];
     const int tile = cid / rows_t;
     const int m0 = cid % rows_t * BM, n0 = tile * (BN / 2), per = KG, g0 = 0;
-
     auto stage = [&](int s) { return buf + s * T::STAGE; };
     const int rows = min(BM, M - m0);
     constexpr int TILE_BYTES = 64 * GS / 2;
@@ -72,7 +73,6 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     };
     uint32_t mask;
     asm volatile("mov.b32 %0, 0x000F000F;\n" : "=r"(mask));
-
     float acc[I][J][4];
 #pragma unroll
     for (int i = 0; i < I; ++i)
@@ -80,6 +80,7 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
         for (int j = 0; j < J; ++j)
 #pragma unroll
             for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
+    // static weights and index windows of the first STAGES - 1 groups before the wait (one commit group each)
 #pragma unroll
     for (int s = 0; s < STAGES - 1; ++s) {
         if (s < per) load_w(s, g0 + s);
@@ -96,7 +97,8 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     }
     grid_launch();
     for (int it = 0; it < per; ++it) {
-        wait<0>();
+        // groups committed after stage it's: STAGES - 2 (the later prologue x groups, or the loop's later stages)
+        wait<STAGES - 2>();
         __syncthreads();
         const unsigned char* p = stage(it % STAGES);
         const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
@@ -136,7 +138,8 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
             xv[i][0] = px[row];
             xv[i][1] = px[row + 8];
         }
-        const int next = it + 1;
+        // the buffer refilled here was last read in iteration it - 1, which every thread left at the barrier above
+        const int next = it + STAGES - 1;
         if (next < per) { load_x(next % STAGES, next); load_w(next % STAGES, next); }
         commit();
         float d[I][J][4];
@@ -215,12 +218,22 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
         const int r = tid / (BN / 128), group = tid % (BN / 128);
         as[static_cast<size_t>(m0 + r) * (P.n / 64) + n0 / 64 + group] = act_group_sum(own + r * BN + group * 64);
     }
-
 }
-
 }
 extern "C" __global__ void __launch_bounds__(128, 3) tf_qmm_mlp_single16_compact_pair(
  const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,
  __nv_bfloat16* act,float* sums,int M,int K,int ldx,int rows_t) {
- tf_qmm_mlp_single::mlp_single_compact_body<>(x,xs,parts,act,sums,M,K,ldx,rows_t);
+ tf_qmm_mlp_single::mlp_single_compact_body<2>(x,xs,parts,act,sums,M,K,ldx,rows_t);
+}
+// The same kernel with three buffers (two groups of weights in flight while one computes): 26304 B, three CTAs an SM.
+extern "C" __global__ void __launch_bounds__(128, 3) tf_qmm_mlp_single16_compact_pair3(
+ const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,
+ __nv_bfloat16* act,float* sums,int M,int K,int ldx,int rows_t) {
+ tf_qmm_mlp_single::mlp_single_compact_body<3>(x,xs,parts,act,sums,M,K,ldx,rows_t);
+}
+// Four buffers, 35072 B: two CTAs an SM (TF_COMPACT_STAGES=4).
+extern "C" __global__ void __launch_bounds__(128, 2) tf_qmm_mlp_single16_compact_pair4(
+ const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,
+ __nv_bfloat16* act,float* sums,int M,int K,int ldx,int rows_t) {
+ tf_qmm_mlp_single::mlp_single_compact_body<4>(x,xs,parts,act,sums,M,K,ldx,rows_t);
 }

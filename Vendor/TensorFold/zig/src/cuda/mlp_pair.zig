@@ -22,6 +22,9 @@ pub const kmajor_smem: u32 = 13440 + 16 * 128 * 2;
 pub const single_smem: u32 = 41088;
 /// Pair-only half panel: two weight/index/sum stages, direct input fragments.
 pub const compact_pair_smem: u32 = 17536;
+/// The same kernel with three and four stages (tf_qmm_mlp_single16_compact_pair3 / 4).
+pub const compact_pair3_smem: u32 = 3 * 8768;
+pub const compact_pair4_smem: u32 = 4 * 8768;
 /// tf_qmm_mlp_single32: two stages of 32 input rows, four 2 KB weight tiles, 256 scales and biases, 32 sums.
 pub const single32_smem: u32 = 2 * (32 * 128 + 256 * 32 + 2 * 256 * 2 + 32 * 4);
 /// tf_qmm_mlp_single16_dict past single_smem: four warps' decoded values, then gate's and up's tables.
@@ -39,6 +42,9 @@ pub const Kernels = struct {
     single32_dict_fn: ?Function = null, // tf_qmm_mlp_single32_dict: dictionary-coded twin on the K-major panels
     dict_fn: ?Function = null, // GB10: tf_qmm_mlp_pair's twin, taken when gate and up are both coded (tile-major)
     compact_pair_fn: ?Function = null,
+    /// The deeper-pipelined twin (TF_COMPACT_STAGES: 3 by default, 4, or 2 for none) and its shared bytes.
+    compact_deep_fn: ?Function = null,
+    compact_deep_smem: u32 = 0,
     single_dict_fn: ?Function = null, // tf_qmm_mlp_single16's, when both are coded on the K-major panel's layout
 
     /// From the loaded qmm_group module; `pdl` as the decode tiles' launches (GB10).
@@ -59,6 +65,23 @@ pub const Kernels = struct {
             // allowing the driver to avoid disruptive per-node reconfiguration.
             try fc.setAttribute(.preferred_shared_memory_carveout, 50);
             k.compact_pair_fn = fc;
+            const stages: u8 = blk: {
+                const v = @import("sys").c.getenv("TF_COMPACT_STAGES") orelse break :blk 3;
+                const s = std.mem.span(v);
+                break :blk if (std.mem.eql(u8, s, "2")) 2 else if (std.mem.eql(u8, s, "4")) 4 else 3;
+            };
+            if (stages != 2) {
+                const fdeep = if (stages == 4)
+                    try group_mod.function("tf_qmm_mlp_single16_compact_pair4")
+                else
+                    try group_mod.function("tf_qmm_mlp_single16_compact_pair3");
+                const bytes: u32 = if (stages == 4) compact_pair4_smem else compact_pair3_smem;
+                try fdeep.allowDynamicShared(bytes);
+                // three CTAs of 26304 B (or two of 35072 B) need the full carveout, not 50%
+                try fdeep.setAttribute(.preferred_shared_memory_carveout, 100);
+                k.compact_deep_fn = fdeep;
+                k.compact_deep_smem = bytes;
+            }
         }
         return k;
     }
@@ -145,8 +168,9 @@ pub const Kernels = struct {
         g.add(act);
         g.add(as);
         for ([_]usize{ rows, gate.k, gate.k, rows_t }) |v| g.add(@as(c_int, @intCast(v)));
-        const f = if (compact) kk.compact_pair_fn.? else if (sdict) kk.single_dict_fn.? else if (major) kk.kmajor_fn.? else if (dict) kk.dict_fn.? else kk.pair_fn;
-        const shared: u32 = if (compact) compact_pair_smem else if (sdict) single_smem + single_dict_dec + singleTab(gate) + singleTab(up) else if (single) single_smem else if (major) kmajor_smem else if (dict) smem + qlinear.dict_dec + @max(gate.tabBytes(), up.tabBytes()) else smem;
+        const deep = compact and kk.compact_deep_fn != null;
+        const f = if (deep) kk.compact_deep_fn.? else if (compact) kk.compact_pair_fn.? else if (sdict) kk.single_dict_fn.? else if (major) kk.kmajor_fn.? else if (dict) kk.dict_fn.? else kk.pair_fn;
+        const shared: u32 = if (deep) kk.compact_deep_smem else if (compact) compact_pair_smem else if (sdict) single_smem + single_dict_dec + singleTab(gate) + singleTab(up) else if (single) single_smem else if (major) kmajor_smem else if (dict) smem + qlinear.dict_dec + @max(gate.tabBytes(), up.tabBytes()) else smem;
         try launch_.launch(f, .{ .grid = .{ .x = @intCast(@as(usize, if (single) 1 else 2) * rows_t * tiles) }, .block = .{ .x = 128 }, .shared = shared, .cluster = if (single) null else .{ .x = 2 }, .pdl = kk.pdl }, s, &g);
     }
 };
