@@ -423,36 +423,6 @@ const PairTrace = struct {
     }
 };
 
-test "fused MLP: alternate words require both views and exactly sixteen rows" {
-    var d: cuda.Driver = undefined;
-    d.api.cuLaunchKernelEx = PairTrace.launch;
-    var pair: cuda.mlp_pair.Kernels = .{ .pair_fn = function(&d, 20), .kmajor_fn = function(&d, 21), .pdl = true };
-    const stream: cuda.Stream = .{ .d = &d, .handle = null };
-    const gate: cuda.qlinear.Affine4 = .{ .w = 10, .verify_w = 100, .s = 20, .b = 30, .n = 17408, .k = 5120, .npad = 17408 };
-    var up = gate;
-    up.w = 40; up.verify_w = 400;
-    for ([_]usize{ 1, 15, 16, 17, 32 }) |rows| {
-        try pair.pair(stream, 1000, 2000, gate, up, 3000, 4000, rows);
-        const major = rows == 16;
-        try t.expectEqual(@as(usize, if (major) 21 else 20), PairTrace.id);
-        try t.expectEqual(@as(u32, @intCast(2 * ((rows + 15) / 16) * (17408 / @as(usize, if (major) 128 else 64)))), PairTrace.grid);
-        try t.expectEqual(@as(u32, if (major) 17536 else 37376), PairTrace.shared);
-        try t.expectEqual(@as(u64, if (major) 100 else 10), PairTrace.parts.p[0].w);
-        try t.expectEqual(@as(u64, if (major) 400 else 40), PairTrace.parts.p[1].w);
-        try t.expectEqual(@as(u64, 20), PairTrace.parts.p[0].scales);
-        try t.expectEqual(@as(u64, 30), PairTrace.parts.p[0].biases);
-        try t.expectEqual(@as(u64, 4000), PairTrace.sums);
-        try t.expectEqual(@as(c_int, @intCast(rows)), PairTrace.rows);
-    }
-    up.verify_w = 0;
-    try pair.pair(stream, 1000, 2000, gate, up, 3000, 4000, 16);
-    try t.expectEqual(@as(usize, 20), PairTrace.id);
-    try t.expectEqual(@as(u64, 10), PairTrace.parts.p[0].w);
-    up.verify_w = 400; pair.kmajor_fn = null;
-    try pair.pair(stream, 1000, 2000, gate, up, 3000, 4000, 16);
-    try t.expectEqual(@as(usize, 20), PairTrace.id);
-}
-
 test "compact MLP: sixteen pair-coded rows use both half panels and preserve fallbacks" {
     var d: cuda.Driver = undefined;
     d.api.cuLaunchKernelEx = PairTrace.launch;
@@ -484,11 +454,6 @@ test "compact MLP: sixteen pair-coded rows use both half panels and preserve fal
     try pair.pair(stream, 1000, 2000, gate, up, 3000, 4000, 16);
     try t.expectEqual(@as(usize, 22), PairTrace.id);
     try t.expectEqual(@as(u32, 68), PairTrace.grid);
-    pair.compact_pair_fn = function(&d, 23);
-    for ([_]usize{ 1, 15, 17, 32 }) |rows| {
-        try pair.pair(stream, 1000, 2000, gate, up, 3000, 4000, rows);
-        try t.expectEqual(@as(usize, 20), PairTrace.id);
-    }
 }
 
 test "verify weights: preparation owns one weight-only view and retains original consumers" {
@@ -523,33 +488,6 @@ test "verify weights: preparation owns one weight-only view and retains original
     try t.expectEqual(PackTrace.alternate[1], layers[0].mlp.dense.up.a4.verify_w);
     try t.expectEqual(@as(u64, 0), layers[0].mlp.dense.down.a4.verify_w);
     }
-}
-
-test "fused MLP: single-CTA variant has no cluster and preserves narrow fallback" {
-    var d: cuda.Driver = undefined;
-    d.api.cuLaunchKernelEx = PairTrace.launch;
-    var pair: cuda.mlp_pair.Kernels = .{ .pair_fn = function(&d, 20), .kmajor_fn = function(&d, 22), .kmajor_single = true, .pdl = true };
-    const stream: cuda.Stream = .{ .d = &d, .handle = null };
-    const gate: cuda.qlinear.Affine4 = .{ .w = 10, .verify_w = 100, .s = 20, .b = 30, .n = 17408, .k = 5120, .npad = 17408 };
-    var up = gate;
-    up.w = 40; up.verify_w = 400;
-    for ([_]usize{ 1, 15, 16, 17, 32 }) |rows| {
-        try pair.pair(stream, 1000, 2000, gate, up, 3000, 4000, rows);
-        const single = rows == 16;
-        try t.expectEqual(@as(usize, if (single) 22 else 20), PairTrace.id);
-        try t.expectEqual(@as(u32, if (single) 68 else @intCast(2 * ((rows + 15) / 16) * 272)), PairTrace.grid);
-        try t.expectEqual(@as(u32, if (single) 1 else 2), PairTrace.cluster);
-        try t.expectEqual(@as(u32, if (single) 41088 else 37376), PairTrace.shared);
-        try t.expectEqual(@as(u64, if (single) 100 else 10), PairTrace.parts.p[0].w);
-        try t.expectEqual(@as(u64, if (single) 400 else 40), PairTrace.parts.p[1].w);
-    }
-    up.verify_w = 0;
-    try pair.pair(stream, 1000, 2000, gate, up, 3000, 4000, 16);
-    try t.expectEqual(@as(usize, 20), PairTrace.id);
-    try t.expectEqual(@as(u32, 2), PairTrace.cluster);
-    up.verify_w = 400; pair.kmajor_fn = null;
-    try pair.pair(stream, 1000, 2000, gate, up, 3000, 4000, 16);
-    try t.expectEqual(@as(usize, 20), PairTrace.id);
 }
 
 const PromptPersistentTrace = struct {

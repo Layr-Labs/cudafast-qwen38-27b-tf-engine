@@ -4,9 +4,9 @@
 // load, the record's lane predicates and log strides computed once.
 #pragma once
 template <int SLOTS>
-__device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q, const __nv_bfloat16* k,
-        const __nv_bfloat16* v, const float* g, const __nv_bfloat16* beta, const Seg* segs,
-        const SlotStep* steps, int layer, __nv_bfloat16* y, const int* P) {
+__device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q0, const __nv_bfloat16* k0,
+        const __nv_bfloat16* v0, const float* g0, const __nv_bfloat16* beta0, const Seg* segs,
+        const SlotStep* steps, int layer, __nv_bfloat16* y0, const int* P) {
     constexpr int R = 4;
     __shared__ float4 kept[4][SLOTS * R * 32];
     const int NK = geo.nk, NV = geo.nv;
@@ -17,13 +17,23 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q, 
     constexpr int PT = DK / 32;
     static_assert(PT == 4, "a lane's four state entries are one float4 slot");
     const size_t at = ((size_t)hv * DK + dv0) * DK + PT * dk;  // row r's entries are r * DK further
-    float* st = reinterpret_cast<float*>(sg.rec) + (size_t)layer * geo.rec() + at;
+    float* st = plain(reinterpret_cast<float*>(sg.rec) + (size_t)layer * geo.rec() + at);
     float4* slots = kept[threadIdx.y];
     float root[R][PT], state[R][PT];
 #pragma unroll
     for (int r = 0; r < R; ++r)
 #pragma unroll
-        for (int i = 0; i < PT; ++i) root[r][i] = st[r * DK + i];
+        for (int i = 0; i < PT; ++i) {
+            root[r][i] = st[r * DK + i];
+            asm volatile("" :: "f"(root[r][i]));
+        }
+    await_prior();
+    const __nv_bfloat16* q = after_wait(q0);
+    const __nv_bfloat16* k = after_wait(k0);
+    const __nv_bfloat16* v = after_wait(v0);
+    const float* g = after_wait(g0);
+    const __nv_bfloat16* beta = after_wait(beta0);
+    __nv_bfloat16* y = after_wait(y0);
     if (sg.pn > 0) {
         Seg prev = sg;
         prev.log = sg.plog;
@@ -221,7 +231,7 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q, 
 extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_lean_##N(Geo geo, const __nv_bfloat16* q, \
  const __nv_bfloat16* k, const __nv_bfloat16* v, const float* g, const __nv_bfloat16* beta, const Seg* segs, \
  const SlotStep* steps, int layer, __nv_bfloat16* y, const int* P) { \
-  release_next(); await_prior(); \
-  q35_slots_lean<N>(geo, after_wait(q), after_wait(k), after_wait(v), after_wait(g), after_wait(beta), segs, steps, layer, after_wait(y), P); }
+  release_next(); \
+  q35_slots_lean<N>(geo, q, k, v, g, beta, segs, steps, layer, y, P); }
 TF_Q35_LEAN(2)
 TF_Q35_LEAN(3)
