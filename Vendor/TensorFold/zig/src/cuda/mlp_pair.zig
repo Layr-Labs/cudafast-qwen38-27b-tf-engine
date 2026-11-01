@@ -20,8 +20,8 @@ pub const symbol_single_dict = "tf_qmm_mlp_single16_dict";
 pub const smem: u32 = qlinear.group_smem + 16 * 64 * 2;
 pub const kmajor_smem: u32 = 13440 + 16 * 128 * 2;
 pub const single_smem: u32 = 41088;
-/// Pair-only half panel: two weight/index/sum stages, direct input fragments.
-pub const compact_pair_smem: u32 = 17536;
+/// Pair-only half panel: two weight/index/sum/input-tile stages (the input fragments read from the staged tile).
+pub const compact_pair_smem: u32 = 21632;
 /// tf_qmm_mlp_single32: two stages of 32 input rows, four 2 KB weight tiles, 256 scales and biases, 32 sums.
 pub const single32_smem: u32 = 2 * (32 * 128 + 256 * 32 + 2 * 256 * 2 + 32 * 4);
 /// tf_qmm_mlp_single16_dict past single_smem: four warps' decoded values, then gate's and up's tables.
@@ -55,9 +55,8 @@ pub const Kernels = struct {
             k.single_dict_fn = fs;
             const fc = try group_mod.function("tf_qmm_mlp_single16_compact_pair");
             try fc.allowDynamicShared(compact_pair_smem);
-            // 50% rounds upward to the 64 KiB carveout on GB10. This is a hint,
-            // allowing the driver to avoid disruptive per-node reconfiguration.
-            try fc.setAttribute(.preferred_shared_memory_carveout, 50);
+            // three CTAs an SM need the 100 KiB carveout on GB10 (3 x 21632 bytes and their reserve exceed 64 KiB)
+            try fc.setAttribute(.preferred_shared_memory_carveout, 100);
             k.compact_pair_fn = fc;
         }
         return k;
@@ -117,7 +116,7 @@ pub const Kernels = struct {
         const major = rows <= 16 and gate.n == 17408 and gate.k == 5120 and
             gate.verify_w != 0 and up.verify_w != 0 and kk.kmajor_fn != null;
         const single = major and kk.kmajor_single;
-        const compact = single and rows == 16 and kk.single_dict_fn != null and kk.compact_pair_fn != null and coded(gate, up, true) and
+        const compact = single and kk.single_dict_fn != null and kk.compact_pair_fn != null and coded(gate, up, true) and
             qlinear.pairCode(gate.code) and qlinear.pairCode(up.code);
         const tiles = gate.n / @as(usize, if (compact) 128 else if (single) 256 else if (major) 128 else 64);
         // the twins: tf_qmm_mlp_pair's (npad carries the code) and tf_qmm_mlp_single16's (first carries it; npad

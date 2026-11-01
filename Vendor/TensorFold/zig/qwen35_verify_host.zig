@@ -468,7 +468,7 @@ test "compact MLP: sixteen pair-coded rows use both half panels and preserve fal
     try pair.pair(stream, 1000, 2000, gate, up, 3000, 4000, 16);
     try t.expectEqual(@as(usize, 23), PairTrace.id);
     try t.expectEqual(@as(u32, 136), PairTrace.grid);
-    try t.expectEqual(@as(u32, 17536), PairTrace.shared);
+    try t.expectEqual(@as(u32, 21632), PairTrace.shared);
     try t.expectEqual(@as(u32, 1), PairTrace.cluster);
     try t.expectEqual(@as(c_int, 136), PairTrace.parts.p[0].tiles);
     try t.expectEqual(@as(u64, 100), PairTrace.parts.p[0].w);
@@ -688,7 +688,7 @@ test "output stream: original slices require a prepared view and the native sixt
         var q4: cuda.qlinear.Affine4 = .{ .w = 10, .stream_w = 100, .s = 20, .b = 30, .n = 5120, .npad = 5120, .k = k };
         for ([_]usize{ 1, 15, 16, 32 }) |rows| {
             try e.affine.cluster(e.stream, 1000, 2000, q4, 3000, rows, 4);
-            const selected = rows == 16;
+            const selected = rows <= 16; // narrow windows take the stream too (affine4_kernels.zig narrow16)
             try t.expectEqual(@as(usize, if (selected) (if (k == 6144) 21 else 20) else 3), OutputStreamTrace.id);
             try t.expectEqual(@as(u32, if (selected) 512 else 128), OutputStreamTrace.threads);
             try t.expectEqual(!selected, OutputStreamTrace.cluster);
