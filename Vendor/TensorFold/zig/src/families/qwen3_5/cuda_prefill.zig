@@ -132,6 +132,11 @@ fn chunk(self: anytype, stream: *lanes.Stream, f: *Fill) !bool {
     const cache = try self.cacheOf(stream);
     var images: ?E.Images = if (f.media) |m| .{ .features = m.features.ptr, .src = m.src, .pos = m.pos } else null;
     const end = nextCut(ids.len, stream.chunks, f.at);
+    // the final chunk of a plain greedy stream (no sampling, log probabilities, grammar or images): its first token
+    // may come from the head sieve (cuda_prompt_tail.zig)
+    self.e.prompt_greedy = end == ids.len and stream.sampling == null and stream.logprobs == null and
+        stream.prompt_logprobs == null and stream.grammar == null and f.media == null and E.promptSieveOn();
+    defer self.e.prompt_greedy = false;
     try self.e.forward(&.{.{ .cache = cache, .rows = end - f.at, .images = if (images) |*im| im else null }}, ids[f.at..end], .last);
     f.at = end;
     stream.fill_at.store(@intCast(end), .monotonic);
@@ -144,3 +149,4 @@ fn chunk(self: anytype, stream: *lanes.Stream, f: *Fill) !bool {
     if (f.media) |m| cache.delta = m.delta;
     return true;
 }
+// draw 2 of 3765f869
