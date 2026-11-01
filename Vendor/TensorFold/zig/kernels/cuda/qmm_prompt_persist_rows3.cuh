@@ -1,4 +1,5 @@
-// Persistent row/column tile scheduling; each output retains the native MMA chain.
+// Persistent row/column tile scheduling; each output retains the native MMA chain. The tiles run the bodies of
+// qmm_prompt_pipe.cuh, whose stage barrier sits inside the group.
 #pragma once
 namespace tf_qmm_persistent_rows3 {
 using namespace tf_qmm_prefill;
@@ -20,8 +21,8 @@ __global__ void __launch_bounds__(WM*128) kernel(const __nv_bfloat16* __restrict
         if constexpr(MLP){
             const int2 at=tile_of(tile,M,parts.p[0].n,BM,64,group);
             if(tf_qmm_rowsdeep0::short_tile<BM,WM>(M-at.x))
-                tf_qmm_rowsdeep0::prompt_mlp_tile<64,BM-16*WM,WM,4,STAGES>(x,parts,act,M,K,ldx,at.x,at.y);
-            else tf_qmm_rowsdeep0::prompt_mlp_tile<64,BM,WM,4,STAGES>(x,parts,act,M,K,ldx,at.x,at.y);
+                tf_qmm_pipe::mlp_tile<64,BM-16*WM,WM,4,STAGES>(x,parts,act,M,K,ldx,at.x,at.y);
+            else tf_qmm_pipe::mlp_tile<64,BM,WM,4,STAGES>(x,parts,act,M,K,ldx,at.x,at.y);
         }else{
             int q=0;
 #pragma unroll
@@ -33,19 +34,19 @@ __global__ void __launch_bounds__(WM*128) kernel(const __nv_bfloat16* __restrict
                 if(local>=full){
                     const int2 at=tile_of(local-full,M,P.n-full_cols,BM,BN/2,group);
                     if(tf_qmm_rowsdeep0::short_tile<BM,WM>(M-at.x))
-                        tf_qmm_rowsdeep0::prompt_tile<64,BM-16*WM,BN/2,WM,4,STAGES>(x,P.w,P.scales,P.biases,P.out,P.n,P.npad,M,K,ldx,at.x,full_cols+at.y);
-                    else tf_qmm_rowsdeep0::prompt_tile<64,BM,BN/2,WM,4,STAGES>(x,P.w,P.scales,P.biases,P.out,P.n,P.npad,M,K,ldx,at.x,full_cols+at.y);
+                        tf_qmm_pipe::tile<64,BM-16*WM,BN/2,WM,4,STAGES>(x,P.w,P.scales,P.biases,P.out,P.n,P.npad,M,K,ldx,at.x,full_cols+at.y);
+                    else tf_qmm_pipe::tile<64,BM,BN/2,WM,4,STAGES>(x,P.w,P.scales,P.biases,P.out,P.n,P.npad,M,K,ldx,at.x,full_cols+at.y);
                 }else{
                     const int2 at=tile_of(local,M,full_cols,BM,BN,group);
                     if(tf_qmm_rowsdeep0::short_tile<BM,WM>(M-at.x))
-                        tf_qmm_rowsdeep0::prompt_tile<64,BM-16*WM,BN,WM,4,STAGES>(x,P.w,P.scales,P.biases,P.out,P.n,P.npad,M,K,ldx,at.x,at.y);
-                    else tf_qmm_rowsdeep0::prompt_tile<64,BM,BN,WM,4,STAGES>(x,P.w,P.scales,P.biases,P.out,P.n,P.npad,M,K,ldx,at.x,at.y);
+                        tf_qmm_pipe::tile<64,BM-16*WM,BN,WM,4,STAGES>(x,P.w,P.scales,P.biases,P.out,P.n,P.npad,M,K,ldx,at.x,at.y);
+                    else tf_qmm_pipe::tile<64,BM,BN,WM,4,STAGES>(x,P.w,P.scales,P.biases,P.out,P.n,P.npad,M,K,ldx,at.x,at.y);
                 }
             }else{
                 const int2 at=tile_of(local,M,P.n,BM,BN,group);
                 if(tf_qmm_rowsdeep0::short_tile<BM,WM>(M-at.x))
-                    tf_qmm_rowsdeep0::prompt_tile<64,BM-16*WM,BN,WM,4,STAGES>(x,P.w,P.scales,P.biases,P.out,P.n,P.npad,M,K,ldx,at.x,at.y);
-                else tf_qmm_rowsdeep0::prompt_tile<64,BM,BN,WM,4,STAGES>(x,P.w,P.scales,P.biases,P.out,P.n,P.npad,M,K,ldx,at.x,at.y);
+                    tf_qmm_pipe::tile<64,BM-16*WM,BN,WM,4,STAGES>(x,P.w,P.scales,P.biases,P.out,P.n,P.npad,M,K,ldx,at.x,at.y);
+                else tf_qmm_pipe::tile<64,BM,BN,WM,4,STAGES>(x,P.w,P.scales,P.biases,P.out,P.n,P.npad,M,K,ldx,at.x,at.y);
             }
         }
         // A faster warp cannot reuse shared panels while a sibling still
