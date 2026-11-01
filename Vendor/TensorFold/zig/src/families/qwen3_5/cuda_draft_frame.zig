@@ -28,6 +28,9 @@ pub fn stagedLen(rank: usize) usize {
 pub fn segments(st: []u8) []Segment {
     return @alignCast(std.mem.bytesAsSlice(Segment, st[segments_at..words_at]));
 }
+/// The frame's readback's running mean wait (cuda_engine.zig pacedSync).
+var frame_wait: @import("cuda_engine.zig").PacedWait = .{};
+
 pub fn stage(c: draft.Config, items: []const dr.Hold, contexts: []const *draft.Ctx, st: []u8) !void {
     if (items.len == 0 or items.len > max_streams or contexts.len != items.len or (c.block != 8 and c.block != 16) or st.len < try stagedBytes(c.rank) or @intFromPtr(st.ptr) % 8 != 0) return error.BadDraftFrame;
     for (items, contexts, 0..) |it, ctx, index| {
@@ -145,7 +148,8 @@ fn body(d: anytype, n: usize, narrow_: bool) !?u64 {
     }
     try d.norm(masked, d.w.final_norm, d.x, rows);
     const spanned = if (narrow_) try head(d, rows) else try full(d, rows);
-    if (spanned != null and d.head2 != null)
+    // the screen's tiles hold 16 rows: wider frames (several streams) keep the span head (head() agrees)
+    if (spanned != null and d.head2 != null and rows <= 16)
         try topkScreened(d, spanned.?, rows)
     else
         try e.draws.topkRows(e.stream, spanned orelse d.logits, if (spanned != null) span_width else c.vocab, @intCast(c.topk), d.parts, d.words, rows);
@@ -200,7 +204,7 @@ pub fn forward(d: anytype, items: []const dr.Hold, contexts: []const *draft.Ctx)
     const spanned = try run(d, items.len, narrow(contexts));
     try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + words_at, d.words, rows * lp_words * 4, e.stream.handle), "cuMemcpyDtoHAsync");
     try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + hp_at, d.hp, rows * c.rank * 2, e.stream.handle), "cuMemcpyDtoHAsync");
-    try e.stream.synchronize();
+    try e.pacedSync(&frame_wait); // sleeps, then spins (cuda_engine.zig pacedSync)
     if (spanned != null) for (0..rows) |r| {
         const w = std.mem.bytesAsSlice(u32, st[words_at + r * lp_words * 4 ..][0 .. lp_words * 4]);
         for (w[2..][0..c.topk]) |*id| if (id.* >= spans[0][1]) {
@@ -245,7 +249,8 @@ fn head(d: anytype, rows: usize) !?u64 {
     const b = a + rows * first.n * 2;
     const out = b + rows * tail.n * 2;
     const skip = spans[1][0] - tail_tile;
-    if (d.head2) |h2| {
+    if (d.head2 != null and rows <= 16) {
+        const h2 = d.head2.?;
         // the first span's columns screened straight into the packed rows; the tail exact, as below
         try screen(d, h2, rows, out);
         try e.project(layers.Proj{ .a4 = tail }, d.x, d.xs, b, rows, false, 0, false);
@@ -344,6 +349,9 @@ fn topkScreened(d: anytype, logits: u64, rows: usize) !void {
     const n: usize = head2_cap;
     const pv = d.parts;
     const pi = d.parts + rows * n * 4;
+    // the select reads the packed rows sixteen bytes at a time
+    comptime std.debug.assert(span_width % 8 == 0);
+    if (logits % 16 != 0) return error.BadDraftFrame;
     var a: cuda.Args = .{};
     a.add(logits);
     a.add(@as(c_int, @intCast(span_width)));
