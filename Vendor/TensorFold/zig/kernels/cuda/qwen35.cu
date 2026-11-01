@@ -117,15 +117,10 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __r
     float* XS = after_wait(XS0);
     if ((E & 3) == 0) {
         const size_t row = blockIdx.x;
-        uint4 hw[4], rw[4];
+        uint4 hw[4];
 #pragma unroll
         for (int j = 0; j < 4; j++)
             if ((t + 256 * j) * 8 < D) hw[j] = *reinterpret_cast<const uint4*>(H + row * D + (t + 256 * j) * 8);
-        if (R != nullptr) {
-#pragma unroll
-            for (int j = 0; j < 4; j++)
-                if ((t + 256 * j) * 8 < D) rw[j] = *reinterpret_cast<const uint4*>(R + row * D + (t + 256 * j) * 8);
-        }
         if (past_rows(P, blockIdx.x)) return;
         // h + r and w * (h * inv) move 8 entries a lane through xrow; the squares keep a thread's E entries in order
 #pragma unroll
@@ -133,8 +128,9 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __r
             const int d = (t + 256 * j) * 8;
             if (d >= D) break;
             if (R != nullptr) {
+                const uint4 rw = *reinterpret_cast<const uint4*>(R + row * D + d);
                 __nv_bfloat16* hb = reinterpret_cast<__nv_bfloat16*>(&hw[j]);
-                const __nv_bfloat16* rb = reinterpret_cast<const __nv_bfloat16*>(&rw[j]);
+                const __nv_bfloat16* rb = reinterpret_cast<const __nv_bfloat16*>(&rw);
 #pragma unroll
                 for (int k = 0; k < 8; k++) hb[k] = __float2bfloat16_rn(bf(hb[k]) + bf(rb[k]));
                 *reinterpret_cast<uint4*>(H + row * D + d) = hw[j];
@@ -459,31 +455,14 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_chain(Geo geo, cons
     for (int i = 0; i < PT; i++) st[i] = state[i];
 }
 
-// out = bf16(silu(z) * bf16(w * rmsnorm(y))) per value head; blockDim.y independent row warps, at most four.
-extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post(Geo geo, const __nv_bfloat16* __restrict__ Y0, const __nv_bfloat16* __restrict__ Z0,
-                                                                   const __nv_bfloat16* __restrict__ NW, float eps, __nv_bfloat16* __restrict__ OUT0,
-                                                                   const int* __restrict__ P, float* __restrict__ XS0) {
-    __shared__ __align__(16) __nv_bfloat16 row_done[4][DK];
-    __nv_bfloat16* done = row_done[threadIdx.y];
-    const int lane = threadIdx.x, hv = blockIdx.y;
-    release_next();
-    // ahead of the wait: the layer's norm weights (static); after it, this forward's rows. The loads move, the
-    // arithmetic does not
-    constexpr int PER0 = DK / 32;
-    const uint2 nw = *reinterpret_cast<const uint2*>(plain(NW) + lane * PER0);
-    asm volatile("" ::"r"(nw.x), "r"(nw.y));  // the load issues before the wait (keep4's rule)
-    await_prior();
-    const __nv_bfloat16* Y = after_wait(Y0);
-    const __nv_bfloat16* Z = after_wait(Z0);
-    __nv_bfloat16* OUT = after_wait(OUT0);
-    float* XS = after_wait(XS0);
-    const size_t m = blockIdx.z * blockDim.y + threadIdx.y;
-    if (past_rows(P, m)) return;
+// gdn_post's row m of value head hv, a warp: out = bf16(silu(z) * bf16(w * rmsnorm(y))), then the row's group sums when
+// XS is set. nw, yw and zw are the lane's four norm weights, y and z values; done is the warp's staging row.
+__device__ __forceinline__ void q35_post_row(Geo geo, uint2 nw, uint2 yw, uint2 zw, __nv_bfloat16* OUT, float* XS,
+                                             float eps, size_t m, int hv, __nv_bfloat16* done) {
+    const int lane = threadIdx.x;
     const size_t W = (size_t)geo.nv * DK;
     constexpr int PER = DK / 32;
     const size_t at = m * W + hv * DK + lane * PER;
-    const uint2 yw = *reinterpret_cast<const uint2*>(Y + at);
-    const uint2 zw = *reinterpret_cast<const uint2*>(Z + at);
     const __nv_bfloat16* yp = reinterpret_cast<const __nv_bfloat16*>(&yw);
     const __nv_bfloat16* zp = reinterpret_cast<const __nv_bfloat16*>(&zw);
     const __nv_bfloat16* wp = reinterpret_cast<const __nv_bfloat16*>(&nw);
@@ -508,6 +487,32 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post(Geo geo, const
     if (XS == nullptr) return;
     __syncwarp();
     if (lane < DK / 64) XS[m * (W / 64) + hv * (DK / 64) + lane] = group_sum(done + lane * 64);
+}
+
+// out = bf16(silu(z) * bf16(w * rmsnorm(y))) per value head; blockDim.y independent row warps, at most four.
+extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post(Geo geo, const __nv_bfloat16* __restrict__ Y0, const __nv_bfloat16* __restrict__ Z0,
+                                                                   const __nv_bfloat16* __restrict__ NW, float eps, __nv_bfloat16* __restrict__ OUT0,
+                                                                   const int* __restrict__ P, float* __restrict__ XS0) {
+    __shared__ __align__(16) __nv_bfloat16 row_done[4][DK];
+    __nv_bfloat16* done = row_done[threadIdx.y];
+    const int lane = threadIdx.x, hv = blockIdx.y;
+    release_next();
+    // ahead of the wait: the layer's norm weights (static); after it, this forward's rows. The loads move, the
+    // arithmetic does not
+    constexpr int PER0 = DK / 32;
+    const uint2 nw = *reinterpret_cast<const uint2*>(plain(NW) + lane * PER0);
+    asm volatile("" ::"r"(nw.x), "r"(nw.y));  // the load issues before the wait (keep4's rule)
+    await_prior();
+    const __nv_bfloat16* Y = after_wait(Y0);
+    const __nv_bfloat16* Z = after_wait(Z0);
+    __nv_bfloat16* OUT = after_wait(OUT0);
+    float* XS = after_wait(XS0);
+    const size_t m = blockIdx.z * blockDim.y + threadIdx.y;
+    if (past_rows(P, m)) return;
+    const size_t at = m * ((size_t)geo.nv * DK) + hv * DK + lane * PER0;
+    const uint2 yw = *reinterpret_cast<const uint2*>(Y + at);
+    const uint2 zw = *reinterpret_cast<const uint2*>(Z + at);
+    q35_post_row(geo, nw, yw, zw, OUT, XS, eps, m, hv, done);
 }
 
 // A prompt chunk's tf_q35_gdn_post with RPW rows a warp: every row's y and z load before any row computes; each row's
@@ -781,8 +786,16 @@ __device__ __forceinline__ void norm_rope_rows(const Geo& geo, const __nv_bfloat
     int pos[3];
     row_positions(sg, rowanc[m], m, M, pos);
     const int slot = sg.len + (int)m - sg.row0;
-    if (query) Qn[(m * QH + head) * HD + t] = rotate(xs, t, pos);
-    else store(sg, head, slot, t, rotate(xs, t, pos), Vr[(m * KVH + head) * HD + t]);
+    auto put = [&](int d, __nv_bfloat16 y) {
+        if (query) Qn[(m * QH + head) * HD + d] = y;
+        else store(sg, head, slot, d, y, Vr[(m * KVH + head) * HD + d]);
+    };
+    if (t < 32) {
+        const float2 sc = rope_coeff(t, pos);
+        const float a = bf(xs[t]), b = bf(xs[t + 32]);
+        put(t, __float2bfloat16_rn(a * sc.y - b * sc.x));
+        put(t + 32, __float2bfloat16_rn(b * sc.y + a * sc.x));
+    } else if (t >= 64) put(t, xs[t]);
 }
 
 extern "C" __global__ void __launch_bounds__(256) tf_q35_norm_rope(Geo geo, const __nv_bfloat16* __restrict__ QRAW, const __nv_bfloat16* __restrict__ KRAW,
