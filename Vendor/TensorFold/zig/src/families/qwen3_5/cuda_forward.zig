@@ -86,7 +86,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 else
                     try e.projMany(&.{ m.q, m.k, m.v }, e.x, &.{ e.qraw, e.kraw, e.vraw }, total, prompt);
                 if (e.learning) |k| try k.attention(i, e.qraw, e.kraw, e.vraw, total);
-                if (prompt and total > 16 and !e.kv8) {
+                if (!e.kv8 and ((prompt and total > 16) or (!prompt and record and total >= 2))) {
                     // Preserve the original two head sums and bf16 boundary before rotary/cache stores.
                     try e.runAfter(e.fns.head_rope_warp, .{ (total * (g.q_heads + g.kv_heads) + 3) / 4, 1, 1 }, .{ 32, 4, 1 }, .{ geo, e.qraw, e.kraw, e.vraw, m.q_norm, m.k_norm, e.qn, t_segs, t_rows, t_anc, @as(c_int, ai), g.eps, t_params, mpos });
                 } else if (e.kv8) {
