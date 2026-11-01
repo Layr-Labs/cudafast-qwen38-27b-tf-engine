@@ -71,9 +71,9 @@ fn ropeQk(d: anytype, xq: u64, wq: u64, outq: u64, xk: u64, wk: u64, outk: u64, 
 pub fn attention(d: anytype, rows: usize, layer: usize) !void {
     const c = d.c;
     const partial = .{ d.q, d.kb, d.vb, d.segments, @as(c_int, @intCast(c.block)), @as(c_int, @intCast(c.heads)), @as(c_int, @intCast(c.kv_heads)), @as(c_int, @intCast(c.ringRows())), @as(c_int, @intCast(c.window)), @as(c_int, @intCast(layer)), d.pm, d.pl, d.po };
-    // four query heads a key head (128 wide): a block takes four rows of a stream and a key head's heads, so each
-    // staged key and value serves 16 (row, head) partials; the same bits as tf_q35d_attn_partial's
-    if (c.heads == 4 * c.kv_heads and c.head_dim == 128 and c.block % 4 == 0)
+    if (c.heads == 4 * c.kv_heads and c.head_dim == 128 and c.block % 8 == 0 and rows >= 8 and rows % 8 == 0)
+        try launch(d, d.fns.attn_partial_rows8, sig.draft_partial_rows8, .{ rows / 8, c.kv_heads, chunks }, .{ 256, 1, 1 }, partial)
+    else if (c.heads == 4 * c.kv_heads and c.head_dim == 128 and c.block % 4 == 0)
         try launch(d, d.fns.attn_partial_rows4, sig.draft_partial_rows, .{ rows / 4, c.kv_heads, chunks }, .{ 128, 1, 1 }, partial)
     else
         try launch(d, d.fns.attn_partial, sig.draft_partial, .{ rows, c.heads, chunks }, .{ 128, 1, 1 }, partial);

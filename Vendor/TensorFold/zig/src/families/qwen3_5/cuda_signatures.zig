@@ -54,11 +54,14 @@ pub const draft_partial = Sig{ .name = "draft_partial", .handle = "d.fns.attn_pa
 /// The draft frame's partial over four rows of a stream and the four query heads of a key head a block.
 pub const draft_partial_rows = Sig{ .name = "draft_partial_rows", .handle = "d.fns.attn_partial_rows4", .symbol = "tf_q35d_attn_partial_rows4", .params = &.{ .ptr, .ptr, .ptr, .ptr, .i32, .i32, .i32, .i32, .i32, .i32, .ptr, .ptr, .ptr } };
 
+/// Eight rows share the same key head while preserving the four-row partial's argument layout.
+pub const draft_partial_rows8 = Sig{ .name = "draft_partial_rows8", .handle = "d.fns.attn_partial_rows8", .symbol = "tf_q35d_attn_partial_rows8", .params = draft_partial_rows.params };
+
 /// The draft frame's merge: the draft rows' chunks' partials into each row's output.
 pub const draft_merge = Sig{ .name = "draft_merge", .handle = "d.fns.attn_merge", .symbol = "tf_q35d_attn_merge", .params = &.{ .ptr, .ptr, .ptr, .i32, .ptr } };
 
 /// Every q35 attention kernel's list: the decode partials, the rows, the merge, the gate, the rope and the draft pair.
-pub const all = [_]Sig{ attn_partial, attn_pair, attn_partial8, attn_rows, attn_rows8, attn_merge, attn_gate, attn_merge_gate, norm_rope, rope, rope8, draft_partial, draft_partial_rows, draft_merge };
+pub const all = [_]Sig{ attn_partial, attn_pair, attn_partial8, attn_rows, attn_rows8, attn_merge, attn_gate, attn_merge_gate, norm_rope, rope, rope8, draft_partial, draft_partial_rows, draft_partial_rows8, draft_merge };
 
 /// The list a launch site's handle names, if the table holds one.
 pub fn byHandle(handle: []const u8) ?Sig {

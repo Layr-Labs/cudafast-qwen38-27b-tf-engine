@@ -294,8 +294,7 @@ __device__ __forceinline__ void attn_partial_heads(const __nv_bfloat16* Q,
     constexpr int KROW = HD * 2 + 16, ROWS = SLICE + R - 1;
     __shared__ __align__(16) unsigned char ks[ROWS * KROW];
     __shared__ __align__(16) __nv_bfloat16 vs[ROWS * HD];
-    __shared__ __align__(16) float qs[R][HD][G];
-    __shared__ __align__(16) float ps[R][SLICE][G];
+    __shared__ __align__(16) __nv_bfloat16 qs[R][HD][G];
     const int lane = threadIdx.x & 31, r = threadIdx.x >> 5;
     const int groups = block_rows / R, stream = blockIdx.x / groups, local0 = blockIdx.x % groups * R, local = local0 + r;
     const int m = stream * block_rows + local, kvh = blockIdx.y, chunk = blockIdx.z, h0 = kvh * G;
@@ -313,7 +312,7 @@ __device__ __forceinline__ void attn_partial_heads(const __nv_bfloat16* Q,
         if (lane < G) { PM[slot0 + lane * DRAFT_CHUNKS] = -INFINITY; PL[slot0 + lane * DRAFT_CHUNKS] = 0.0f; }
         return;
     }
-    for (int i = lane; i < HD * G; i += 32) qs[r][i % HD][i / HD] = bf(Q[((size_t)m * heads + h0 + i / HD) * HD + i % HD]);
+    for (int i = lane; i < HD * G; i += 32) qs[r][i % HD][i / HD] = Q[((size_t)m * heads + h0 + i / HD) * HD + i % HD];
     const auto stage = [&](int w, bool key) {
         const long long a0 = lo + chunk * CHUNK + w * SLICE, a1 = min(hi + chunk * CHUNK + w * SLICE + SLICE, end);
         const int staged = (int)max(a1 - a0, 0LL);
@@ -359,7 +358,9 @@ __device__ __forceinline__ void attn_partial_heads(const __nv_bfloat16* Q,
 #pragma unroll
                     for (int i = 0; i < 8; ++i) {
                         const float kv = bf(kb[i]);
-                        const float4 q = *reinterpret_cast<const float4*>(&qs[r][8 * c + i][0]);
+                        const uint2 qw = *reinterpret_cast<const uint2*>(&qs[r][8 * c + i][0]);
+                        const __nv_bfloat16* qb = reinterpret_cast<const __nv_bfloat16*>(&qw);
+                        const float4 q = make_float4(bf(qb[0]), bf(qb[1]), bf(qb[2]), bf(qb[3]));
                         dot[0] = fmaf(q.x, kv, dot[0]);
                         dot[1] = fmaf(q.y, kv, dot[1]);
                         dot[2] = fmaf(q.z, kv, dot[2]);
@@ -386,13 +387,12 @@ __device__ __forceinline__ void attn_partial_heads(const __nv_bfloat16* Q,
         }
 #pragma unroll
         for (int j = 0; j < PER; ++j) {
-            float p[G];
 #pragma unroll
             for (int g = 0; g < G; ++g) {
-                p[g] = lane + 32 * j < n ? __expf(score[g][j] - mx[g]) : 0.0f;
-                sum[g] += p[g];
+                const float p = lane + 32 * j < n ? __expf(score[g][j] - mx[g]) : 0.0f;
+                sum[g] += p;
+                score[g][j] = p;
             }
-            *reinterpret_cast<float4*>(&ps[r][lane + 32 * j][0]) = make_float4(p[0], p[1], p[2], p[3]);
         }
 #pragma unroll
         for (int g = 0; g < G; ++g) sum[g] = warp_sum(sum[g]);
@@ -411,7 +411,13 @@ __device__ __forceinline__ void attn_partial_heads(const __nv_bfloat16* Q,
             for (int b = 0; b < BATCH; ++b) {
                 if (e0 + b >= n) break;
                 const __nv_bfloat16* vb = reinterpret_cast<const __nv_bfloat16*>(&vw[b]);
-                const float4 p = *reinterpret_cast<const float4*>(&ps[r][e0 + b][0]);
+                const bool second = e0 + b >= 32;
+                const int source = (e0 + b) & 31;
+                const float4 p = make_float4(
+                    __shfl_sync(0xffffffffu, second ? score[0][1] : score[0][0], source),
+                    __shfl_sync(0xffffffffu, second ? score[1][1] : score[1][0], source),
+                    __shfl_sync(0xffffffffu, second ? score[2][1] : score[2][0], source),
+                    __shfl_sync(0xffffffffu, second ? score[3][1] : score[3][0], source));
 #pragma unroll
                 for (int i = 0; i < DPL; ++i) {
                     const float v = bf(vb[i]);
@@ -464,6 +470,14 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35d_attn_partial_rows4(con
     release_next();
     await_prior();
     attn_partial_heads<4>(after_wait(Q0), after_wait(KB0), after_wait(VB0), segments, block_rows, heads, kv_heads, W, window, layer, after_wait(PM0), after_wait(PL0), after_wait(PO0));
+}
+
+extern "C" __global__ void __launch_bounds__(256) tf_q35d_attn_partial_rows8(const __nv_bfloat16* Q0,
+        const __nv_bfloat16* KB0, const __nv_bfloat16* VB0, const DraftSegment* segments,
+        int block_rows, int heads, int kv_heads, int W, int window, int layer, float* PM0, float* PL0, float* PO0) {
+    release_next();
+    await_prior();
+    attn_partial_heads<8>(after_wait(Q0), after_wait(KB0), after_wait(VB0), segments, block_rows, heads, kv_heads, W, window, layer, after_wait(PM0), after_wait(PL0), after_wait(PO0));
 }
 
 extern "C" __global__ void __launch_bounds__(32) tf_q35d_attn_merge(const float* PM0, const float* PL0,
