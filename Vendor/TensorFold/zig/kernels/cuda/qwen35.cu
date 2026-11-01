@@ -739,7 +739,7 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35_attn_merge_gate(Geo geo,
 
 // tf_q35_head_norm of a (row, head) on threads 0-63, then tf_q35_rope's rotation of it: a query head's into Qn, a key
 // head's with its value into the cache slot. Grid (rows, query heads + key heads), HD threads.
-template <typename Store, bool EARLY = false>
+template <typename Store, bool EARLY = false, bool ONCE = false>
 __device__ __forceinline__ void norm_rope_rows(const Geo& geo, const __nv_bfloat16* __restrict__ QRAW, const __nv_bfloat16* __restrict__ KRAW,
                                                const __nv_bfloat16* __restrict__ WQ, const __nv_bfloat16* __restrict__ WK,
                                                __nv_bfloat16* __restrict__ Qn, const __nv_bfloat16* __restrict__ Vr, const Seg* __restrict__ segs,
@@ -781,9 +781,33 @@ __device__ __forceinline__ void norm_rope_rows(const Geo& geo, const __nv_bfloat
     int pos[3];
     row_positions(sg, rowanc[m], m, M, pos);
     const int slot = sg.len + (int)m - sg.row0;
-    if (query) Qn[(m * QH + head) * HD + t] = rotate(xs, t, pos);
-    else store(sg, head, slot, t, rotate(xs, t, pos), Vr[(m * KVH + head) * HD + t]);
+    if constexpr (ONCE) {
+        // the pair (t, t + 32) turned once: `rotate` computes the pair's angle twice, once per output thread
+        // (a powf and a sincosf each); the arithmetic per output is `rotate`'s, unchanged
+        if (t < 32) {
+            const float angle = (float)pos[mrope_axis(t)] * powf(10000000.0f, -(float)t / 32.0f);
+            float sn, cs;
+            sincosf(angle, &sn, &cs);
+            const float a = bf(xs[t]), b = bf(xs[t + 32]);
+            const __nv_bfloat16 lo = __float2bfloat16_rn(a * cs - b * sn);
+            const __nv_bfloat16 hi = __float2bfloat16_rn(b * cs + a * sn);
+            if (query) {
+                Qn[(m * QH + head) * HD + t] = lo;
+                Qn[(m * QH + head) * HD + t + 32] = hi;
+            } else {
+                store(sg, head, slot, t, lo, Vr[(m * KVH + head) * HD + t]);
+                store(sg, head, slot, t + 32, hi, Vr[(m * KVH + head) * HD + t + 32]);
+            }
+        } else if (t >= 64) {
+            if (query) Qn[(m * QH + head) * HD + t] = xs[t];
+            else store(sg, head, slot, t, xs[t], Vr[(m * KVH + head) * HD + t]);
+        }
+    } else {
+        if (query) Qn[(m * QH + head) * HD + t] = rotate(xs, t, pos);
+        else store(sg, head, slot, t, rotate(xs, t, pos), Vr[(m * KVH + head) * HD + t]);
+    }
 }
+
 
 extern "C" __global__ void __launch_bounds__(256) tf_q35_norm_rope(Geo geo, const __nv_bfloat16* __restrict__ QRAW, const __nv_bfloat16* __restrict__ KRAW,
                                                                      const __nv_bfloat16* __restrict__ WQ, const __nv_bfloat16* __restrict__ WK,
@@ -802,6 +826,27 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm_rope(Geo geo, cons
     }
     await_prior();
     norm_rope_rows<StoreBf16, true>(geo, after_wait(QRAW), after_wait(KRAW), WQ, WK, after_wait(Qn), after_wait(Vr), segs, rowseg, rowanc, P, M, eps, StoreBf16{layer, geo.kvh}, wv);
+}
+
+// tf_q35_norm_rope with each rotary pair turned once (TF_ROPE_ONCE=0 picks the twin above): one powf/sincosf a pair
+// instead of `rotate`'s one an output; the arithmetic per output is unchanged.
+extern "C" __global__ void __launch_bounds__(256) tf_q35_norm_rope_once(Geo geo, const __nv_bfloat16* __restrict__ QRAW, const __nv_bfloat16* __restrict__ KRAW,
+                                                                        const __nv_bfloat16* __restrict__ WQ, const __nv_bfloat16* __restrict__ WK,
+                                                                        __nv_bfloat16* __restrict__ Qn, const __nv_bfloat16* __restrict__ Vr,
+                                                                        const Seg* __restrict__ segs, const int* __restrict__ rowseg,
+                                                                        const Ancestor* __restrict__ rowanc, int layer, const int* __restrict__ P,
+                                                                        const int* __restrict__ M, float eps) {
+    release_next();
+    // ahead of the wait: the head's norm weights (static); after it, this forward's rows. The loads move, the
+    // arithmetic does not
+    uint2 wv = make_uint2(0, 0);
+    if (threadIdx.x < 64) {
+        const __nv_bfloat16* W = blockIdx.y < (unsigned)geo.qh ? WQ : WK;
+        wv = *reinterpret_cast<const uint2*>(plain(W) + 4 * threadIdx.x);
+        asm volatile("" ::"r"(wv.x), "r"(wv.y));  // issued before the wait (keep4's rule)
+    }
+    await_prior();
+    norm_rope_rows<StoreBf16, true, true>(geo, after_wait(QRAW), after_wait(KRAW), WQ, WK, after_wait(Qn), after_wait(Vr), segs, rowseg, rowanc, P, M, eps, StoreBf16{layer, geo.kvh}, wv);
 }
 
 #include "qwen35_rows.cuh"

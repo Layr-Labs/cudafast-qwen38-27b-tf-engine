@@ -82,10 +82,13 @@ pub fn attention(d: anytype, rows: usize, layer: usize) !void {
 }
 pub fn publish(d: anytype, items: []const dr.Hold, contexts: []const *draft.Ctx) !void {
     defer d.selection_base = 0;
+    var _p0: std.Io.Timestamp = undefined;
+    if (@import("sys").c.getenv("TF_TIMING") != null) _p0 = std.Io.Clock.awake.now(d.io);
     for (items, contexts, 0..) |it, ctx, i| {
         d.selection_base = i * (d.c.block - 1);
         try d.selectHold(ctx, it);
     }
+    if (@import("sys").c.getenv("TF_TIMING") != null) @import("cuda_draft.zig").timing("tree", d.io, _p0);
 }
 fn paired(l: anytype, B: usize) bool {
     return draft.pairedMlp() and B > 0 and B <= 16 and cuda.mlp_pair.Kernels.fits(l.gate, l.up);
@@ -178,7 +181,10 @@ fn run(d: anytype, n: usize, narrow_: bool) !?u64 {
         exec = captured.instantiate() catch null;
     } else |_| {}
     try d.graphs.put(d.gpa, key, .{ .exec = exec, .spanned = spanned });
-    if (exec) |x| try x.launchOn(e.stream) else _ = try body(d, n, narrow_);
+    if (exec) |x| {
+        if (!draft.graphUploadOff()) try x.upload(e.stream);
+        try x.launchOn(e.stream);
+    } else _ = try body(d, n, narrow_);
     return spanned;
 }
 
@@ -201,12 +207,15 @@ pub fn forward(d: anytype, items: []const dr.Hold, contexts: []const *draft.Ctx)
     try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + words_at, d.words, rows * lp_words * 4, e.stream.handle), "cuMemcpyDtoHAsync");
     try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + hp_at, d.hp, rows * c.rank * 2, e.stream.handle), "cuMemcpyDtoHAsync");
     try e.stream.synchronize();
+    var _t0: std.Io.Timestamp = undefined;
+    if (@import("sys").c.getenv("TF_TIMING") != null) _t0 = std.Io.Clock.awake.now(d.io);
     if (spanned != null) for (0..rows) |r| {
         const w = std.mem.bytesAsSlice(u32, st[words_at + r * lp_words * 4 ..][0 .. lp_words * 4]);
         for (w[2..][0..c.topk]) |*id| if (id.* >= spans[0][1]) {
             id.* += @intCast(spans[1][0] - spans[0][1]);
         };
     };
+    if (@import("sys").c.getenv("TF_TIMING") != null) @import("cuda_draft.zig").timing("spanfix", d.io, _t0);
     try publish(d, items, contexts);
 }
 

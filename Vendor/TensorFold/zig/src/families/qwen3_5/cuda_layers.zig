@@ -77,6 +77,8 @@ pub const Fns = struct {
     attn_gate: cuda.Function,
     attn_merge_gate: cuda.Function,
     norm_rope: cuda.Function,
+    /// tf_q35_norm_rope's twin with each rotary pair turned once (TF_ROPE_ONCE picks it; same parameter list).
+    norm_rope_once: cuda.Function,
     mlp_act: cuda.Function,
     argmax: cuda.Function,
     argmax_slices: cuda.Function,

@@ -6,7 +6,14 @@ const engine = @import("cuda_engine.zig");
 
 /// Children a node, the selector's weight, the softmax scale, and the nodes a tree takes by default.
 const branch = 12;
-const edge_weight = 0.6;
+/// A predecessor's landing chance times this weights its edges against deeper paths (jungjipdo's 71b343b measured
+/// 0.85 over 0.6 at +0.12% officially; TF_EDGE_WEIGHT overrides, as a percent).
+fn edgeWeight() f64 {
+    if (@import("sys").c.getenv("TF_EDGE_WEIGHT")) |v| {
+        if (std.fmt.parseInt(i32, std.mem.span(v), 10)) |pct| return @as(f64, @floatFromInt(pct)) / 100.0 else |_| {}
+    }
+    return 0.85;
+}
 const scale = 1.5;
 /// A sampled stream's candidates carry the draw's own Gumbel noise at this weight (the 27B engine's draft_tree).
 const noise_weight = 0.7;
@@ -187,7 +194,7 @@ fn chancesAfterFast(c: Candidates, r: usize, pred: u32, out: *[lp_top]f64) void 
     for (0..vec_n) |v| edge[v * lanes_f64 ..][0..lanes_f64].* = acc[v];
     var most: f64 = -std.math.inf(f64);
     for (0..c.topk) |j| {
-        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edge_weight * edge[j]) / scale;
+        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edgeWeight() * edge[j]) / scale;
         most = @max(most, out[j]);
     }
     var total: f64 = 0;
@@ -211,7 +218,7 @@ fn chancesAfter(c: Candidates, r: usize, pred: u32, out: *[lp_top]f64) void {
         for (edge[0..c.topk], succ[0..c.topk]) |*e, row| e.* += ph * bf16(row[k]);
     }
     for (0..c.topk) |j| {
-        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edge_weight * edge[j]) / scale;
+        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edgeWeight() * edge[j]) / scale;
         most = @max(most, out[j]);
     }
     var total: f64 = 0;
