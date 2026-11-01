@@ -179,6 +179,7 @@ pub const Engine = struct {
     amax: u64, // the argmax slices' bests: most_verify rows of argmaxSlices(vocab) (f32, i32)
     head_amax: u64, // a greedy verify head's per-tile bests: max rows of 64-id tiles (f32, i32; Shape.amax)
     head_argmax: bool, // TF_HEAD_ARGMAX=0: greedy verify rows keep their logits and the argmax launches
+    sieve: ?cuda.head_sieve.HeadSieve = null, // a greedy verify head on the 2-bit sieve (TF_HEAD_SIEVE=0: the full head)
     picks: u64, // drawRows' slice scratch: most_verify rows of cuda.sample.Draws.row_scratch
     // per-forward tables (ids, segments, rows' segment, parent and ancestors, the draws' rules) staged in pinned memory
     tables: DeviceBuffer,
@@ -253,6 +254,7 @@ pub const Engine = struct {
         e.n_taps = 0;
         e.features = 0;
         e.head_argmax = !envOff("TF_HEAD_ARGMAX");
+        e.sieve = null;
         e.stream = try cuda.Stream.init(d, true);
         errdefer e.stream.deinit();
         e.blocks = .empty; // the field's default does not apply: Allocation(Engine).create leaves the engine undefined
@@ -365,6 +367,14 @@ pub const Engine = struct {
         errdefer if (e.verify_weights) |*b| b.free();
         if (streams) e.projection_streams = try projection_stream_layout.prepare(e, gdn_stream, output_stream);
         if (e.mo) |*m| try m.reserveParts(e);
+        // the greedy verify head's 2-bit sieve (head_sieve.zig): its copy of the head's codes, built now
+        if (gb10 and e.head_argmax) switch (e.head) {
+            .a4 => |q| if (e.affine.headArgmaxFits(q, 1)) {
+                e.sieve = try cuda.head_sieve.HeadSieve.init(d, e.mods[0], q, e.stream, e.affine.pdl);
+            },
+            else => {},
+        };
+        errdefer if (e.sieve) |*sv| sv.deinit();
         try @import("cuda_engine_tail.zig").finish(e, io, started);
         return e;
     }
@@ -407,6 +417,7 @@ pub const Engine = struct {
         if (e.projection_streams) |*b| b.free();
         if (e.verify_weights) |*b| b.free();
         if (e.fast) |*p| p.free();
+        if (e.sieve) |*sv| sv.deinit();
         e.arena.free();
         e.gpa.free(e.layers);
         e.gpa.free(e.dir);
@@ -727,6 +738,7 @@ pub const Engine = struct {
                 try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(e.host_logits.bytes.ptr, toks, total * 4, e.stream.handle), "cuMemcpyDtoHAsync");
                 try e.stream.synchronize();
                 @memcpy(e.tokens[0..total], e.host_logits.slice(u32)[0..total]);
+                if (shape.amax) if (e.sieve) |*sv| sv.after();
             },
             .logits, .last => {
                 const out = e.host_logits.bytes[0 .. heads * g.vocab * 2];
