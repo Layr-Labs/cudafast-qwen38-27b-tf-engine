@@ -180,6 +180,10 @@ pub const Engine = struct {
     head_amax: u64, // a greedy verify head's per-tile bests: max rows of 64-id tiles (f32, i32; Shape.amax)
     head_argmax: bool, // TF_HEAD_ARGMAX=0: greedy verify rows keep their logits and the argmax launches
     sieve: ?cuda.head_sieve.HeadSieve = null, // a greedy verify head on the 2-bit sieve (TF_HEAD_SIEVE=0: the full head)
+    /// The next prompt forward's last row may take its token from the sieve (cuda_prefill.zig sets it for a plain
+    /// greedy stream's final chunk; TF_PROMPT_SIEVE=0: never); prompt_sieved: that forward did.
+    prompt_greedy: bool = false,
+    prompt_sieved: bool = false,
     picks: u64, // drawRows' slice scratch: most_verify rows of cuda.sample.Draws.row_scratch
     // per-forward tables (ids, segments, rows' segment, parent and ancestors, the draws' rules) staged in pinned memory
     tables: DeviceBuffer,
@@ -601,6 +605,8 @@ pub const Engine = struct {
     /// One forward over `parts`' windows, with every input admitted before an unkept verify is settled.
     pub fn forward(e: *Engine, parts: []const Part, ids: []const u32, keep: Keep) !void {
         try e.admit(parts, ids, keep);
+        for (parts) |p| p.cache.first = null;
+        e.prompt_sieved = false;
         const g = e.g;
         const total = ids.len;
         const record = keep != .last;
@@ -740,16 +746,48 @@ pub const Engine = struct {
                 @memcpy(e.tokens[0..total], e.host_logits.slice(u32)[0..total]);
                 if (shape.amax) if (e.sieve) |*sv| sv.after();
             },
-            .logits, .last => {
+            .logits, .last => if (keep == .last and e.prompt_sieved) {
+                // the sieve wrote the row's token (cuda_prompt_tail.zig): 4 bytes back instead of the row's logits
+                const toks = e.tables.ptr + tokens_at;
+                const check = promptSieveCheck();
+                const row = e.host_logits.bytes[0 .. g.vocab * 2];
+                const tok = e.host_logits.bytes[g.vocab * 2 .. g.vocab * 2 + 4];
+                try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(tok.ptr, toks, 4, e.stream.handle), "cuMemcpyDtoHAsync");
+                if (check) try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(row.ptr, e.logits, row.len, e.stream.handle), "cuMemcpyDtoHAsync");
+                try e.promptWait(prompt);
+                if (prompt and e.l2_persist > 0) _ = e.d.api.cuCtxResetPersistingL2Cache();
+                const sieved = std.mem.bytesToValue(u32, tok[0..4]);
+                if (check) {
+                    // TF_PROMPT_SIEVE=check: the full head ran too; its host draw is the token, the sieve's is compared
+                    @memcpy(parts[0].cache.logits, e.rowLogits(0));
+                    const full = try @import("draw.zig").draw(std.heap.page_allocator, parts[0].cache.logits, null, 0, &.{});
+                    std.debug.print("[prompt sieve] check token sieve {d} full {d} {s}\n", .{ sieved, full, if (sieved == full) "match" else "MISMATCH" });
+                    parts[0].cache.first = full;
+                } else parts[0].cache.first = sieved;
+            } else {
                 const out = e.host_logits.bytes[0 .. heads * g.vocab * 2];
                 try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(out.ptr, e.logits, out.len, e.stream.handle), "cuMemcpyDtoHAsync");
-                try e.stream.synchronize();
+                try e.promptWait(prompt);
                 // the chunk is done: its persisting lines turn normal, so decode has all of L2
                 if (prompt and e.l2_persist > 0) _ = e.d.api.cuCtxResetPersistingL2Cache();
                 if (keep == .last) @memcpy(parts[0].cache.logits, e.rowLogits(0));
             },
         }
         recurrent.completed(e);
+    }
+
+    /// A prompt pass's last wait sleeps on a blocking-sync event instead of spinning a core in this spin-scheduled
+    /// context for the whole pass (GB10's CPU and GPU share one package); decode rounds keep their spin waits.
+    /// TF_PROMPT_WAIT=spin restores the spin wait. Wait mode only: no launch or value changes.
+    fn promptWait(e: *Engine, prompt: bool) !void {
+        if (!prompt or std.mem.eql(u8, std.mem.span(@import("sys").c.getenv("TF_PROMPT_WAIT") orelse ""), "spin"))
+            return e.stream.synchronize();
+        var ev: cuda.abi.Event = null;
+        // 0x1: CU_EVENT_BLOCKING_SYNC (its waiter sleeps whatever the context's schedule)
+        try e.d.check(e.d.api.cuEventCreate(&ev, 0x1 | cuda.abi.event_disable_timing), "cuEventCreate");
+        defer _ = e.d.api.cuEventDestroy_v2(ev);
+        try e.d.check(e.d.api.cuEventRecord(ev, e.stream.handle), "cuEventRecord");
+        try e.d.check(e.d.api.cuEventSynchronize(ev), "cuEventSynchronize");
     }
 
     pub const Shape = @import("cuda_shapes.zig").Shape;
@@ -800,6 +838,16 @@ test "dense read cost: hidden and slot variants have distinct graph keys" {
 }
 
 /// An engine A/B switch: true when `name` is set to "0".
+/// TF_PROMPT_SIEVE=0: a prompt's first token always from the full head; =check: both, compared (the full head's kept).
+pub fn promptSieveOn() bool {
+    return !envOff("TF_PROMPT_SIEVE");
+}
+
+fn promptSieveCheck() bool {
+    const v = @import("sys").c.getenv("TF_PROMPT_SIEVE") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "check");
+}
+
 fn envOff(name: [*:0]const u8) bool {
     const v = @import("sys").c.getenv(name) orelse return false;
     return std.mem.eql(u8, std.mem.span(v), "0");
