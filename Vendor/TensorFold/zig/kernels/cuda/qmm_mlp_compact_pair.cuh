@@ -85,6 +85,7 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
         if (s < per) load_w(s, g0 + s);
         commit();
     }
+    grid_launch();
     grid_wait();
     const __nv_bfloat16* x_ready = x;
     asm volatile("" : "+l"(x_ready) :: "memory");
@@ -94,7 +95,6 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
         if (s < per) load_x(s, g0 + s);
         commit();
     }
-    grid_launch();
     for (int it = 0; it < per; ++it) {
         wait<0>();
         __syncthreads();

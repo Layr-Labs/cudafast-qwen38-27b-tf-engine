@@ -138,13 +138,13 @@ __global__ void __launch_bounds__(WM * WN * 32) group_kernel(
             if (s < per) load_w(s, g0 + s);
             commit();
         }
+        grid_launch();
         grid_wait();
 #pragma unroll
         for (int s = 0; s < STAGES - 1; ++s) {
             if (s < per) load_x(s, g0 + s);
             commit();
         }
-        grid_launch();
         auto steps = [&](auto live_c) {                   // LIVE: the warp's m16 tiles holding rows below M
             [[maybe_unused]] constexpr int LIVE = decltype(live_c)::value;
             for (int it = 0; it < per; ++it) {
@@ -471,6 +471,7 @@ __global__ void __launch_bounds__(WM * WN * 32) group_kernel_dict(
             if (s < per) load_w(s, g0 + s);
             commit();
         }
+        grid_launch();
         grid_wait();
         qmm_dict::x_keep_l2(x + static_cast<size_t>(m0) * ldx, rows, K, ldx);
 #pragma unroll
@@ -478,7 +479,6 @@ __global__ void __launch_bounds__(WM * WN * 32) group_kernel_dict(
             if (s < per) load_x(s, g0 + s);
             commit();
         }
-        grid_launch();
         const int b_off = D.pair ? 0 : 16;
         auto steps = [&](auto live_c) {                   // LIVE: the warp's m16 tiles holding rows below M
             [[maybe_unused]] constexpr int LIVE = decltype(live_c)::value;
@@ -835,6 +835,7 @@ __device__ __forceinline__ void mlp_pair_body(const __nv_bfloat16* __restrict__ 
         if (s < per) load_w(s, g0 + s);
         commit();
     }
+    grid_launch();
     grid_wait();
     qmm_dict::x_keep_l2(x + static_cast<size_t>(m0) * ldx, rows, K, ldx);
 #pragma unroll
@@ -842,7 +843,6 @@ __device__ __forceinline__ void mlp_pair_body(const __nv_bfloat16* __restrict__ 
         if (s < per) load_x(s, g0 + s);
         commit();
     }
-    grid_launch();
     const int b_off = DICT ? (D.pair ? 0 : 16) : 0;
     for (int it = 0; it < per; ++it) {
         wait<STAGES - 2>();
@@ -1024,3 +1024,5 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_pair_dict(const __n
 #include "qmm_mlp_single_dict.cuh"
 #include "qmm_mlp_compact_pair.cuh"
 #include "qmm_mlp_single32.cuh"
+
+#include "qmm_head_sieve.cuh"

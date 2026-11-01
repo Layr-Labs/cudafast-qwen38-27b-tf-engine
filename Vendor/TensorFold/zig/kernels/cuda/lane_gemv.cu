@@ -142,6 +142,7 @@ __device__ __forceinline__ void gemv_items(const __nv_bfloat16* __restrict__ x, 
         if (s < items) load_w(s, s);
         commit();
     }
+    grid_launch();
     grid_wait();
     qmm_dict::x_keep_l2(x, rows, K, ldx);
 #pragma unroll
@@ -149,7 +150,6 @@ __device__ __forceinline__ void gemv_items(const __nv_bfloat16* __restrict__ x, 
         if (s < items) load_x(s, s);
         commit();
     }
-    grid_launch();
     const int b_off = DICT ? (D.pair ? 0 : 16) : 0;
     for (int it = 0; it < items; ++it) {
         wait<STAGES - 2>();
