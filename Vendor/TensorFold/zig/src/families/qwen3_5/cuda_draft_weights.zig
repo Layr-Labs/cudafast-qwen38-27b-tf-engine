@@ -94,7 +94,9 @@ fn toBf16(x: f32) u16 {
     return @intCast((u +% rounding) >> 16);
 }
 
-/// MLX affine-4, group 64: minimize weight error with a bf16 scale and bias; pack low nibbles first.
+/// MLX affine-4, group 64: minimize weight error with a bf16 scale and bias; pack low nibbles first. Rows are
+/// independent, so the fit runs on several threads (the clip search is ~13x the plain fit's work): every row's
+/// words, scale and bias are the same on any number of threads.
 fn quantize(gpa: std.mem.Allocator, w: []align(1) const u16, n: usize, k: usize) !struct { words: []u32, scales: []u16, biases: []u16 } {
     const groups = k / 64;
     const words = try gpa.alloc(u32, n * k / 8);
@@ -103,7 +105,39 @@ fn quantize(gpa: std.mem.Allocator, w: []align(1) const u16, n: usize, k: usize)
     errdefer gpa.free(scales);
     const biases = try gpa.alloc(u16, n * groups);
     errdefer gpa.free(biases);
-    for (0..n) |r| {
+    const job: QuantJob = .{ .w = w, .k = k, .words = words, .scales = scales, .biases = biases };
+    const threads: usize = @min(fit_threads, @max(1, std.Thread.getCpuCount() catch 1));
+    if (threads <= 1 or n < threads) {
+        quantizeRows(&job, 0, n);
+        return .{ .words = words, .scales = scales, .biases = biases };
+    }
+    var handles: [fit_threads]?std.Thread = @splat(null);
+    const per = (n + threads - 1) / threads;
+    for (0..threads) |t| {
+        const r0 = t * per;
+        if (r0 >= n) break;
+        const r1 = @min(n, r0 + per);
+        handles[t] = std.Thread.spawn(.{}, quantizeRows, .{ &job, r0, r1 }) catch blk: {
+            quantizeRows(&job, r0, r1);
+            break :blk null;
+        };
+    }
+    for (handles[0..threads]) |h| if (h) |th| th.join();
+    return .{ .words = words, .scales = scales, .biases = biases };
+}
+
+const fit_threads = 16;
+const QuantJob = struct { w: []align(1) const u16, k: usize, words: []u32, scales: []u16, biases: []u16 };
+
+/// Rows [r0, r1) of a quantize job.
+fn quantizeRows(job: *const QuantJob, r0: usize, r1: usize) void {
+    const w = job.w;
+    const k = job.k;
+    const groups = k / 64;
+    const words = job.words;
+    const scales = job.scales;
+    const biases = job.biases;
+    for (r0..r1) |r| {
         for (0..groups) |g| {
             const row = w[r * k + g * 64 ..][0..64];
             var lo: f32 = std.math.inf(f32);
@@ -115,6 +149,21 @@ fn quantize(gpa: std.mem.Allocator, w: []align(1) const u16, n: usize, k: usize)
             }
             var fit = [2]f32{ (hi - lo) / 15.0, lo };
             fit = leastSquares(row, fit);
+            // clip search: also start the fit from shrunken ranges (clipping the group's extremes trades a few large
+            // errors for smaller steps everywhere); keep the least squared error after bf16 rounding
+            var best_err = groupError(row, fit);
+            var c: usize = 1;
+            while (c <= 12) : (c += 1) {
+                const shrink = 1.0 - 0.02 * @as(f32, @floatFromInt(c));
+                const mid = (hi + lo) / 2;
+                const half = (hi - lo) / 2 * shrink;
+                const cand = leastSquares(row, .{ 2 * half / 15.0, mid - half });
+                const err = groupError(row, cand);
+                if (err < best_err) {
+                    best_err = err;
+                    fit = cand;
+                }
+            }
             const scale = toBf16(fit[0]);
             const bias = toBf16(fit[1]);
             scales[r * groups + g] = scale;
@@ -122,17 +171,60 @@ fn quantize(gpa: std.mem.Allocator, w: []align(1) const u16, n: usize, k: usize)
             const s = bf16(scale);
             const b = bf16(bias);
             const inv = if (s == 0) 0.0 else 1.0 / s;
-            for (0..8) |j| {
-                var word: u32 = 0;
-                for (0..8) |i| {
-                    const q = std.math.clamp(@round((bf16(row[j * 8 + i]) - b) * inv), 0.0, 15.0);
-                    word |= @as(u32, @intFromFloat(q)) << @intCast(4 * i);
-                }
-                words[(r * k + g * 64) / 8 + j] = word;
-            }
+            var codes = nearestCodes(row, s, b, inv);
+            const carried = feedbackCodes(row, s, b, inv);
+            if (carried.err < codes.err) codes = carried;
+            const base = (r * k + g * 64) / 8;
+            for (0..8) |j| words[base + j] = codes.words[j];
         }
     }
-    return .{ .words = words, .scales = scales, .biases = biases };
+}
+
+/// One group's packed word stream and the squared error that stream stores under a bf16 scale and bias.
+const Codes = struct { words: [8]u32, err: f64 };
+
+/// The group's words when every weight takes the code nearest the line under (s, b) -- the parent's assignment -- and
+/// the error those words store, which is the error `groupError` scores.
+fn nearestCodes(row: []align(1) const u16, s: f32, b: f32, inv: f32) Codes {
+    var out = Codes{ .words = .{ 0, 0, 0, 0, 0, 0, 0, 0 }, .err = 0 };
+    for (0..8) |j| {
+        var word: u32 = 0;
+        for (0..8) |i| {
+            const x = bf16(row[j * 8 + i]);
+            const q = std.math.clamp(@round((x - b) * inv), 0.0, 15.0);
+            word |= @as(u32, @intFromFloat(q)) << @intCast(4 * i);
+            const e = @as(f64, x) - (@as(f64, s) * @as(f64, q) + @as(f64, b));
+            out.err += e * e;
+        }
+        out.words[j] = word;
+    }
+    return out;
+}
+
+/// The same words chosen in order, each against the residual the codes before it left in the group: the line is
+/// walked in code units with one sweep of error feedback, so a weight the line cannot reach is paid for by the
+/// weights that follow it instead of by the scale. Two groups of eight are packed in the order the stream stores
+/// them, and the error is the stored one, so a caller may keep whichever stream measures lower.
+fn feedbackCodes(row: []align(1) const u16, s: f32, b: f32, inv: f32) Codes {
+    var out = Codes{ .words = .{ 0, 0, 0, 0, 0, 0, 0, 0 }, .err = std.math.inf(f64) };
+    if (!(s > 0)) return out;
+    var carry: f32 = 0;
+    var err: f64 = 0;
+    for (0..8) |j| {
+        var word: u32 = 0;
+        for (0..8) |i| {
+            const x = bf16(row[j * 8 + i]);
+            const v = (x - b) * inv + carry;
+            const q = std.math.clamp(@round(v), 0.0, 15.0);
+            word |= @as(u32, @intFromFloat(q)) << @intCast(4 * i);
+            carry = v - q;
+            const e = @as(f64, x) - (@as(f64, s) * @as(f64, q) + @as(f64, b));
+            err += e * e;
+        }
+        out.words[j] = word;
+    }
+    out.err = err;
+    return out;
 }
 
 /// A group's (scale, bias) improved by alternating code assignment and a least-squares line fit; kept only where the
@@ -194,14 +286,7 @@ fn groupError(row: []align(1) const u16, fit: [2]f32) f64 {
     const s = bf16(toBf16(fit[0]));
     const b = bf16(toBf16(fit[1]));
     const inv = if (s == 0) 0.0 else 1.0 / s;
-    var err: f64 = 0;
-    for (row) |h| {
-        const x = bf16(h);
-        const q = std.math.clamp(@round((x - b) * inv), 0.0, 15.0);
-        const d: f64 = x - (q * s + b);
-        err += d * d;
-    }
-    return err;
+    return nearestCodes(row, s, b, inv).err;
 }
 
 /// A bf16 (n, k) tensor quantized and packed through `stage` into the drafter's arena.
