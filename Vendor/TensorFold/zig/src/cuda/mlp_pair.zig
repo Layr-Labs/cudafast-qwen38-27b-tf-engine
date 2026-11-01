@@ -111,10 +111,13 @@ pub const Kernels = struct {
                 return launch_.launch(f32_use, .{ .grid = .{ .x = @intCast(gate.n / 128) }, .block = .{ .x = 128 }, .shared = sh32, .pdl = kk.pdl }, s, &a);
             };
         const rows_t = (rows + 15) / 16;
-        const major = rows == 16 and gate.n == 17408 and gate.k == 5120 and
+        // a window of at most 16 rows: the single16 tile bounds its own rows (`min(BM, M - m0)`), so it reads the
+        // K-major panels and their dictionary index stream (a byte a 64 weights) instead of the tile-major panels'
+        // separate scale and bias arrays (four bytes a 64 weights) on every window narrower than 16 rows
+        const major = rows <= 16 and gate.n == 17408 and gate.k == 5120 and
             gate.verify_w != 0 and up.verify_w != 0 and kk.kmajor_fn != null;
         const single = major and kk.kmajor_single;
-        const compact = single and kk.single_dict_fn != null and kk.compact_pair_fn != null and coded(gate, up, true) and
+        const compact = single and rows == 16 and kk.single_dict_fn != null and kk.compact_pair_fn != null and coded(gate, up, true) and
             qlinear.pairCode(gate.code) and qlinear.pairCode(up.code);
         const tiles = gate.n / @as(usize, if (compact) 128 else if (single) 256 else if (major) 128 else 64);
         // the twins: tf_qmm_mlp_pair's (npad carries the code) and tf_qmm_mlp_single16's (first carries it; npad
