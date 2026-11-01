@@ -45,6 +45,35 @@ extern "C" __global__ void tf_pack_wide_kmajor(const uint32_t* words, uint32_t* 
  out[(group * tiles + tile) * 512 + i % 512] = words[i];
 }
 
+// The fast pool's probe (cuda_fastpool.zig): each CTA streams its own slab of a candidate piece through eight 2 KB
+// cp.async stages, the decode kernels' read pattern; the xor of the staged words keeps the loads alive. Reads only.
+extern "C" __global__ void __launch_bounds__(128) tf_fastpool_read(const unsigned char* __restrict__ p, unsigned long long slab,
+                                                                    uint32_t* __restrict__ out) {
+    constexpr int STAGES = 8, SB = 128 * 16;
+    __shared__ __align__(16) unsigned char sm[STAGES * SB];
+    const unsigned char* base = p + blockIdx.x * slab;
+    const int steps = static_cast<int>(slab / SB);
+    uint32_t acc = 0;
+    auto load = [&](int s, int i) {
+        const unsigned d = static_cast<unsigned>(__cvta_generic_to_shared(sm + s * SB + threadIdx.x * 16));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(d), "l"(base + static_cast<size_t>(i) * SB + threadIdx.x * 16));
+    };
+    for (int s = 0; s < STAGES - 1; ++s) {
+        if (s < steps) load(s, s);
+        asm volatile("cp.async.commit_group;");
+    }
+    for (int i = 0; i < steps; ++i) {
+        asm volatile("cp.async.wait_group %0;" ::"n"(STAGES - 2));
+        __syncthreads();
+        const int next = i + STAGES - 1;
+        if (next < steps) load(next % STAGES, next);
+        asm volatile("cp.async.commit_group;");
+        acc ^= *reinterpret_cast<const uint32_t*>(sm + (i % STAGES) * SB + threadIdx.x * 16);
+    }
+    asm volatile("cp.async.wait_all;");
+    if (acc == 0x9e3779b9u) out[0] = acc;
+}
+
 extern "C" __global__ void tf_pack_kmajor(const uint32_t* input, uint32_t* output, int groups, int tiles) {
     const size_t at=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
     const size_t words=size_t(groups)*tiles*512;
