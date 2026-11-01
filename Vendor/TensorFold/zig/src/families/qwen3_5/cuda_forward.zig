@@ -198,6 +198,7 @@ fn chainConvOn() bool {
 
 /// TF_GDN_ROWS4=0: 16..64-row windows keep one row warp a block in tf_q35_gdn_pre.
 /// TF_PROMPT_ILP=0: a prompt chunk keeps gdn_post's and attn_gate's one-row (one-entry) launches.
+/// A draw of the a83d781b record tree.
 fn promptIlpOn() bool {
     const v = @import("sys").c.getenv("TF_PROMPT_ILP") orelse return true;
     return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
