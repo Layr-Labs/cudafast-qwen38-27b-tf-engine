@@ -495,6 +495,7 @@ const Lanes = struct {
 
     fn firstMaskedFn(ptr: *anyopaque, stream: *lanes.Stream, position: u64, mask: []const u32) !u64 {
         const self = cast(ptr);
+        try self.e.settleLogits(); // the prompt's last cut may have left its logits in flight (cuda_engine.zig Overlap)
         const cache = try self.cacheOf(stream);
         if (position != cache.len) return error.InvalidQwenPosition;
         return try draws.draw(self.gpa, cache.logits, stream.sampling, position, mask);
@@ -520,6 +521,7 @@ const Lanes = struct {
 
     fn firstRowFn(ptr: *anyopaque, stream: *lanes.Stream) anyerror!lanes.LogprobRow {
         const self = cast(ptr);
+        try self.e.settleLogits();
         const cache = try self.cacheOf(stream);
         const pick_ = try draws.draw(self.gpa, cache.logits, stream.sampling, cache.len, &.{});
         return lanes.LogprobRow.fromBf16(cache.logits, pick_, stream.logprobs.?);
