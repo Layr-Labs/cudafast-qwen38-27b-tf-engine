@@ -253,8 +253,12 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         problem.* = try std.fmt.allocPrint(a, "{s}{d}: this machine has {d} CUDA device{s} (0 to {d})", .{ named, device, count, if (count == 1) "" else "s", @max(count, 1) - 1 });
         return null;
     }
-    // Decode consumes small host readbacks between GPU rounds; avoid scheduler wake-up latency at those waits.
-    try cuda.Context.setSchedule(&g.driver, @intCast(device), .spin);
+    // The host's waits on the device block (CU_CTX_SCHED_BLOCKING_SYNC): GB10's CPU and GPU share one package, and a
+    // core spinning through every verify round and drafter frame takes power the GPU could use. A blocked wait wakes
+    // within tens of microseconds, against rounds of tens of milliseconds. TF_CUDA_SCHED=spin: spin waits, as before
+    // (decode's small host readbacks then skip the wake-up). Host scheduling only: no launch or value changes.
+    const sched: cuda.Context.Schedule = if (std.mem.eql(u8, std.mem.span(std.c.getenv("TF_CUDA_SCHED") orelse ""), "spin")) .spin else .blocking;
+    try cuda.Context.setSchedule(&g.driver, @intCast(device), sched);
     g.ctx = try cuda.Context.init(&g.driver, @intCast(device));
     defer if (!opened) g.ctx.deinit();
     bound = &g.ctx;
