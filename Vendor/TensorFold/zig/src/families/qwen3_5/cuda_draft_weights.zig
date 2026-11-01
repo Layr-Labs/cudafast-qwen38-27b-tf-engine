@@ -37,8 +37,12 @@ pub const Weights = struct {
     layers: []Layer,
     arena: DeviceBuffer,
     arena_at: usize = 0,
+    /// The drafter's weights on the fastest screened pieces of free memory (cuda_fastpool.zig), when the target's copies
+    /// were screened too; what does not fit there comes from `arena`.
+    pool: ?@import("cuda_fastpool.zig").Pool = null,
 
     pub fn deinit(w: *Weights, gpa: std.mem.Allocator) void {
+        if (w.pool) |*p| p.free();
         w.arena.free();
         gpa.free(w.predecessor);
         gpa.free(w.successor);
@@ -46,6 +50,7 @@ pub const Weights = struct {
     }
 
     fn alloc(w: *Weights, bytes: usize) !u64 {
+        if (w.pool) |*p| if (p.alloc(bytes)) |at| return at;
         const at = aligned(w.arena_at);
         if (at + bytes > w.arena.len) return error.ArenaExhausted;
         w.arena_at = at + bytes;
@@ -249,7 +254,9 @@ fn linear(gpa: std.mem.Allocator, e: *Engine, stage: *DeviceBuffer, w: *Weights,
 fn vector(w: *Weights, ck: *core.Checkpoint, name: []const u8, shape: []const usize) !u64 {
     const t = try ck.expect(name, .bf16, shape);
     const p = try w.alloc(t.bytes.len);
-    try w.arena.upload(p - w.arena.ptr, t.bytes);
+    // a pooled vector sits outside the arena: copied through a view of its own
+    const view: DeviceBuffer = .{ .d = w.arena.d, .ptr = p, .len = t.bytes.len, .borrowed = true };
+    try view.upload(0, t.bytes);
     return p;
 }
 
@@ -268,6 +275,19 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: *Engine, dir: []const u8, s: 
     var w: Weights = .{ .fc = undefined, .hidden_norm = 0, .final_norm = 0, .selector = undefined, .predecessor = &.{}, .successor = &.{}, .layers = &.{}, .arena = try DeviceBuffer.alloc(e.d, total(s)) };
     errdefer w.arena.free();
     try w.arena.fill8(0, null);
+    // the drafter streams its weights every round as the target does its copies: on screened pieces when the target's
+    // copies were placed that way (TF_DRAFT_FASTPOOL=0 keeps the arena)
+    if (e.fast != null and !std.mem.eql(u8, std.mem.span(@import("sys").c.getenv("TF_DRAFT_FASTPOOL") orelse ""), "0")) {
+        const fast = @import("cuda_fastpool.zig");
+        var sizes: [64]usize = undefined;
+        const share: usize = fast.piece * 2 / 3; // two thirds of a piece each, so the real sizes pack with room
+        const n = @min(sizes.len, (total(s) + total(s) / 8 + share - 1) / share);
+        for (sizes[0..n]) |*z| z.* = share;
+        if (e.mods[3].function("tf_fastpool_read")) |probe| {
+            w.pool = fast.screen(e.d, e.stream, probe, sizes[0..n]);
+        } else |_| {}
+    }
+    errdefer if (w.pool) |*p| p.free();
     var stage = try DeviceBuffer.alloc(e.d, stageBytes(s));
     defer stage.free();
     w.layers = try gpa.alloc(Layer, s.layers);
