@@ -17,6 +17,12 @@ __device__ __forceinline__ uint4 ld_w(const uint4* p) {
 
 __device__ __forceinline__ uint4 ld_x(const __nv_bfloat16* p) { return __ldg(reinterpret_cast<const uint4*>(p)); }
 
+__device__ __forceinline__ void grid_wait() {
+#if __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
+}
+
 template <int XV>
 __device__ __forceinline__ float group_sum(const uint4 (&v)[XV]) {
   float s = 0.f;
@@ -205,6 +211,7 @@ __device__ int place_items(int c, int E, int T, int* __restrict__ items, int* __
 __global__ void __launch_bounds__(PLAN_THREADS)
     plan_kernel(const int* __restrict__ picks, int P, int E, int T, int* __restrict__ members,
                 int* __restrict__ items, int* __restrict__ counts) {
+  grid_wait();
   __shared__ int pk[PSMALL];
   __shared__ int cnt[EMAX];
   __shared__ int off[EMAX];
@@ -232,6 +239,7 @@ __global__ void __launch_bounds__(PLAN_THREADS)
 __global__ void __launch_bounds__(PLAN_THREADS)
     plan_rows(const int* __restrict__ picks, int P, int E, int T, int* __restrict__ members,
               int* __restrict__ items, int* __restrict__ counts, const int* __restrict__ rows, int per) {
+  grid_wait();
   P = min(P, *rows * per);
   __shared__ int pk[PSMALL];
   __shared__ int cnt[EMAX];

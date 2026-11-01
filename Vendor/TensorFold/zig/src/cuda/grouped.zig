@@ -45,7 +45,7 @@ pub const Router = struct {
     }
 
     fn go(f: Function, s: Stream, grid: usize, block: u32, a: *launch_.Args) !void {
-        try launch_.launch(f, .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = block } }, s, a);
+        try launch_.launch(f, .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = block }, .pdl = true }, s, a);
     }
 
     /// route over the first `rows.*` rows' pairs (`per` a row; `rows` a device int, 0: all), at any width.

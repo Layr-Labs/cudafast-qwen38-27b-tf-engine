@@ -31,7 +31,7 @@ pub const Fns = struct {
         a.add(logits);
         for ([_]usize{ rows, dims, count }) |v| a.add(int(v));
         a.add(params);
-        const cfg: launch_.Config = .{ .grid = .{ .x = @intCast((rows + 15) / 16), .y = @intCast((count + 15) / 16), .z = 1 }, .block = .{ .x = 256 } };
+        const cfg: launch_.Config = .{ .grid = .{ .x = @intCast((rows + 15) / 16), .y = @intCast((count + 15) / 16), .z = 1 }, .block = .{ .x = 256 }, .pdl = true };
         try launch_.launch(f.router_fn, cfg, s, &a);
     }
 
@@ -45,7 +45,7 @@ pub const Fns = struct {
         a.add(int(experts));
         a.add(int(top_k));
         a.add(params);
-        try launch_.launch(f.topk_fn, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = 32 } }, s, &a);
+        try launch_.launch(f.topk_fn, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = 32 }, .pdl = true }, s, &a);
     }
 
     /// out[r] = bf16(sum of w[r][s] * y[r][s]) over the slots in order; y fp32 (decode rows) or bf16 (prompt rows).
@@ -59,7 +59,7 @@ pub const Fns = struct {
         a.add(int(dims));
         a.add(params);
         const blocks = @min((dims + 255) / 256, 16);
-        try launch_.launch(f.combine_fn, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(blocks), .z = 1 }, .block = .{ .x = 256 } }, s, &a);
+        try launch_.launch(f.combine_fn, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(blocks), .z = 1 }, .block = .{ .x = 256 }, .pdl = true }, s, &a);
     }
 };
 

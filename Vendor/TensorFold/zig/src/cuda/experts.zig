@@ -196,7 +196,7 @@ pub const Affine4Experts = struct {
         const grid = @min((max_units + 3) / 4, e.resident[which]);
         if (grid < 1) return;
         var a = argsOf(x, x_stride, slots, w, kg, nb, p, out, n);
-        const cfg: launch_.Config = .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 128 }, .shared = 0 };
+        const cfg: launch_.Config = .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 128 }, .shared = 0, .pdl = true };
         try launch_.launch(if (!up) e.down_fn else if (pair) e.pair_fn else e.up_fn, cfg, s, &a);
     }
 

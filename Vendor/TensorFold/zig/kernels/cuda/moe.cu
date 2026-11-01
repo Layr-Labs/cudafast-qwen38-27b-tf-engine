@@ -12,12 +12,19 @@ __device__ __forceinline__ float rbf(float v) { return __bfloat162float(__float2
 constexpr int TILE = 16;  // rows and experts a block covers
 constexpr int KC = 256;   // inputs a shared-memory chunk holds
 
+__device__ __forceinline__ void grid_wait() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
+}
+
 }  // namespace
 
 // OUT[r][e] = fp32 x[r] . w[e] in index order (an fma chain a pair), grid (R / 16, E / 16); skips rows >= P[2].
 extern "C" __global__ void __launch_bounds__(256) tf_moe_router(const __nv_bfloat16* __restrict__ X, int x_stride,
                                                                   const __nv_bfloat16* __restrict__ W, float* __restrict__ OUT,
                                                                   int R, int D, int E, const int* __restrict__ P) {
+    grid_wait();
     if (P != nullptr) R = min(R, P[2]);
     if (static_cast<int>(blockIdx.x) * TILE >= R) return;
     __shared__ __nv_bfloat16 xs[TILE][KC + 2];
@@ -53,6 +60,7 @@ __device__ __forceinline__ bool beats(float v, int i, float bv, int bi) { return
 extern "C" __global__ void __launch_bounds__(32) tf_moe_topk(const float* __restrict__ L, int* __restrict__ PICK,
                                                               float* __restrict__ WT, int NE, int TOPK,
                                                               const int* __restrict__ P) {
+    grid_wait();
     const int64_t r = blockIdx.x;
     if (P != nullptr && r >= P[2]) return;
     const int lane = threadIdx.x;
@@ -105,6 +113,7 @@ extern "C" __global__ void __launch_bounds__(32) tf_moe_topk(const float* __rest
 extern "C" __global__ void __launch_bounds__(256) tf_moe_combine(const void* __restrict__ Y, int y_f32, const float* __restrict__ WT,
                                                                    __nv_bfloat16* __restrict__ OUT, int S, int D,
                                                                    const int* __restrict__ P) {
+    grid_wait();
     const int64_t r = blockIdx.x;
     if (P != nullptr && r >= P[2]) return;
     for (int d = blockIdx.y * 256 + threadIdx.x; d < D; d += gridDim.y * 256) {

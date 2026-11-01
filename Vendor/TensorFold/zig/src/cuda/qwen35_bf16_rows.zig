@@ -48,6 +48,6 @@ pub const Kernels = struct {
         var a: launch.Args = .{};
         for ([_]u64{ x, w, out }) |v| a.add(v);
         for ([_]usize{ n, k }) |v| a.add(@as(i32, @intCast(v)));
-        try launch.launch(kn.dense_fn, .{ .grid = .{ .x = @intCast(n), .y = @intCast(rows), .z = 1 }, .block = .{ .x = threads } }, s, &a);
+        try launch.launch(kn.dense_fn, .{ .grid = .{ .x = @intCast(n), .y = @intCast(rows), .z = 1 }, .block = .{ .x = threads }, .pdl = true }, s, &a);
     }
 };
