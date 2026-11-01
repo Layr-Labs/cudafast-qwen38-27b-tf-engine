@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## 1.1.6
 
+- CUDA's greedy verification head divides each 64-column scan tile between two warps. It retains the existing group arithmetic, bounds and exact rescoring path.
+
 - DeepSeek-V4.1 (experimental): a tool call in the model's spaced DSML spelling now comes back in `tool_calls`, streamed and whole, instead of in the reply's text, and a lone DSML opener inside a `<tool_call>` no longer crashes the parser; the `TF_DSV41_ASSETS` refusal names the file boot actually opens (`engram-token-map.bin`) (#1324).
 
 - Host sampling with no rank cut (`top_k: 0`, `top_p: 1`) finds the sampled token by a keyed race over the candidates instead of sorting the whole vocabulary (#1337). The draw is the same: a host test compares it with the full sort over 483,840 sampler settings, ties and extreme values included, and on M3 Ultras with Qwen3.8-27B and Nemotron sampled replies equal the previous build's token for token. Thanks to @ajensenwaud.

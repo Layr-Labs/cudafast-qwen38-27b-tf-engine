@@ -19,8 +19,8 @@ namespace tf_head_sieve {
 using namespace qmm_frag;
 
 constexpr int ROWS = 16;
-constexpr int TILES = 4;                  // 64-id tiles a sieve CTA, a warp each
-constexpr int STAGES = 4;               // the scan's stages: three CTAs an SM (GB10, measured quickest)
+constexpr int TILES = 4;                  // 64-id tiles a sieve CTA, two warps each
+constexpr int STAGES = 4;
 constexpr int AFR = 4 * 32 * 16;          // a group's A fragments: four k16 steps, a lane's four registers
 constexpr int W2 = TILES * 1024;          // the tiles' 2-bit codes of a group
 constexpr int DW = TILES * 256;           // the tiles' dictionary index windows of a group
@@ -117,11 +117,11 @@ extern "C" __global__ void __launch_bounds__(128) tf_head_sieve_prep(const __nv_
     qmm_frag::grid_launch();
 }
 
-// The sieve: a CTA's four 64-id tiles, a warp each, through every group of the 2-bit copy (bf16 MMA on the rows' A
+// The sieve: a CTA's four 64-id tiles, two warps each, through every group of the 2-bit copy (bf16 MMA on the rows' A
 // fragments, the pair dictionary's scales and biases). Each (row, n8 tile)'s best a + k s + slack into himax
 // [n8][16], its best a into himid [n8][16]; approx (when set) gets every (id, row)'s a and s
 // ([id][32]: a for 16 rows, then s). Pair-coded heads (code) read the dictionary, others (code 0) the (kg, npad)
-// scale and bias arrays. Grid tiles / 4, 128 threads; shared SMEM + tab_smem (the pair table, or 0: through L2).
+// scale and bias arrays. Grid tiles / 4, 256 threads; shared SMEM + tab_smem (the pair table, or 0: through L2).
 namespace tf_head_sieve {
 
 template <int NS>
@@ -135,16 +135,13 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
     const int bits = code & 31, step = 8 * bits;
     const uint32_t imask = (1u << bits) - 1u;
     unsigned char* tabs = buf + NS * STAGE;
-    for (int c = tid; c < tab_smem / 16; c += 128) qmm_frag::cp16(tabs + c * 16, reinterpret_cast<const unsigned char*>(tab) + c * 16);
+    for (int c = tid; c < tab_smem / 16; c += 256) qmm_frag::cp16(tabs + c * 16, reinterpret_cast<const unsigned char*>(tab) + c * 16);
     const size_t t0 = static_cast<size_t>(blockIdx.x) * TILES;
     auto stage = [&](int s) { return buf + s * STAGE; };
     auto load_w = [&](int s, int g) {
         unsigned char* p = stage(s);
-#pragma unroll
-        for (int j = 0; j < 2; ++j) {
-            const int c = tid + j * 128, t = c >> 6, off = c & 63;
-            qmm_frag::cp16(p + AFR + t * 1024 + off * 16, reinterpret_cast<const unsigned char*>(w2) + ((t0 + t) * KG + g) * 1024 + off * 16);
-        }
+        const int t = tid >> 6, off = tid & 63;
+        qmm_frag::cp16(p + AFR + t * 1024 + off * 16, reinterpret_cast<const unsigned char*>(w2) + ((t0 + t) * KG + g) * 1024 + off * 16);
         if (tid < 64) {
             const int t = tid >> 4, part = tid & 15;
             if (code != 0)
@@ -157,7 +154,7 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
     };
     auto load_x = [&](int s, int g) {
         unsigned char* p = stage(s);
-        qmm_frag::cp16(p + tid * 16, afr + static_cast<size_t>(g) * 128 + tid);
+        if (tid < 128) qmm_frag::cp16(p + tid * 16, afr + static_cast<size_t>(g) * 128 + tid);
         if (tid < 8) qmm_frag::cp16(p + AFR + W2 + DW + tid * 16, xv + static_cast<size_t>(g) * 32 + tid * 4);
     };
 #pragma unroll
@@ -172,9 +169,9 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
         qmm_frag::commit();
     }
     qmm_frag::grid_launch();
-    float acc[8][4], sg[8][4];
+    float acc[4][4], sg[4][4];
 #pragma unroll
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 4; ++i)
 #pragma unroll
         for (int e = 0; e < 4; ++e) {
             acc[i][e] = 0.0f;
@@ -201,28 +198,24 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
             a[kt][2] = v.z;
             a[kt][3] = v.w;
         }
-        const uint4 wlo = reinterpret_cast<const uint4*>(p + AFR + warp * 1024)[lane];
-        const uint4 whi = reinterpret_cast<const uint4*>(p + AFR + warp * 1024 + 512)[lane];
-        const uint32_t* pk = reinterpret_cast<const uint32_t*>(p + AFR + W2 + warp * 256);
+        const uint4 wq = reinterpret_cast<const uint4*>(p + AFR + warp * 512)[lane];
+        const uint32_t* pk = reinterpret_cast<const uint32_t*>(p + AFR + W2 + (warp >> 1) * 256);
         const int base = (g * step & 63) * 8;
-        uint32_t ent[2];
-#pragma unroll
-        for (int hh = 0; hh < 2; ++hh) {
-            if (code != 0) {
-                const int off = base + (lane + 32 * hh) * bits;
-                const uint32_t idx = __funnelshift_r(pk[off >> 5], pk[(off >> 5) + 1], off & 31) & imask;
-                ent[hh] = stab ? reinterpret_cast<const uint32_t*>(tabs)[idx] : __ldg(tab + idx);
-            } else {
-                const unsigned short* ph = reinterpret_cast<const unsigned short*>(pk);
-                ent[hh] = static_cast<uint32_t>(ph[lane + 32 * hh]) | static_cast<uint32_t>(ph[64 + lane + 32 * hh]) << 16;
-            }
+        const int col = (warp & 1) * 32 + lane;
+        uint32_t eh;
+        if (code != 0) {
+            const int off = base + col * bits;
+            const uint32_t idx = __funnelshift_r(pk[off >> 5], pk[(off >> 5) + 1], off & 31) & imask;
+            eh = stab ? reinterpret_cast<const uint32_t*>(tabs)[idx] : __ldg(tab + idx);
+        } else {
+            const unsigned short* ph = reinterpret_cast<const unsigned short*>(pk);
+            eh = static_cast<uint32_t>(ph[col]) | static_cast<uint32_t>(ph[64 + col]) << 16;
         }
         const float* pv = reinterpret_cast<const float*>(p + AFR + W2 + DW);
         const float xs0 = pv[r0], xs1 = pv[r0 + 8], q0 = pv[16 + r0], q1 = pv[16 + r0 + 8];
 #pragma unroll
-        for (int nt = 0; nt < 8; ++nt) {
-            const uint4 wq = nt < 4 ? wlo : whi;
-            const uint32_t wv = (nt & 3) == 0 ? wq.x : (nt & 3) == 1 ? wq.y : (nt & 3) == 2 ? wq.z : wq.w;
+        for (int nt = 0; nt < 4; ++nt) {
+            const uint32_t wv = nt == 0 ? wq.x : nt == 1 ? wq.y : nt == 2 ? wq.z : wq.w;
             float d[4];
 #pragma unroll
             for (int kt = 0; kt < 4; ++kt) {
@@ -231,7 +224,6 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
                 else qmm_frag::mma(d, a[kt], b0, b1);
             }
             const int src = (nt & 3) * 8 + (lane & 3) * 2;
-            const uint32_t eh = nt < 4 ? ent[0] : ent[1];
             const uint32_t ea = __shfl_sync(0xffffffffu, eh, src), eb = __shfl_sync(0xffffffffu, eh, src + 1);
             const float s0 = __uint_as_float(ea << 16), c0 = __uint_as_float(ea & 0xFFFF0000u);
             const float s1 = __uint_as_float(eb << 16), c1 = __uint_as_float(eb & 0xFFFF0000u);
@@ -249,14 +241,14 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
     qmm_frag::wait<0>();
     __syncthreads();
 #pragma unroll
-    for (int nt = 0; nt < 8; ++nt) {
+    for (int nt = 0; nt < 4; ++nt) {
         float hi[4];
 #pragma unroll
         for (int e = 0; e < 4; ++e) {
             const float sd = sqrtf(1.25f * sg[nt][e]), ks = kappa * sd, v = acc[nt][e];
             hi[e] = v + ks + fmaf(fabsf(v) + ks, SLACK_REL, SLACK_ABS);
             if (approx != nullptr) {
-                const size_t id = (t0 + warp) * 64 + nt * 8 + (lane & 3) * 2 + (e & 1);
+                const size_t id = (t0 + (warp >> 1)) * 64 + (warp & 1) * 32 + nt * 8 + (lane & 3) * 2 + (e & 1);
                 const int row = r0 + (e >> 1) * 8;
                 approx[id * 32 + row] = v;
                 approx[id * 32 + 16 + row] = sd;
@@ -273,7 +265,7 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
         m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, 1));
         m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, 2));
         if ((lane & 3) == 0) {
-            const size_t n8 = (t0 + warp) * 8 + nt;
+            const size_t n8 = (t0 + (warp >> 1)) * 8 + (warp & 1) * 4 + nt;
             if (r0 < rows) {
                 himax[n8 * 16 + r0] = h0;
                 himid[n8 * 16 + r0] = m0;
@@ -288,7 +280,7 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
 
 } // namespace tf_head_sieve
 
-extern "C" __global__ void __launch_bounds__(128, 3) tf_head_sieve_scan(const uint32_t* __restrict__ w2,
+extern "C" __global__ void __launch_bounds__(256, 2) tf_head_sieve_scan(const uint32_t* __restrict__ w2,
         const uint4* __restrict__ afr, const float* __restrict__ xv, const unsigned char* __restrict__ sb,
         const uint32_t* __restrict__ tab, int code, int tab_smem, const __nv_bfloat16* __restrict__ sc,
         const __nv_bfloat16* __restrict__ bi, int npad, int KG, int rows, float kappa, float* __restrict__ himax,
