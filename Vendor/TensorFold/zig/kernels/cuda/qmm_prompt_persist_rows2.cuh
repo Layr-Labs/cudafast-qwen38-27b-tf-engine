@@ -49,9 +49,6 @@ __global__ void __launch_bounds__(WM*128) kernel(const __nv_bfloat16* __restrict
                 else tf_qmm_pipe::tile<64,BM,BN,WM,4,STAGES>(x,P.w,P.scales,P.biases,P.out,P.n,P.npad,M,K,ldx,at.x,at.y);
             }
         }
-        // A faster warp cannot reuse shared panels while a sibling still
-        // reads the preceding tile. Each native tile already waits for copies.
-        __syncthreads();
     }
 }
 } // namespace tf_qmm_persistent_rows2

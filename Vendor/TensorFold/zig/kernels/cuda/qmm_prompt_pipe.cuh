@@ -22,6 +22,8 @@ __device__ __forceinline__ void cp16p(void* dst, const void* src, bool p) {
     asm volatile("{\n\t.reg .pred q;\n\tsetp.ne.b32 q, %2, 0;\n\t@q cp.async.cg.shared.global [%0], [%1], 16;\n\t}\n" ::"r"(smem(dst)), "l"(src), "r"((int)p));
 }
 
+// The final group barrier ends all shared reads; persistent workers can reuse the stages on return.
+
 // prompt_mlp_tile's outputs (gate and up through silu(gate) * up) with the barrier inside the group, two stages.
 template <int GS, int BM, int WM, int WN, int STAGES>
 __device__ __forceinline__ void mlp_tile(const __nv_bfloat16* __restrict__ x, const ManyParts& parts, __nv_bfloat16* __restrict__ act, int M, int K,
@@ -129,25 +131,24 @@ __device__ __forceinline__ void mlp_tile(const __nv_bfloat16* __restrict__ x, co
                 const int next_j = (j + 1) % T::NT, next_kt = kt + (j + 1 == T::NT);
                 const int slot = (kt * T::NT + j) & 1;
                 if (last) {
-                    // every read of this stage is issued (A rows for this k16 step came in the previous one): the
-                    // next stage may be read once landed, and this one refilled after the barrier. A tile's last
-                    // group reads the other stage too; nothing uses what it reads.
                     wait<0>();
                     __syncthreads();
-                    read_w(pn);
-                    b[slot ^ 1] = weight_pair(0, 0);
+                    if (more) {
+                        read_w(pn);
+                        b[slot ^ 1] = weight_pair(0, 0);
+                    }
                 } else {
                     b[slot ^ 1] = weight_pair(next_j, next_kt);
                 }
 #pragma unroll
                 for (int i = 0; i < T::MT; ++i) {
                     mma(acc[i][j], a[i], b[slot].x, b[slot].y);
-                    if (j + 1 == T::NT) load_a_row(kt + 1 < GS / 16 ? p : pn, (kt + 1) % (GS / 16), i);
+                    if (j + 1 == T::NT && (kt + 1 < GS / 16 || more))
+                        load_a_row(kt + 1 < GS / 16 ? p : pn, (kt + 1) % (GS / 16), i);
                 }
             }
         }
     }
-    wait<0>();
 #pragma unroll
     for (int i = 0; i < T::MT; ++i)
 #pragma unroll
@@ -276,20 +277,22 @@ __device__ __forceinline__ void tile(
                 if (last) {
                     wait<0>();
                     __syncthreads();
-                    read_w(pn);
-                    b[slot ^ 1] = weight_pair(0, 0);
+                    if (more) {
+                        read_w(pn);
+                        b[slot ^ 1] = weight_pair(0, 0);
+                    }
                 } else {
                     b[slot ^ 1] = weight_pair(next_j, next_kt);
                 }
 #pragma unroll
                 for (int i = 0; i < T::MT; ++i) {
                     mma(acc[i][j], a[i], b[slot].x, b[slot].y);
-                    if (j + 1 == T::NT) load_a_row(kt + 1 < GS / 16 ? p : pn, (kt + 1) % (GS / 16), i);
+                    if (j + 1 == T::NT && (kt + 1 < GS / 16 || more))
+                        load_a_row(kt + 1 < GS / 16 ? p : pn, (kt + 1) % (GS / 16), i);
                 }
             }
         }
     }
-    wait<0>();
 #pragma unroll
     for (int i = 0; i < T::MT; ++i)
 #pragma unroll
