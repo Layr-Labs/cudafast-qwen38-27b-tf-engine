@@ -134,7 +134,10 @@ fn body(d: anytype, n: usize, narrow_: bool) !?u64 {
     }
     try d.norm(masked, d.w.final_norm, d.x, rows);
     const spanned = if (narrow_) try head(d, rows) else try full(d, rows);
-    try e.draws.topkRows(e.stream, spanned orelse d.logits, if (spanned != null) span_width else c.vocab, @intCast(c.topk), d.parts, d.words, rows);
+    if (spanned != null and d.head2 != null)
+        try topkScreened(d, spanned.?, rows)
+    else
+        try e.draws.topkRows(e.stream, spanned orelse d.logits, if (spanned != null) span_width else c.vocab, @intCast(c.topk), d.parts, d.words, rows);
     try d.projAgain(d.w.selector, d.x, d.hp, rows);
     return spanned;
 }
@@ -230,10 +233,18 @@ fn head(d: anytype, rows: usize) !?u64 {
     const a = d.logits; // rows x 98,304, then rows x 320, then the packed rows x 98,592
     const b = a + rows * first.n * 2;
     const out = b + rows * tail.n * 2;
+    const skip = spans[1][0] - tail_tile;
+    if (d.head2) |h2| {
+        // the first span's columns screened straight into the packed rows; the tail exact, as below
+        try screen(d, h2, rows, out);
+        try e.project(layers.Proj{ .a4 = tail }, d.x, d.xs, b, rows, false, 0, false);
+        const m: cuda.abi.Memcpy2D = .{ .src = b + skip * 2, .src_pitch = tail.n * 2, .dst = out + first.n * 2, .dst_pitch = span_width * 2, .width = (tail.n - skip) * 2, .height = rows };
+        try e.d.check(e.d.api.cuMemcpy2DAsync_v2(&m, e.stream.handle), "cuMemcpy2DAsync");
+        return out;
+    }
     // d.x and its group sums d.xs are the final norm's (body): both projections read them, no sums launch of their own
     try e.project(layers.Proj{ .a4 = first }, d.x, d.xs, a, rows, false, 0, false);
     try e.project(layers.Proj{ .a4 = tail }, d.x, d.xs, b, rows, false, 0, false);
-    const skip = spans[1][0] - tail_tile;
     const copies = [2]cuda.abi.Memcpy2D{
         .{ .src = a, .src_pitch = first.n * 2, .dst = out, .dst_pitch = span_width * 2, .width = first.n * 2, .height = rows },
         .{ .src = b + skip * 2, .src_pitch = tail.n * 2, .dst = out + first.n * 2, .dst_pitch = span_width * 2, .width = (tail.n - skip) * 2, .height = rows },
@@ -246,4 +257,106 @@ fn head(d: anytype, rows: usize) !?u64 {
 fn full(d: anytype, rows: usize) !?u64 {
     try d.e.project(d.e.head, d.x, d.xs, d.logits, rows, false, 0, false);
     return null;
+}
+
+/// The span head's 2-bit screen (qwen35_head2.cuh): the first span's 98,304 head rows as each 4-bit code's two high bits
+/// with (4 s, b + 1.5 s) a group, screened for every column; each row's best screened columns then take their exact
+/// logits from the 4-bit head (group_kernel_dict's arithmetic) before the merge, so the rows' drafts are the full head's
+/// whenever their best columns are among the screened candidates. TF_HEAD2=0: the span head as before.
+const head2_first = spans[0][1];
+const head2_tiles = head2_first / 64;
+const head2_stages = 8;
+const head2_stage_bytes = 16 * 64 * 2 + 256 * 4 + 64 * 4 + 16 * 4;
+
+/// The candidates a row the merge reads (the parts buffer holds the whole vocabulary's slices at k, 976 a row).
+const head2_cap = 640;
+
+/// TF_HEAD2_K: the select's target count a row (default 512; 64 .. head2_cap).
+fn head2K() usize {
+    const v = @import("sys").c.getenv("TF_HEAD2_K") orelse return 512;
+    const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return 512;
+    return std.math.clamp(n, 64, head2_cap);
+}
+
+fn head2On() bool {
+    const v = @import("sys").c.getenv("TF_HEAD2") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
+
+/// The screen's buffer (codes, screen scales, exact column scales) packed from the target head, or null.
+pub fn head2Init(d: anytype) !?cuda.DeviceBuffer {
+    const e = d.e;
+    if (!head2On()) return null;
+    const q = switch (e.head) {
+        .a4 => |q| q,
+        else => return null,
+    };
+    if (q.n != spans[1][1] or q.k != 5120 or q.npad < q.n or q.code == 0) return null;
+    const kg = q.k / 64;
+    const codes_bytes = head2_tiles * kg * 256 * 4;
+    const scales_bytes = head2_tiles * kg * 64 * 4;
+    const sb_bytes = head2_first * kg * 4;
+    var buf = try cuda.DeviceBuffer.alloc(e.d, codes_bytes + scales_bytes + sb_bytes);
+    errdefer buf.free();
+    var a: cuda.Args = .{};
+    for ([_]u64{ q.w, q.s, q.b }) |v| a.add(v);
+    a.add(@as(c_int, @intCast(q.npad)));
+    a.add(@as(c_int, @intCast(kg)));
+    for ([_]u64{ buf.ptr, buf.ptr + codes_bytes, buf.ptr + codes_bytes + scales_bytes }) |v| a.add(v);
+    try cuda.launch.launch(d.fns.head2_pack, .{ .grid = .{ .x = @intCast(head2_tiles), .y = @intCast(kg) }, .block = .{ .x = 256 } }, e.stream, &a);
+    try e.stream.synchronize();
+    return buf;
+}
+
+/// The screened values of the first span's columns into the packed rows `out` (pitch span_width).
+fn screen(d: anytype, h2: cuda.DeviceBuffer, rows: usize, out: u64) !void {
+    const e = d.e;
+    const kg: usize = 80;
+    const codes_bytes = head2_tiles * kg * 256 * 4;
+    var a: cuda.Args = .{};
+    for ([_]u64{ d.x, d.xs, h2.ptr, h2.ptr + codes_bytes }) |v| a.add(v);
+    a.add(@as(c_int, @intCast(rows)));
+    a.add(@as(c_int, @intCast(kg)));
+    a.add(out);
+    a.add(@as(c_int, @intCast(span_width)));
+    try cuda.launch.launch(d.fns.head2_screen, .{ .grid = .{ .x = @intCast(head2_tiles) }, .block = .{ .x = 128 }, .shared = head2_stages * head2_stage_bytes }, e.stream, &a);
+}
+
+/// topkRows' words over the packed span rows: each row's best `head2K()` columns by their screened values (ties at the
+/// cut while room lasts, at most head2_cap), the first span's among them rescored exactly, then the merge's k best.
+fn topkScreened(d: anytype, logits: u64, rows: usize) !void {
+    const e = d.e;
+    const h2 = d.head2.?;
+    const q = e.head.a4;
+    const kg: usize = q.k / 64;
+    const k: usize = d.c.topk;
+    const n: usize = head2_cap;
+    const pv = d.parts;
+    const pi = d.parts + rows * n * 4;
+    var a: cuda.Args = .{};
+    a.add(logits);
+    a.add(@as(c_int, @intCast(span_width)));
+    a.add(@as(c_int, @intCast(span_width)));
+    a.add(@as(c_int, @intCast(head2K())));
+    a.add(@as(c_int, @intCast(n)));
+    a.add(pv);
+    a.add(pi);
+    try cuda.launch.launch(d.fns.head2_select, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, e.stream, &a);
+    const sb = h2.ptr + head2_tiles * kg * 256 * 4 + head2_tiles * kg * 64 * 4;
+    var r: cuda.Args = .{};
+    for ([_]u64{ d.x, d.xs, q.w, sb }) |v| r.add(v);
+    r.add(@as(c_int, @intCast(kg)));
+    r.add(@as(c_int, @intCast(rows)));
+    r.add(pv);
+    r.add(pi);
+    r.add(@as(c_int, @intCast(n)));
+    r.add(@as(c_int, @intCast(head2_first)));
+    try cuda.launch.launch(d.fns.head2_rescore, .{ .grid = .{ .x = @intCast(rows), .y = @intCast((n + 31) / 32) }, .block = .{ .x = 128 } }, e.stream, &r);
+    var m: cuda.Args = .{};
+    m.add(pv);
+    m.add(pi);
+    m.add(@as(u32, @intCast(n)));
+    m.add(@as(u32, @intCast(k)));
+    m.add(d.words);
+    try cuda.launch.launch(e.draws.topk_merge_fn, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, e.stream, &m);
 }

@@ -506,7 +506,15 @@ pub const Affine4Kernels = struct {
         const gdn_streamed = rows == 16 or (rows > 16 and rows <= 32 and a.gdn_stream32_fn != null);
         if (!gdn_streamed or !a.pdl or a.gdn_stream16_fn == null) return false;
         for (outs) |o| if (o.q.k != 5120 or o.q.stream_w == 0) return false;
+        // attention's q (with its gate half), k and v of one input (TF_ATTN_STREAM=0: their mixed cluster launch)
+        if (outs.len == 3 and rows == 16 and attnStreams())
+            return outs[0].q.n == 12288 and outs[1].q.n == 1024 and outs[2].q.n == 1024;
         return outs.len == 4 and outs[0].q.n == 10240 and outs[1].q.n == 6144 and outs[2].q.n == 48 and outs[3].q.n == 48;
+    }
+
+    fn attnStreams() bool {
+        const v = @import("sys").c.getenv("TF_ATTN_STREAM") orelse return true;
+        return !std.mem.eql(u8, std.mem.span(v), "0");
     }
 
     pub fn decodeMany(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, outs: []const Out, rows: usize) !void {
@@ -522,13 +530,18 @@ pub const Affine4Kernels = struct {
                 tab = @max(tab, o.q.tabBytesUpTo(linear.gdn_pair_tab_max));
             };
             var parts: Parts = std.mem.zeroes(Parts);
-            parts.count = 4;
+            parts.count = @intCast(outs.len);
             var first: usize = 0;
             for (outs, 0..) |o, index| {
-                const tiles = if (index < 2) o.q.n / bn else 1;
+                const tiles = if (index < 2) o.q.n / bn else (o.q.n + 63) / 64;
                 const twin = dict and a.coded(o.q);
                 parts.p[index] = .{ .w = o.q.stream_w, .scales = if (twin) o.q.sb else o.q.s, .biases = if (twin) o.q.tab else o.q.b, .out = o.out, .n = int(o.q.n), .npad = if (twin) @bitCast(o.q.code) else int(o.q.npad), .sk = int(splitK(o.q.n,o.q.k)), .tiles = if (dict) (if (twin) int(o.q.npad) else 0) else int(tiles), .first = int(first) };
                 first += tiles;
+            }
+            // three parts: the fourth starts past the grid, so no CTA takes it
+            if (outs.len == 3) {
+                parts.p[3] = parts.p[2];
+                parts.p[3].first = int(first);
             }
             var g: launch_.Args = .{};
             g.add(x); g.add(xs); g.add(parts);
