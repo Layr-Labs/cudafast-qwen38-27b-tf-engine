@@ -97,6 +97,9 @@ pub const Draft = struct {
     staged: cuda.HostBuffer, // pinned: the ids up, the words and projected rows down
     streams: std.AutoHashMapUnmanaged(*Stream, *Ctx) = .empty,
     graphs: std.AutoHashMapUnmanaged(u64, struct { exec: ?cuda.graph.Exec, spanned: ?u64 }) = .empty,
+    /// The live absorb (one chunk of accepted rows) captured once per shape; its by-value start and rows are
+    /// rewritten in the executable graph each round (the gather, every layer's norm_rope and ring_put nodes).
+    absorb_graphs: std.AutoHashMapUnmanaged(u64, AbsorbGraph) = .empty,
     /// Contexts between streams, allocated and run once (`reserve`), as the driver stalls a buffer's first kernel.
     pool: std.ArrayList(*Ctx) = .empty,
     /// Grown trees' nodes offered and landed, by own chance: the nodes' chances the round loop prices.
@@ -181,6 +184,13 @@ pub const Draft = struct {
         while (it.next()) |graph| if (graph.exec) |*exec| exec.deinit();
         d.graphs.deinit(d.gpa);
         d.graphs = .empty;
+        var ai = d.absorb_graphs.valueIterator();
+        while (ai.next()) |graph| {
+            if (graph.exec) |*exec| exec.deinit();
+            if (graph.template) |*template| template.deinit();
+        }
+        d.absorb_graphs.deinit(d.gpa);
+        d.absorb_graphs = .empty;
     }
     pub fn deinit(d: *Draft) void {
         d.clearGraphs();
@@ -343,61 +353,165 @@ pub const Draft = struct {
             ctx.begin = start;
         }
         ctx.end = start;
-        const e = d.e;
         while (n > 0) {
             const rows = @min(n, max_rows);
-            if (rows_) |rs| {
-                var tr: TapRows = .{ .n = @intCast(rows), .rows = @splat(0) };
-                for (rs, 0..) |r, i| tr.rows[i] = @intCast(r);
-                try e.runAfter(d.fns.gather_rows, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ tap_ring, @as(c_int, engine.tap_rows), @as(c_longlong, @intCast(start)), tr, @as(c_int, @intCast(c.n_taps * c.hidden)), d.taps_in });
-            } else try e.runAfter(d.fns.gather_taps, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ tap_ring, @as(c_int, engine.tap_rows), @as(c_longlong, @intCast(start)), @as(c_int, @intCast(c.n_taps * c.hidden)), d.taps_in });
-            try d.proj(d.w.fc, d.taps_in, d.th, rows);
-            const kv = rows * c.kvWidth() * 2; // a layer's k (v) rows in kabs (vabs)
-            // a prompt piece: every layer's k and v project the same normed taps, up to four a prompt GEMM launch
-            const grouped = precision.prompt(d.projection_role, rows, precision.dflash_projection_prompt_cutoff);
-            try e.runAfter(e.fns.norm, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ d.th, @as(u64, 0), d.w.hidden_norm, d.thn, d.c.eps, @as(c_int, @intCast(d.c.hidden)), @as(u64, 0), if (grouped) @as(u64, 0) else d.xs });
-            const grouped_live = liveGroups() and !grouped and rows <= 16;
-            if (grouped) {
-                const P = cuda.prompt_many;
-                var many: [P.parts_max]P.Out = undefined;
-                var n_many: usize = 0;
-                for (d.w.layers, 0..) |l, i| for ([2]cuda.qlinear.Affine4{ l.k, l.v }, [2]u64{ d.kabs + i * kv, d.vabs + i * kv }) |q, out| {
-                    many[n_many] = .{ .q = q, .out = out };
-                    n_many += 1;
-                    if (n_many == many.len) {
-                        try e.prompt_many.prompt(e.stream, d.thn, many[0..n_many], rows);
-                        n_many = 0;
-                    }
-                };
-                if (n_many > 0) try e.prompt_many.prompt(e.stream, d.thn, many[0..n_many], rows);
-            }
-            if (grouped_live) {
-                const A = cuda.qlinear.Affine4Kernels;
-                var many: [A.segs_max]A.Out = undefined;
-                var count: usize = 0;
-                for (d.w.layers, 0..) |l, i| for ([2]cuda.qlinear.Affine4{ l.k, l.v }, [2]u64{ d.kabs + i * kv, d.vabs + i * kv }) |weight, out| {
-                    many[count] = .{ .q = weight, .out = out };
-                    count += 1;
-                    if (count == many.len) {
-                        try e.affine.decodeMany(e.stream, d.thn, d.xs, many[0..count], rows);
-                        count = 0;
-                    }
-                };
-                if (count > 0) try e.affine.decodeMany(e.stream, d.thn, d.xs, many[0..count], rows);
-            }
-            for (d.w.layers, 0..) |l, i| {
-                const kabs = d.kabs + i * kv;
-                const vabs = d.vabs + i * kv;
-                if (!grouped and !grouped_live) try d.projAgain(l.k, d.thn, kabs, rows);
-                try d.normRope(kabs, l.k_norm, d.kn, rows, c.kv_heads, start);
-                if (!grouped and !grouped_live) try d.projAgain(l.v, d.thn, vabs, rows);
-                try e.runAfter(d.fns.ring_put, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ d.kn, vabs, d.ringK(ctx, i), d.ringV(ctx, i), @as(c_int, @intCast(c.kvWidth())), @as(c_longlong, @intCast(start)), @as(c_int, @intCast(c.ringRows())) });
-            }
+            if (!prompt and rows == n) try d.absorbLive(ctx, tap_ring, start, rows, rows_) else try d.absorbChunk(ctx, tap_ring, start, rows, rows_, prompt);
             start += rows;
             n -= rows;
             ctx.end = start;
         }
         if (ctx.end > c.window and ctx.begin < ctx.end - c.window) ctx.begin = ctx.end - c.window;
+    }
+
+    /// One chunk of `absorb`: gather `rows` tap rows from `start`, project, norm, k/v, norm_rope and ring_put.
+    fn absorbChunk(d: *Draft, ctx: *Ctx, tap_ring: u64, start: u64, rows: usize, rows_: ?[]const u32, prompt: bool) !void {
+        _ = prompt;
+        const c = d.c;
+        const e = d.e;
+        if (rows_) |rs| {
+            var tr: TapRows = .{ .n = @intCast(rows), .rows = @splat(0) };
+            for (rs, 0..) |r, i| tr.rows[i] = @intCast(r);
+            try e.runAfter(d.fns.gather_rows, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ tap_ring, @as(c_int, engine.tap_rows), @as(c_longlong, @intCast(start)), tr, @as(c_int, @intCast(c.n_taps * c.hidden)), d.taps_in });
+        } else try e.runAfter(d.fns.gather_taps, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ tap_ring, @as(c_int, engine.tap_rows), @as(c_longlong, @intCast(start)), @as(c_int, @intCast(c.n_taps * c.hidden)), d.taps_in });
+        try d.proj(d.w.fc, d.taps_in, d.th, rows);
+        const kv = rows * c.kvWidth() * 2; // a layer's k (v) rows in kabs (vabs)
+        // a prompt piece: every layer's k and v project the same normed taps, up to four a prompt GEMM launch
+        const grouped = precision.prompt(d.projection_role, rows, precision.dflash_projection_prompt_cutoff);
+        try e.runAfter(e.fns.norm, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ d.th, @as(u64, 0), d.w.hidden_norm, d.thn, d.c.eps, @as(c_int, @intCast(d.c.hidden)), @as(u64, 0), if (grouped) @as(u64, 0) else d.xs });
+        const grouped_live = liveGroups() and !grouped and rows <= 16;
+        if (grouped) {
+            const P = cuda.prompt_many;
+            var many: [P.parts_max]P.Out = undefined;
+            var n_many: usize = 0;
+            for (d.w.layers, 0..) |l, i| for ([2]cuda.qlinear.Affine4{ l.k, l.v }, [2]u64{ d.kabs + i * kv, d.vabs + i * kv }) |q, out| {
+                many[n_many] = .{ .q = q, .out = out };
+                n_many += 1;
+                if (n_many == many.len) {
+                    try e.prompt_many.prompt(e.stream, d.thn, many[0..n_many], rows);
+                    n_many = 0;
+                }
+            };
+            if (n_many > 0) try e.prompt_many.prompt(e.stream, d.thn, many[0..n_many], rows);
+        }
+        if (grouped_live) {
+            const A = cuda.qlinear.Affine4Kernels;
+            var many: [A.segs_max]A.Out = undefined;
+            var count: usize = 0;
+            for (d.w.layers, 0..) |l, i| for ([2]cuda.qlinear.Affine4{ l.k, l.v }, [2]u64{ d.kabs + i * kv, d.vabs + i * kv }) |weight, out| {
+                many[count] = .{ .q = weight, .out = out };
+                count += 1;
+                if (count == many.len) {
+                    try e.affine.decodeMany(e.stream, d.thn, d.xs, many[0..count], rows);
+                    count = 0;
+                }
+            };
+            if (count > 0) try e.affine.decodeMany(e.stream, d.thn, d.xs, many[0..count], rows);
+        }
+        for (d.w.layers, 0..) |l, i| {
+            const kabs = d.kabs + i * kv;
+            const vabs = d.vabs + i * kv;
+            if (!grouped and !grouped_live) try d.projAgain(l.k, d.thn, kabs, rows);
+            try d.normRope(kabs, l.k_norm, d.kn, rows, c.kv_heads, start);
+            if (!grouped and !grouped_live) try d.projAgain(l.v, d.thn, vabs, rows);
+            try e.runAfter(d.fns.ring_put, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ d.kn, vabs, d.ringK(ctx, i), d.ringV(ctx, i), @as(c_int, @intCast(c.kvWidth())), @as(c_longlong, @intCast(start)), @as(c_int, @intCast(c.ringRows())) });
+        }
+    }
+
+    fn absorbArgsGather(d: *Draft, tap_ring: u64, start: u64, rows: usize, rows_: ?[]const u32, a: *cuda.Args) void {
+        const c = d.c;
+        if (rows_) |rs| {
+            var tr: TapRows = .{ .n = @intCast(rows), .rows = @splat(0) };
+            for (rs, 0..) |r, i| tr.rows[i] = @intCast(r);
+            inline for (.{ tap_ring, @as(c_int, engine.tap_rows), @as(c_longlong, @intCast(start)), tr, @as(c_int, @intCast(c.n_taps * c.hidden)), d.taps_in }) |v| a.add(v);
+        } else inline for (.{ tap_ring, @as(c_int, engine.tap_rows), @as(c_longlong, @intCast(start)), @as(c_int, @intCast(c.n_taps * c.hidden)), d.taps_in }) |v| a.add(v);
+    }
+
+    /// Rewrites the start-dependent nodes of a captured live absorb for this round's start and rows.
+    fn absorbUpdate(d: *Draft, g: *const AbsorbGraph, x: cuda.graph.Exec, ctx: *Ctx, tap_ring: u64, start: u64, rows: usize, rows_: ?[]const u32) !void {
+        const c = d.c;
+        const kv = rows * c.kvWidth() * 2;
+        {
+            var a: cuda.Args = .{};
+            d.absorbArgsGather(tap_ring, start, rows, rows_, &a);
+            const f = if (rows_ != null) d.fns.gather_rows else d.fns.gather_taps;
+            try x.setKernel(g.gather, f, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = 256, .y = 1, .z = 1 } }, &a);
+        }
+        for (d.w.layers, 0..) |l, i| {
+            const kabs = d.kabs + i * kv;
+            const vabs = d.vabs + i * kv;
+            var r: cuda.Args = .{};
+            inline for (.{ kabs, l.k_norm, d.kn, @as(c_int, @intCast(c.kv_heads)), @as(c_int, @intCast(c.kv_heads * c.head_dim)), @as(c_longlong, @intCast(start)), c.eps, c.theta }) |v| r.add(v);
+            try x.setKernel(g.rope[i], d.fns.norm_rope, .{ .grid = .{ .x = @intCast(rows * c.kv_heads), .y = 1, .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, &r);
+            var p: cuda.Args = .{};
+            inline for (.{ d.kn, vabs, d.ringK(ctx, i), d.ringV(ctx, i), @as(c_int, @intCast(c.kvWidth())), @as(c_longlong, @intCast(start)), @as(c_int, @intCast(c.ringRows())) }) |v| p.add(v);
+            try x.setKernel(g.put[i], d.fns.ring_put, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = 256, .y = 1, .z = 1 } }, &p);
+        }
+    }
+
+    /// Finds the gather and each layer's norm_rope and ring_put among a captured absorb's nodes, in capture order.
+    fn absorbNodes(d: *Draft, g: cuda.graph.Graph, out: *AbsorbGraph, gathered_rows: bool) !bool {
+        const api = g.d.api;
+        const n = try g.nodeCount();
+        const buf = try d.gpa.alloc(cuda.graph.Node, n);
+        defer d.gpa.free(buf);
+        const nodes = try g.nodes(buf);
+        const gather_f = (if (gathered_rows) d.fns.gather_rows else d.fns.gather_taps).handle;
+        var gathers: usize = 0;
+        var ropes: usize = 0;
+        var puts: usize = 0;
+        for (nodes) |node| {
+            var p: cuda.abi.KernelNodeParams = undefined;
+            if (api.cuGraphKernelNodeGetParams_v2(node, &p) != cuda.abi.success) continue;
+            if (p.func == gather_f) {
+                out.gather = node;
+                gathers += 1;
+            } else if (p.func == d.fns.norm_rope.handle) {
+                if (ropes >= out.rope.len) return false;
+                out.rope[ropes] = node;
+                ropes += 1;
+            } else if (p.func == d.fns.ring_put.handle) {
+                if (puts >= out.put.len) return false;
+                out.put[puts] = node;
+                puts += 1;
+            }
+        }
+        return gathers == 1 and ropes == d.w.layers.len and puts == d.w.layers.len;
+    }
+
+    /// A live absorb chunk through its captured graph (one per rows, gather kind and buffers), eager otherwise.
+    fn absorbLive(d: *Draft, ctx: *Ctx, tap_ring: u64, start: u64, rows: usize, rows_: ?[]const u32) !void {
+        const e = d.e;
+        if (graphsOff() or absorbGraphsOff() or d.w.layers.len > absorb_layers_max) return d.absorbChunk(ctx, tap_ring, start, rows, rows_, false);
+        var key: u64 = rows | (@as(u64, @intFromBool(rows_ != null)) << 16) | (@as(u64, @intFromBool(liveGroups())) << 17);
+        key = std.hash.Wyhash.hash(key, std.mem.asBytes(&[_]u64{ tap_ring, d.taps_in, d.th, d.thn, d.kabs, d.vabs, d.kn, d.xs, ctx.ring.ptr }));
+        if (d.absorb_graphs.getPtr(key)) |g| {
+            if (g.exec) |x| {
+                try d.absorbUpdate(g, x, ctx, tap_ring, start, rows, rows_);
+                try x.launchOn(e.stream);
+                return;
+            }
+            return d.absorbChunk(ctx, tap_ring, start, rows, rows_, false);
+        }
+        cuda.graph.beginCapture(e.stream, .thread_local) catch return d.absorbChunk(ctx, tap_ring, start, rows, rows_, false);
+        d.absorbChunk(ctx, tap_ring, start, rows, rows_, false) catch |err| {
+            var broken = cuda.graph.endCapture(e.stream) catch return err;
+            broken.deinit();
+            return err;
+        };
+        var entry: AbsorbGraph = .{};
+        if (cuda.graph.endCapture(e.stream)) |captured_| {
+            var captured = captured_;
+            const found = d.absorbNodes(captured, &entry, rows_ != null) catch false;
+            if (found) {
+                if (captured.instantiate()) |x| {
+                    entry.exec = x;
+                    entry.template = captured;
+                } else |_| captured.deinit();
+            } else captured.deinit();
+        } else |_| {}
+        try d.absorb_graphs.put(d.gpa, key, entry);
+        // the capture recorded the launches without running them: run this round's chunk now
+        if (entry.exec) |x| try x.launchOn(e.stream) else try d.absorbChunk(ctx, tap_ring, start, rows, rows_, false);
     }
 
     /// A warmup or standalone hold goes through the same batched frame as shared lane holds.
@@ -622,6 +736,20 @@ test "a drafter config with a zero divisor is refused, and any admitted rank's s
 }
 
 /// Independent runtime controls for qualification against the current eager frame.
+const absorb_layers_max = 16;
+const AbsorbGraph = struct {
+    exec: ?cuda.graph.Exec = null,
+    /// the captured graph; its node handles address the executable graph's nodes, so it lives as long as `exec`
+    template: ?cuda.graph.Graph = null,
+    gather: cuda.graph.Node = null,
+    rope: [absorb_layers_max]cuda.graph.Node = @splat(null),
+    put: [absorb_layers_max]cuda.graph.Node = @splat(null),
+};
+/// TF_DRAFT_ABSORB_GRAPH=0 launches the live absorb eagerly.
+pub fn absorbGraphsOff() bool {
+    const value = platform.c.getenv("TF_DRAFT_ABSORB_GRAPH") orelse return false;
+    return std.mem.eql(u8, std.mem.span(value), "0");
+}
 pub fn graphsOff() bool {
     const value = platform.c.getenv("TF_DRAFT_GRAPH") orelse return false;
     return !std.mem.eql(u8, std.mem.span(value), "1");
