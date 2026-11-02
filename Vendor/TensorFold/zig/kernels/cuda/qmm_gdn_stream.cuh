@@ -305,8 +305,10 @@ __device__ __forceinline__ void tile(const __nv_bfloat16* x,const float* xs,cons
     constexpr int NT=GemvTile<64,BN,2>::NT;
     const auto original=p;
     const int KG=K/64,per=KG/p.sk;float acc[NT][4]{},tot[NT][4]{};
+    int next=per;
     wide_items<64,BN,2,FutureGroups,DICT>(x,xs,original,M,K,ldx,KG,[&](int g){return make_int2(g,t*BN);},acc,[&](int g){
-        if((g+1)%per!=0)return;bool first=g+1==per;
+        if(g+1!=next)return;bool first=g+1==per;
+        next+=per;
 #pragma unroll
         for(int j=0;j<NT;++j)
 #pragma unroll
