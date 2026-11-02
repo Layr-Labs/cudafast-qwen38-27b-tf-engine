@@ -117,15 +117,10 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __r
     float* XS = after_wait(XS0);
     if ((E & 3) == 0) {
         const size_t row = blockIdx.x;
-        uint4 hw[4], rw[4];
+        uint4 hw[4];
 #pragma unroll
         for (int j = 0; j < 4; j++)
             if ((t + 256 * j) * 8 < D) hw[j] = *reinterpret_cast<const uint4*>(H + row * D + (t + 256 * j) * 8);
-        if (R != nullptr) {
-#pragma unroll
-            for (int j = 0; j < 4; j++)
-                if ((t + 256 * j) * 8 < D) rw[j] = *reinterpret_cast<const uint4*>(R + row * D + (t + 256 * j) * 8);
-        }
         if (past_rows(P, blockIdx.x)) return;
         // h + r and w * (h * inv) move 8 entries a lane through xrow; the squares keep a thread's E entries in order
 #pragma unroll
@@ -133,8 +128,9 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __r
             const int d = (t + 256 * j) * 8;
             if (d >= D) break;
             if (R != nullptr) {
+                const uint4 rw = *reinterpret_cast<const uint4*>(R + row * D + d); // the residual at use: a shorter live range
                 __nv_bfloat16* hb = reinterpret_cast<__nv_bfloat16*>(&hw[j]);
-                const __nv_bfloat16* rb = reinterpret_cast<const __nv_bfloat16*>(&rw[j]);
+                const __nv_bfloat16* rb = reinterpret_cast<const __nv_bfloat16*>(&rw);
 #pragma unroll
                 for (int k = 0; k < 8; k++) hb[k] = __float2bfloat16_rn(bf(hb[k]) + bf(rb[k]));
                 *reinterpret_cast<uint4*>(H + row * D + d) = hw[j];
@@ -781,8 +777,16 @@ __device__ __forceinline__ void norm_rope_rows(const Geo& geo, const __nv_bfloat
     int pos[3];
     row_positions(sg, rowanc[m], m, M, pos);
     const int slot = sg.len + (int)m - sg.row0;
-    if (query) Qn[(m * QH + head) * HD + t] = rotate(xs, t, pos);
-    else store(sg, head, slot, t, rotate(xs, t, pos), Vr[(m * KVH + head) * HD + t]);
+    auto put = [&](int d, __nv_bfloat16 y) {
+        if (query) Qn[(m * QH + head) * HD + d] = y;
+        else store(sg, head, slot, d, y, Vr[(m * KVH + head) * HD + d]);
+    };
+    if (t < 32) {
+        const float2 sc = rope_coeff(t, pos);
+        const float a = bf(xs[t]), b = bf(xs[t + 32]);
+        put(t, __float2bfloat16_rn(a * sc.y - b * sc.x));
+        put(t + 32, __float2bfloat16_rn(b * sc.y + a * sc.x));
+    } else if (t >= 64) put(t, xs[t]);
 }
 
 extern "C" __global__ void __launch_bounds__(256) tf_q35_norm_rope(Geo geo, const __nv_bfloat16* __restrict__ QRAW, const __nv_bfloat16* __restrict__ KRAW,
