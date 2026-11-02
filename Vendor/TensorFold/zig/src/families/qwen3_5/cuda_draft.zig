@@ -24,7 +24,7 @@ const lp_top = 20;
 pub const Config = @import("cuda_draft_config.zig").Config;
 pub const frame = @import("cuda_draft_frame.zig");
 pub const memory = @import("cuda_draft_memory.zig");
-const Fns = struct { gather_taps: cuda.Function, gather_rows: cuda.Function, dyn_conv: cuda.Function, norm_rope: cuda.Function, ring_put: cuda.Function, attn: cuda.Function, dyn_conv_batch: cuda.Function, norm_rope_batch: cuda.Function, norm_rope_qk_batch: cuda.Function, mask_rows: cuda.Function, attn_partial: cuda.Function, attn_partial_rows4: cuda.Function, attn_merge: cuda.Function, head2_pack: cuda.Function, head2_screen: cuda.Function, head2_select: cuda.Function, head2_rescore: cuda.Function };
+const Fns = struct { gather_taps: cuda.Function, gather_rows: cuda.Function, dyn_conv: cuda.Function, norm_rope: cuda.Function, norm_rope_ring: cuda.Function, ring_put: cuda.Function, attn: cuda.Function, dyn_conv_batch: cuda.Function, norm_rope_batch: cuda.Function, norm_rope_qk_batch: cuda.Function, mask_rows: cuda.Function, attn_partial: cuda.Function, attn_partial_rows4: cuda.Function, attn_merge: cuda.Function, head2_pack: cuda.Function, head2_screen: cuda.Function, head2_select: cuda.Function, head2_rescore: cuda.Function };
 
 /// qwen35_draft.cu's TapRows.
 const TapRows = extern struct { n: c_int, rows: [engine.most_window]c_int };
@@ -388,10 +388,16 @@ pub const Draft = struct {
             for (d.w.layers, 0..) |l, i| {
                 const kabs = d.kabs + i * kv;
                 const vabs = d.vabs + i * kv;
-                if (!grouped and !grouped_live) try d.projAgain(l.k, d.thn, kabs, rows);
-                try d.normRope(kabs, l.k_norm, d.kn, rows, c.kv_heads, start);
-                if (!grouped and !grouped_live) try d.projAgain(l.v, d.thn, vabs, rows);
-                try e.runAfter(d.fns.ring_put, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ d.kn, vabs, d.ringK(ctx, i), d.ringV(ctx, i), @as(c_int, @intCast(c.kvWidth())), @as(c_longlong, @intCast(start)), @as(c_int, @intCast(c.ringRows())) });
+                if (!prompt and grouped_live) {
+                    // Both projections are already issued. Fuse norm/RoPE and ring commit without
+                    // changing the prompt path or delaying K behind V in the ungrouped path.
+                    try e.runAfter(d.fns.norm_rope_ring, .{ rows * c.kv_heads, 1, 1 }, .{ 32, 1, 1 }, .{ kabs, l.k_norm, vabs, d.ringK(ctx, i), d.ringV(ctx, i), @as(c_int, @intCast(c.kv_heads)), @as(c_longlong, @intCast(start)), @as(c_int, @intCast(c.ringRows())), c.eps, c.theta });
+                } else {
+                    if (!grouped and !grouped_live) try d.projAgain(l.k, d.thn, kabs, rows);
+                    try d.normRope(kabs, l.k_norm, d.kn, rows, c.kv_heads, start);
+                    if (!grouped and !grouped_live) try d.projAgain(l.v, d.thn, vabs, rows);
+                    try e.runAfter(d.fns.ring_put, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ d.kn, vabs, d.ringK(ctx, i), d.ringV(ctx, i), @as(c_int, @intCast(c.kvWidth())), @as(c_longlong, @intCast(start)), @as(c_int, @intCast(c.ringRows())) });
+                }
             }
             start += rows;
             n -= rows;
