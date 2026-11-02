@@ -22,6 +22,10 @@ pub const Affine4 = struct {
     wide_w: u64 = 0, // weight-only group-major view for 17 to 32-row verification
     wide_kind: u8 = 0, // 1 attention inputs, 2 down, 3 head
     verify_w: u64 = 0, // optional immutable K-major words; original w serves all other paths
+    /// A gate's co-packed compact-pair records (cuda_copack.zig): its and up's verify_w tiles and dictionary windows,
+    /// one record of `copack_rec` bytes a (128-column tile, group); 0: the compact pair reads them where they are.
+    copack: u64 = 0,
+    copack_rec: u32 = 0,
     w: u64,
     s: u64,
     b: u64,

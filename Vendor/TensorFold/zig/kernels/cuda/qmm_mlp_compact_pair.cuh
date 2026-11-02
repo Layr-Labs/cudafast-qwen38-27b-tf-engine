@@ -7,10 +7,15 @@ __device__ __forceinline__ uint32_t compact_load_a(const __nv_bfloat16* p) {
     return word;
 }
 
-template <int STAGES = 2, int BN = 256, bool KMAJOR = true>
+// COPACK: the stage's weights and dictionary windows come from one co-packed record a (column tile, group), laid out
+// as the stage's shared bytes [0, W + 16 (run0 + run1)): gate's two tiles, up's two, gate's window, up's window
+// (tf_qmm_mlp_copack_pack writes them from the record kernel's own source addresses). The shared bytes, and so every
+// value computed, are the record kernel's; only the global addresses the loader reads change.
+template <int STAGES = 2, int BN = 256, bool KMAJOR = true, bool COPACK = false>
 __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
                                               const Parts& parts, __nv_bfloat16* __restrict__ act,
-                                              float* __restrict__ as, int M, int K, int ldx, int rows_t) {
+                                              float* __restrict__ as, int M, int K, int ldx, int rows_t,
+                                              const unsigned char* __restrict__ rec = nullptr, int rec_bytes = 0) {
     constexpr int GS = 64, BM = 16, WM = 1, WN = 4;
     using Base = LaneTile<GS, BM, BN, WM, WN, STAGES>;
     struct T : Base {
@@ -70,8 +75,19 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
         if (xsok) cp4(stage(s) + T::W + 2 * T::S + tid * 4, xssrc + g);
         cp16(stage(s) + xtdst, xtsrc + g * GS);
     };
+    const int rec_chunks = T::W / 16 + run0 + run1;
+    const unsigned char* rec_tile = COPACK ? rec + static_cast<size_t>(tile) * KG * rec_bytes : nullptr;
     auto load_w = [&](int s, int g) {
         unsigned char* p = stage(s);
+        if constexpr (COPACK) {
+            const unsigned char* r = rec_tile + static_cast<size_t>(g) * rec_bytes;
+#pragma unroll
+            for (int j = 0; j < (T::W / 16 + 2 * T::S / 16 + T::THREADS - 1) / T::THREADS; ++j) {
+                const int c = tid + j * T::THREADS;
+                if (c < rec_chunks) cp16(p + T::X + c * 16, r + c * 16);
+            }
+            return;
+        }
 #pragma unroll
         for (int j = 0; j < WC; ++j)
             if (wok[j]) cp16(p + wdst[j], wsrc[j] + static_cast<size_t>(g) * (KMAJOR ? P.npad / 64 : 1) * TILE_BYTES);
@@ -234,4 +250,37 @@ extern "C" __global__ void __launch_bounds__(128, 3) tf_qmm_mlp_single16_compact
  const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,
  __nv_bfloat16* act,float* sums,int M,int K,int ldx,int rows_t) {
  tf_qmm_mlp_single::mlp_single_compact_body<>(x,xs,parts,act,sums,M,K,ldx,rows_t);
+}
+
+// The co-packed twin: the same body reading each stage from its record (see COPACK above).
+extern "C" __global__ void __launch_bounds__(128, 3) tf_qmm_mlp_single16_compact_copack(
+ const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,
+ __nv_bfloat16* act,float* sums,int M,int K,int ldx,int rows_t,const unsigned char* rec,int rec_bytes) {
+ tf_qmm_mlp_single::mlp_single_compact_body<2, 256, true, true>(x,xs,parts,act,sums,M,K,ldx,rows_t,rec,rec_bytes);
+}
+
+// Writes the records: block (tile, g) copies, chunk by chunk, the bytes the record kernel's loader would read for that
+// stage (its wsrc and dsrc formulas, BN = 256, K-major panels) into record tile * KG + g. Input-independent weights only.
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_copack_pack(
+ const __grid_constant__ tf_qmm_group::Parts parts,int KG,unsigned char* rec,int rec_bytes) {
+ constexpr int GS = 64, TILE_BYTES = 64 * GS / 2, W = 256 * GS / 2;
+ const int tile = blockIdx.x / KG, g = blockIdx.x % KG, n0 = tile * 128;
+ const tf_qmm_group::Part P = parts.p[0];
+ const int code0 = parts.p[0].first, code1 = parts.p[1].first;
+ const int run0 = qmm_dict::dict_bits(code0), run1 = qmm_dict::dict_bits(code1);
+ unsigned char* r = rec + (static_cast<size_t>(tile) * KG + g) * rec_bytes;
+ for (int c = threadIdx.x; c < W / 16 + run0 + run1; c += blockDim.x) {
+  const unsigned char* src;
+  if (c < W / 16) {
+   const int t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
+   src = reinterpret_cast<const unsigned char*>(parts.p[t / 2].w) + static_cast<size_t>(n0 / 64 + t % 2) * TILE_BYTES +
+         off * 16 + static_cast<size_t>(g) * (P.npad / 64) * TILE_BYTES;
+  } else {
+   const int d = c - W / 16, dpart = d < run0 ? 0 : 1, dchunk = d < run0 ? d : d - run0;
+   const int dstep = qmm_dict::dict_step(dpart ? code1 : code0);
+   src = reinterpret_cast<const unsigned char*>(parts.p[dpart].scales) + static_cast<size_t>(n0 / 64) * dstep +
+         dchunk * 16 + static_cast<size_t>(g) * (P.npad / 64 * dstep);
+  }
+  *reinterpret_cast<uint4*>(r + c * 16) = *reinterpret_cast<const uint4*>(src);
+ }
 }

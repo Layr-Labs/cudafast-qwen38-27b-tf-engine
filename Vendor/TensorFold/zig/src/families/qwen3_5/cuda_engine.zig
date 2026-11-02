@@ -7,6 +7,7 @@ const Round = @import("cuda_round.zig");
 const geometry = @import("cuda_geometry.zig");
 const weights = @import("cuda_weights.zig");
 pub const verify_weight_layout = @import("cuda_verify_weights.zig");
+pub const copack_layout = @import("cuda_copack.zig");
 const caches = @import("cuda_cache.zig");
 const routed = @import("cuda_routed.zig");
 const hooks = @import("cuda_learn_hooks.zig");
@@ -356,16 +357,20 @@ pub const Engine = struct {
         const streams = gb10 and g.hidden == 5120 and g.layers == 64 and g.experts == 0 and g.pocket == 0 and (output_stream or gdn_stream);
         // the decode copies on the fastest pieces of free memory (cuda_fastpool.zig); TF_FASTPOOL=0 keeps one buffer each
         if (gb10 and (panels or streams) and !envOff("TF_FASTPOOL")) {
-            var sizes: [2 * 64 + 6 * 64]usize = undefined;
+            var sizes: [3 * 64 + 6 * 64]usize = undefined;
             var n: usize = 0;
             if (panels) n += verify_weight_layout.copySizes(e, sizes[n..]);
             if (streams) n += projection_stream_layout.copySizes(e, gdn_stream, output_stream, sizes[n..]);
+            // last: the co-packed compact-pair records, so every copy above is placed exactly as without them
+            if (panels and single) n += copack_layout.copySizes(e, sizes[n..]);
             sponge.free(); // the screen takes its candidates out of all the free memory
             e.fast = fast_placement.screen(d, e.stream, try e.mods[3].function("tf_fastpool_read"), sizes[0..n]);
         }
         if (panels) e.verify_weights = try verify_weight_layout.prepare(e, single);
         errdefer if (e.verify_weights) |*b| b.free();
         if (streams) e.projection_streams = try projection_stream_layout.prepare(e, gdn_stream, output_stream);
+        // after every other fast-pool copy; a failure leaves every layer on the record's compact pair
+        if (panels and single) copack_layout.prepare(e) catch |err| std.debug.print("info: compact pair co-packing skipped: {s}\n", .{@errorName(err)});
         if (e.mo) |*m| try m.reserveParts(e);
         // the greedy verify head's 2-bit sieve (head_sieve.zig): its copy of the head's codes, built now
         if (gb10 and e.head_argmax) switch (e.head) {

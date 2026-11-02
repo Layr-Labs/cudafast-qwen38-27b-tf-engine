@@ -39,6 +39,7 @@ pub const Kernels = struct {
     single32_dict_fn: ?Function = null, // tf_qmm_mlp_single32_dict: dictionary-coded twin on the K-major panels
     dict_fn: ?Function = null, // GB10: tf_qmm_mlp_pair's twin, taken when gate and up are both coded (tile-major)
     compact_pair_fn: ?Function = null,
+    copack_fn: ?Function = null, // tf_qmm_mlp_single16_compact_copack: the same tile reading co-packed records
     single_dict_fn: ?Function = null, // tf_qmm_mlp_single16's, when both are coded on the K-major panel's layout
 
     /// From the loaded qmm_group module; `pdl` as the decode tiles' launches (GB10).
@@ -58,14 +59,43 @@ pub const Kernels = struct {
             // three CTAs an SM need the 100 KiB carveout on GB10 (3 x 21632 bytes and their reserve exceed 64 KiB)
             try fc.setAttribute(.preferred_shared_memory_carveout, 100);
             k.compact_pair_fn = fc;
+            const fp = try group_mod.function("tf_qmm_mlp_single16_compact_copack");
+            try fp.allowDynamicShared(compact_pair_smem);
+            try fp.setAttribute(.preferred_shared_memory_carveout, 100);
+            k.copack_fn = fp; // used only for a gate whose records cuda_copack.zig built and checked
         }
         return k;
     }
 
     /// Both projections' twin of `layout`: gate and up coded, in it (qlinear.dict_kmajor: the K-major panel's).
-    fn coded(gate: Affine4, up: Affine4, kmajor: bool) bool {
+    pub fn coded(gate: Affine4, up: Affine4, kmajor: bool) bool {
         const want: u32 = if (kmajor) qlinear.dict_kmajor else 0;
         return gate.code != 0 and up.code != 0 and gate.code & qlinear.dict_kmajor == want and up.code & qlinear.dict_kmajor == want;
+    }
+
+    /// The compact pair's Parts for gate and up (what `pair` passes it), for its launches and tf_qmm_mlp_copack_pack.
+    pub fn compactParts(gate: Affine4, up: Affine4) qlinear.Parts {
+        var parts: qlinear.Parts = std.mem.zeroes(qlinear.Parts);
+        for ([2]Affine4{ gate, up }, parts.p[0..2]) |q, *p| p.* = .{
+            .w = q.verify_w,
+            .scales = q.sb,
+            .biases = q.tab,
+            .out = 0,
+            .n = @intCast(q.n),
+            .npad = @intCast(q.npad),
+            .sk = 1,
+            .tiles = @intCast(q.n / 128),
+            .first = @bitCast(q.code & ~qlinear.dict_kmajor),
+        };
+        parts.count = 2;
+        return parts;
+    }
+
+    /// Whether `pair` runs gate and up on the compact pair for a window of `rows` (its own test, in one place).
+    pub fn compactFor(kk: *const Kernels, gate: Affine4, up: Affine4, rows: usize) bool {
+        return fits(gate, up) and rows > 0 and rows <= 16 and gate.n == 17408 and gate.k == 5120 and gate.verify_w != 0 and
+            up.verify_w != 0 and kk.kmajor_fn != null and kk.kmajor_single and kk.single_dict_fn != null and
+            kk.compact_pair_fn != null and coded(gate, up, true) and qlinear.pairCode(gate.code) and qlinear.pairCode(up.code);
     }
 
     /// tf_qmm_mlp_single16's shared table bytes for q: a pair code's table is read through L2 there (none).
@@ -147,6 +177,11 @@ pub const Kernels = struct {
         g.add(act);
         g.add(as);
         for ([_]usize{ rows, gate.k, gate.k, rows_t }) |v| g.add(@as(c_int, @intCast(v)));
+        if (compact and gate.copack != 0) if (kk.copack_fn) |fc| {
+            g.add(gate.copack);
+            g.add(@as(c_int, @intCast(gate.copack_rec)));
+            return launch_.launch(fc, .{ .grid = .{ .x = @intCast(rows_t * tiles) }, .block = .{ .x = 128 }, .shared = compact_pair_smem, .pdl = kk.pdl }, s, &g);
+        };
         const f = if (compact) kk.compact_pair_fn.? else if (sdict) kk.single_dict_fn.? else if (major) kk.kmajor_fn.? else if (dict) kk.dict_fn.? else kk.pair_fn;
         const shared: u32 = if (compact) compact_pair_smem else if (sdict) single_smem + single_dict_dec + singleTab(gate) + singleTab(up) else if (single) single_smem else if (major) kmajor_smem else if (dict) smem + qlinear.dict_dec + @max(gate.tabBytes(), up.tabBytes()) else smem;
         try launch_.launch(f, .{ .grid = .{ .x = @intCast(@as(usize, if (single) 1 else 2) * rows_t * tiles) }, .block = .{ .x = 128 }, .shared = shared, .cluster = if (single) null else .{ .x = 2 }, .pdl = kk.pdl }, s, &g);
