@@ -39,6 +39,7 @@ pub const Kernels = struct {
     single32_dict_fn: ?Function = null, // tf_qmm_mlp_single32_dict: dictionary-coded twin on the K-major panels
     dict_fn: ?Function = null, // GB10: tf_qmm_mlp_pair's twin, taken when gate and up are both coded (tile-major)
     compact_pair_fn: ?Function = null,
+    compact_ready_fn: ?Function = null, // tf_qmm_mlp_single16_compact_pair_ready: the same, publishing each tile
     single_dict_fn: ?Function = null, // tf_qmm_mlp_single16's, when both are coded on the K-major panel's layout
 
     /// From the loaded qmm_group module; `pdl` as the decode tiles' launches (GB10).
@@ -58,6 +59,11 @@ pub const Kernels = struct {
             // three CTAs an SM need the 100 KiB carveout on GB10 (3 x 21632 bytes and their reserve exceed 64 KiB)
             try fc.setAttribute(.preferred_shared_memory_carveout, 100);
             k.compact_pair_fn = fc;
+            // its twin for cuda_mlp_ready.zig (tile flags after each CTA's stores; the same arithmetic and footprint)
+            const fr = try group_mod.function("tf_qmm_mlp_single16_compact_pair_ready");
+            try fr.allowDynamicShared(compact_pair_smem);
+            try fr.setAttribute(.preferred_shared_memory_carveout, 100);
+            k.compact_ready_fn = fr;
         }
         return k;
     }
@@ -81,7 +87,21 @@ pub const Kernels = struct {
 
     /// act (rows, n) = bf16(silu(x through gate) * (x through up)), x's group sums in xs; act's group sums into as.
     pub fn pair(kk: *const Kernels, s: Stream, x: u64, xs: u64, gate: Affine4, up: Affine4, act: u64, as: u64, rows: usize) !void {
+        return kk.pairWith(s, x, xs, gate, up, act, as, rows, 0);
+    }
+
+    /// Whether `pair` takes its compact pair-only kernel for these projections and rows (the selection below).
+    pub fn compactFits(kk: *const Kernels, gate: Affine4, up: Affine4, rows: usize) bool {
+        if (!fits(gate, up) or rows == 0 or rows > 16) return false;
+        const major = gate.n == 17408 and gate.k == 5120 and gate.verify_w != 0 and up.verify_w != 0 and kk.kmajor_fn != null;
+        return major and kk.kmajor_single and kk.single_dict_fn != null and kk.compact_pair_fn != null and
+            coded(gate, up, true) and qlinear.pairCode(gate.code) and qlinear.pairCode(up.code);
+    }
+
+    /// `pair`; with `ready` (cuda_mlp_ready.zig, compactFits only) the compact kernel's twin that publishes each tile.
+    pub fn pairWith(kk: *const Kernels, s: Stream, x: u64, xs: u64, gate: Affine4, up: Affine4, act: u64, as: u64, rows: usize, ready: u64) !void {
         if (!fits(gate, up) or rows == 0) return error.InputMismatch;
+        if (ready != 0 and (!kk.compactFits(gate, up, rows) or kk.compact_ready_fn == null)) return error.InputMismatch;
         if (rows > 16 and rows <= 32 and gate.n == 17408 and gate.k == 5120 and gate.verify_w != 0 and up.verify_w != 0)
             if (kk.single32_fn) |fw| {
                 const sdict32 = kk.single32_dict_fn != null and coded(gate, up, true) and singleTab(gate) + singleTab(up) <= single_tab_max;
@@ -147,7 +167,8 @@ pub const Kernels = struct {
         g.add(act);
         g.add(as);
         for ([_]usize{ rows, gate.k, gate.k, rows_t }) |v| g.add(@as(c_int, @intCast(v)));
-        const f = if (compact) kk.compact_pair_fn.? else if (sdict) kk.single_dict_fn.? else if (major) kk.kmajor_fn.? else if (dict) kk.dict_fn.? else kk.pair_fn;
+        if (ready != 0) g.add(ready);
+        const f = if (compact and ready != 0) kk.compact_ready_fn.? else if (compact) kk.compact_pair_fn.? else if (sdict) kk.single_dict_fn.? else if (major) kk.kmajor_fn.? else if (dict) kk.dict_fn.? else kk.pair_fn;
         const shared: u32 = if (compact) compact_pair_smem else if (sdict) single_smem + single_dict_dec + singleTab(gate) + singleTab(up) else if (single) single_smem else if (major) kmajor_smem else if (dict) smem + qlinear.dict_dec + @max(gate.tabBytes(), up.tabBytes()) else smem;
         try launch_.launch(f, .{ .grid = .{ .x = @intCast(@as(usize, if (single) 1 else 2) * rows_t * tiles) }, .block = .{ .x = 128 }, .shared = shared, .cluster = if (single) null else .{ .x = 2 }, .pdl = kk.pdl }, s, &g);
     }

@@ -168,8 +168,11 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     // and up still read; most_verify rows of each fit xs), then down over them; every bit as the two
                     // projections, mlp_act and down give
                     const act_sums = e.xs + E.most_verify * (g.hidden / 64) * 4;
-                    try e.mlp_pair.pair(e.stream, e.x, e.xs, m.gate.a4, m.up.a4, e.act, act_sums, total);
-                    try e.project(m.down, e.act, act_sums, e.r, total, prompt, t_params, false);
+                    // a verify window: down takes each gate/up tile as it lands (cuda_mlp_ready.zig, the same bits)
+                    if (!try @import("cuda_mlp_ready.zig").run(e, m.gate.a4, m.up.a4, m.down, act_sums, total)) {
+                        try e.mlp_pair.pair(e.stream, e.x, e.xs, m.gate.a4, m.up.a4, e.act, act_sums, total);
+                        try e.project(m.down, e.act, act_sums, e.r, total, prompt, t_params, false);
+                    }
                 } else {
                     try e.projMany(&.{ m.gate, m.up }, e.x, &.{ e.gate, e.up }, total, prompt);
                     if (e.learning) |k| try k.mlp(i, e.gate, e.up, total);

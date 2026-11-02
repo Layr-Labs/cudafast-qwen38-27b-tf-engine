@@ -2,6 +2,7 @@
 #pragma once
 #include "qmm_frag.cuh"
 #include "qmm_dict.cuh"
+#include "qmm_ready.cuh"
 namespace tf_qmm_output_stream {
 using namespace qmm_frag;
 constexpr int Stage=4416, SliceBytes=Stage*2, Bytes=SliceBytes*4, OUT_PAIR_SMEM=14336;
@@ -15,9 +16,13 @@ __device__ __forceinline__ void dict_decode_at(const qmm_dict::DictLanes& D,cons
     qmm_dict::dict_put(D,dec,qmm_dict::dict_fetch(D,packed,table,g));
 }
 
-template<int FutureGroups,int Slices=4,int Rolling=0,bool DICT=false>
+// READY (cuda_mlp_ready.zig, the decode down projection after tf_qmm_mlp_single16_compact_pair_ready): in place of the
+// wait on the whole gate/up grid, each K slice's thread 0 acquires the gate/up tile of its next group (128 act columns:
+// groups 2t and 2t + 1) before the CTA barrier that precedes that group's x loads; the slices still take their groups
+// in order and add the slices in order, so every value is the same bits. The last CTA moves the generation.
+template<int FutureGroups,int Slices=4,int Rolling=0,bool DICT=false,bool READY=false>
 __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const float* __restrict__ xs,
-        const tf_qmm_group::Parts& parts,int M,int K,int ldx) {
+        const tf_qmm_group::Parts& parts,int M,int K,int ldx,unsigned* ready=nullptr) {
     static_assert(!DICT||Rolling==0,"coded rolling prefetch is not implemented");
     extern __shared__ __align__(128) unsigned char buf[];
     const auto p=parts.p[0];
@@ -61,7 +66,14 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
         }
     }
 #endif
-    grid_wait();qmm_dict::x_keep_l2(x,rows,K,ldx);load_x(0);commit();grid_launch();
+    [[maybe_unused]] unsigned want=0;
+    if constexpr(READY){
+        // the generation before this launch pair's down CTAs finish: the previous pair moved it before its grid ended
+        want=qmm_ready::ld_relaxed(ready+qmm_ready::GEN)+1u;
+        if(tid==0)qmm_ready::await_tile(ready,g0/2,want);
+        __syncthreads();
+    }else grid_wait();
+    qmm_dict::x_keep_l2(x,rows,K,ldx);load_x(0);commit();grid_launch();
     uint32_t mask;asm volatile("mov.b32 %0, 0x000F000F;\n":"=r"(mask));
     float acc[2][4]{};
     const int b_off=DICT?(D.pair?0:16):0;
@@ -75,6 +87,8 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
             asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(b) : "memory");
         }
 #endif
+        // the next group's tile, acquired before the barrier that orders the CTA's x loads of that group after it
+        if constexpr(READY)if(tid==0&&it+1<per&&((g0+it+1)&1)==0)qmm_ready::await_tile(ready,(g0+it+1)/2,want);
         wait<0>();__syncthreads();
         if(it+1<per){load_w(it+1);load_x(it+1);}commit();
         const auto* at=stage(it);const auto* wp=reinterpret_cast<const uint32_t*>(at+2048);
@@ -136,6 +150,7 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
                 if(r<M&&c+1<p.n)*reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<__nv_bfloat16*>(p.out)+size_t(r)*p.n+c)=__floats2bfloat162_rn(acc[j][2*h],acc[j][2*h+1]);
             }
     }
+    if constexpr(READY){__syncthreads();if(threadIdx.x==0)qmm_ready::finish_down(ready,want);}
 }
 }
 
@@ -146,6 +161,13 @@ extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_stream16(const _
 extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_stream16_dict(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
     if(K==6144)tf_qmm_output_stream::body<4,4,0,true>(x,xs,parts,M,K,ldx);
     else tf_qmm_output_stream::body<0,4,0,true>(x,xs,parts,M,K,ldx);
+}
+// The decode MLP's down projection (K = 17408) after tf_qmm_mlp_single16_compact_pair_ready, tile by tile.
+extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_stream16_ready(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx,unsigned* ready){
+    tf_qmm_output_stream::body<0,4,0,false,true>(x,xs,parts,M,K,ldx,ready);
+}
+extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_stream16_dict_ready(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx,unsigned* ready){
+    tf_qmm_output_stream::body<0,4,0,true,true>(x,xs,parts,M,K,ldx,ready);
 }
 extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_prefetch16(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
     tf_qmm_output_stream::body<4>(x,xs,parts,M,K,ldx);

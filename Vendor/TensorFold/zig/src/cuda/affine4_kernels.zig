@@ -132,6 +132,7 @@ pub const Affine4Kernels = struct {
     group_fn: Function,
     stream16_fns: [2]?Function = @splat(null),
     stream16_dict_fn: ?Function = null, // tf_qmm_output_stream16 on a dictionary-coded down projection
+    stream16_ready_fns: [2]?Function = @splat(null), // their twins after the gate/up kernel's tile flags (cuda_mlp_ready.zig)
     gdn_stream16_dict_fn: ?Function = null, // tf_qmm_gdn_stream16 with its dictionary-coded parts
     gdn_stream16_fn: ?Function = null,
     gdn_stream32_fn: ?Function = null,
@@ -193,6 +194,7 @@ pub const Affine4Kernels = struct {
         a.pdl = gb10;
         a.stream16_fns = @splat(null);
         a.stream16_dict_fn = null;
+        a.stream16_ready_fns = @splat(null);
         a.gdn_stream16_dict_fn = null;
         a.gdn_stream16_fn = null;
         a.gdn_stream32_fn = null;
@@ -881,6 +883,27 @@ pub const Affine4Kernels = struct {
 
     /// qmm_group's tile 2: a cluster of `sk` CTAs a column tile, its K slices summed over distributed shared memory.
     pub fn cluster(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, q: Affine4, out: u64, rows: usize, sk: usize) !void {
+        return a.clusterWith(s, x, xs, q, out, rows, sk, 0);
+    }
+
+    /// Whether decode() takes cluster()'s output stream for a K = 17408 down projection at `rows`, plain or coded,
+    /// and its tile-flag twin is loaded: the launch cuda_mlp_ready.zig replaces (every condition decode() and
+    /// cluster() test on the way there).
+    pub fn downReadyFits(a: *const Affine4Kernels, q: Affine4, rows: usize) bool {
+        if (rows == 0 or rows > max_rows or !narrow16(rows)) return false;
+        if (q.n != 5120 or q.k != 17408 or q.stream_w == 0 or a.stream16_fns[0] == null) return false;
+        const sk = splitK(q.n, q.k);
+        if (sk != 4 or a.split != null or !a.cluster_decode) return false;
+        if (a.narrow != null and (q.n + 63) / 64 <= narrow_tiles) return false;
+        const short = a.short_lane and q.k / 64 / sk < lane_min and q.k / 64 >= lane_groups and !a.streamed(q, rows, sk);
+        if (short) return false;
+        const dict = q.npad == 5120 and a.coded(q) and a.stream16_dict_fn != null;
+        return a.stream16_ready_fns[@intFromBool(dict)] != null;
+    }
+
+    /// cluster(); with `ready` (downReadyFits only) the output stream's twin that takes each gate/up tile as it lands.
+    pub fn clusterWith(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, q: Affine4, out: u64, rows: usize, sk: usize, ready: u64) !void {
+        if (ready != 0 and !a.downReadyFits(q, rows)) return error.InputMismatch;
         const stream_fn = if (q.stream_w == 0) null else a.stream16_fns[@as(usize, if (q.k == 6144) 1 else 0)];
         // K = 4096: the drafter's o projection (its stream view only exists when cuda_draft_weights packed it)
         if (narrow16(rows) and sk == 4 and q.n == 5120 and (q.k == 6144 or q.k == 17408 or q.k == 4096) and q.stream_w != 0 and stream_fn != null) {
@@ -893,8 +916,10 @@ pub const Affine4Kernels = struct {
             var g: launch_.Args = .{};
             g.add(x); g.add(xs); g.add(parts);
             for ([_]usize{ rows, q.k, q.k }) |v| g.add(int(v));
+            if (ready != 0) g.add(ready);
             const shared = if (dict) linear.out16_smem + q.tabBytesUpTo(linear.out_pair_tab_max) else linear.out16_smem;
-            return launch_.launch(if (dict) a.stream16_dict_fn.? else stream_fn.?, .{ .grid = .{ .x = 80 }, .block = .{ .x = 512 }, .shared = shared, .pdl = a.pdl }, s, &g);
+            const f = if (ready != 0) a.stream16_ready_fns[@intFromBool(dict)].? else if (dict) a.stream16_dict_fn.? else stream_fn.?;
+            return launch_.launch(f, .{ .grid = .{ .x = 80 }, .block = .{ .x = 512 }, .shared = shared, .pdl = a.pdl }, s, &g);
         }
         const tiles = (q.n + 63) / 64;
         const rows_t = (rows + 15) / 16;

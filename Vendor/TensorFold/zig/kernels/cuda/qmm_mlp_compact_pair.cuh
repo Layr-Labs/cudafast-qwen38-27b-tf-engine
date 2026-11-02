@@ -1,5 +1,6 @@
 #pragma once
 #include "qmm_mlp_single_dict.cuh"
+#include "qmm_ready.cuh"
 namespace tf_qmm_mlp_single {
 __device__ __forceinline__ uint32_t compact_load_a(const __nv_bfloat16* p) {
     uint32_t word;
@@ -7,10 +8,13 @@ __device__ __forceinline__ uint32_t compact_load_a(const __nv_bfloat16* p) {
     return word;
 }
 
-template <int STAGES = 2, int BN = 256, bool KMAJOR = true>
+// READY (cuda_mlp_ready.zig): after its act tile and group sums, the CTA publishes tile `cid` at the forward's
+// generation plus one (qmm_ready.cuh) for the down launch's K slices; everything else is the same code and bits.
+template <int STAGES = 2, int BN = 256, bool KMAJOR = true, bool READY = false>
 __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
                                               const Parts& parts, __nv_bfloat16* __restrict__ act,
-                                              float* __restrict__ as, int M, int K, int ldx, int rows_t) {
+                                              float* __restrict__ as, int M, int K, int ldx, int rows_t,
+                                              unsigned* ready = nullptr) {
     constexpr int GS = 64, BM = 16, WM = 1, WN = 4;
     using Base = LaneTile<GS, BM, BN, WM, WN, STAGES>;
     struct T : Base {
@@ -93,6 +97,9 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
         commit();
     }
     grid_wait();
+    // the generation after the wait: the previous launch pair's last down CTA moved it before that grid finished
+    [[maybe_unused]] unsigned want = 0;
+    if constexpr (READY) want = qmm_ready::ld_relaxed(ready + qmm_ready::GEN) + 1u;
     const __nv_bfloat16* x_ready = x;
     asm volatile("" : "+l"(x_ready) :: "memory");
     qmm_dict::x_keep_l2(x_ready + static_cast<size_t>(m0) * ldx, rows, K, ldx);
@@ -226,6 +233,10 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
         const int r = tid / (BN / 128), group = tid % (BN / 128);
         as[static_cast<size_t>(m0 + r) * (P.n / 64) + n0 / 64 + group] = act_group_sum(own + r * BN + group * 64);
     }
+    if constexpr (READY) {
+        __syncthreads();  // every act and group-sum store of the CTA before thread 0 publishes the tile
+        if (tid == 0) qmm_ready::publish_tile(ready, cid, want);
+    }
 
 }
 
@@ -234,4 +245,10 @@ extern "C" __global__ void __launch_bounds__(128, 3) tf_qmm_mlp_single16_compact
  const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,
  __nv_bfloat16* act,float* sums,int M,int K,int ldx,int rows_t) {
  tf_qmm_mlp_single::mlp_single_compact_body<>(x,xs,parts,act,sums,M,K,ldx,rows_t);
+}
+// tf_qmm_mlp_single16_compact_pair that publishes each finished tile for tf_qmm_output_stream16(_dict)_ready.
+extern "C" __global__ void __launch_bounds__(128, 3) tf_qmm_mlp_single16_compact_pair_ready(
+ const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,
+ __nv_bfloat16* act,float* sums,int M,int K,int ldx,int rows_t,unsigned* ready) {
+ tf_qmm_mlp_single::mlp_single_compact_body<2,256,true,true>(x,xs,parts,act,sums,M,K,ldx,rows_t,ready);
 }

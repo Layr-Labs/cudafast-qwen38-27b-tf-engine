@@ -89,6 +89,14 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
         break :blk f;
     };
     try out.allowDynamicShared(35328);
+    // the down projection's twins after the gate/up kernel's tile flags (cuda_mlp_ready.zig), the same footprints
+    const down_ready = try e.mods[0].function("tf_qmm_output_stream16_ready");
+    try down_ready.allowDynamicShared(35328);
+    const down_dict_ready: ?cuda.Function = if (down_dict == null) null else blk: {
+        const f = try e.mods[0].function("tf_qmm_output_stream16_dict_ready");
+        try f.allowDynamicShared(35328 + @as(u32, @max(cuda.qlinear.dict_tab_max, cuda.qlinear.out_pair_tab_max)));
+        break :blk f;
+    };
     var buffer: ?cuda.DeviceBuffer = null;
     if (e.fast == null) {
         buffer = try cuda.DeviceBuffer.alloc(e.d, bytes);
@@ -134,6 +142,7 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     };
     if (output) e.affine.stream16_fns = .{ down, out };
     if (output) e.affine.stream16_dict_fn = down_dict;
+    if (output) e.affine.stream16_ready_fns = .{ down_ready, down_dict_ready };
     if (input) {
         e.affine.gdn_stream16_fn = grouped;
         e.affine.gdn_stream16_dict_fn = grouped_dict;

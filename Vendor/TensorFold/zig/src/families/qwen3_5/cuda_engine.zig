@@ -181,6 +181,7 @@ pub const Engine = struct {
     head_argmax: bool, // TF_HEAD_ARGMAX=0: greedy verify rows keep their logits and the argmax launches
     sieve: ?cuda.head_sieve.HeadSieve = null, // a greedy verify head on the 2-bit sieve (TF_HEAD_SIEVE=0: the full head)
     picks: u64, // drawRows' slice scratch: most_verify rows of cuda.sample.Draws.row_scratch
+    mlp_ready: u64, // cuda_mlp_ready.zig's generation, finished-CTA count and gate/up tile flags (cleared each forward)
     // per-forward tables (ids, segments, rows' segment, parent and ancestors, the draws' rules) staged in pinned memory
     tables: DeviceBuffer,
     staged: cuda.HostBuffer,
@@ -496,6 +497,7 @@ pub const Engine = struct {
         e.amax = try t.alloc(most_verify * argmaxSlices(g.vocab) * 8);
         e.head_amax = try t.alloc(cuda.qlinear.Affine4Kernels.max_rows * ((g.vocab + 63) / 64) * 8);
         e.picks = try t.alloc(most_verify * cuda.sample.Draws.row_scratch);
+        e.mlp_ready = try t.alloc(@import("cuda_mlp_ready.zig").bytes);
         return total;
     }
 
@@ -654,6 +656,7 @@ pub const Engine = struct {
             Round.stageImageTables(st, im, p0, total);
         }
         try e.tables.uploadAsync(0, st[0..if (images != null) tables_len else src_at], e.stream.handle); // text: as before
+        try @import("cuda_mlp_ready.zig").clear(e, total); // the MLP tile flags of a window start from zeros
         // carried plans of 2..32 rows (at most 3 slots) scan four value rows a warp on qwen35_slots_lean.cuh (slots_3's
         // arithmetic, its addressing hoisted; 2 slots where they suffice); TF_SLOTS_LEAN=0 keeps prior dispatch
         const lean = record and total > 1 and total <= 32 and e.affine.pdl and !envOff("TF_SLOTS_LEAN");
