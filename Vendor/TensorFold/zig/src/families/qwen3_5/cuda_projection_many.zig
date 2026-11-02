@@ -51,5 +51,5 @@ pub fn projectMany(e: *Engine, ls: []const Proj, x: u64, xs: u64, outs: []const 
 }
 
 fn mixedAttention() bool {
-    return true;
+    return false;
 }
