@@ -115,20 +115,23 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
             for(int e=0;e<4;++e)acc[j][e]=__fmaf_rn(xv[e>>1],bv[e&1],__fmaf_rn(d[j][e],sv[e&1],acc[j][e]));
         }
     }
-    wait<0>();__syncthreads();auto* partial=reinterpret_cast<float*>(buf);
+    wait<0>();__syncthreads();auto* partial=reinterpret_cast<float4*>(buf);
     if(slice!=0){
 #pragma unroll
         for(int j=0;j<2;++j)
-#pragma unroll
-            for(int e=0;e<4;++e)partial[((slice*2+j)*4+e)*128+tid]=acc[j][e];
+            partial[(slice*2+j)*128+tid]=make_float4(acc[j][0],acc[j][1],acc[j][2],acc[j][3]);
     }
     __syncthreads();
     if(slice==0){
         for(int peer=1;peer<Slices;++peer)
 #pragma unroll
-            for(int j=0;j<2;++j)
-#pragma unroll
-                for(int e=0;e<4;++e)acc[j][e]=acc[j][e]+partial[((peer*2+j)*4+e)*128+tid];
+            for(int j=0;j<2;++j){
+                const float4 t=partial[(peer*2+j)*128+tid];
+                acc[j][0]=acc[j][0]+t.x;
+                acc[j][1]=acc[j][1]+t.y;
+                acc[j][2]=acc[j][2]+t.z;
+                acc[j][3]=acc[j][3]+t.w;
+            }
 #pragma unroll
         for(int j=0;j<2;++j)
 #pragma unroll
