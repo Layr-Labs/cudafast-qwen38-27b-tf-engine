@@ -37,6 +37,7 @@ pub const HeadSieve = struct {
     pack_fn: Function,
     prep_fn: Function,
     sieve_fn: Function,
+    sieve8_fn: Function,
     top_fn: Function,
     select_fn: Function,
     rescore_fn: Function,
@@ -95,6 +96,7 @@ pub const HeadSieve = struct {
         h.pack_fn = try group_mod.function("tf_head_sieve_pack");
         h.prep_fn = try group_mod.function("tf_head_sieve_prep");
         h.sieve_fn = try group_mod.function("tf_head_sieve_scan");
+        h.sieve8_fn = try group_mod.function("tf_head_sieve_scan8");
         h.top_fn = try group_mod.function("tf_head_sieve_top");
         h.select_fn = try group_mod.function("tf_head_sieve_select");
         h.rescore_fn = try group_mod.function("tf_head_sieve_rescore");
@@ -114,6 +116,7 @@ pub const HeadSieve = struct {
         const tab_bytes: u32 = if (h.code != 0) ((h.code >> 5 & 0x1FFF) * 4 + 15) / 16 * 16 else 0;
         h.tab_smem = if (tab_bytes <= tab_room) tab_bytes else 0;
         try h.sieve_fn.allowDynamicShared(sieve_smem + h.tab_smem);
+        try h.sieve8_fn.allowDynamicShared(sieve_smem + h.tab_smem);
         try h.rescore_fn.allowDynamicShared(rescore_smem);
         // the buffer: 2-bit words, A fragments, group sums, the sieve's bests, list, count, bests, tokens, counters
         var at: usize = 0;
@@ -210,7 +213,8 @@ pub const HeadSieve = struct {
             a.add(h.himax);
             a.add(h.himid);
             a.add(h.approx);
-            try launch_.launch(h.sieve_fn, .{ .grid = .{ .x = @intCast(h.ctas) }, .block = .{ .x = 128 }, .shared = sieve_smem + h.tab_smem, .pdl = h.pdl }, s, &a);
+            const scan = if (rows <= 8 and h.mode == .on) h.sieve8_fn else h.sieve_fn;
+            try launch_.launch(scan, .{ .grid = .{ .x = @intCast(h.ctas) }, .block = .{ .x = 128 }, .shared = sieve_smem + h.tab_smem, .pdl = h.pdl }, s, &a);
         }
         // each row's first tile (its best a) exactly; the row's threshold the lower of its exact best and its best a
         {

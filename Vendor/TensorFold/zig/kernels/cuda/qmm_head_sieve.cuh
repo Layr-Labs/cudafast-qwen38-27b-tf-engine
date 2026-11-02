@@ -124,7 +124,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_head_sieve_prep(const __nv_
 // scale and bias arrays. Grid tiles / 4, 128 threads; shared SMEM + tab_smem (the pair table, or 0: through L2).
 namespace tf_head_sieve {
 
-template <int NS>
+template <int NS, bool LowRows = false>
 __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
         const uint4* __restrict__ afr, const float* __restrict__ xv, const unsigned char* __restrict__ sb,
         const uint32_t* __restrict__ tab, int code, int tab_smem, const __nv_bfloat16* __restrict__ sc,
@@ -172,11 +172,12 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
         qmm_frag::commit();
     }
     qmm_frag::grid_launch();
-    float acc[8][4], sg[8][4];
+    constexpr int components = LowRows ? 2 : 4;
+    float acc[8][components], sg[8][components];
 #pragma unroll
     for (int i = 0; i < 8; ++i)
 #pragma unroll
-        for (int e = 0; e < 4; ++e) {
+        for (int e = 0; e < components; ++e) {
             acc[i][e] = 0.0f;
             sg[i][e] = 0.0f;
         }
@@ -238,21 +239,25 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
             const float m0 = fmaf(1.5f, s0, c0), m1 = fmaf(1.5f, s1, c1);
             acc[nt][0] = fmaf(4.0f * s0, d[0], fmaf(m0, xs0, acc[nt][0]));
             acc[nt][1] = fmaf(4.0f * s1, d[1], fmaf(m1, xs0, acc[nt][1]));
-            acc[nt][2] = fmaf(4.0f * s0, d[2], fmaf(m0, xs1, acc[nt][2]));
-            acc[nt][3] = fmaf(4.0f * s1, d[3], fmaf(m1, xs1, acc[nt][3]));
+            if constexpr (!LowRows) {
+                acc[nt][2] = fmaf(4.0f * s0, d[2], fmaf(m0, xs1, acc[nt][2]));
+                acc[nt][3] = fmaf(4.0f * s1, d[3], fmaf(m1, xs1, acc[nt][3]));
+            }
             sg[nt][0] = fmaf(s0 * s0, q0, sg[nt][0]);
             sg[nt][1] = fmaf(s1 * s1, q0, sg[nt][1]);
-            sg[nt][2] = fmaf(s0 * s0, q1, sg[nt][2]);
-            sg[nt][3] = fmaf(s1 * s1, q1, sg[nt][3]);
+            if constexpr (!LowRows) {
+                sg[nt][2] = fmaf(s0 * s0, q1, sg[nt][2]);
+                sg[nt][3] = fmaf(s1 * s1, q1, sg[nt][3]);
+            }
         }
     }
     qmm_frag::wait<0>();
     __syncthreads();
 #pragma unroll
     for (int nt = 0; nt < 8; ++nt) {
-        float hi[4];
+        float hi[components];
 #pragma unroll
-        for (int e = 0; e < 4; ++e) {
+        for (int e = 0; e < components; ++e) {
             const float sd = sqrtf(1.25f * sg[nt][e]), ks = kappa * sd, v = acc[nt][e];
             hi[e] = v + ks + fmaf(fabsf(v) + ks, SLACK_REL, SLACK_ABS);
             if (approx != nullptr) {
@@ -262,25 +267,18 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
                 approx[id * 32 + 16 + row] = sd;
             }
         }
-        float h0 = fmaxf(hi[0], hi[1]), h1 = fmaxf(hi[2], hi[3]);
-        h0 = fmaxf(h0, __shfl_xor_sync(0xffffffffu, h0, 1));
-        h0 = fmaxf(h0, __shfl_xor_sync(0xffffffffu, h0, 2));
-        h1 = fmaxf(h1, __shfl_xor_sync(0xffffffffu, h1, 1));
-        h1 = fmaxf(h1, __shfl_xor_sync(0xffffffffu, h1, 2));
-        float m0 = fmaxf(acc[nt][0], acc[nt][1]), m1 = fmaxf(acc[nt][2], acc[nt][3]);
-        m0 = fmaxf(m0, __shfl_xor_sync(0xffffffffu, m0, 1));
-        m0 = fmaxf(m0, __shfl_xor_sync(0xffffffffu, m0, 2));
-        m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, 1));
-        m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, 2));
-        if ((lane & 3) == 0) {
-            const size_t n8 = (t0 + warp) * 8 + nt;
-            if (r0 < rows) {
-                himax[n8 * 16 + r0] = h0;
-                himid[n8 * 16 + r0] = m0;
-            }
-            if (r0 + 8 < rows) {
-                himax[n8 * 16 + r0 + 8] = h1;
-                himid[n8 * 16 + r0 + 8] = m1;
+#pragma unroll
+        for (int h = 0; h < components / 2; ++h) {
+            float bound = fmaxf(hi[2 * h], hi[2 * h + 1]);
+            bound = fmaxf(bound, __shfl_xor_sync(0xffffffffu, bound, 1));
+            bound = fmaxf(bound, __shfl_xor_sync(0xffffffffu, bound, 2));
+            float best = fmaxf(acc[nt][2 * h], acc[nt][2 * h + 1]);
+            best = fmaxf(best, __shfl_xor_sync(0xffffffffu, best, 1));
+            best = fmaxf(best, __shfl_xor_sync(0xffffffffu, best, 2));
+            if ((lane & 3) == 0 && r0 + h * 8 < rows) {
+                const size_t n8 = (t0 + warp) * 8 + nt;
+                himax[n8 * 16 + r0 + h * 8] = bound;
+                himid[n8 * 16 + r0 + h * 8] = best;
             }
         }
     }
@@ -294,6 +292,14 @@ extern "C" __global__ void __launch_bounds__(128, 3) tf_head_sieve_scan(const ui
         const __nv_bfloat16* __restrict__ bi, int npad, int KG, int rows, float kappa, float* __restrict__ himax,
         float* __restrict__ himid, float* __restrict__ approx) {
     tf_head_sieve::scan<tf_head_sieve::STAGES>(w2, afr, xv, sb, tab, code, tab_smem, sc, bi, npad, KG, rows, kappa, himax, himid, approx);
+}
+
+extern "C" __global__ void __launch_bounds__(128, 3) tf_head_sieve_scan8(const uint32_t* __restrict__ w2,
+        const uint4* __restrict__ afr, const float* __restrict__ xv, const unsigned char* __restrict__ sb,
+        const uint32_t* __restrict__ tab, int code, int tab_smem, const __nv_bfloat16* __restrict__ sc,
+        const __nv_bfloat16* __restrict__ bi, int npad, int KG, int rows, float kappa, float* __restrict__ himax,
+        float* __restrict__ himid, float* __restrict__ approx) {
+    tf_head_sieve::scan<tf_head_sieve::STAGES, true>(w2, afr, xv, sb, tab, code, tab_smem, sc, bi, npad, KG, rows, kappa, himax, himid, approx);
 }
 
 // Each row's first tile: the n8 tile of its highest value in h (himid: the best a; key: then the lower tile) into
