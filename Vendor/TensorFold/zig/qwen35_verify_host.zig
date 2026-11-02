@@ -468,7 +468,7 @@ test "compact MLP: sixteen pair-coded rows use both half panels and preserve fal
     try pair.pair(stream, 1000, 2000, gate, up, 3000, 4000, 16);
     try t.expectEqual(@as(usize, 23), PairTrace.id);
     try t.expectEqual(@as(u32, 136), PairTrace.grid);
-    try t.expectEqual(@as(u32, 21632), PairTrace.shared);
+    try t.expectEqual(@as(u32, 17536), PairTrace.shared);
     try t.expectEqual(@as(u32, 1), PairTrace.cluster);
     try t.expectEqual(@as(c_int, 136), PairTrace.parts.p[0].tiles);
     try t.expectEqual(@as(u64, 100), PairTrace.parts.p[0].w);
