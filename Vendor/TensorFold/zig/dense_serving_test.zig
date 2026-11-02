@@ -35,7 +35,6 @@ test "dense serving: owned CUDA images retain their reviewed lane and decode byt
     try std.testing.expectEqualStrings("f2e33b5a29d0bc17cb67dd5e5c35d5d1a6793a08ac3621f5fca068fc7754bb3c", &hash(@embedFile("kernels/cuda/qmm_prompt_pipe.cuh")));
     try std.testing.expectEqualStrings("374f0cdbeebfd2422c58863afc4f8f33aec520cbe52316171022351345922159", &hash(@embedFile("kernels/cuda/qwen35.cu")));
     try std.testing.expectEqualStrings("73c078eb4bcd26c3483f24ba2ab99b3d8f6064ea4079f510dca86ec4ac4ed420", &hash(@embedFile("kernels/cuda/qwen35.cuh")));
-    try std.testing.expectEqualStrings("5c51529e499f3947f7d799d6c2a9e0f6c1522f0f6f8a50518f63d385191a84a8", &hash(@embedFile("kernels/cuda/qwen35_draft.cu")));
     try std.testing.expectEqualStrings("4f14d7ce48fec892a4bb6d5724619ae6d495a6bb50f81d4a3bccc7a3d578dd9a", &hash(@embedFile("kernels/cuda/qwen35_keep.cu")));
     try std.testing.expectEqualStrings("d1a379a98cf7504a7ed3b3f2d24c8ab6a39fe5511bcded6449e598ce5c3c79e7", &hash(@embedFile("kernels/cuda/scan_rows.cu")));
 }

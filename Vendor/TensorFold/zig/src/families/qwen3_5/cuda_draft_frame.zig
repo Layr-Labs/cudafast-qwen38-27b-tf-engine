@@ -91,9 +91,9 @@ fn paired(l: anytype, B: usize) bool {
     return draft.pairedMlp() and B > 0 and B <= 16 and cuda.mlp_pair.Kernels.fits(l.gate, l.up);
 }
 
-/// Whether the MLP's input conv writes the pair's input sums itself (one 256-channel pass, whole groups a block).
-fn convSums(d: anytype, l: anytype, B: usize) bool {
-    return paired(l, B) and d.c.hidden % 256 == 0 and l.gate.k == d.c.hidden and !std.mem.eql(u8, std.mem.span(@import("sys").c.getenv("TF_DRAFT_CONV_SUMS") orelse ""), "0");
+/// A 256-channel convolution tile writes four complete 64-group sums without changing their addition order.
+fn convSums(d: anytype, B: usize) bool {
+    return B > 0 and B <= 16 and d.c.hidden % 256 == 0 and !std.mem.eql(u8, std.mem.span(@import("sys").c.getenv("TF_DRAFT_CONV_SUMS") orelse ""), "0");
 }
 
 /// Reuse the native fused pair while keeping its input sums separate from its output sums; `summed`: the conv that
@@ -124,15 +124,16 @@ fn body(d: anytype, n: usize, narrow_: bool) !?u64 {
     for (d.w.layers, 0..) |l, i| {
         try d.norm(d.h, l.input_norm, d.x, B);
         try d.projAgain(l.attn_conv, d.x, d.dyn, B);
-        try conv(d, d.x, l.attn_base, 0, d.xin, B, 0, 0);
-        try d.projMany(&.{ l.q, l.k, l.v }, d.xin, &.{ d.qraw, d.kraw, d.vb }, B);
+        const qkv_summed = convSums(d, B) and l.q.k == c.hidden and l.k.k == c.hidden and l.v.k == c.hidden;
+        try conv(d, d.x, l.attn_base, 0, d.xin, B, 0, if (qkv_summed) d.xs else 0);
+        try d.projMany(&.{ l.q, l.k, l.v }, d.xin, &.{ d.qraw, d.kraw, d.vb }, B, qkv_summed);
         try ropeQk(d, d.qraw, l.q_norm, d.q, d.kraw, l.k_norm, d.kb, B);
         try attention(d, B, i);
         try d.proj(l.o, d.att, d.o, B);
         try conv(d, d.o, l.attn_base, d.h, d.h2, B, 1, 0);
         try d.norm(d.h2, l.post_norm, d.x, B);
         try d.projAgain(l.mlp_conv, d.x, d.dyn, B);
-        const summed = convSums(d, l, B);
+        const summed = paired(l, B) and l.gate.k == c.hidden and convSums(d, B);
         try conv(d, d.x, l.mlp_base, 0, d.xin, B, 0, if (summed) d.xs else 0);
         try mlp(d, l, B, summed);
         try conv(d, d.o, l.mlp_base, d.h2, d.h, B, 1, 0);
