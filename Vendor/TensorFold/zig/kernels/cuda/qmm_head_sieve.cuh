@@ -20,7 +20,7 @@ using namespace qmm_frag;
 
 constexpr int ROWS = 16;
 constexpr int TILES = 4;                  // 64-id tiles a sieve CTA, a warp each
-constexpr int STAGES = 4;               // the scan's stages: three CTAs an SM (GB10, measured quickest)
+constexpr int STAGES = 3;
 constexpr int AFR = 4 * 32 * 16;          // a group's A fragments: four k16 steps, a lane's four registers
 constexpr int W2 = TILES * 1024;          // the tiles' 2-bit codes of a group
 constexpr int DW = TILES * 256;           // the tiles' dictionary index windows of a group
@@ -288,7 +288,7 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
 
 } // namespace tf_head_sieve
 
-extern "C" __global__ void __launch_bounds__(128, 3) tf_head_sieve_scan(const uint32_t* __restrict__ w2,
+extern "C" __global__ void __launch_bounds__(128, 4) tf_head_sieve_scan(const uint32_t* __restrict__ w2,
         const uint4* __restrict__ afr, const float* __restrict__ xv, const unsigned char* __restrict__ sb,
         const uint32_t* __restrict__ tab, int code, int tab_smem, const __nv_bfloat16* __restrict__ sc,
         const __nv_bfloat16* __restrict__ bi, int npad, int KG, int rows, float kappa, float* __restrict__ himax,

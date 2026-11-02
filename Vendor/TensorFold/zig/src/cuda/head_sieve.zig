@@ -26,10 +26,10 @@ pub const Mode = enum { on, check };
 
 pub const HeadSieve = struct {
     pub const rows_max = 16;
-    pub const sieve_smem: u32 = 4 * (2048 + 4 * 1024 + 4 * 256 + 128); // tf_head_sieve::SMEM
+    pub const sieve_smem: u32 = 3 * (2048 + 4 * 1024 + 4 * 256 + 128); // tf_head_sieve::SMEM
     pub const rescore_smem: u32 = 8 * (2048 + 4 * 288 + 64); // tf_head_sieve::RS_SMEM
-    /// The pair table in shared memory when three scan CTAs an SM still fit (GB10: 100 KiB an SM, 1 KiB a CTA).
-    const tab_room: u32 = 102400 / 3 - 1024 - sieve_smem;
+    /// The pair table in shared memory when four scan CTAs an SM fit (GB10: 100 KiB an SM, 1 KiB a CTA).
+    const tab_room: u32 = 102400 / 4 - 1024 - sieve_smem;
     const stats_words = 64;
     const rescore_ctas = 144; // three an SM (GB10: 48 SMs)
     const select_ctas = 48;
