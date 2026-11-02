@@ -241,27 +241,37 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_pre(Geo geo, const 
     release_next();
     const int lane = threadIdx.x;
     const int head = blockIdx.y;
+    constexpr int PER = DK / 32;
+    const int cl = head * DK + lane * PER;
+    if (past_rows(P, blockIdx.z * blockDim.y)) return;
+    __shared__ uint2 shared_cw[TAPS][32];
+    if (blockDim.y > 1) {
+        if (threadIdx.y == 0) {
+#pragma unroll
+            for (int tap = 0; tap < TAPS; ++tap)
+                shared_cw[tap][lane] = *reinterpret_cast<const uint2*>(CW + (size_t)cl * TAPS + tap * PER);
+        }
+        __syncthreads();
+    }
     const int w = blockIdx.z * blockDim.y + threadIdx.y;
     if (past_rows(P, w)) return;
     const int NK = geo.nk, NV = geo.nv, C = geo.conv();
     const Seg sg = segs[rowseg[w]];
     const __nv_bfloat16* CS = reinterpret_cast<const __nv_bfloat16*>(sg.conv) + (size_t)layer * geo.conv_rows();
     const bool isq = head < NK, isk = !isq && head < 2 * NK;
-    const int c0 = head * DK;  // q, k and v channels are consecutive heads of DK
     int src[TAPS];  // tap t reads the row TAPS - 1 - t tokens back: a forward row, or -1 - (tail row)
 #pragma unroll
     for (int tap = 0; tap < TAPS; tap++) src[tap] = back(rowpar, w, TAPS - 1 - tap);
-    constexpr int PER = DK / 32;
     const bool rec = recorded(P);
     // a recorded window's row logs the tail after it (taps 1..TAPS-1) here, so conv_commit only moves the stream's
     __nv_bfloat16* tail = rec ? log_row(geo, sg, layer, w - sg.row0).conv : nullptr;
     // a lane's PER channels in 8-byte loads: each tap's row, the weights (PER x TAPS in a row), the logged tail
     static_assert(PER == 4 && TAPS == 4, "a tap's channels and a channel's taps are one uint2");
-    const int cl = c0 + lane * PER;
     uint2 xw[TAPS], ww[TAPS];
 #pragma unroll
     for (int tap = 0; tap < TAPS; tap++) {
-        ww[tap] = *reinterpret_cast<const uint2*>(CW + (size_t)cl * TAPS + tap * PER);
+        ww[tap] = blockDim.y > 1 ? shared_cw[tap][lane]
+            : *reinterpret_cast<const uint2*>(CW + (size_t)cl * TAPS + tap * PER);
         if (rec && src[tap] < 0) xw[tap] = *reinterpret_cast<const uint2*>(CS + (size_t)(-1 - src[tap]) * C + cl);
     }
     await_prior();
