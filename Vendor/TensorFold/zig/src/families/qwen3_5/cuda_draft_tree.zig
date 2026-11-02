@@ -25,6 +25,7 @@ pub const Candidates = struct {
     // a sampled stream's rule and its first draft's position: row r's candidates scored as the target's draw at r
     sampling: ?lanes.Sampling = null,
     position: u64 = 0,
+    pricing_scale: f64 = scale, // proposal softmax only; target sampling and acceptance remain unchanged
 };
 
 /// A candidate's score as the target's draw sees it: its logit at the stream's temperature plus the draw's noise.
@@ -187,7 +188,7 @@ fn chancesAfterFast(c: Candidates, r: usize, pred: u32, out: *[lp_top]f64) void 
     for (0..vec_n) |v| edge[v * lanes_f64 ..][0..lanes_f64].* = acc[v];
     var most: f64 = -std.math.inf(f64);
     for (0..c.topk) |j| {
-        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edge_weight * edge[j]) / scale;
+        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edge_weight * edge[j]) / c.pricing_scale;
         most = @max(most, out[j]);
     }
     var total: f64 = 0;
@@ -211,7 +212,7 @@ fn chancesAfter(c: Candidates, r: usize, pred: u32, out: *[lp_top]f64) void {
         for (edge[0..c.topk], succ[0..c.topk]) |*e, row| e.* += ph * bf16(row[k]);
     }
     for (0..c.topk) |j| {
-        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edge_weight * edge[j]) / scale;
+        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edge_weight * edge[j]) / c.pricing_scale;
         most = @max(most, out[j]);
     }
     var total: f64 = 0;
