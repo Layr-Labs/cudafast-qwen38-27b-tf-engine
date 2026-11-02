@@ -61,14 +61,13 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     const uint32_t* const mgtab = reinterpret_cast<const uint32_t*>(parts.p[mpart].biases);
     const bool xsok = tid < rows;
     const float* xssrc = xs + static_cast<size_t>(m0 + min(tid, rows - 1)) * KG;
-    // x's 16 rows of the group: 16-byte chunk ch of row r at slot ch ^ (r & 7) (rows past M repeat the last one: their
-    // products are never stored); the fragments below read the same bf16 words the x rows hold
     const int xr = tid >> 3, xch = tid & 7;
+    const bool xtok = xr < rows;
     const __nv_bfloat16* xtsrc = x + static_cast<size_t>(m0 + min(xr, rows - 1)) * ldx + xch * 8;
     const int xtdst = T::XT + xr * 128 + ((xch ^ (xr & 7)) * 16);
     auto load_x = [&](int s, int g) {
         if (xsok) cp4(stage(s) + T::W + 2 * T::S + tid * 4, xssrc + g);
-        cp16(stage(s) + xtdst, xtsrc + g * GS);
+        if (xtok) cp16(stage(s) + xtdst, xtsrc + g * GS);
     };
     auto load_w = [&](int s, int g) {
         unsigned char* p = stage(s);
@@ -114,7 +113,8 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
 #pragma unroll
                 for (int i = 0; i < I; ++i) {
                     const int r = wm * (BM / WM) + i * 16 + (lane >> 2);
-                    auto at = [&](int row, int ch) {
+                    auto at = [&](int row0, int ch) {
+                        const int row = min(row0, rows - 1);
                         return *reinterpret_cast<const uint32_t*>(xt + row * 128 + ((ch ^ (row & 7)) * 16) + b);
                     };
                     av[kt][i][0] = at(r, 2 * kt);
