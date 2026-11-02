@@ -1,4 +1,4 @@
-// One warp retains the two original head-normalization sums, followed by register-only rotary exchange.
+// One warp retains the two head-normalization sums; its block shares position-independent rotary frequencies.
 extern "C" __global__ void __launch_bounds__(256) tf_q35_head_rope_warp(
         Geo geo, const __nv_bfloat16* __restrict__ Qraw0, const __nv_bfloat16* __restrict__ Kraw0,
         const __nv_bfloat16* __restrict__ Vraw0, const __nv_bfloat16* __restrict__ Qweight,
@@ -7,19 +7,28 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_head_rope_warp(
         const Ancestor* __restrict__ rowanc, int layer, float eps,
         const int* __restrict__ P, const int* __restrict__ M) {
     release_next();
+    const int heads = geo.qh + geo.kvh, lane = threadIdx.x;
+    __shared__ float frequencies[32];
+    if (threadIdx.y == 0 && lane < 32)
+        frequencies[lane] = powf(10000000.0f, -(float)lane / 32.0f);
+    const size_t row_head = blockIdx.x * blockDim.y + threadIdx.y, row = row_head / heads;
+    const int head = row_head % heads;
+    const bool query = head < geo.qh;
+    const __nv_bfloat16* wsrc = plain(query ? Qweight : Kweight);
+    const uint2 wpre[2] = {*reinterpret_cast<const uint2*>(wsrc + 4 * lane), *reinterpret_cast<const uint2*>(wsrc + 128 + 4 * lane)};
+    asm volatile("" ::"r"(wpre[0].x), "r"(wpre[0].y), "r"(wpre[1].x), "r"(wpre[1].y));
+    __syncthreads();
     await_prior();
     const __nv_bfloat16* Qraw = after_wait(Qraw0);
     const __nv_bfloat16* Kraw = after_wait(Kraw0);
     const __nv_bfloat16* Vraw = after_wait(Vraw0);
     __nv_bfloat16* Qn = after_wait(Qn0);
-    const int heads = geo.qh + geo.kvh, lane = threadIdx.x;
-    const size_t row_head = blockIdx.x * blockDim.y + threadIdx.y, row = row_head / heads;
-    if (past_rows(P, row)) return; // Every lane of this independent warp has the same row.
-    const int head = row_head % heads;
-    const bool query = head < geo.qh;
+    const int* counts = after_wait(P);
+    const size_t first_row = blockIdx.x * blockDim.y / heads;
+    if (past_rows(counts, first_row)) return;
+    if (past_rows(counts, row)) return;
     const __nv_bfloat16* x = query ? Qraw + (row * geo.qh + head) * 2 * HD
                                   : Kraw + (row * geo.kvh + head - geo.qh) * HD;
-    const __nv_bfloat16* weight = query ? Qweight : Kweight;
     float values[2][4], sums[2] = {};
 #pragma unroll
     for (int half = 0; half < 2; ++half) {
@@ -36,8 +45,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_head_rope_warp(
     __nv_bfloat16 normalized[2][4];
 #pragma unroll
     for (int half = 0; half < 2; ++half) {
-        const uint2 packed = *reinterpret_cast<const uint2*>(weight + half * 128 + 4 * lane);
-        const __nv_bfloat16* weights = reinterpret_cast<const __nv_bfloat16*>(&packed);
+        const __nv_bfloat16* weights = reinterpret_cast<const __nv_bfloat16*>(&wpre[half]);
 #pragma unroll
         for (int i = 0; i < 4; ++i)
             normalized[half][i] = __float2bfloat16_rn(bf(weights[i]) * (values[half][i] * inv));
@@ -55,7 +63,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_head_rope_warp(
         __nv_bfloat16 low = normalized[0][i];
         if (d < 64) {
             const int frequency = d % 32;
-            const float angle = (float)pos[mrope_axis(frequency)] * powf(10000000.0f, -(float)frequency / 32.0f);
+            const float angle = (float)pos[mrope_axis(frequency)] * frequencies[frequency];
             float sn, cs;
             sincosf(angle, &sn, &cs);
             const float a = d < 32 ? own : partner, b = d < 32 ? partner : own;
