@@ -80,7 +80,7 @@ pub fn delta(e: *E.Engine, layer: usize, rows: usize) !void {
 /// `delta` with the value heads' convolution, decay and strength done in the chain's stages (gdn_prefill.cu's
 /// tf_gdn_chain_conv, tf_q35_gdn_pre's bits): gdn_pre ran for the q and k heads only, and the stream's convolution
 /// tail is still the one before the chunk (conv_commit runs after).
-pub fn deltaConv(e: *E.Engine, layer: usize, rows: usize, m: anytype) !void {
+pub fn deltaConv(e: *E.Engine, layer: usize, rows: usize, m: anytype, flags: u64) !void {
     const g = e.g;
     const sg = std.mem.bytesToValue(Seg, e.staged.bytes[E.Engine.segs_at..][0..@sizeOf(Seg)]);
     const state = sg.rec + layer * g.v_heads * geometry.dk * geometry.dk * 4;
@@ -88,6 +88,8 @@ pub fn deltaConv(e: *E.Engine, layer: usize, rows: usize, m: anytype) !void {
     var a: cuda.Args = .{};
     for ([_]u64{ e.q, e.k, e.qkv, m.conv, tail, e.tables.ptr + E.Engine.rowpar_at, e.a, e.b, m.a_log, m.dt_bias, state, e.y }) |v| a.add(v);
     for ([_]usize{ rows, g.k_heads, g.v_heads }) |v| a.add(@as(c_int, @intCast(v)));
+    // flags (0: none): each block's progress for tf_q35_gdn_post_follow, launched next as the chain's dependent
+    a.add(flags);
     const cfg: cuda.Config = .{ .grid = .{ .x = @intCast(g.v_heads), .y = @intCast(geometry.dk / chain_rows) }, .block = .{ .x = 2 * chain_rows } };
     try cuda.launch.launch(e.prompt_attn.chain_conv, cfg, e.stream, &a);
 }
