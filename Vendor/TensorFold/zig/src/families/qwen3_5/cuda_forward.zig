@@ -52,6 +52,10 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     const t_params = e.tables.ptr + params_at;
     const geo = e.geo;
     const group = g.q_heads / g.kv_heads;
+    // the attention pair switch is read once a forward: its environment cannot change inside one
+    const pair_mode = pairOn();
+    // whether any layer has a live pocket, once a forward rather than once a layer
+    const pockets_live = e.pockets.any();
 
     try e.embed(t_ids, e.h, total, t_params);
     // the producers of the out, o and down inputs write their group sums; a prompt GEMM past 16 rows needs none
@@ -74,6 +78,8 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 // a prompt chunk: the chain convolves the value heads and takes their decay and strength in its stages,
                 // so gdn_pre runs the q and k heads and conv_commit follows the chain (TF_CHAIN_CONV=0: as before)
                 const conv_in_chain = prompt and nseg == 1 and !record and chainConvOn();
+                // a recorded window's early lean scan runs the layer's gdn_post on each head's last CTA
+                const fused_post = record and !prompt and E.Engine.fusedPost(shape.slots);
                 const pre_heads = if (conv_in_chain) 2 * g.k_heads else 2 * g.k_heads + g.v_heads;
                 try e.runAfter(e.fns.gdn_pre, .{ 1, pre_heads, pre_blocks }, .{ 32, pre_rows, 1 }, .{ geo, e.qkv, t_segs, t_rows, t_par, layer, m.conv, e.a, e.b, m.a_log, m.dt_bias, e.q, e.k, e.v, e.g_, e.beta, t_params });
                 // one recorded window of 2+ rows: gdn_pre logged its tails, conv_commit would only return
@@ -82,9 +88,9 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 if (conv_in_chain) {
                     try @import("cuda_prompt.zig").deltaConv(e, di, total, m);
                     if (commit) try e.runAfter(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
-                } else if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else try e.deltaScan(record, shape.slots, nseg, layer);
+                } else if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else if (fused_post) try e.leanScanPost(shape.slots, nseg, layer, m.norm, sums) else try e.deltaScan(record, shape.slots, nseg, layer);
                 // a prompt chunk: eight rows a warp, their loads in flight together (TF_PROMPT_ILP=0: a row a warp)
-                if (prompt and total > 16 and promptIlpOn())
+                if (fused_post) {} else if (prompt and total > 16 and promptIlpOn())
                     try e.runAfter(e.fns.gdn_post_ilp, .{ 1, g.v_heads, (total + 31) / 32 }, .{ 32, 4, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums })
                 else
                     try e.runAfter(e.fns.gdn_post, .{ 1, g.v_heads, post_blocks }, .{ 32, post_rows, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums });
@@ -129,7 +135,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     } else {
                         // a 2..64-row window: row pairs share each chunk's stream-key tiles (attn_pair, the same bits);
                         // TF_ATTN_PAIR=0 keeps attn_partial's block a row
-                        if (record and total >= 2 and 2 * group <= 16 and pairOn())
+                        if (record and total >= 2 and 2 * group <= 16 and pair_mode)
                             try sharedSized(e, e.fns.attn_pair, sig.attn_pair, .{ (total + 1) / 2, partial_chunks, g.kv_heads }, 128, attn_tile, args)
                         else
                             try sharedSized(e, e.fns.attn_partial, sig.attn_partial, .{ total, partial_chunks, g.kv_heads }, 128, attn_tile, args);
@@ -177,7 +183,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     try e.runAfter(e.fns.mlp_act, .{ (total * g.intermediate + 1023) / 1024, 1, 1 }, .{ 256, 1, 1 }, .{ e.gate, e.up, e.act, n, t_params, @as(c_int, @intCast(g.intermediate)), sums });
                     try e.projAgain(m.down, e.act, e.r, total, prompt);
                 }
-                if (e.mlp) |k| try k.f(k.ctx, i, e.x, e.r, total, e.taught) else try e.pockets.add(e.stream, i, e.x, e.r, total, e.taught);
+                if (e.mlp) |k| try k.f(k.ctx, i, e.x, e.r, total, e.taught) else if (pockets_live) try e.pockets.add(e.stream, i, e.x, e.r, total, e.taught);
             },
             .moe => |m| try e.routedRows(m.router, m.experts, e.x, e.r, total, promptMoe(prompt, total), t_params),
         }
