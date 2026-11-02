@@ -79,12 +79,16 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 // one recorded window of 2+ rows: gdn_pre logged its tails, conv_commit would only return
                 const commit = !(record and nseg == 1 and total > 1);
                 if (commit and !conv_in_chain) try e.runAfter(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
+                // the chain's dependent gdn_post (gdn_post_ilp's rows and bits) takes each row as both of its head's
+                // chain blocks publish it, during the chain (TF_POST_FOLLOW=0: gdn_post after the chain)
+                const follow = conv_in_chain and total > 16 and promptIlpOn() and postFollowOn();
                 if (conv_in_chain) {
-                    try @import("cuda_prompt.zig").deltaConv(e, di, total, m);
+                    try @import("cuda_prompt.zig").deltaConv(e, di, total, m, if (follow) e.chain_flags else 0);
+                    if (follow) try e.runAfter(e.fns.gdn_post_follow, .{ follow_blocks, 1, 1 }, .{ 32, 4, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums, e.chain_flags, @as(c_int, @intCast(total)) });
                     if (commit) try e.runAfter(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
                 } else if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else try e.deltaScan(record, shape.slots, nseg, layer);
                 // a prompt chunk: eight rows a warp, their loads in flight together (TF_PROMPT_ILP=0: a row a warp)
-                if (prompt and total > 16 and promptIlpOn())
+                if (follow) {} else if (prompt and total > 16 and promptIlpOn())
                     try e.runAfter(e.fns.gdn_post_ilp, .{ 1, g.v_heads, (total + 31) / 32 }, .{ 32, 4, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums })
                 else
                     try e.runAfter(e.fns.gdn_post, .{ 1, g.v_heads, post_blocks }, .{ 32, post_rows, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums });
@@ -190,33 +194,53 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     try finish(e, total, heads, shape.hidden, if (@hasField(@TypeOf(shape), "amax")) shape.amax else false);
 }
 
+/// Process-constant switches, read once. `body` asks these per layer, on the host, between the launches of the timed
+/// stream: each ask re-scanned `environ` twice a layer a forward, and a run's environment cannot change.
+var chain_conv_on: ?bool = null;
+var post_follow_on: ?bool = null;
+var prompt_ilp_on: ?bool = null;
+var post_rows2_on: ?bool = null;
+var rows4_on: ?bool = null;
+var attn_pair_on: ?bool = null;
+
+fn switchOn(cached: *?bool, name: [*:0]const u8) bool {
+    if (cached.*) |on| return on;
+    const v = @import("sys").c.getenv(name) orelse return true;
+    const on = !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
+    cached.* = on;
+    return on;
+}
+
 /// TF_CHAIN_CONV=0: a prompt chunk's gdn_pre keeps the value heads and the chain reads its v, g and beta.
 fn chainConvOn() bool {
-    const v = @import("sys").c.getenv("TF_CHAIN_CONV") orelse return true;
-    return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
+    return switchOn(&chain_conv_on, "TF_CHAIN_CONV");
+}
+
+/// gdn_post_follow's persistent blocks of four row warps beside the chain (GB10: one an SM).
+const follow_blocks = 48;
+
+/// TF_POST_FOLLOW=0: a prompt chunk's gdn_post runs after its chain instead of following it.
+fn postFollowOn() bool {
+    return switchOn(&post_follow_on, "TF_POST_FOLLOW");
 }
 
 /// TF_GDN_ROWS4=0: 16..64-row windows keep one row warp a block in tf_q35_gdn_pre.
 /// TF_PROMPT_ILP=0: a prompt chunk keeps gdn_post's and attn_gate's one-row (one-entry) launches.
 fn promptIlpOn() bool {
-    const v = @import("sys").c.getenv("TF_PROMPT_ILP") orelse return true;
-    return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
+    return switchOn(&prompt_ilp_on, "TF_PROMPT_ILP");
 }
 
 fn postRows2On() bool {
-    const v = @import("sys").c.getenv("TF_POST_ROWS2") orelse return true;
-    return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
+    return switchOn(&post_rows2_on, "TF_POST_ROWS2");
 }
 
 fn rows4On() bool {
-    const v = @import("sys").c.getenv("TF_GDN_ROWS4") orelse return true;
-    return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
+    return switchOn(&rows4_on, "TF_GDN_ROWS4");
 }
 
 /// TF_ATTN_PAIR=0: 2..64-row windows keep tf_q35_attn_partial (a block a row).
 fn pairOn() bool {
-    const v = @import("sys").c.getenv("TF_ATTN_PAIR") orelse return true;
-    return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
+    return switchOn(&attn_pair_on, "TF_ATTN_PAIR");
 }
 
 /// A launch whose arguments are checked against the kernel's .cu signature: a wrong count or kind does not build.
@@ -248,6 +272,8 @@ fn sharedSized(e: *E.Engine, f: cuda.Function, comptime s: sig.Sig, grid: [3]usi
 /// Layer inputs are already kept; hidden reads need neither the final norm nor the vocabulary head.
 pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool, amax: bool) !void {
     if (hidden) return;
+    // an armed prompt cut (cuda_engine.zig Overlap): the drafter's prompt absorb may start once the last layer is done
+    if (@hasField(@TypeOf(e.*), "overlap")) if (e.overlap.armed) try e.overlapTail();
     const g = e.g;
     if (e.learning == null and heads < total) {
         try e.normTail(e.final_norm, total, heads);
@@ -261,6 +287,8 @@ pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool, amax: bool) 
             // row's best a tile and the merge each row's token (cuda_engine.zig forward then skips its argmax)
             const x = e.x + (total - heads) * g.hidden * 2;
             const toks = e.tables.ptr + @import("cuda_round.zig").tokens_at;
+            // the 2-bit screen and exact rescore (cuda_head3.zig); a failed certificate reruns this head after the readback
+            if (@hasField(@TypeOf(e.*), "head3")) if (e.head3) |*h3| return h3.run(e.stream, x, e.xs, e.head.a4, heads, toks);
             // the 2-bit sieve and the listed column groups exactly (head_sieve.zig); check mode runs the full head too
             if (@hasField(@TypeOf(e.*), "sieve")) if (e.sieve) |*sv| {
                 if (sv.mode == .check) try e.affine.headArgmax(e.stream, x, e.xs, e.head.a4, e.head_amax, heads, toks);
