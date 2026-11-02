@@ -40,7 +40,7 @@ fn size(p: layers.Proj) usize {
 /// (TF_ATTN_COPIES_POOLED=1: those too).
 fn pooled(layer: *const layers.Layer, index: usize) bool {
     if (layer.mixer != .attention or index < 2) return true;
-    const v = @import("sys").c.getenv("TF_ATTN_COPIES_POOLED") orelse return false;
+    const v = @import("sys").c.getenv("TF_ATTN_COPIES_POOLED") orelse return true;
     return @import("std").mem.eql(u8, @import("std").mem.span(v), "1");
 }
 
