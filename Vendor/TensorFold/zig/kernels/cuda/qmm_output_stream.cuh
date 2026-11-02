@@ -2,6 +2,7 @@
 #pragma once
 #include "qmm_frag.cuh"
 #include "qmm_dict.cuh"
+#include "qmm_bulk.cuh"
 namespace tf_qmm_output_stream {
 using namespace qmm_frag;
 constexpr int Stage=4416, SliceBytes=Stage*2, Bytes=SliceBytes*4, OUT_PAIR_SMEM=14336;
@@ -31,11 +32,33 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
     if constexpr(DICT){D=qmm_dict::dict_lanes<64,4>(p,n0,KG,tid);qmm_dict::dict_room(D,p,OUT_PAIR_SMEM);}
     unsigned char* dec=buf+Bytes;
     unsigned char* table=buf+Bytes;
+#if __CUDA_ARCH__ >= 1200
+    __shared__ __align__(8) uint64_t bulk_barriers[Slices][2];
+    if(tid==0){
+        qmm_bulk::init(&bulk_barriers[slice][0]);
+        qmm_bulk::init(&bulk_barriers[slice][1]);
+        qmm_bulk::publish();
+    }
+    __syncthreads();
+#endif
     auto load_w=[&](int it){
         auto* dst=stage(it);const int g=g0+it;
+#if __CUDA_ARCH__ >= 1200
+        if(tid==0){
+            auto* bar=&bulk_barriers[slice][it&1];
+            qmm_bulk::expect(bar,2304); // 2048 weight bytes and the exact native 256-byte metadata window
+            qmm_bulk::copy(dst+2048,weight(g),2048,bar);
+            if constexpr(DICT) qmm_bulk::copy(dst+4096,D.src+qmm_dict::dict_window(D,g),256,bar);
+            else{
+                qmm_bulk::copy(dst+4096,p.scales+size_t(g)*p.npad+n0,128,bar);
+                qmm_bulk::copy(dst+4224,p.biases+size_t(g)*p.npad+n0,128,bar);
+            }
+        }
+#else
         cp16(dst+2048+tid*16,weight(g)+tid*16);
         if constexpr(DICT){if(D.ok)cp16(dst+4096+tid*16,D.src+qmm_dict::dict_window(D,g));}
         else if(tid<16){const auto* table=tid<8?p.scales:p.biases;cp16(dst+4096+tid*16,table+size_t(g)*p.npad+n0+(tid%8)*8);}
+#endif
     };
     auto load_x=[&](int it){
         auto* dst=stage(it);const int row=tid/8,ch=tid%8,g=g0+it;
@@ -75,7 +98,11 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
             asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(b) : "memory");
         }
 #endif
-        wait<0>();__syncthreads();
+        wait<0>();
+#if __CUDA_ARCH__ >= 1200
+        if(tid==0) qmm_bulk::wait(&bulk_barriers[slice][it&1],(it/2)&1);
+#endif
+        __syncthreads();
         if(it+1<per){load_w(it+1);load_x(it+1);}commit();
         const auto* at=stage(it);const auto* wp=reinterpret_cast<const uint32_t*>(at+2048);
         // the lane's scale or bias, fetched now and stored after the MMAs (a global pair table's latency)
@@ -115,7 +142,14 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
             for(int e=0;e<4;++e)acc[j][e]=__fmaf_rn(xv[e>>1],bv[e&1],__fmaf_rn(d[j][e],sv[e&1],acc[j][e]));
         }
     }
-    wait<0>();__syncthreads();auto* partial=reinterpret_cast<float*>(buf);
+    wait<0>();
+#if __CUDA_ARCH__ >= 1200
+    if(tid==0){
+        qmm_bulk::invalidate(&bulk_barriers[slice][0]);
+        qmm_bulk::invalidate(&bulk_barriers[slice][1]);
+    }
+#endif
+    __syncthreads();auto* partial=reinterpret_cast<float*>(buf);
     if(slice!=0){
 #pragma unroll
         for(int j=0;j<2;++j)

@@ -1,6 +1,7 @@
 // Native grouped-input MMA and slice order, with one wider word-only K-major stream per CTA.
 #pragma once
 #include "qmm_dict.cuh"
+#include "qmm_bulk.cuh"
 namespace tf_qmm_gdn_stream {
 using namespace tf_qmm_group;
 template<int GS,int BN,int STAGES>using GemvTile=qmm_frag::LaneTile<GS,16,BN,1,4,STAGES>;
@@ -25,6 +26,7 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
 #pragma unroll
         for (int s = 0; s < STAGES; ++s)
             asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" :: "r"(smem(&weight_barriers[s])) : "memory");
+    if (tid == 0) qmm_bulk::publish();
     __syncthreads();
 #endif
     const int KG = K / GS;
@@ -80,16 +82,28 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
             const uint32_t barrier = smem(&weight_barriers[s]);
             const auto* src = wb + static_cast<size_t>(g) * (npad / 64) * TILE_BYTES;
             asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;\n"
-                         :: "r"(barrier), "n"(T::W) : "memory");
+                         :: "r"(barrier), "n"(T::W + 2 * T::S) : "memory");
             asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
             asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
                          :: "r"(smem(p + T::X)), "l"(src), "n"(T::W), "r"(barrier) : "memory");
+            auto* bar = &weight_barriers[s];
+            if constexpr (DICT) {
+                const int step = qmm_dict::dict_step(P.npad);
+                const size_t window = static_cast<size_t>(g) * step & ~static_cast<size_t>(63);
+#pragma unroll
+                for (int t = 0; t < BN / 64; ++t)
+                    qmm_bulk::copy(p + T::X + T::W + t * 256,
+                        reinterpret_cast<const unsigned char*>(P.scales) +
+                        static_cast<size_t>(n0 / 64 + t) * KG * step + window, 256, bar);
+            } else {
+                qmm_bulk::copy(p + T::X + T::W, P.scales + n0 + static_cast<size_t>(g) * P.npad, T::S, bar);
+                qmm_bulk::copy(p + T::X + T::W + T::S, P.biases + n0 + static_cast<size_t>(g) * P.npad, T::S, bar);
+            }
         }
 #else
 #pragma unroll
         for (int j = 0; j < WC; ++j)
             if (wok[j]) cp16(p + wdst[j], wb + woff[j] + static_cast<size_t>(g) * (npad/64) * TILE_BYTES);
-#endif
         if constexpr (DICT) {
             // the CTA's tiles' index windows: tile n0 / 64 + c / 16, chunk c % 16, from each group's 64-byte line
             const int step = qmm_dict::dict_step(P.npad);
@@ -102,6 +116,7 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
         for (int j = 0; j < SC; ++j)
             if (sok[j]) cp16(p + sdst[j], (sbias[j] ? P.biases : P.scales) + n0 + soff[j] + static_cast<size_t>(g) * P.npad);
         }
+#endif
     };
     unsigned char* dec = buf + T::SMEM;  // DICT: BN decoded scales, BN biases, then the part's table
     unsigned char* table = dec + 4 * BN;

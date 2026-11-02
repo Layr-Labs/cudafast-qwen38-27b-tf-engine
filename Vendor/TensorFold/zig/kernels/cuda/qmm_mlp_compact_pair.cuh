@@ -1,5 +1,6 @@
 #pragma once
 #include "qmm_mlp_single_dict.cuh"
+#include "qmm_bulk.cuh"
 namespace tf_qmm_mlp_single {
 __device__ __forceinline__ uint32_t compact_load_a(const __nv_bfloat16* p) {
     uint32_t word;
@@ -70,12 +71,39 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
         if (xsok) cp4(stage(s) + T::W + 2 * T::S + tid * 4, xssrc + g);
         cp16(stage(s) + xtdst, xtsrc + g * GS);
     };
+#if __CUDA_ARCH__ >= 1200
+    __shared__ __align__(8) uint64_t bulk_barriers[STAGES];
+    if (tid == 0) {
+#pragma unroll
+        for (int s = 0; s < STAGES; ++s) qmm_bulk::init(&bulk_barriers[s]);
+        qmm_bulk::publish();
+    }
+    __syncthreads();
+#endif
     auto load_w = [&](int s, int g) {
         unsigned char* p = stage(s);
+#if __CUDA_ARCH__ >= 1200
+        if (tid == 0) {
+            auto* bar = &bulk_barriers[s];
+            qmm_bulk::expect(bar, T::W + 16 * (run0 + run1));
+#pragma unroll
+            for (int q = 0; q < 2; ++q) {
+                // Two adjacent native 2 KB tiles per projection, with unchanged K-major pitch.
+                const auto& part = parts.p[q];
+                const size_t panel = (static_cast<size_t>(g) * (part.npad / 64) + n0 / 64) * TILE_BYTES;
+                qmm_bulk::copy(p + q * (T::W / 2), reinterpret_cast<const unsigned char*>(part.w) + panel, T::W / 2, bar);
+                const int run = q ? run1 : run0, step = dict_step(q ? code1 : code0);
+                const auto* indices = reinterpret_cast<const unsigned char*>(part.scales) +
+                    (static_cast<size_t>(g) * (part.npad / 64) + n0 / 64) * step;
+                if (run != 0) qmm_bulk::copy(p + T::W + (q ? 16 * run0 : 0), indices, 16 * run, bar);
+            }
+        }
+#else
 #pragma unroll
         for (int j = 0; j < WC; ++j)
             if (wok[j]) cp16(p + wdst[j], wsrc[j] + static_cast<size_t>(g) * (KMAJOR ? P.npad / 64 : 1) * TILE_BYTES);
         if (dok) cp16(p + ddst, dsrc + static_cast<size_t>(g) * dpitch);
+#endif
     };
     uint32_t mask;
     asm volatile("mov.b32 %0, 0x000F000F;\n" : "=r"(mask));
@@ -104,6 +132,9 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     grid_launch();
     for (int it = 0; it < per; ++it) {
         wait<0>();
+#if __CUDA_ARCH__ >= 1200
+        if (tid == 0) qmm_bulk::wait(&bulk_barriers[it % STAGES], (it / STAGES) & 1);
+#endif
         __syncthreads();
         uint32_t av[GS / 16][I][4];
         {
@@ -186,6 +217,12 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
         }
     }
     wait<0>();
+#if __CUDA_ARCH__ >= 1200
+    if (tid == 0) {
+#pragma unroll
+        for (int s = 0; s < STAGES; ++s) qmm_bulk::invalidate(&bulk_barriers[s]);
+    }
+#endif
     __nv_bfloat16* own = reinterpret_cast<__nv_bfloat16*>(buf);
     __syncthreads();
 #pragma unroll
