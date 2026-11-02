@@ -20,8 +20,8 @@ pub const symbol_single_dict = "tf_qmm_mlp_single16_dict";
 pub const smem: u32 = qlinear.group_smem + 16 * 64 * 2;
 pub const kmajor_smem: u32 = 13440 + 16 * 128 * 2;
 pub const single_smem: u32 = 41088;
-/// Pair-only half panel: two weight/index/sum/input-tile stages (the input fragments read from the staged tile).
-pub const compact_pair_smem: u32 = 21632;
+/// Pair-only half panel: two weight/index/sum stages, direct input fragments.
+pub const compact_pair_smem: u32 = 17536;
 /// tf_qmm_mlp_single32: two stages of 32 input rows, four 2 KB weight tiles, 256 scales and biases, 32 sums.
 pub const single32_smem: u32 = 2 * (32 * 128 + 256 * 32 + 2 * 256 * 2 + 32 * 4);
 /// tf_qmm_mlp_single16_dict past single_smem: four warps' decoded values, then gate's and up's tables.
@@ -39,6 +39,7 @@ pub const Kernels = struct {
     single32_dict_fn: ?Function = null, // tf_qmm_mlp_single32_dict: dictionary-coded twin on the K-major panels
     dict_fn: ?Function = null, // GB10: tf_qmm_mlp_pair's twin, taken when gate and up are both coded (tile-major)
     compact_pair_fn: ?Function = null,
+    compact_tma_fn: ?Function = null, // the compact pair with its weight tiles by bulk copy (TF_MLP_TMA=0: cp.async)
     single_dict_fn: ?Function = null, // tf_qmm_mlp_single16's, when both are coded on the K-major panel's layout
 
     /// From the loaded qmm_group module; `pdl` as the decode tiles' launches (GB10).
@@ -55,9 +56,17 @@ pub const Kernels = struct {
             k.single_dict_fn = fs;
             const fc = try group_mod.function("tf_qmm_mlp_single16_compact_pair");
             try fc.allowDynamicShared(compact_pair_smem);
-            // three CTAs an SM need the 100 KiB carveout on GB10 (3 x 21632 bytes and their reserve exceed 64 KiB)
-            try fc.setAttribute(.preferred_shared_memory_carveout, 100);
+            // 50% rounds upward to the 64 KiB carveout on GB10. This is a hint,
+            // allowing the driver to avoid disruptive per-node reconfiguration.
+            try fc.setAttribute(.preferred_shared_memory_carveout, 50);
             k.compact_pair_fn = fc;
+            if (!tmaOff()) {
+                if (group_mod.function("tf_qmm_mlp_single16_compact_pair_tma")) |ft| {
+                    try ft.allowDynamicShared(compact_pair_smem);
+                    try ft.setAttribute(.preferred_shared_memory_carveout, 100);
+                    k.compact_tma_fn = ft;
+                } else |_| {}
+            }
         }
         return k;
     }
@@ -147,8 +156,14 @@ pub const Kernels = struct {
         g.add(act);
         g.add(as);
         for ([_]usize{ rows, gate.k, gate.k, rows_t }) |v| g.add(@as(c_int, @intCast(v)));
-        const f = if (compact) kk.compact_pair_fn.? else if (sdict) kk.single_dict_fn.? else if (major) kk.kmajor_fn.? else if (dict) kk.dict_fn.? else kk.pair_fn;
+        const f = if (compact and kk.compact_tma_fn != null) kk.compact_tma_fn.? else if (compact) kk.compact_pair_fn.? else if (sdict) kk.single_dict_fn.? else if (major) kk.kmajor_fn.? else if (dict) kk.dict_fn.? else kk.pair_fn;
         const shared: u32 = if (compact) compact_pair_smem else if (sdict) single_smem + single_dict_dec + singleTab(gate) + singleTab(up) else if (single) single_smem else if (major) kmajor_smem else if (dict) smem + qlinear.dict_dec + @max(gate.tabBytes(), up.tabBytes()) else smem;
         try launch_.launch(f, .{ .grid = .{ .x = @intCast(@as(usize, if (single) 1 else 2) * rows_t * tiles) }, .block = .{ .x = 128 }, .shared = shared, .cluster = if (single) null else .{ .x = 2 }, .pdl = kk.pdl }, s, &g);
     }
 };
+
+/// TF_MLP_TMA=0: the compact pair's weight tiles by the lanes' cp.async (the record's kernel).
+fn tmaOff() bool {
+    const v = std.c.getenv("TF_MLP_TMA") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "0");
+}

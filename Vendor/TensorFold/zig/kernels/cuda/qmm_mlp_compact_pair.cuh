@@ -7,19 +7,18 @@ __device__ __forceinline__ uint32_t compact_load_a(const __nv_bfloat16* p) {
     return word;
 }
 
-template <int STAGES = 2, int BN = 256, bool KMAJOR = true>
+template <int STAGES = 2, int BN = 256, bool KMAJOR = true, bool BULK = false>
 __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
                                               const Parts& parts, __nv_bfloat16* __restrict__ act,
                                               float* __restrict__ as, int M, int K, int ldx, int rows_t) {
     constexpr int GS = 64, BM = 16, WM = 1, WN = 4;
     using Base = LaneTile<GS, BM, BN, WM, WN, STAGES>;
     struct T : Base {
-        // XT: the group's x tile (BM rows of 64 bf16), staged with the weights
-        enum { X = 0, W = BN * GS / 2, S = 256, XT = W + 2 * S + BM * 4, STAGE = XT + BM * GS * 2,
+        enum { X = 0, W = BN * GS / 2, S = 256, STAGE = W + 2 * S + BM * 4,
                SMEM = STAGES * STAGE };
     };
     constexpr int PASSES = BN / WN / 32;
-    static_assert(T::SMEM == 21632, "compact pair pipeline footprint");
+    static_assert(T::SMEM == 17536, "compact pair pipeline footprint");
     constexpr int I = T::MT, J = T::NT;
     extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -55,23 +54,63 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
                                 static_cast<size_t>(n0 / 64) * dstep + dchunk * 16;
     const int dpitch = P.npad / 64 * dstep;
     const int ddst = T::X + T::W + (dpart ? 16 * run0 : 0) + dchunk * 16;
+#if __CUDA_ARCH__ >= 1200
+    // BULK: a stage's four contiguous 2 KB weight tiles land by four 1D bulk copies that thread 0 issues, completing on
+    // the stage's mbarrier, instead of 512 lane cp.async copies across the CTA; the dictionary runs, the input sums and the
+    // swizzled input tile keep their cp.async. The bytes land at the same offsets, so everything after is unchanged.
+    __shared__ __align__(8) uint64_t wbar[BULK ? STAGES : 1];
+    if constexpr (BULK) {
+        if (tid == 0)
+#pragma unroll
+            for (int s = 0; s < STAGES; ++s)
+                asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" :: "r"(smem(&wbar[s])) : "memory");
+        __syncthreads();
+    }
+#endif
     const int mpart = wn / 2, mbits = mpart ? bits1 : bits0;
     const uint32_t mmask = (1u << mbits) - 1u;
     const int mrun = mpart ? 16 * run0 : 0;
     const uint32_t* const mgtab = reinterpret_cast<const uint32_t*>(parts.p[mpart].biases);
     const bool xsok = tid < rows;
     const float* xssrc = xs + static_cast<size_t>(m0 + min(tid, rows - 1)) * KG;
-    // x's 16 rows of the group: 16-byte chunk ch of row r at slot ch ^ (r & 7) (rows past M repeat the last one: their
-    // products are never stored); the fragments below read the same bf16 words the x rows hold
-    const int xr = tid >> 3, xch = tid & 7;
-    const __nv_bfloat16* xtsrc = x + static_cast<size_t>(m0 + min(xr, rows - 1)) * ldx + xch * 8;
-    const int xtdst = T::XT + xr * 128 + ((xch ^ (xr & 7)) * 16);
     auto load_x = [&](int s, int g) {
         if (xsok) cp4(stage(s) + T::W + 2 * T::S + tid * 4, xssrc + g);
-        cp16(stage(s) + xtdst, xtsrc + g * GS);
     };
     auto load_w = [&](int s, int g) {
         unsigned char* p = stage(s);
+#if __CUDA_ARCH__ >= 1200
+        if constexpr (BULK) {
+            if (tid == 0) {
+                const uint32_t bar = smem(&wbar[s]);
+                asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;\n"
+                             :: "r"(bar), "r"(static_cast<uint32_t>(T::W + 16 * (run0 + run1))) : "memory");
+                asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                const size_t wstep = static_cast<size_t>(g) * (P.npad / 64) * TILE_BYTES;
+#pragma unroll
+                for (int t = 0; t < BN / 64; ++t) {
+                    const unsigned char* src = reinterpret_cast<const unsigned char*>(parts.p[t / (BN / 128)].w) +
+                                               static_cast<size_t>(n0 / 64 + t % (BN / 128)) * TILE_BYTES + wstep;
+                    asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
+                                 :: "r"(smem(p + T::X + t * TILE_BYTES)), "l"(src), "r"(static_cast<uint32_t>(TILE_BYTES)), "r"(bar) : "memory");
+                }
+            }
+            // the gate and up dictionary index runs (16 * run bytes each, contiguous) on the same barrier
+            if (tid == 0) {
+                const uint32_t bar = smem(&wbar[s]);
+#pragma unroll
+                for (int q = 0; q < 2; ++q) {
+                    const int run = q ? run1 : run0, code = q ? code1 : code0;
+                    if (run == 0) continue;
+                    const int step = dict_step(code);
+                    const unsigned char* src = reinterpret_cast<const unsigned char*>(parts.p[q].scales) +
+                                               static_cast<size_t>(n0 / 64) * step + static_cast<size_t>(g) * (P.npad / 64 * step);
+                    asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
+                                 :: "r"(smem(p + T::X + T::W + (q ? 16 * run0 : 0))), "l"(src), "r"(static_cast<uint32_t>(16 * run)), "r"(bar) : "memory");
+                }
+            }
+            return;
+        }
+#endif
 #pragma unroll
         for (int j = 0; j < WC; ++j)
             if (wok[j]) cp16(p + wdst[j], wsrc[j] + static_cast<size_t>(g) * (KMAJOR ? P.npad / 64 : 1) * TILE_BYTES);
@@ -104,25 +143,19 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     grid_launch();
     for (int it = 0; it < per; ++it) {
         wait<0>();
-        __syncthreads();
-        uint32_t av[GS / 16][I][4];
-        {
-            const unsigned char* xt = stage(it % STAGES) + T::XT;
-            const int b = (2 * (lane & 3)) * 2;
-#pragma unroll
-            for (int kt = 0; kt < GS / 16; ++kt)
-#pragma unroll
-                for (int i = 0; i < I; ++i) {
-                    const int r = wm * (BM / WM) + i * 16 + (lane >> 2);
-                    auto at = [&](int row, int ch) {
-                        return *reinterpret_cast<const uint32_t*>(xt + row * 128 + ((ch ^ (row & 7)) * 16) + b);
-                    };
-                    av[kt][i][0] = at(r, 2 * kt);
-                    av[kt][i][1] = at(r + 8, 2 * kt);
-                    av[kt][i][2] = at(r, 2 * kt + 1);
-                    av[kt][i][3] = at(r + 8, 2 * kt + 1);
-                }
+#if __CUDA_ARCH__ >= 1200
+        if constexpr (BULK) {
+            if (tid == 0) {
+                const uint32_t bar = smem(&wbar[it % STAGES]), phase = (it / STAGES) & 1;
+                asm volatile("{ .reg .pred ready;\n"
+                             "compact_wait_w:\n"
+                             "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 ready, [%0], %1;\n"
+                             "@!ready bra compact_wait_w;\n"
+                             "}\n" :: "r"(bar), "r"(phase) : "memory");
+            }
         }
+#endif
+        __syncthreads();
         const int next = it + 1;
         if (next < per) { load_x(next % STAGES, next); load_w(next % STAGES, next); }
         commit();
@@ -143,6 +176,20 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
         for (int j = 0; j < T::NT; ++j)
 #pragma unroll
             for (int v = 0; v < GS / 32; ++v) words[j][v] = pw[((wn * T::NT + j) * 32 + lane) * (GS / 32) + v];
+        uint32_t av[GS / 16][I][4];
+#pragma unroll
+        for (int kt = 0; kt < GS / 16; ++kt)
+#pragma unroll
+            for (int i = 0; i < I; ++i) {
+                const int r = wm * (BM / WM) + i * 16 + (lane >> 2);
+                const int c = it * GS + kt * 16 + 2 * (lane & 3);
+                const __nv_bfloat16* a0 = x_ready + static_cast<size_t>(m0 + r) * ldx + c;
+                const __nv_bfloat16* a1 = a0 + 8 * ldx;
+                av[kt][i][0] = compact_load_a(a0);
+                av[kt][i][1] = compact_load_a(a1);
+                av[kt][i][2] = compact_load_a(a0 + 8);
+                av[kt][i][3] = compact_load_a(a1 + 8);
+            }
         float xv[I][2];
 #pragma unroll
         for (int i = 0; i < I; ++i) {
@@ -234,4 +281,10 @@ extern "C" __global__ void __launch_bounds__(128, 3) tf_qmm_mlp_single16_compact
  const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,
  __nv_bfloat16* act,float* sums,int M,int K,int ldx,int rows_t) {
  tf_qmm_mlp_single::mlp_single_compact_body<>(x,xs,parts,act,sums,M,K,ldx,rows_t);
+}
+// The compact pair with its weight tiles by bulk copy (mlp_single_compact_body<2, 256, true, true>); same bits.
+extern "C" __global__ void __launch_bounds__(128, 3) tf_qmm_mlp_single16_compact_pair_tma(
+ const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,
+ __nv_bfloat16* act,float* sums,int M,int K,int ldx,int rows_t) {
+ tf_qmm_mlp_single::mlp_single_compact_body<2, 256, true, true>(x,xs,parts,act,sums,M,K,ldx,rows_t);
 }
