@@ -13,7 +13,7 @@ pub const attn_tiles = 4 * 32 * 512;
 /// tf_q35_attn_partial's one key and value tile (Bf16Tiles1), and the chunk blocks it launches a (row, key head):
 /// each takes every partial_chunks-th of the MAXCH chunks, so a short stream's rows dispatch no idle blocks.
 const attn_tile = attn_tiles / 2;
-const partial_chunks = 12;
+const partial_chunks = 16;
 /// qwen35_attn_tc.cuh's GROUP_LEN: a stream at least this long has its rows on tf_q35_attn_rows.
 pub const group_len = 8192;
 const ids_at = E.Engine.ids_at;
@@ -79,12 +79,16 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 // one recorded window of 2+ rows: gdn_pre logged its tails, conv_commit would only return
                 const commit = !(record and nseg == 1 and total > 1);
                 if (commit and !conv_in_chain) try e.runAfter(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
+                // the chain's dependent gdn_post (gdn_post_ilp's rows and bits) takes each row as both of its head's
+                // chain blocks publish it, during the chain (TF_POST_FOLLOW=0: gdn_post after the chain)
+                const follow = conv_in_chain and total > 16 and promptIlpOn() and postFollowOn();
                 if (conv_in_chain) {
-                    try @import("cuda_prompt.zig").deltaConv(e, di, total, m);
+                    try @import("cuda_prompt.zig").deltaConv(e, di, total, m, if (follow) e.chain_flags else 0);
+                    if (follow) try e.runAfter(e.fns.gdn_post_follow, .{ follow_blocks, 1, 1 }, .{ 32, 4, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums, e.chain_flags, @as(c_int, @intCast(total)) });
                     if (commit) try e.runAfter(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
                 } else if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else try e.deltaScan(record, shape.slots, nseg, layer);
                 // a prompt chunk: eight rows a warp, their loads in flight together (TF_PROMPT_ILP=0: a row a warp)
-                if (prompt and total > 16 and promptIlpOn())
+                if (follow) {} else if (prompt and total > 16 and promptIlpOn())
                     try e.runAfter(e.fns.gdn_post_ilp, .{ 1, g.v_heads, (total + 31) / 32 }, .{ 32, 4, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums })
                 else
                     try e.runAfter(e.fns.gdn_post, .{ 1, g.v_heads, post_blocks }, .{ 32, post_rows, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums });
@@ -196,6 +200,15 @@ fn chainConvOn() bool {
     return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
 }
 
+/// gdn_post_follow's persistent blocks of four row warps beside the chain (GB10: one an SM).
+const follow_blocks = 48;
+
+/// TF_POST_FOLLOW=0: a prompt chunk's gdn_post runs after its chain instead of following it.
+fn postFollowOn() bool {
+    const v = @import("sys").c.getenv("TF_POST_FOLLOW") orelse return true;
+    return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
+}
+
 /// TF_GDN_ROWS4=0: 16..64-row windows keep one row warp a block in tf_q35_gdn_pre.
 /// TF_PROMPT_ILP=0: a prompt chunk keeps gdn_post's and attn_gate's one-row (one-entry) launches.
 fn promptIlpOn() bool {
@@ -248,6 +261,8 @@ fn sharedSized(e: *E.Engine, f: cuda.Function, comptime s: sig.Sig, grid: [3]usi
 /// Layer inputs are already kept; hidden reads need neither the final norm nor the vocabulary head.
 pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool, amax: bool) !void {
     if (hidden) return;
+    // an armed prompt cut (cuda_engine.zig Overlap): the drafter's prompt absorb may start once the last layer is done
+    if (@hasField(@TypeOf(e.*), "overlap")) if (e.overlap.armed) try e.overlapTail();
     const g = e.g;
     if (e.learning == null and heads < total) {
         try e.normTail(e.final_norm, total, heads);
@@ -261,6 +276,8 @@ pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool, amax: bool) 
             // row's best a tile and the merge each row's token (cuda_engine.zig forward then skips its argmax)
             const x = e.x + (total - heads) * g.hidden * 2;
             const toks = e.tables.ptr + @import("cuda_round.zig").tokens_at;
+            // the 2-bit screen and exact rescore (cuda_head3.zig); a failed certificate reruns this head after the readback
+            if (@hasField(@TypeOf(e.*), "head3")) if (e.head3) |*h3| return h3.run(e.stream, x, e.xs, e.head.a4, heads, toks);
             // the 2-bit sieve and the listed column groups exactly (head_sieve.zig); check mode runs the full head too
             if (@hasField(@TypeOf(e.*), "sieve")) if (e.sieve) |*sv| {
                 if (sv.mode == .check) try e.affine.headArgmax(e.stream, x, e.xs, e.head.a4, e.head_amax, heads, toks);
