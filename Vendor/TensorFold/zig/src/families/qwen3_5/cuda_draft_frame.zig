@@ -145,8 +145,11 @@ fn body(d: anytype, n: usize, narrow_: bool) !?u64 {
     }
     try d.norm(masked, d.w.final_norm, d.x, rows);
     const spanned = if (narrow_) try head(d, rows) else try full(d, rows);
-    if (spanned != null and d.head2 != null)
-        try topkScreened(d, spanned.?, rows)
+    // the screen's tiles hold 16 rows: wider frames (several streams) keep the span head (head() agrees)
+    if (spanned != null and d.head2 != null and rows <= 16)
+        try topkScreened(d, spanned.?, rows, span_width, head2_first, head2_cap, head2K())
+    else if (spanned == null and wideScreened(d, rows))
+        try topkScreened(d, d.logits, rows, head2_all, head2_all, head2_all_cap, head2_all_cap)
     else
         try e.draws.topkRows(e.stream, spanned orelse d.logits, if (spanned != null) span_width else c.vocab, @intCast(c.topk), d.parts, d.words, rows);
     try d.projAgain(d.w.selector, d.x, d.hp, rows);
@@ -181,7 +184,6 @@ fn run(d: anytype, n: usize, narrow_: bool) !?u64 {
     if (exec) |x| try x.launchOn(e.stream) else _ = try body(d, n, narrow_);
     return spanned;
 }
-
 
 pub fn forward(d: anytype, items: []const dr.Hold, contexts: []const *draft.Ctx) !void {
     const c = d.c;
@@ -245,9 +247,10 @@ fn head(d: anytype, rows: usize) !?u64 {
     const b = a + rows * first.n * 2;
     const out = b + rows * tail.n * 2;
     const skip = spans[1][0] - tail_tile;
-    if (d.head2) |h2| {
+    if (d.head2 != null and rows <= 16) {
+        const h2 = d.head2.?;
         // the first span's columns screened straight into the packed rows; the tail exact, as below
-        try screen(d, h2, rows, out);
+        try screen(d, h2, rows, out, head2_tiles, span_width);
         try e.project(layers.Proj{ .a4 = tail }, d.x, d.xs, b, rows, false, 0, false);
         const m: cuda.abi.Memcpy2D = .{ .src = b + skip * 2, .src_pitch = tail.n * 2, .dst = out + first.n * 2, .dst_pitch = span_width * 2, .width = (tail.n - skip) * 2, .height = rows };
         try e.d.check(e.d.api.cuMemcpy2DAsync_v2(&m, e.stream.handle), "cuMemcpy2DAsync");
@@ -263,11 +266,22 @@ fn head(d: anytype, rows: usize) !?u64 {
     for (&copies) |*m| try e.d.check(e.d.api.cuMemcpy2DAsync_v2(m, e.stream.handle), "cuMemcpy2DAsync");
     return out;
 }
-
-/// The rows' draft logits over the whole vocabulary, in d.logits (over the final norm's d.x and d.xs, as head's).
+/// The rows' draft logits over the whole vocabulary, in d.logits (over the final norm's d.x and d.xs, as head's). With
+/// the 2-bit screen packed, every column is screened (half the 4-bit head's bytes) and topkScreened rescores each row's
+/// best screened columns exactly, as the span head does for its first span.
 fn full(d: anytype, rows: usize) !?u64 {
+    if (wideScreened(d, rows)) {
+        try screen(d, d.head2.?, rows, d.logits, head2_all_tiles, head2_all);
+        return null;
+    }
     try d.e.project(d.e.head, d.x, d.xs, d.logits, rows, false, 0, false);
     return null;
+}
+
+/// Whether a wide frame's head is the whole-vocabulary screen (the screen's pack covers every head row, and its tiles
+/// hold 16 rows: a frame of more streams keeps the exact projection and topkRows).
+fn wideScreened(d: anytype, rows: usize) bool {
+    return d.head2 != null and rows <= 16 and d.c.vocab == head2_all;
 }
 
 /// The span head's 2-bit screen (qwen35_head2.cuh): the first span's 98,304 head rows as each 4-bit code's two high bits
@@ -276,11 +290,16 @@ fn full(d: anytype, rows: usize) !?u64 {
 /// whenever their best columns are among the screened candidates. TF_HEAD2=0: the span head as before.
 const head2_first = spans[0][1];
 const head2_tiles = head2_first / 64;
+const head2_all = spans[1][1];
+const head2_all_tiles = head2_all / 64;
 const head2_stages = 8;
 const head2_stage_bytes = 16 * 64 * 2 + 256 * 4 + 64 * 4 + 16 * 4;
 
 /// The candidates a row the merge reads (the parts buffer holds the whole vocabulary's slices at k, 976 a row).
 const head2_cap = 640;
+/// The whole-vocabulary frame's candidates a row: the same buffer's 976 slots, the select's cut at the pool's own end,
+/// so a frame that screens every head row keeps 960 columns to rescore exactly instead of the span head's 512.
+const head2_all_cap = 960;
 
 /// TF_HEAD2_K: the select's target count a row (default 512; 64 .. head2_cap).
 fn head2K() usize {
@@ -304,9 +323,9 @@ pub fn head2Init(d: anytype) !?cuda.DeviceBuffer {
     };
     if (q.n != spans[1][1] or q.k != 5120 or q.npad < q.n or q.code == 0) return null;
     const kg = q.k / 64;
-    const codes_bytes = head2_tiles * kg * 256 * 4;
-    const scales_bytes = head2_tiles * kg * 64 * 4;
-    const sb_bytes = head2_first * kg * 4;
+    const codes_bytes = head2_all_tiles * kg * 256 * 4;
+    const scales_bytes = head2_all_tiles * kg * 64 * 4;
+    const sb_bytes = head2_all * kg * 4;
     var buf = try cuda.DeviceBuffer.alloc(e.d, codes_bytes + scales_bytes + sb_bytes);
     errdefer buf.free();
     var a: cuda.Args = .{};
@@ -314,46 +333,49 @@ pub fn head2Init(d: anytype) !?cuda.DeviceBuffer {
     a.add(@as(c_int, @intCast(q.npad)));
     a.add(@as(c_int, @intCast(kg)));
     for ([_]u64{ buf.ptr, buf.ptr + codes_bytes, buf.ptr + codes_bytes + scales_bytes }) |v| a.add(v);
-    try cuda.launch.launch(d.fns.head2_pack, .{ .grid = .{ .x = @intCast(head2_tiles), .y = @intCast(kg) }, .block = .{ .x = 256 } }, e.stream, &a);
+    try cuda.launch.launch(d.fns.head2_pack, .{ .grid = .{ .x = @intCast(head2_all_tiles), .y = @intCast(kg) }, .block = .{ .x = 256 } }, e.stream, &a);
     try e.stream.synchronize();
     return buf;
 }
 
-/// The screened values of the first span's columns into the packed rows `out` (pitch span_width).
-fn screen(d: anytype, h2: cuda.DeviceBuffer, rows: usize, out: u64) !void {
+/// The screened values of the first `tiles` 64-column tiles into the rows `out` (pitch ldo).
+fn screen(d: anytype, h2: cuda.DeviceBuffer, rows: usize, out: u64, tiles: usize, ldo: usize) !void {
     const e = d.e;
     const kg: usize = 80;
-    const codes_bytes = head2_tiles * kg * 256 * 4;
+    const codes_bytes = head2_all_tiles * kg * 256 * 4;
     var a: cuda.Args = .{};
     for ([_]u64{ d.x, d.xs, h2.ptr, h2.ptr + codes_bytes }) |v| a.add(v);
     a.add(@as(c_int, @intCast(rows)));
     a.add(@as(c_int, @intCast(kg)));
     a.add(out);
-    a.add(@as(c_int, @intCast(span_width)));
-    try cuda.launch.launch(d.fns.head2_screen, .{ .grid = .{ .x = @intCast(head2_tiles) }, .block = .{ .x = 128 }, .shared = head2_stages * head2_stage_bytes }, e.stream, &a);
+    a.add(@as(c_int, @intCast(ldo)));
+    try cuda.launch.launch(d.fns.head2_screen, .{ .grid = .{ .x = @intCast(tiles) }, .block = .{ .x = 128 }, .shared = head2_stages * head2_stage_bytes }, e.stream, &a);
 }
 
 /// topkRows' words over the packed span rows: each row's best `head2K()` columns by their screened values (ties at the
 /// cut while room lasts, at most head2_cap), the first span's among them rescored exactly, then the merge's k best.
-fn topkScreened(d: anytype, logits: u64, rows: usize) !void {
+fn topkScreened(d: anytype, logits: u64, rows: usize, width: usize, first: usize, cap: usize, kth: usize) !void {
     const e = d.e;
     const h2 = d.head2.?;
     const q = e.head.a4;
     const kg: usize = q.k / 64;
     const k: usize = d.c.topk;
-    const n: usize = head2_cap;
+    const n: usize = cap;
     const pv = d.parts;
     const pi = d.parts + rows * n * 4;
+    // the select reads the packed rows sixteen bytes at a time
+    comptime std.debug.assert(width % 8 == 0);
+    if (logits % 16 != 0) return error.BadDraftFrame;
     var a: cuda.Args = .{};
     a.add(logits);
-    a.add(@as(c_int, @intCast(span_width)));
-    a.add(@as(c_int, @intCast(span_width)));
-    a.add(@as(c_int, @intCast(head2K())));
+    a.add(@as(c_int, @intCast(width)));
+    a.add(@as(c_int, @intCast(width)));
+    a.add(@as(c_int, @intCast(kth)));
     a.add(@as(c_int, @intCast(n)));
     a.add(pv);
     a.add(pi);
     try cuda.launch.launch(d.fns.head2_select, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, e.stream, &a);
-    const sb = h2.ptr + head2_tiles * kg * 256 * 4 + head2_tiles * kg * 64 * 4;
+    const sb = h2.ptr + head2_all_tiles * kg * 256 * 4 + head2_all_tiles * kg * 64 * 4;
     var r: cuda.Args = .{};
     for ([_]u64{ d.x, d.xs, q.w, sb }) |v| r.add(v);
     r.add(@as(c_int, @intCast(kg)));
@@ -361,7 +383,7 @@ fn topkScreened(d: anytype, logits: u64, rows: usize) !void {
     r.add(pv);
     r.add(pi);
     r.add(@as(c_int, @intCast(n)));
-    r.add(@as(c_int, @intCast(head2_first)));
+    r.add(@as(c_int, @intCast(first)));
     try cuda.launch.launch(d.fns.head2_rescore, .{ .grid = .{ .x = @intCast(rows), .y = @intCast((n + 31) / 32) }, .block = .{ .x = 128 } }, e.stream, &r);
     var m: cuda.Args = .{};
     m.add(pv);
