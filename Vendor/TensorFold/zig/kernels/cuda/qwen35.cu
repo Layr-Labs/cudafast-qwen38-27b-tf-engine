@@ -90,6 +90,27 @@ __device__ __forceinline__ T* plain(T* p) {
 }
 __device__ __forceinline__ void keep4(const uint4& v) { asm volatile("" ::"r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)); }
 
+// An L2 warm-up of the next weight stream (cache state only; no value changes): the first `take` bytes of each of `tiles`
+// tiles of `tile_bytes` at w, issued as bulk L2 prefetches by the grid's first blocks while a latency-bound kernel runs.
+__device__ __forceinline__ void warm_tiles(const void* w, int tile_bytes, int tiles, int take) {
+#if __CUDA_ARCH__ >= 900
+    if (w == nullptr || take <= 0) return;
+    constexpr int CH = 16384;
+    const int nb = gridDim.x * gridDim.y * gridDim.z;
+    const int b = blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
+    const int issuers = min(nb, 40);
+    if (b >= issuers) return;
+    const int per = (take + CH - 1) / CH;
+    for (int i = threadIdx.x + blockDim.x * threadIdx.y; ; i += blockDim.x * blockDim.y) {
+        const int t = b + issuers * (i / per), c = i % per;
+        if (t >= tiles) break;
+        const int sz = min(CH, take - c * CH);
+        const char* a = reinterpret_cast<const char*>(w) + (size_t)t * tile_bytes + (size_t)c * CH;
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(a), "r"(sz) : "memory");
+    }
+#endif
+}
+
 // h = bf16(h + r) (r may be null), x = bf16(w * (h * inv)), XS (may be null) x's group sums; D 256k up to 8192.
 extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __restrict__ H0, const __nv_bfloat16* __restrict__ R0,
                                                                const __nv_bfloat16* __restrict__ W, __nv_bfloat16* __restrict__ X0, float eps, int D,
@@ -573,6 +594,94 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post_ilp(Geo geo, c
     }
 }
 
+// tf_q35_gdn_post_ilp behind a running tf_gdn_chain_conv (gdn_prefill.cu): launched as its programmatic dependent,
+// persistent row warps take items (RPW rows, value head) in row order; each waits until both value-row blocks of its
+// head have published its rows (progress words 2 hv and 2 hv + 1, a 128-byte line each), then loads y and computes
+// exactly as tf_q35_gdn_post_ilp. Every block ends with griddepcontrol.wait, so the grid ends no earlier than the chain
+// and the kernels after it see a whole chain. W_chain: the chain's rows (none past them is waited for).
+__device__ __forceinline__ int relaxed(const int* f) {
+    int v;
+    asm volatile("ld.global.relaxed.gpu.b32 %0, [%1];\n" : "=r"(v) : "l"(f) : "memory");
+    return v;
+}
+
+constexpr int POLL_NS = 2000;
+constexpr int FLAG_STRIDE = 32;  // a progress word a 128-byte line (gdn_prefill.cu's)
+extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post_follow(Geo geo, const __nv_bfloat16* __restrict__ Y0, const __nv_bfloat16* __restrict__ Z0,
+                                                                          const __nv_bfloat16* __restrict__ NW, float eps, __nv_bfloat16* __restrict__ OUT0,
+                                                                          const int* __restrict__ P, float* __restrict__ XS0, const int* flags, int W_chain) {
+    constexpr int RPW = 8;
+    __shared__ __align__(16) __nv_bfloat16 row_done[4][DK];
+    __nv_bfloat16* done = row_done[threadIdx.y];
+    const int lane = threadIdx.x;
+    release_next();
+    constexpr int PER = DK / 32;
+    const uint2 nw = *reinterpret_cast<const uint2*>(plain(NW) + lane * PER);
+    asm volatile("" ::"r"(nw.x), "r"(nw.y));
+    // z, the norm weights and the counts were written before the chain began (its launch waited for them)
+    const __nv_bfloat16* Z = plain(Z0);
+    __nv_bfloat16* OUT = plain(OUT0);
+    float* XS = plain(XS0);
+    const int rows = P[2];
+    const size_t W = (size_t)geo.nv * DK;
+    // persistent row warps: item (row block of RPW, value head), row blocks in order, so the earliest rows go first
+    const int items = (rows + RPW - 1) / RPW * geo.nv, step = gridDim.x * blockDim.y;
+    for (int item = blockIdx.x * blockDim.y + threadIdx.y; item < items; item += step) {
+        const int hv = item % geo.nv;
+        const size_t m0 = (size_t)(item / geo.nv) * RPW;
+        uint2 yw[RPW], zw[RPW];
+#pragma unroll
+        for (int r = 0; r < RPW; r++) {
+            const size_t m = m0 + r < (size_t)rows ? m0 + r : (size_t)rows - 1;
+            zw[r] = *reinterpret_cast<const uint2*>(Z + m * W + hv * DK + lane * PER);
+        }
+        const int need = (int)min(min(m0 + RPW, (size_t)rows), (size_t)W_chain);
+        // relaxed polls (an acquire load per poll would invalidate the SM's L1 under the running chain each time),
+        // then one acquire fence: the rows' y stores, released before the words, are visible to the loads below
+        while (min(relaxed(flags + FLAG_STRIDE * (2 * hv)), relaxed(flags + FLAG_STRIDE * (2 * hv + 1))) < need) __nanosleep(POLL_NS);
+        asm volatile("fence.acq_rel.gpu;\n" ::: "memory");
+        const __nv_bfloat16* Y = plain(Y0);
+#pragma unroll
+        for (int r = 0; r < RPW; r++) {
+            const size_t m = m0 + r < (size_t)rows ? m0 + r : (size_t)rows - 1;
+            yw[r] = __ldcg(reinterpret_cast<const uint2*>(Y + m * W + hv * DK + lane * PER));
+        }
+        const __nv_bfloat16* wp = reinterpret_cast<const __nv_bfloat16*>(&nw);
+#pragma unroll
+        for (int r = 0; r < RPW; r++) {
+            const size_t m = m0 + r;
+            if (m >= (size_t)rows) break;
+            const size_t at = m * W + hv * DK + lane * PER;
+            const __nv_bfloat16* yp = reinterpret_cast<const __nv_bfloat16*>(&yw[r]);
+            const __nv_bfloat16* zp = reinterpret_cast<const __nv_bfloat16*>(&zw[r]);
+            float yv[PER], ss = 0.0f;
+#pragma unroll
+            for (int j = 0; j < PER; j++) {
+                yv[j] = bf(yp[j]);
+                ss += yv[j] * yv[j];
+            }
+            ss = warp_sum(ss);
+            const float inv = rsqrtf(ss / (float)DK + eps);
+            uint2 ow;
+            __nv_bfloat16* op = reinterpret_cast<__nv_bfloat16*>(&ow);
+#pragma unroll
+            for (int j = 0; j < PER; j++) {
+                const float x = rbf(bf(wp[j]) * (yv[j] * inv));
+                const float zf = bf(zp[j]);
+                op[j] = __float2bfloat16_rn(zf / (1.0f + expf(-zf)) * x);
+            }
+            *reinterpret_cast<uint2*>(OUT + at) = ow;
+            if (XS == nullptr) continue;
+            __syncwarp();
+            *reinterpret_cast<uint2*>(done + lane * PER) = ow;
+            __syncwarp();
+            if (lane < DK / 64) XS[m * (W / 64) + hv * (DK / 64) + lane] = group_sum(done + lane * 64);
+        }
+    }
+    // every block ends no earlier than the chain: the grid's end implies the chain's
+    await_prior();
+}
+
 #include "qwen35_head_norm.cuh"
 #include "qwen35_head_rope.cuh"
 
@@ -814,9 +923,11 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm_rope(Geo geo, cons
 extern "C" __global__ void __launch_bounds__(128) tf_q35_attn_partial(Geo geo, const __nv_bfloat16* __restrict__ Q0, const Seg* __restrict__ segs,
                                                                         const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
                                                                         const int* __restrict__ P, float scale,
-                                                                        float* __restrict__ PM0, float* __restrict__ PL0, float* __restrict__ PO0) {
+                                                                        float* __restrict__ PM0, float* __restrict__ PL0, float* __restrict__ PO0,
+                                                                        const void* pfw, int pft, int pfn, int pfb) {
     release_next();
     await_prior();
+    warm_tiles(plain(pfw), pft, pfn, pfb);
     const __nv_bfloat16* Q = after_wait(Q0);
     float* PM = after_wait(PM0);
     float* PL = after_wait(PL0);
