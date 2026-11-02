@@ -37,8 +37,12 @@ pub const Weights = struct {
     layers: []Layer,
     arena: DeviceBuffer,
     arena_at: usize = 0,
+    /// The fastest screened pieces of the free memory left after the target, holding the copies every draft reads (the MLP
+    /// gate and up panels, the down and o streams); null without one (TF_DRAFT_FASTPOOL=0: the copies stay in the arena).
+    fast: ?engine.fast_placement.Pool = null,
 
     pub fn deinit(w: *Weights, gpa: std.mem.Allocator) void {
+        if (w.fast) |*p| p.free();
         w.arena.free();
         gpa.free(w.predecessor);
         gpa.free(w.successor);
@@ -51,7 +55,42 @@ pub const Weights = struct {
         w.arena_at = at + bytes;
         return w.arena.ptr + at;
     }
+
+    /// A per-draft copy: on the drafter's fast pool when it has room (asked for in fastSizes' order), else in the arena.
+    fn allocCopy(w: *Weights, bytes: usize) !u64 {
+        if (w.fast) |*p| if (p.alloc(bytes)) |at| return at;
+        return w.alloc(bytes);
+    }
 };
+
+fn fastPoolOn() bool {
+    const v = @import("sys").c.getenv("TF_DRAFT_FASTPOOL") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
+
+/// The per-draft copies `linear` makes, in the order it makes them (each layer's o stream, gate and up panels, down
+/// stream), for the drafter's fast pool screen; returns how many.
+fn fastSizes(e: *const Engine, s: Shape, out: []usize) usize {
+    var n: usize = 0;
+    const panels = e.mlp_pair.kmajor_fn != null and s.intermediate == 17408 and s.hidden == 5120;
+    const streams = e.affine.stream16_fns[0] != null and s.hidden == 5120;
+    for (0..s.layers) |_| {
+        if (streams and s.q_width == 4096 and oStream()) {
+            out[n] = Affine4.layout(s.hidden, s.q_width).words;
+            n += 1;
+        }
+        if (panels) {
+            out[n] = Affine4.layout(s.intermediate, s.hidden).words;
+            out[n + 1] = out[n];
+            n += 2;
+        }
+        if (streams and s.intermediate == 17408) {
+            out[n] = Affine4.layout(s.hidden, s.intermediate).words;
+            n += 1;
+        }
+    }
+    return n;
+}
 
 /// The drafter's widths the loader needs (cuda_draft.zig's Config).
 pub const Shape = struct { hidden: usize, intermediate: usize, layers: usize, vocab: usize, q_width: usize, kv_width: usize, head_dim: usize, dynamic: usize, rank: usize, taps: usize };
@@ -169,28 +208,70 @@ fn leastSquares(row: []align(1) const u16, start: [2]f32) [2]f32 {
             best = cur;
         }
     }
-    // Search adjacent representable stored values; keep only an improvement under
-    // the same BF16-rounded error used by the base fit. Never alter the target.
-    const scale_bits = toBf16(best[0]);
-    const bias_bits = toBf16(best[1]);
-    for ([_]i32{ -1, 0, 1 }) |ds| {
-        for ([_]i32{ -1, 0, 1 }) |db| {
-            const su = @as(i32, scale_bits) + ds;
-            const bu = @as(i32, bias_bits) + db;
-            if (su < 0 or su > 65535 or bu < 0 or bu > 65535) continue;
-            const candidate = [2]f32{ bf16(@intCast(su)), bf16(@intCast(bu)) };
-            if (!(candidate[0] > 0) or !std.math.isFinite(candidate[0]) or !std.math.isFinite(candidate[1])) continue;
-            const err = groupError(row, candidate);
-            if (err < best_err) {
-                best_err = err;
-                best = candidate;
+    // Two rounds of the stored-value neighbourhood around the line fit, kept only where the bf16-rounded
+    // error the kernels actually see drops: the coarse pass walks the representable window the rounded
+    // scale and bias sit in, the fine pass the adjacent values of whatever it kept. Each round only
+    // accepts a strictly smaller error, so a group never leaves the fit worse than the line alone.
+    nearest(row, best, 2, &best_err, &best);
+    // the codes the coarse window implied, refit once: a bias step of a few ulps re-rounds the nibbles
+    if (best_err < groupError(row, start)) {
+        const s = best[0];
+        if (s > 0) {
+            var sq: f64 = 0;
+            var sqq: f64 = 0;
+            var sw: f64 = 0;
+            var sqw: f64 = 0;
+            for (row) |h| {
+                const x: f64 = bf16(h);
+                const q: f64 = std.math.clamp(@round((x - best[1]) / s), 0.0, 15.0);
+                sq += q;
+                sqq += q * q;
+                sw += x;
+                sqw += q * x;
+            }
+            const det = 64 * sqq - sq * sq;
+            if (det > 0) {
+                const ns = (64 * sqw - sq * sw) / det;
+                if (ns > 0) {
+                    const refined = [2]f32{ @floatCast(ns), @floatCast((sw - ns * sq) / 64) };
+                    const err = groupError(row, refined);
+                    if (err < best_err) {
+                        best_err = err;
+                        best = refined;
+                    }
+                }
             }
         }
     }
+    nearest(row, best, 1, &best_err, &best);
     return best;
 }
 
-/// The group's squared error under bf16-rounded scale and bias, as quantize then stores and the kernels read it.
+/// Walks the representable bf16 values within `span` ulps of `from`'s rounded scale and bias, keeping the pair with
+/// the smallest group error (ties keep the earlier one, so the search is a no-op where it finds nothing better).
+fn nearest(row: []align(1) const u16, from: [2]f32, span: i32, best_err: *f64, best: *[2]f32) void {
+    const scale_bits = toBf16(from[0]);
+    const bias_bits = toBf16(from[1]);
+    var ds: i32 = -span;
+    while (ds <= span) : (ds += 1) {
+        const su = @as(i32, scale_bits) + ds;
+        if (su < 0 or su > 65535) continue;
+        var db: i32 = -span;
+        while (db <= span) : (db += 1) {
+            const bu = @as(i32, bias_bits) + db;
+            if (bu < 0 or bu > 65535) continue;
+            const candidate = [2]f32{ bf16(@intCast(su)), bf16(@intCast(bu)) };
+            if (!(candidate[0] > 0) or !std.math.isFinite(candidate[0]) or !std.math.isFinite(candidate[1])) continue;
+            const err = groupError(row, candidate);
+            if (err < best_err.*) {
+                best_err.* = err;
+                best.* = candidate;
+            }
+        }
+    }
+}
+
+/// A group's squared error under bf16-rounded scale and bias, as quantize then stores and the kernels read it.
 fn groupError(row: []align(1) const u16, fit: [2]f32) f64 {
     const s = bf16(toBf16(fit[0]));
     const b = bf16(toBf16(fit[1]));
@@ -234,12 +315,12 @@ fn linear(gpa: std.mem.Allocator, e: *Engine, stage: *DeviceBuffer, w: *Weights,
     var out: Affine4 = .{ .w = try w.alloc(l.words), .s = try w.alloc(l.scales), .b = try w.alloc(l.scales), .n = n, .k = k, .npad = l.npad };
     try e.affine.pack(e.stream, raw[0], raw[1], raw[2], out);
     if (e.mlp_pair.kmajor_fn != null and n == 17408 and k == 5120) {
-        out.verify_w = try w.alloc(l.words);
+        out.verify_w = try w.allocCopy(l.words);
         const pack = try e.mods[3].function("tf_pack_kmajor");
         const words = l.npad * k / 8;
         try e.run(pack, .{ (words + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ out.w, out.verify_w, @as(c_int, @intCast(k / 64)), @as(c_int, @intCast(l.npad / 64)) });
     } else if (e.affine.stream16_fns[0] != null and n == 5120 and (k == 17408 or (k == 4096 and oStream()))) {
-        out.stream_w = try w.alloc(l.words);
+        out.stream_w = try w.allocCopy(l.words);
         const pack = try e.mods[3].function("tf_pack_kmajor");
         const words = l.npad * k / 8;
         try e.run(pack, .{ (words + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ out.w, out.stream_w, @as(c_int, @intCast(k / 64)), @as(c_int, @intCast(l.npad / 64)) });
@@ -278,6 +359,14 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: *Engine, dir: []const u8, s: 
     try w.arena.fill8(0, null);
     var stage = try DeviceBuffer.alloc(e.d, stageBytes(s));
     defer stage.free();
+    // the per-draft copies on the fastest pieces of what the target left free, screened as the target's (cuda_fastpool.zig);
+    // the copies hold the same words wherever they sit
+    if (fastPoolOn() and s.layers <= 16) {
+        var sizes: [4 * 16]usize = undefined;
+        const n = fastSizes(e, s, &sizes);
+        if (n > 0) w.fast = engine.fast_placement.screen(e.d, e.stream, try e.mods[3].function("tf_fastpool_read"), sizes[0..n]);
+    }
+    errdefer if (w.fast) |*p| p.free();
     w.layers = try gpa.alloc(Layer, s.layers);
     errdefer gpa.free(w.layers);
     w.fc = try linear(gpa, e, &stage, &w, &ck, "fc.weight", s.hidden, s.taps * s.hidden);
