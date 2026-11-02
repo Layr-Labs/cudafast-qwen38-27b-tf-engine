@@ -104,11 +104,9 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __r
     uint4 wv[4];
     if ((E & 3) == 0) {
 #pragma unroll
-        for (int j = 0; j < 4; j++)
-            if ((t + 256 * j) * 8 < D) wv[j] = *reinterpret_cast<const uint4*>(plain(W) + (t + 256 * j) * 8);
+        for (int j = 0; j < 4; j++) wv[j] = *reinterpret_cast<const uint4*>(plain(W) + min((t + 256 * j) * 8, D - 8));
 #pragma unroll
-        for (int j = 0; j < 4; j++)
-            if ((t + 256 * j) * 8 < D) keep4(wv[j]);
+        for (int j = 0; j < 4; j++) keep4(wv[j]);
     }
     await_prior();
     __nv_bfloat16* H = after_wait(H0);
@@ -117,15 +115,9 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __r
     float* XS = after_wait(XS0);
     if ((E & 3) == 0) {
         const size_t row = blockIdx.x;
-        uint4 hw[4], rw[4];
+        uint4 hw[4];
 #pragma unroll
-        for (int j = 0; j < 4; j++)
-            if ((t + 256 * j) * 8 < D) hw[j] = *reinterpret_cast<const uint4*>(H + row * D + (t + 256 * j) * 8);
-        if (R != nullptr) {
-#pragma unroll
-            for (int j = 0; j < 4; j++)
-                if ((t + 256 * j) * 8 < D) rw[j] = *reinterpret_cast<const uint4*>(R + row * D + (t + 256 * j) * 8);
-        }
+        for (int j = 0; j < 4; j++) hw[j] = *reinterpret_cast<const uint4*>(H + row * D + min((t + 256 * j) * 8, D - 8));
         if (past_rows(P, blockIdx.x)) return;
         // h + r and w * (h * inv) move 8 entries a lane through xrow; the squares keep a thread's E entries in order
 #pragma unroll
@@ -133,8 +125,9 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __r
             const int d = (t + 256 * j) * 8;
             if (d >= D) break;
             if (R != nullptr) {
+                const uint4 rw = *reinterpret_cast<const uint4*>(R + row * D + d); // the residual at use: a shorter live range
                 __nv_bfloat16* hb = reinterpret_cast<__nv_bfloat16*>(&hw[j]);
-                const __nv_bfloat16* rb = reinterpret_cast<const __nv_bfloat16*>(&rw[j]);
+                const __nv_bfloat16* rb = reinterpret_cast<const __nv_bfloat16*>(&rw);
 #pragma unroll
                 for (int k = 0; k < 8; k++) hb[k] = __float2bfloat16_rn(bf(hb[k]) + bf(rb[k]));
                 *reinterpret_cast<uint4*>(H + row * D + d) = hw[j];
@@ -573,6 +566,94 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post_ilp(Geo geo, c
     }
 }
 
+// tf_q35_gdn_post_ilp behind a running tf_gdn_chain_conv (gdn_prefill.cu): launched as its programmatic dependent,
+// persistent row warps take items (RPW rows, value head) in row order; each waits until both value-row blocks of its
+// head have published its rows (progress words 2 hv and 2 hv + 1, a 128-byte line each), then loads y and computes
+// exactly as tf_q35_gdn_post_ilp. Every block ends with griddepcontrol.wait, so the grid ends no earlier than the chain
+// and the kernels after it see a whole chain. W_chain: the chain's rows (none past them is waited for).
+__device__ __forceinline__ int relaxed(const int* f) {
+    int v;
+    asm volatile("ld.global.relaxed.gpu.b32 %0, [%1];\n" : "=r"(v) : "l"(f) : "memory");
+    return v;
+}
+
+constexpr int POLL_NS = 2000;
+constexpr int FLAG_STRIDE = 32;  // a progress word a 128-byte line (gdn_prefill.cu's)
+extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post_follow(Geo geo, const __nv_bfloat16* __restrict__ Y0, const __nv_bfloat16* __restrict__ Z0,
+                                                                          const __nv_bfloat16* __restrict__ NW, float eps, __nv_bfloat16* __restrict__ OUT0,
+                                                                          const int* __restrict__ P, float* __restrict__ XS0, const int* flags, int W_chain) {
+    constexpr int RPW = 8;
+    __shared__ __align__(16) __nv_bfloat16 row_done[4][DK];
+    __nv_bfloat16* done = row_done[threadIdx.y];
+    const int lane = threadIdx.x;
+    release_next();
+    constexpr int PER = DK / 32;
+    const uint2 nw = *reinterpret_cast<const uint2*>(plain(NW) + lane * PER);
+    asm volatile("" ::"r"(nw.x), "r"(nw.y));
+    // z, the norm weights and the counts were written before the chain began (its launch waited for them)
+    const __nv_bfloat16* Z = plain(Z0);
+    __nv_bfloat16* OUT = plain(OUT0);
+    float* XS = plain(XS0);
+    const int rows = P[2];
+    const size_t W = (size_t)geo.nv * DK;
+    // persistent row warps: item (row block of RPW, value head), row blocks in order, so the earliest rows go first
+    const int items = (rows + RPW - 1) / RPW * geo.nv, step = gridDim.x * blockDim.y;
+    for (int item = blockIdx.x * blockDim.y + threadIdx.y; item < items; item += step) {
+        const int hv = item % geo.nv;
+        const size_t m0 = (size_t)(item / geo.nv) * RPW;
+        uint2 yw[RPW], zw[RPW];
+#pragma unroll
+        for (int r = 0; r < RPW; r++) {
+            const size_t m = m0 + r < (size_t)rows ? m0 + r : (size_t)rows - 1;
+            zw[r] = *reinterpret_cast<const uint2*>(Z + m * W + hv * DK + lane * PER);
+        }
+        const int need = (int)min(min(m0 + RPW, (size_t)rows), (size_t)W_chain);
+        // relaxed polls (an acquire load per poll would invalidate the SM's L1 under the running chain each time),
+        // then one acquire fence: the rows' y stores, released before the words, are visible to the loads below
+        while (min(relaxed(flags + FLAG_STRIDE * (2 * hv)), relaxed(flags + FLAG_STRIDE * (2 * hv + 1))) < need) __nanosleep(POLL_NS);
+        asm volatile("fence.acq_rel.gpu;\n" ::: "memory");
+        const __nv_bfloat16* Y = plain(Y0);
+#pragma unroll
+        for (int r = 0; r < RPW; r++) {
+            const size_t m = m0 + r < (size_t)rows ? m0 + r : (size_t)rows - 1;
+            yw[r] = __ldcg(reinterpret_cast<const uint2*>(Y + m * W + hv * DK + lane * PER));
+        }
+        const __nv_bfloat16* wp = reinterpret_cast<const __nv_bfloat16*>(&nw);
+#pragma unroll
+        for (int r = 0; r < RPW; r++) {
+            const size_t m = m0 + r;
+            if (m >= (size_t)rows) break;
+            const size_t at = m * W + hv * DK + lane * PER;
+            const __nv_bfloat16* yp = reinterpret_cast<const __nv_bfloat16*>(&yw[r]);
+            const __nv_bfloat16* zp = reinterpret_cast<const __nv_bfloat16*>(&zw[r]);
+            float yv[PER], ss = 0.0f;
+#pragma unroll
+            for (int j = 0; j < PER; j++) {
+                yv[j] = bf(yp[j]);
+                ss += yv[j] * yv[j];
+            }
+            ss = warp_sum(ss);
+            const float inv = rsqrtf(ss / (float)DK + eps);
+            uint2 ow;
+            __nv_bfloat16* op = reinterpret_cast<__nv_bfloat16*>(&ow);
+#pragma unroll
+            for (int j = 0; j < PER; j++) {
+                const float x = rbf(bf(wp[j]) * (yv[j] * inv));
+                const float zf = bf(zp[j]);
+                op[j] = __float2bfloat16_rn(zf / (1.0f + expf(-zf)) * x);
+            }
+            *reinterpret_cast<uint2*>(OUT + at) = ow;
+            if (XS == nullptr) continue;
+            __syncwarp();
+            *reinterpret_cast<uint2*>(done + lane * PER) = ow;
+            __syncwarp();
+            if (lane < DK / 64) XS[m * (W / 64) + hv * (DK / 64) + lane] = group_sum(done + lane * 64);
+        }
+    }
+    // every block ends no earlier than the chain: the grid's end implies the chain's
+    await_prior();
+}
+
 #include "qwen35_head_norm.cuh"
 #include "qwen35_head_rope.cuh"
 
@@ -781,8 +862,16 @@ __device__ __forceinline__ void norm_rope_rows(const Geo& geo, const __nv_bfloat
     int pos[3];
     row_positions(sg, rowanc[m], m, M, pos);
     const int slot = sg.len + (int)m - sg.row0;
-    if (query) Qn[(m * QH + head) * HD + t] = rotate(xs, t, pos);
-    else store(sg, head, slot, t, rotate(xs, t, pos), Vr[(m * KVH + head) * HD + t]);
+    auto put = [&](int d, __nv_bfloat16 y) {
+        if (query) Qn[(m * QH + head) * HD + d] = y;
+        else store(sg, head, slot, d, y, Vr[(m * KVH + head) * HD + d]);
+    };
+    if (t < 32) {
+        const float2 sc = rope_coeff(t, pos);
+        const float a = bf(xs[t]), b = bf(xs[t + 32]);
+        put(t, __float2bfloat16_rn(a * sc.y - b * sc.x));
+        put(t + 32, __float2bfloat16_rn(b * sc.y + a * sc.x));
+    } else if (t >= 64) put(t, xs[t]);
 }
 
 extern "C" __global__ void __launch_bounds__(256) tf_q35_norm_rope(Geo geo, const __nv_bfloat16* __restrict__ QRAW, const __nv_bfloat16* __restrict__ KRAW,
