@@ -55,8 +55,10 @@ pub const Kernels = struct {
             k.single_dict_fn = fs;
             const fc = try group_mod.function("tf_qmm_mlp_single16_compact_pair");
             try fc.allowDynamicShared(compact_pair_smem);
-            // three CTAs an SM need the 100 KiB carveout on GB10 (3 x 21632 bytes and their reserve exceed 64 KiB)
-            try fc.setAttribute(.preferred_shared_memory_carveout, 100);
+            // 50% rounds upward to the 64 KiB carveout on GB10. This is a hint,
+            // allowing the driver to avoid disruptive per-node reconfiguration. Three CTAs
+            // still fit it: 3 x 21632 bytes, the staged input tile included.
+            try fc.setAttribute(.preferred_shared_memory_carveout, 50);
             k.compact_pair_fn = fc;
         }
         return k;
