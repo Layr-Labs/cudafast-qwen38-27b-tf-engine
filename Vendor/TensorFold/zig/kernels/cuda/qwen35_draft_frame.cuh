@@ -8,14 +8,6 @@ extern "C" __global__ void tf_q35d_dyn_conv_batch(const __nv_bfloat16* __restric
                                               __nv_bfloat16* __restrict__ OUT0, int D, int group, int branch, int block_rows,
                                               float* __restrict__ XS0) {
     release_next();
-    // ahead of the wait: this thread's first channel's two base taps (static); this frame's rows after it
-    const int c0 = blockIdx.y * blockDim.x + threadIdx.x;
-    float base0[2] = {0.0f, 0.0f};
-    if (c0 < D) {
-        base0[0] = bf(BASE[(branch * 2) * D + c0]);
-        base0[1] = bf(BASE[(branch * 2 + 1) * D + c0]);
-    }
-    asm volatile("" ::"f"(base0[0]), "f"(base0[1]));
     await_prior();
     const __nv_bfloat16* X = after_wait(X0);
     const __nv_bfloat16* DYN = after_wait(DYN0);
@@ -35,7 +27,7 @@ extern "C" __global__ void tf_q35d_dyn_conv_batch(const __nv_bfloat16* __restric
         for (int l = 0; l < 2; l++) {
             if (t % block_rows - l < 0) continue;
             const float x = bf(X[(size_t)(t - l) * D + c]);
-            total = rbf(total + rbf((c == c0 ? base0[l] : bf(BASE[(branch * 2 + l) * D + c])) * x));
+            total = rbf(total + rbf(bf(BASE[(branch * 2 + l) * D + c]) * x));
             total = rbf(total + rbf(bf(DYN[(size_t)t * (4 * groups) + (branch * 2 + l) * groups + g]) * x));
         }
         if (RES != nullptr) total = rbf(total + bf(RES[(size_t)t * D + c]));
@@ -55,15 +47,17 @@ extern "C" __global__ void tf_q35d_dyn_conv_batch(const __nv_bfloat16* __restric
 
 extern "C" __global__ void __launch_bounds__(32) tf_q35d_norm_rope_batch(const __nv_bfloat16* __restrict__ X0, const __nv_bfloat16* __restrict__ W,
                                                                      __nv_bfloat16* __restrict__ OUT0, int heads, int stride, const DraftSegment* segments, int block_rows,
-                                                                     float eps, float theta) {
     release_next();
+    const int t = threadIdx.x;
+    const uint2 wv = *reinterpret_cast<const uint2*>(plain(W) + 4 * t);
+    asm volatile("" ::"r"(wv.x), "r"(wv.y));
     await_prior();
     const __nv_bfloat16* X = after_wait(X0);
     __nv_bfloat16* OUT = after_wait(OUT0);
     const int head = blockIdx.x % heads;
     const size_t m = blockIdx.x / heads;
-    const int t = threadIdx.x;
     const __nv_bfloat16* x = X + m * stride + head * HD;
+    const __nv_bfloat16* wb = reinterpret_cast<const __nv_bfloat16*>(&wv);
     float v[4], acc = 0.0f;
 #pragma unroll
     for (int i = 0; i < 4; i++) {
@@ -74,7 +68,7 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35d_norm_rope_batch(const _
     const float inv = rsqrtf(acc / (float)HD + eps);
     float n[4];
 #pragma unroll
-    for (int i = 0; i < 4; i++) n[i] = rbf(rbf(v[i] * inv) * bf(W[4 * t + i]));
+    for (int i = 0; i < 4; i++) n[i] = rbf(rbf(v[i] * inv) * bf(wb[i]));
     // the pair of lane element d is d + HD / 2: this lane's partner values come from the lane HD / 8 = 16 away
     const float pos = (float)(segments[m / block_rows].position + (long long)(m % block_rows));
     __nv_bfloat16* out = OUT + (m * heads + head) * HD;
@@ -95,37 +89,21 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35d_norm_rope_qk_batch(cons
         const __nv_bfloat16* __restrict__ XK0, const __nv_bfloat16* __restrict__ WK, __nv_bfloat16* __restrict__ OUTK0,
         int kv_heads, int rows, const DraftSegment* segments, int block_rows, float eps, float theta) {
     release_next();
-    const int qb = rows * q_heads;
-    const bool isq = blockIdx.x < qb;
-    const int bx = isq ? blockIdx.x : blockIdx.x - qb;
-    const int heads = isq ? q_heads : kv_heads;
-    const __nv_bfloat16* W = isq ? WQ : WK;
-    const int head = bx % heads;
-    const size_t m = bx / heads;
-    const int t = threadIdx.x;
-    // ahead of the wait: the head's norm weights (static) and the row's rotary angles (its position comes from the
-    // segments the host staged before the frame's first launch); the rows this frame wrote are read after it
-    float wn[4], sn4[4], cs4[4];
-#pragma unroll
-    for (int i = 0; i < 4; i++) wn[i] = bf(W[4 * t + i]);
-    {
-        const float pos = (float)(segments[m / block_rows].position + (long long)(m % block_rows));
-#pragma unroll
-        for (int i = 0; i < 4; i++) {
-            const int d = 4 * t + i;
-            const int j = d < HD / 2 ? d : d - HD / 2;
-            const float angle = pos * powf(theta, -(float)j / (float)(HD / 2));
-            sincosf(angle, &sn4[i], &cs4[i]);
-        }
-    }
-    asm volatile("" ::"f"(wn[0]), "f"(wn[1]), "f"(wn[2]), "f"(wn[3]), "f"(sn4[0]), "f"(cs4[0]), "f"(sn4[3]), "f"(cs4[3]));
     await_prior();
     const __nv_bfloat16* XQ = after_wait(XQ0);
     __nv_bfloat16* OUTQ = after_wait(OUTQ0);
     const __nv_bfloat16* XK = after_wait(XK0);
     __nv_bfloat16* OUTK = after_wait(OUTK0);
+    const int qb = rows * q_heads;
+    const bool isq = blockIdx.x < qb;
+    const int bx = isq ? blockIdx.x : blockIdx.x - qb;
+    const int heads = isq ? q_heads : kv_heads;
     const __nv_bfloat16* X = isq ? XQ : XK;
+    const __nv_bfloat16* W = isq ? WQ : WK;
     __nv_bfloat16* OUT = isq ? OUTQ : OUTK;
+    const int head = bx % heads;
+    const size_t m = bx / heads;
+    const int t = threadIdx.x;
     const __nv_bfloat16* x = X + m * ((size_t)heads * HD) + head * HD;
     float v[4], acc = 0.0f;
 #pragma unroll
@@ -137,13 +115,18 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35d_norm_rope_qk_batch(cons
     const float inv = rsqrtf(acc / (float)HD + eps);
     float n[4];
 #pragma unroll
-    for (int i = 0; i < 4; i++) n[i] = rbf(rbf(v[i] * inv) * wn[i]);
+    for (int i = 0; i < 4; i++) n[i] = rbf(rbf(v[i] * inv) * bf(W[4 * t + i]));
+    const float pos = (float)(segments[m / block_rows].position + (long long)(m % block_rows));
     __nv_bfloat16* out = OUT + (m * heads + head) * HD;
 #pragma unroll
     for (int i = 0; i < 4; i++) {
         const int d = 4 * t + i;
         const float partner = __shfl_xor_sync(0xffffffffu, n[i], 16);
-        out[d] = __float2bfloat16_rn(d < HD / 2 ? n[i] * cs4[i] - partner * sn4[i] : n[i] * cs4[i] + partner * sn4[i]);
+        const int j = d < HD / 2 ? d : d - HD / 2;
+        const float angle = pos * powf(theta, -(float)j / (float)(HD / 2));
+        float sn, cs;
+        sincosf(angle, &sn, &cs);
+        out[d] = __float2bfloat16_rn(d < HD / 2 ? n[i] * cs - partner * sn : n[i] * cs + partner * sn);
     }
 }
 
