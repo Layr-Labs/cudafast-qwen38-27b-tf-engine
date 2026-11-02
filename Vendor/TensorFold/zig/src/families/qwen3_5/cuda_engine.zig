@@ -600,6 +600,7 @@ pub const Engine = struct {
 
     /// One forward over `parts`' windows, with every input admitted before an unkept verify is settled.
     pub fn forward(e: *Engine, parts: []const Part, ids: []const u32, keep: Keep) !void {
+        bigCores();
         try e.admit(parts, ids, keep);
         const g = e.g;
         const total = ids.len;
@@ -813,4 +814,54 @@ pub const glue_pdl = true;
 fn scanEarlyOn() bool {
     const v = std.c.getenv("TF_SCAN_EARLY") orelse return true;
     return !std.mem.eql(u8, std.mem.span(v), "0");
+}
+
+/// Whether this thread has already been placed by `bigCores` (once a thread: the serving thread's first forward).
+threadlocal var big_cores_placed: bool = false;
+
+/// The serving thread (verify launches, readback spin, host acceptance, the drafter's tree build) onto the allowed CPUs
+/// of the highest /sys cpu_capacity, once a thread. GB10's X925s against its A725s; the whole top-capacity set rather
+/// than one CPU, so the scheduler still avoids a busy core. Nothing when the capacities are equal or unreadable, when
+/// TF_BIG_CORES=0, or off Linux. Host scheduling only: no launch, value or cross-phase state changes.
+fn bigCores() void {
+    if (big_cores_placed) return;
+    big_cores_placed = true;
+    if (@import("builtin").os.tag != .linux) return;
+    if (@import("sys").c.getenv("TF_BIG_CORES")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) return;
+    const linux = std.os.linux;
+    var allowed: linux.cpu_set_t = undefined;
+    if (linux.errno(linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &allowed)) != .SUCCESS) return;
+    var caps: [linux.CPU_SETSIZE]u32 = @splat(0);
+    var top: u32 = 0;
+    var low: u32 = std.math.maxInt(u32);
+    for (allowed, 0..) |word, wi| {
+        var bits = word;
+        while (bits != 0) : (bits &= bits - 1) {
+            const cpu: usize = wi * @bitSizeOf(usize) + @ctz(bits);
+            const c = cpuCapacity(cpu) orelse return; // a CPU without a capacity: leave placement to the scheduler
+            caps[cpu] = c;
+            top = @max(top, c);
+            low = @min(low, c);
+        }
+    }
+    if (top == 0 or top == low) return;
+    var set: linux.cpu_set_t = @splat(0);
+    for (caps, 0..) |c, cpu| {
+        if (c == top) set[cpu / @bitSizeOf(usize)] |= @as(usize, 1) << @intCast(cpu % @bitSizeOf(usize));
+    }
+    linux.sched_setaffinity(0, &set) catch {};
+}
+
+fn cpuCapacity(cpu: usize) ?u32 {
+    const linux = std.os.linux;
+    var pb: [64]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&pb, "/sys/devices/system/cpu/cpu{d}/cpu_capacity", .{cpu}, 0) catch return null;
+    const rc = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    var b: [16]u8 = undefined;
+    const n = linux.read(fd, &b, b.len);
+    if (linux.errno(n) != .SUCCESS) return null;
+    return std.fmt.parseInt(u32, std.mem.trim(u8, b[0..n], " \n"), 10) catch null;
 }
