@@ -129,20 +129,7 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
         const unsigned char* p = stage(it % STAGES);
         const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
         const uint32_t* pk = reinterpret_cast<const uint32_t*>(p + T::X + T::W + mrun);
-        uint32_t pe[PASSES] = {};
-        {
-#pragma unroll
-            for (int pass = 0; pass < PASSES; ++pass) {
-                const int c = (wn % 2) * (BN / WN) + pass * 32 + lane, off = (c / 64 * 64 + c % 64) * mbits;
-                pe[pass] = __ldg(mgtab + (__funnelshift_r(pk[off >> 5], pk[(off >> 5) + 1], off & 31) & mmask));
-            }
-        }
         const float* px = reinterpret_cast<const float*>(p + T::X + T::W + 2 * T::S);
-        uint32_t words[T::NT][GS / 32];
-#pragma unroll
-        for (int j = 0; j < T::NT; ++j)
-#pragma unroll
-            for (int v = 0; v < GS / 32; ++v) words[j][v] = pw[((wn * T::NT + j) * 32 + lane) * (GS / 32) + v];
         float xv[I][2];
 #pragma unroll
         for (int i = 0; i < I; ++i) {
@@ -150,29 +137,42 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
             xv[i][0] = px[row];
             xv[i][1] = px[row + 8];
         }
-        float d[I][J][4];
-#pragma unroll
-        for (int kt = 0; kt < GS / 16; ++kt) {
-#pragma unroll
-            for (int j = 0; j < T::NT; ++j) {
-                const uint32_t b0 = pairm(words[j][kt / 2], (kt & 1) * 8, mask);
-                const uint32_t b1 = pairm(words[j][kt / 2], (kt & 1) * 8 + 4, mask);
-#pragma unroll
-                for (int i = 0; i < I; ++i) {
-                    if (kt == 0) mma0(d[i][j], av[kt][i], b0, b1);
-                    else mma(d[i][j], av[kt][i], b0, b1);
-                }
-            }
-        }
+        // Consume one dictionary pass before creating the next pass's group products.
+        // Each output keeps kt=0,1,2,3, group order and the same two rounded FMAs.
+        constexpr int STRIP = 4;
+        static_assert(J == PASSES * STRIP, "one strip per dictionary pass");
 #pragma unroll
         for (int pass = 0; pass < PASSES; ++pass) {
-            const unsigned short s_bits = static_cast<unsigned short>(pe[pass]);
-            const unsigned short b_bits = static_cast<unsigned short>(pe[pass] >> 16);
+            const int c = (wn % 2) * (BN / WN) + pass * 32 + lane;
+            const int off = (c / 64 * 64 + c % 64) * mbits;
+            const uint32_t pe = __ldg(mgtab + (__funnelshift_r(pk[off >> 5], pk[(off >> 5) + 1], off & 31) & mmask));
+            uint32_t words[STRIP][GS / 32];
+#pragma unroll
+            for (int jj = 0; jj < STRIP; ++jj)
+#pragma unroll
+                for (int v = 0; v < GS / 32; ++v)
+                    words[jj][v] = pw[((wn * T::NT + pass * STRIP + jj) * 32 + lane) * (GS / 32) + v];
+            float d[I][STRIP][4];
+#pragma unroll
+            for (int kt = 0; kt < GS / 16; ++kt) {
+#pragma unroll
+                for (int jj = 0; jj < STRIP; ++jj) {
+                    const uint32_t b0 = pairm(words[jj][kt / 2], (kt & 1) * 8, mask);
+                    const uint32_t b1 = pairm(words[jj][kt / 2], (kt & 1) * 8 + 4, mask);
+#pragma unroll
+                    for (int i = 0; i < I; ++i) {
+                        if (kt == 0) mma0(d[i][jj], av[kt][i], b0, b1);
+                        else mma(d[i][jj], av[kt][i], b0, b1);
+                    }
+                }
+            }
+            const unsigned short s_bits = static_cast<unsigned short>(pe);
+            const unsigned short b_bits = static_cast<unsigned short>(pe >> 16);
             const float sf = __bfloat162float(__ushort_as_bfloat16(s_bits));
             const float bf = __bfloat162float(__ushort_as_bfloat16(b_bits));
 #pragma unroll
-            for (int jj = 0; jj < 4; ++jj) {
-                const int j = pass * 4 + jj;
+            for (int jj = 0; jj < STRIP; ++jj) {
+                const int j = pass * STRIP + jj;
                 const int col = jj * 8 + (lane & 3) * 2;
                 const float sv[2] = {__shfl_sync(0xffffffffu, sf, col), __shfl_sync(0xffffffffu, sf, col + 1)};
                 const float bv[2] = {__shfl_sync(0xffffffffu, bf, col), __shfl_sync(0xffffffffu, bf, col + 1)};
@@ -180,7 +180,7 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
                 for (int i = 0; i < I; ++i) {
 #pragma unroll
                     for (int e = 0; e < 4; ++e)
-                        acc[i][j][e] = __fmaf_rn(xv[i][e >> 1], bv[e & 1], __fmaf_rn(d[i][j][e], sv[e & 1], acc[i][j][e]));
+                        acc[i][j][e] = __fmaf_rn(xv[i][e >> 1], bv[e & 1], __fmaf_rn(d[i][jj][e], sv[e & 1], acc[i][j][e]));
                 }
             }
         }
