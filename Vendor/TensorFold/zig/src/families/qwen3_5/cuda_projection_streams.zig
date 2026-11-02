@@ -89,6 +89,21 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
         break :blk f;
     };
     try out.allowDynamicShared(35328);
+    // Allocation is before any graph capture, owned by Affine4Kernels, and never resized.
+    // Resolve every symbol before installing the path so ordinary fallback stays intact.
+    if (output) {
+        const slices = try e.mods[0].function("tf_qmm_output_slices16");
+        const slices_dict = try e.mods[0].function("tf_qmm_output_slices16_dict");
+        const merge = try e.mods[0].function("tf_qmm_output_slices16_merge");
+        try slices.allowDynamicShared(cuda.qlinear.out16_smem / 4);
+        try slices_dict.allowDynamicShared(cuda.qlinear.out16_smem / 4 + @max(cuda.qlinear.dict_tab_max, cuda.qlinear.out_pair_tab_max));
+        e.affine.stream16_partials = try cuda.DeviceBuffer.alloc(e.d, 80 * 4 * 16 * 64 * @sizeOf(f32));
+        // Every producer overwrites every element before merge; no zero-fill or tickets.
+        e.affine.stream16_owner = e.stream;
+        e.affine.stream16_slices_fn = slices;
+        e.affine.stream16_slices_dict_fn = slices_dict;
+        e.affine.stream16_slices_merge_fn = merge;
+    }
     var buffer: ?cuda.DeviceBuffer = null;
     if (e.fast == null) {
         buffer = try cuda.DeviceBuffer.alloc(e.d, bytes);

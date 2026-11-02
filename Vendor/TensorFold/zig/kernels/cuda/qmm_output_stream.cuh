@@ -15,22 +15,24 @@ __device__ __forceinline__ void dict_decode_at(const qmm_dict::DictLanes& D,cons
     qmm_dict::dict_put(D,dec,qmm_dict::dict_fetch(D,packed,table,g));
 }
 
-template<int FutureGroups,int Slices=4,int Rolling=0,bool DICT=false>
+// EXTERNAL gives each of the same four K slices its own CTA. Only the placement of the
+// fp32 partials changes; the groups, MMA/FMA chains and final slice order do not.
+template<int FutureGroups,int Slices=4,int Rolling=0,bool DICT=false,bool EXTERNAL=false>
 __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const float* __restrict__ xs,
-        const tf_qmm_group::Parts& parts,int M,int K,int ldx) {
+        const tf_qmm_group::Parts& parts,int M,int K,int ldx,float* partials=nullptr) {
     static_assert(!DICT||Rolling==0,"coded rolling prefetch is not implemented");
     extern __shared__ __align__(128) unsigned char buf[];
     const auto p=parts.p[0];
-    const int slice=threadIdx.x/128,tid=threadIdx.x%128,lane=tid&31,wn=tid>>5;
+    const int slice=EXTERNAL?int(blockIdx.y):int(threadIdx.x)/128,tid=threadIdx.x%128,lane=tid&31,wn=tid>>5;
     const int KG=K/64,per=KG/Slices,g0=slice*per,tile=blockIdx.x,n0=tile*64,rows=min(M,16);
     const int tiles=DICT?int(gridDim.x):p.npad/64;
-    auto* local=buf+slice*SliceBytes;
+    auto* local=buf+(EXTERNAL?0:slice*SliceBytes);
     auto stage=[&](int it){return local+(it&1)*Stage;};
     auto weight=[&](int g){return reinterpret_cast<const unsigned char*>(p.w)+(size_t(g)*tiles+tile)*2048;};
     qmm_dict::DictLanes D{};
     if constexpr(DICT){D=qmm_dict::dict_lanes<64,4>(p,n0,KG,tid);qmm_dict::dict_room(D,p,OUT_PAIR_SMEM);}
-    unsigned char* dec=buf+Bytes;
-    unsigned char* table=buf+Bytes;
+    unsigned char* dec=buf+(EXTERNAL?SliceBytes:Bytes);
+    unsigned char* table=dec;
     auto load_w=[&](int it){
         auto* dst=stage(it);const int g=g0+it;
         cp16(dst+2048+tid*16,weight(g)+tid*16);
@@ -42,7 +44,7 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
         cp16z(dst+row*128+swz<8>(row,ch)*16,x+size_t(min(row,rows-1))*ldx+g*64+ch*8,row<rows);
         if(tid<16){if(tid<rows)cp4(dst+4352+tid*4,xs+size_t(tid)*KG+g);else *reinterpret_cast<float*>(dst+4352+tid*4)=0;}
     };
-    if constexpr(DICT)qmm_dict::dict_table<Slices*128>(p,table,threadIdx.x,OUT_PAIR_SMEM);
+    if constexpr(DICT)qmm_dict::dict_table<EXTERNAL?128:Slices*128>(p,table,threadIdx.x,OUT_PAIR_SMEM);
     load_w(0);commit();
 #if __CUDA_ARCH__ >= 900
     if(tid==0) {
@@ -115,7 +117,18 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
             for(int e=0;e<4;++e)acc[j][e]=__fmaf_rn(xv[e>>1],bv[e&1],__fmaf_rn(d[j][e],sv[e&1],acc[j][e]));
         }
     }
-    wait<0>();__syncthreads();auto* partial=reinterpret_cast<float*>(buf);
+    wait<0>();__syncthreads();
+    if constexpr(EXTERNAL){
+        // Every lane writes all eight values, including zero-filled rows. A stream-ordered
+        // merge waits for the complete producer grid; there is no inter-CTA polling.
+        auto* partial=partials+size_t(tile)*Slices*16*64;
+#pragma unroll
+        for(int j=0;j<2;++j)
+#pragma unroll
+            for(int e=0;e<4;++e)partial[((slice*2+j)*4+e)*128+tid]=acc[j][e];
+        return;
+    }
+    auto* partial=reinterpret_cast<float*>(buf);
     if(slice!=0){
 #pragma unroll
         for(int j=0;j<2;++j)
@@ -149,4 +162,42 @@ extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_stream16_dict(co
 }
 extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_prefetch16(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
     tf_qmm_output_stream::body<4>(x,xs,parts,M,K,ldx);
+}
+
+// grid=(80,4), block=128: the original four slices, distributed over independent CTAs.
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_output_slices16(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx,float* partials){
+    if(K==6144)tf_qmm_output_stream::body<4,4,0,false,true>(x,xs,parts,M,K,ldx,partials);
+    else tf_qmm_output_stream::body<0,4,0,false,true>(x,xs,parts,M,K,ldx,partials);
+}
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_output_slices16_dict(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx,float* partials){
+    if(K==6144)tf_qmm_output_stream::body<4,4,0,true,true>(x,xs,parts,M,K,ldx,partials);
+    else tf_qmm_output_stream::body<0,4,0,true,true>(x,xs,parts,M,K,ldx,partials);
+}
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_output_slices16_merge(const float* partials,const __grid_constant__ tf_qmm_group::Parts parts,int M){
+    using namespace qmm_frag;
+    // PDL may start this kernel before the producer has finished. No partial is read
+    // until the producer grid completes. Plain launches obey the same stream order.
+    grid_wait();
+    const auto p=parts.p[0];
+    const int tid=threadIdx.x,lane=tid&31,wn=tid>>5,n0=int(blockIdx.x)*64;
+    const auto* partial=partials+size_t(blockIdx.x)*4*16*64;
+    float acc[2][4];
+#pragma unroll
+    for(int j=0;j<2;++j)
+#pragma unroll
+        for(int e=0;e<4;++e)acc[j][e]=partial[(j*4+e)*128+tid];
+    // Identical to the native CTA's slice-0 epilogue: (((s0+s1)+s2)+s3).
+    for(int peer=1;peer<4;++peer)
+#pragma unroll
+        for(int j=0;j<2;++j)
+#pragma unroll
+            for(int e=0;e<4;++e)acc[j][e]=acc[j][e]+partial[((peer*2+j)*4+e)*128+tid];
+#pragma unroll
+    for(int j=0;j<2;++j)
+#pragma unroll
+        for(int h=0;h<2;++h){const int r=(lane>>2)+h*8,c=n0+wn*16+j*8+(lane&3)*2;
+            if(r<M&&c+1<p.n)*reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<__nv_bfloat16*>(p.out)+size_t(r)*p.n+c)=__floats2bfloat162_rn(acc[j][2*h],acc[j][2*h+1]);
+        }
+    // Release only after consuming scratch. Its next writer also executes grid_wait().
+    grid_launch();
 }

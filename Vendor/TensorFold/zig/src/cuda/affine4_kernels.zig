@@ -132,6 +132,11 @@ pub const Affine4Kernels = struct {
     group_fn: Function,
     stream16_fns: [2]?Function = @splat(null),
     stream16_dict_fn: ?Function = null, // tf_qmm_output_stream16 on a dictionary-coded down projection
+    stream16_slices_fn: ?Function = null,
+    stream16_slices_dict_fn: ?Function = null,
+    stream16_slices_merge_fn: ?Function = null,
+    stream16_partials: ?DeviceBuffer = null, // four native FP32 slices, 80 tiles of 16x64
+    stream16_owner: ?Stream = null, // scratch is used only on this engine's serial compute stream
     gdn_stream16_dict_fn: ?Function = null, // tf_qmm_gdn_stream16 with its dictionary-coded parts
     gdn_stream16_fn: ?Function = null,
     gdn_stream32_fn: ?Function = null,
@@ -193,6 +198,11 @@ pub const Affine4Kernels = struct {
         a.pdl = gb10;
         a.stream16_fns = @splat(null);
         a.stream16_dict_fn = null;
+        a.stream16_slices_fn = null;
+        a.stream16_slices_dict_fn = null;
+        a.stream16_slices_merge_fn = null;
+        a.stream16_partials = null;
+        a.stream16_owner = null;
         a.gdn_stream16_dict_fn = null;
         a.gdn_stream16_fn = null;
         a.gdn_stream32_fn = null;
@@ -471,6 +481,7 @@ pub const Affine4Kernels = struct {
     }
 
     pub fn deinit(a: *Affine4Kernels) void {
+        if (a.stream16_partials) |*b| b.free();
         if (a.split) |*sp| sp.deinit();
         if (a.narrow) |*sp| sp.deinit();
     }
@@ -893,6 +904,18 @@ pub const Affine4Kernels = struct {
             var g: launch_.Args = .{};
             g.add(x); g.add(xs); g.add(parts);
             for ([_]usize{ rows, q.k, q.k }) |v| g.add(int(v));
+            // Four independent CTAs, preserving exactly the native K partition and reduction.
+            // Other streams and short windows keep the existing scratch-free launch.
+            const slices_fn = if (dict) a.stream16_slices_dict_fn else a.stream16_slices_fn;
+            if (rows >= 8 and slices_fn != null and a.stream16_slices_merge_fn != null and
+                a.stream16_partials != null and a.stream16_owner != null and a.stream16_owner.?.handle == s.handle) {
+                g.add(a.stream16_partials.?.ptr);
+                const shared_slices: u32 = linear.out16_smem / 4 + (if (dict) q.tabBytesUpTo(linear.out_pair_tab_max) else @as(u32, 0));
+                try launch_.launch(slices_fn.?, .{ .grid = .{ .x = 80, .y = 4 }, .block = .{ .x = 128 }, .shared = shared_slices, .pdl = a.pdl }, s, &g);
+                var merge: launch_.Args = .{};
+                merge.add(a.stream16_partials.?.ptr); merge.add(parts); merge.add(int(rows));
+                return launch_.launch(a.stream16_slices_merge_fn.?, .{ .grid = .{ .x = 80 }, .block = .{ .x = 128 }, .pdl = a.pdl }, s, &merge);
+            }
             const shared = if (dict) linear.out16_smem + q.tabBytesUpTo(linear.out_pair_tab_max) else linear.out16_smem;
             return launch_.launch(if (dict) a.stream16_dict_fn.? else stream_fn.?, .{ .grid = .{ .x = 80 }, .block = .{ .x = 512 }, .shared = shared, .pdl = a.pdl }, s, &g);
         }
