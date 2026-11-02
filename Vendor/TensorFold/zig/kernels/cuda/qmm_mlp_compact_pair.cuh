@@ -7,7 +7,7 @@ __device__ __forceinline__ uint32_t compact_load_a(const __nv_bfloat16* p) {
     return word;
 }
 
-template <int STAGES = 2, int BN = 256, bool KMAJOR = true>
+template <int STAGES = 3, int BN = 256, bool KMAJOR = true>
 __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
                                               const Parts& parts, __nv_bfloat16* __restrict__ act,
                                               float* __restrict__ as, int M, int K, int ldx, int rows_t) {
@@ -19,7 +19,7 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
                SMEM = STAGES * STAGE };
     };
     constexpr int PASSES = BN / WN / 32;
-    static_assert(T::SMEM == 21632, "compact pair pipeline footprint");
+    static_assert(T::STAGE == 10816, "compact pair stage footprint");  // three stages: 32448 bytes
     constexpr int I = T::MT, J = T::NT;
     extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -103,7 +103,7 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     }
     grid_launch();
     for (int it = 0; it < per; ++it) {
-        wait<0>();
+        wait<STAGES - 2>();  // stage it landed; the STAGES - 2 later ones may still be in flight
         __syncthreads();
         uint32_t av[GS / 16][I][4];
         {
@@ -123,7 +123,7 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
                     av[kt][i][3] = at(r + 8, 2 * kt + 1);
                 }
         }
-        const int next = it + 1;
+        const int next = it + STAGES - 1;  // the stage consumed at it - 1: every warp passed this step's barrier
         if (next < per) { load_x(next % STAGES, next); load_w(next % STAGES, next); }
         commit();
         const unsigned char* p = stage(it % STAGES);
