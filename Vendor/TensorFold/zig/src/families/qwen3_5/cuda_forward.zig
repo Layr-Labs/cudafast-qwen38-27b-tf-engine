@@ -184,8 +184,6 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
         if (shape.taps) for (e.taps[0..e.n_taps], 0..) |t, ti| if (t == i) {
             try e.runAfter(e.fns.tap, .{ total, (g.hidden + 2047) / 2048, 1 }, .{ 256, 1, 1 }, .{ e.h, e.r, t_segs, t_rows, @as(c_int, @intCast(ti)), @as(c_int, @intCast(g.hidden)), t_params });
         };
-        // a captured forward's first layer is a graph of its own (cuda_engine.zig's cutCapture)
-        if (i == 0) try e.cutCapture();
     }
     try finish(e, total, heads, shape.hidden, if (@hasField(@TypeOf(shape), "amax")) shape.amax else false);
 }
