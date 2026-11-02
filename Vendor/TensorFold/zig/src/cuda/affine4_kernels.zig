@@ -536,7 +536,13 @@ pub const Affine4Kernels = struct {
         if (a.streamable(outs, rows)) {
             const rows32 = rows > 16;
             const bn: usize = if (rows32) 128 else 256;
-            const dict_fn = if (rows32) a.gdn_stream32_dict_fn else a.gdn_stream16_dict_fn;
+            const native_gdn = !rows32 and outs.len == 4 and
+                (for (outs) |o| {
+                    if (o.q.s == 0 or o.q.b == 0) break false;
+                } else true);
+            const dict_fn = if (native_gdn)
+                null
+            else if (rows32) a.gdn_stream32_dict_fn else a.gdn_stream16_dict_fn;
             // coded parts stream their index windows (the dictionary twin): npad holds the code, tiles the real npad
             var dict = false;
             var tab: u32 = 0;
