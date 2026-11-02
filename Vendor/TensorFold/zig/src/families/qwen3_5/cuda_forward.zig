@@ -260,7 +260,7 @@ pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool, amax: bool) 
             // a greedy verify: the norm wrote the rows' group sums (projAgain's input); the head's tile writes each
             // row's best a tile and the merge each row's token (cuda_engine.zig forward then skips its argmax)
             const x = e.x + (total - heads) * g.hidden * 2;
-            const toks = e.tables.ptr + @import("cuda_round.zig").tokens_at;
+            const toks = if (@hasDecl(@TypeOf(e.*), "tokenOutput")) e.tokenOutput() else e.tables.ptr + @import("cuda_round.zig").tokens_at;
             // the 2-bit sieve and the listed column groups exactly (head_sieve.zig); check mode runs the full head too
             if (@hasField(@TypeOf(e.*), "sieve")) if (e.sieve) |*sv| {
                 if (sv.mode == .check) try e.affine.headArgmax(e.stream, x, e.xs, e.head.a4, e.head_amax, heads, toks);

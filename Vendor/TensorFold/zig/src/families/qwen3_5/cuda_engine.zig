@@ -185,6 +185,9 @@ pub const Engine = struct {
     tables: DeviceBuffer,
     staged: cuda.HostBuffer,
     host_logits: cuda.HostBuffer,
+    host_tokens: ?cuda.HostBuffer = null,
+    token_device: u64 = 0,
+    mapped_results: bool = false,
     /// The kept rows' device draws, when forward was given them.
     tokens: [most_verify]u32 = undefined,
     /// The captured forwards by shape (`Shape.key`): the launches from the embedding to the head.
@@ -219,8 +222,12 @@ pub const Engine = struct {
         const g = try Geometry.read(gpa, io, dir);
         const d = ctx.d;
         const e = try @import("cuda_prompt_int8.zig").Allocation(Engine).create(gpa);
+        e.host_tokens = null;
+        e.token_device = 0;
+        e.mapped_results = false;
         e.h_window = null; // Allocation.create leaves fields undefined before the first captured forward.
         errdefer gpa.destroy(e);
+        errdefer if (e.host_tokens) |*b| b.free();
         e.projection_streams = null;
         errdefer if (e.projection_streams) |*b| b.free();
         e.fast = null;
@@ -281,6 +288,9 @@ pub const Engine = struct {
         const major = try ctx.attribute(.compute_capability_major);
         const minor = try ctx.attribute(.compute_capability_minor);
         const gb10 = major == 12 and minor == 1;
+        e.mapped_results = gb10 and !envOff("TF_MAPPED_RESULTS") and
+            (ctx.attribute(.can_map_host_memory) catch 0) != 0;
+        if (e.mapped_results) e.host_tokens = try @import("cuda_mapped_results.zig").alloc(d, most_verify * 4, true, &e.token_device);
         e.affine = try cuda.qlinear.Affine4Kernels.resolve(d, e.mods[0], e.mods[1], e.mods[2], e.mods[3], sms, gb10);
         e.affine.half_prompt = !gb10; // the 27B's prompt tile (Tile<64, 128, 128, 2, 2, 2>), quicker on an RTX 5090
         // GB10: split-K decode/verify projections on the cluster tile (bits unchanged); TF_CLUSTER_DECODE=0 restores lane_gemv
@@ -411,6 +421,7 @@ pub const Engine = struct {
         while (hit.next()) |x| x.deinit();
         e.heads.deinit(e.gpa);
         e.host_logits.free();
+        if (e.host_tokens) |*b| b.free();
         e.staged.free();
         e.tables.free();
         if (e.wide_words) |*b| b.free();
@@ -724,7 +735,7 @@ pub const Engine = struct {
         switch (keep) {
             .hidden => try e.stream.synchronize(), // mapped layer inputs are ready before the learner reads them
             .draws => |pk| {
-                const toks = e.tables.ptr + tokens_at;
+                const toks = e.tokenOutput();
                 var i: usize = if (shape.amax) pk.len else 0; // amax: the graph's head wrote every row's token
                 while (i < pk.len) { // runs of greedy rows argmaxed together, runs of sampled rows drawn together
                     const sampled = pk[i].rule != null;
@@ -735,9 +746,12 @@ pub const Engine = struct {
                     } else try e.argmax(i, n, toks);
                     i += n;
                 }
-                try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(e.host_logits.bytes.ptr, toks, total * 4, e.stream.handle), "cuMemcpyDtoHAsync");
+                const host = e.host_tokens orelse e.host_logits;
+                if (e.token_device == 0)
+                    try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(host.bytes.ptr, toks, total * 4, e.stream.handle), "cuMemcpyDtoHAsync");
+                // This completion is also the visibility boundary for GPU stores into mapped host memory.
                 try e.stream.synchronize();
-                @memcpy(e.tokens[0..total], e.host_logits.slice(u32)[0..total]);
+                @memcpy(e.tokens[0..total], host.slice(u32)[0..total]);
                 if (shape.amax) if (e.sieve) |*sv| sv.after();
             },
             .logits, .last => {
@@ -750,6 +764,11 @@ pub const Engine = struct {
             },
         }
         recurrent.completed(e);
+    }
+
+    /// Stable for the engine lifetime, including every captured greedy-head path.
+    pub fn tokenOutput(e: *const Engine) u64 {
+        return if (e.token_device != 0) e.token_device else e.tables.ptr + tokens_at;
     }
 
     pub const Shape = @import("cuda_shapes.zig").Shape;

@@ -95,6 +95,7 @@ pub const Draft = struct {
     hp: u64,
     ids: u64, // u32 the block's ids
     staged: cuda.HostBuffer, // pinned: the ids up, the words and projected rows down
+    staged_device: u64 = 0, // a stable mapped view, or zero for the existing D2H path
     streams: std.AutoHashMapUnmanaged(*Stream, *Ctx) = .empty,
     graphs: std.AutoHashMapUnmanaged(u64, struct { exec: ?cuda.graph.Exec, spanned: ?u64 }) = .empty,
     /// Contexts between streams, allocated and run once (`reserve`), as the driver stalls a buffer's first kernel.
@@ -137,8 +138,9 @@ pub const Draft = struct {
         try d.scratch.fill8(0, null);
         d.at = 0;
         _ = try d.layout(true);
-        d.staged = try cuda.HostBuffer.alloc(e.d, try frame.stagedBytes(c.rank));
+        d.staged = try @import("cuda_mapped_results.zig").alloc(e.d, try frame.stagedBytes(c.rank), e.mapped_results, &d.staged_device);
         errdefer d.staged.free();
+        _ = try d.layout(true); // bind mapped terminal outputs before any warmup or graph capture
         d.head2 = try frame.head2Init(d);
         errdefer if (d.head2) |*h| h.free();
         // the first context, and a hold timed on it (the quickest of several: the first ones pay the driver's stalls)
@@ -229,6 +231,11 @@ pub const Draft = struct {
             const at = (try std.math.add(usize, total, 255)) & ~@as(usize, 255);
             total = try std.math.add(usize, at, s[1]);
             if (assign) @field(d, s[0]) = d.scratch.ptr + at;
+        }
+        if (assign and d.staged_device != 0) {
+            // Keep scratch accounting/layout unchanged; resize must restore these stable output addresses.
+            d.words = d.staged_device + words_at;
+            d.hp = d.staged_device + hp_at;
         }
         return total;
     }
