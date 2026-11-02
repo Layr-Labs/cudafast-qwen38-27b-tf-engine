@@ -1,0 +1,8 @@
+{
+  "local_patches": [
+    {
+      "file": "Vendor/TensorFold/VENDOR.json (annotation only)",
+      "why": "Retry failed platform evaluation dc25b506-9c57-459e-bf76-b1ef0d615a07; runtime source identical."
+    }
+  ]
+}
