@@ -119,7 +119,7 @@ __device__ __forceinline__ void gemv_items(const __nv_bfloat16* __restrict__ x, 
                                   static_cast<size_t>(n0 / 64) * KG * TILE_BYTES + (n0 % 64) * GS / 2;
 #pragma unroll
         for (int j = 0; j < WC; ++j)
-            if (wok[j]) cp16(p + wdst[j], wb + woff[j] + static_cast<size_t>(g) * TILE_BYTES);
+            if (wok[j]) cp16w(p + wdst[j], wb + woff[j] + static_cast<size_t>(g) * TILE_BYTES);
         if constexpr (DICT) {
             if (D.ok) cp16(p + T::X + T::W + tid * 16, D.src + static_cast<size_t>(n0 / 64) * KG * D.step + dict_window(D, g));
         } else {

@@ -74,7 +74,7 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
         unsigned char* p = stage(s);
 #pragma unroll
         for (int j = 0; j < WC; ++j)
-            if (wok[j]) cp16(p + wdst[j], wsrc[j] + static_cast<size_t>(g) * (KMAJOR ? P.npad / 64 : 1) * TILE_BYTES);
+            if (wok[j]) cp16w(p + wdst[j], wsrc[j] + static_cast<size_t>(g) * (KMAJOR ? P.npad / 64 : 1) * TILE_BYTES);
         if (dok) cp16(p + ddst, dsrc + static_cast<size_t>(g) * dpitch);
     };
     uint32_t mask;

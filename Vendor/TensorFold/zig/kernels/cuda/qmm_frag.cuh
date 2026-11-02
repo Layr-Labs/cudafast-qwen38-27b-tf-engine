@@ -31,6 +31,19 @@ __device__ __forceinline__ void cp16(void* dst, const void* src) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(smem(dst)), "l"(src));
 }
 
+// The packed weight stream (single-use 4-bit codes): an L2 evict-first policy, so the stream's lines go first and the
+// lines a round re-reads (activation tiles, group sums, dictionaries, KV) stay. A cache hint only: the bytes are the same.
+// Not volatile: one policy register a thread, hoisted out of the stage loops.
+__device__ __forceinline__ uint64_t stream_policy() {
+    uint64_t p;
+    asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(p));
+    return p;
+}
+
+__device__ __forceinline__ void cp16w(void* dst, const void* src) {
+    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n" ::"r"(smem(dst)), "l"(src), "l"(stream_policy()));
+}
+
 __device__ __forceinline__ void cp16z(void* dst, const void* src, bool read) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem(dst)), "l"(src), "r"(read ? 16 : 0));
 }

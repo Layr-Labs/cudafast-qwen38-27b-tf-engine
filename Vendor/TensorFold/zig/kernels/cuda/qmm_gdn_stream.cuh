@@ -88,7 +88,7 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
 #else
 #pragma unroll
         for (int j = 0; j < WC; ++j)
-            if (wok[j]) cp16(p + wdst[j], wb + woff[j] + static_cast<size_t>(g) * (npad/64) * TILE_BYTES);
+            if (wok[j]) cp16w(p + wdst[j], wb + woff[j] + static_cast<size_t>(g) * (npad/64) * TILE_BYTES);
 #endif
         if constexpr (DICT) {
             // the CTA's tiles' index windows: tile n0 / 64 + c / 16, chunk c % 16, from each group's 64-byte line
@@ -407,7 +407,7 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
                                   static_cast<size_t>(n0 / 64) * TILE_BYTES + (n0 % 64) * GS / 2;
 #pragma unroll
         for (int j = 0; j < WC; ++j)
-            if (wok[j]) cp16(p + wdst[j], wb + woff[j] + static_cast<size_t>(g) * (npad / 64) * TILE_BYTES);
+            if (wok[j]) cp16w(p + wdst[j], wb + woff[j] + static_cast<size_t>(g) * (npad / 64) * TILE_BYTES);
         if constexpr (DICT) {
             const int step = qmm_dict::dict_step(P.npad);
             const size_t window = static_cast<size_t>(g) * step & ~static_cast<size_t>(63);
