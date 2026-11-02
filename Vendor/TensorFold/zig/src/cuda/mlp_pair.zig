@@ -55,8 +55,12 @@ pub const Kernels = struct {
             k.single_dict_fn = fs;
             const fc = try group_mod.function("tf_qmm_mlp_single16_compact_pair");
             try fc.allowDynamicShared(compact_pair_smem);
-            // three CTAs an SM need the 100 KiB carveout on GB10 (3 x 21632 bytes and their reserve exceed 64 KiB)
-            try fc.setAttribute(.preferred_shared_memory_carveout, 100);
+            // three CTAs an SM need the 100 KiB class of shared memory on GB10 (3 x 21632 bytes and their reserve exceed
+            // 64 KiB); the attribute is a percentage of the unified pool, so 100 is the whole 228 KiB and it costs this
+            // kernel its L1. 50 keeps 128 KiB of shared for those three CTAs and hands the other half back to L1, where
+            // the x fragments (2 KiB a group, re-read by every one of the 136 column tiles) are reused by the three
+            // co-resident CTAs. A hint: a launch still gets at least the dynamic shared memory it asks for.
+            try fc.setAttribute(.preferred_shared_memory_carveout, 50);
             k.compact_pair_fn = fc;
         }
         return k;
