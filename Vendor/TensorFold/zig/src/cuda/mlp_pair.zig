@@ -22,6 +22,9 @@ pub const kmajor_smem: u32 = 13440 + 16 * 128 * 2;
 pub const single_smem: u32 = 41088;
 /// Pair-only half panel: two weight/index/sum/input-tile stages (the input fragments read from the staged tile).
 pub const compact_pair_smem: u32 = 21632;
+/// tf_qmm_mlp_single16_compact_pair_ws: three stages of compact_pair_smem's stage (10816 bytes), the input tile staged too;
+/// 160 threads (four compute warps and a loader warp), still three CTAs an SM with the 100 KiB carveout.
+pub const compact_ws_smem: u32 = 3 * 10816;
 /// tf_qmm_mlp_single32: two stages of 32 input rows, four 2 KB weight tiles, 256 scales and biases, 32 sums.
 pub const single32_smem: u32 = 2 * (32 * 128 + 256 * 32 + 2 * 256 * 2 + 32 * 4);
 /// tf_qmm_mlp_single16_dict past single_smem: four warps' decoded values, then gate's and up's tables.
@@ -39,6 +42,7 @@ pub const Kernels = struct {
     single32_dict_fn: ?Function = null, // tf_qmm_mlp_single32_dict: dictionary-coded twin on the K-major panels
     dict_fn: ?Function = null, // GB10: tf_qmm_mlp_pair's twin, taken when gate and up are both coded (tile-major)
     compact_pair_fn: ?Function = null,
+    compact_ws_fn: ?Function = null, // the compact pair with a loader warp (TF_MLP_WS=0: the four-warp kernel)
     single_dict_fn: ?Function = null, // tf_qmm_mlp_single16's, when both are coded on the K-major panel's layout
 
     /// From the loaded qmm_group module; `pdl` as the decode tiles' launches (GB10).
@@ -58,6 +62,13 @@ pub const Kernels = struct {
             // three CTAs an SM need the 100 KiB carveout on GB10 (3 x 21632 bytes and their reserve exceed 64 KiB)
             try fc.setAttribute(.preferred_shared_memory_carveout, 100);
             k.compact_pair_fn = fc;
+            if (!wsOff()) {
+                if (group_mod.function("tf_qmm_mlp_single16_compact_pair_ws")) |fw| {
+                    try fw.allowDynamicShared(compact_ws_smem);
+                    try fw.setAttribute(.preferred_shared_memory_carveout, 100);
+                    k.compact_ws_fn = fw;
+                } else |_| {}
+            }
         }
         return k;
     }
@@ -147,8 +158,15 @@ pub const Kernels = struct {
         g.add(act);
         g.add(as);
         for ([_]usize{ rows, gate.k, gate.k, rows_t }) |v| g.add(@as(c_int, @intCast(v)));
-        const f = if (compact) kk.compact_pair_fn.? else if (sdict) kk.single_dict_fn.? else if (major) kk.kmajor_fn.? else if (dict) kk.dict_fn.? else kk.pair_fn;
-        const shared: u32 = if (compact) compact_pair_smem else if (sdict) single_smem + single_dict_dec + singleTab(gate) + singleTab(up) else if (single) single_smem else if (major) kmajor_smem else if (dict) smem + qlinear.dict_dec + @max(gate.tabBytes(), up.tabBytes()) else smem;
-        try launch_.launch(f, .{ .grid = .{ .x = @intCast(@as(usize, if (single) 1 else 2) * rows_t * tiles) }, .block = .{ .x = 128 }, .shared = shared, .cluster = if (single) null else .{ .x = 2 }, .pdl = kk.pdl }, s, &g);
+        const ws = compact and kk.compact_ws_fn != null;
+        const f = if (ws) kk.compact_ws_fn.? else if (compact) kk.compact_pair_fn.? else if (sdict) kk.single_dict_fn.? else if (major) kk.kmajor_fn.? else if (dict) kk.dict_fn.? else kk.pair_fn;
+        const shared: u32 = if (ws) compact_ws_smem else if (compact) compact_pair_smem else if (sdict) single_smem + single_dict_dec + singleTab(gate) + singleTab(up) else if (single) single_smem else if (major) kmajor_smem else if (dict) smem + qlinear.dict_dec + @max(gate.tabBytes(), up.tabBytes()) else smem;
+        try launch_.launch(f, .{ .grid = .{ .x = @intCast(@as(usize, if (single) 1 else 2) * rows_t * tiles) }, .block = .{ .x = if (ws) 160 else 128 }, .shared = shared, .cluster = if (single) null else .{ .x = 2 }, .pdl = kk.pdl }, s, &g);
     }
 };
+
+/// TF_MLP_WS=0: the compact pair keeps its four-warp kernel (no loader warp).
+fn wsOff() bool {
+    const v = std.c.getenv("TF_MLP_WS") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "0");
+}
