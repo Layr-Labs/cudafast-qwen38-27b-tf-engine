@@ -600,6 +600,7 @@ pub const Engine = struct {
 
     /// One forward over `parts`' windows, with every input admitted before an unkept verify is settled.
     pub fn forward(e: *Engine, parts: []const Part, ids: []const u32, keep: Keep) !void {
+        const began = monoNs();
         try e.admit(parts, ids, keep);
         const g = e.g;
         const total = ids.len;
@@ -736,7 +737,9 @@ pub const Engine = struct {
                     i += n;
                 }
                 try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(e.host_logits.bytes.ptr, toks, total * 4, e.stream.handle), "cuMemcpyDtoHAsync");
+                verify_wait.sleep(began);
                 try e.stream.synchronize();
+                verify_wait.done(began);
                 @memcpy(e.tokens[0..total], e.host_logits.slice(u32)[0..total]);
                 if (shape.amax) if (e.sieve) |*sv| sv.after();
             },
@@ -744,6 +747,7 @@ pub const Engine = struct {
                 const out = e.host_logits.bytes[0 .. heads * g.vocab * 2];
                 try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(out.ptr, e.logits, out.len, e.stream.handle), "cuMemcpyDtoHAsync");
                 try e.stream.synchronize();
+                verify_wait = .{}; // a prompt or logits forward starts a new phase: no verify span carries over
                 // the chunk is done: its persisting lines turn normal, so decode has all of L2
                 if (prompt and e.l2_persist > 0) _ = e.d.api.cuCtxResetPersistingL2Cache();
                 if (keep == .last) @memcpy(parts[0].cache.logits, e.rowLogits(0));
@@ -813,4 +817,58 @@ pub const glue_pdl = true;
 fn scanEarlyOn() bool {
     const v = std.c.getenv("TF_SCAN_EARLY") orelse return true;
     return !std.mem.eql(u8, std.mem.span(v), "0");
+}
+
+/// The decode verify's readback wait: most of a verify round (the weight stream, tens of ms) the host would spin on
+/// the driver's synchronize, competing with the GPU for the shared LPDDR and power. Once four verify spans of this phase
+/// are known, the thread sleeps until 1.5 ms before the shortest of the last four (from the forward's start), then spins
+/// as before, so the wake-up latency at completion is the spin's. Host timing only: no launch, value or token changes.
+/// TF_VERIFY_SLEEP=0 keeps the plain spin.
+const VerifyWait = struct {
+    spans: [4]u64 = @splat(0),
+    n: u32 = 0,
+
+    const margin_ns: u64 = 1_500_000;
+    const min_ns: u64 = 5_000_000;
+
+    fn shortest(w: *const VerifyWait) u64 {
+        var m: u64 = std.math.maxInt(u64);
+        for (w.spans) |s| m = @min(m, s);
+        return m;
+    }
+
+    fn sleep(w: *const VerifyWait, began: u64) void {
+        if (@import("builtin").os.tag != .linux or w.n < w.spans.len or began == 0 or sleepOff()) return;
+        const est = w.shortest();
+        if (est < min_ns) return;
+        const now = monoNs();
+        if (now == 0 or now < began) return;
+        const wake = began + est - margin_ns;
+        if (wake <= now + 200_000) return; // under 0.2 ms left: just spin
+        const left = wake - now;
+        const ts: std.os.linux.timespec = .{ .sec = @intCast(left / 1_000_000_000), .nsec = @intCast(left % 1_000_000_000) };
+        _ = std.os.linux.nanosleep(&ts, null);
+    }
+
+    fn done(w: *VerifyWait, began: u64) void {
+        const now = monoNs();
+        if (began == 0 or now < began) return;
+        w.spans[w.n % w.spans.len] = now - began;
+        w.n +|= 1;
+    }
+};
+
+threadlocal var verify_wait: VerifyWait = .{};
+
+fn sleepOff() bool {
+    const v = @import("sys").c.getenv("TF_VERIFY_SLEEP") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "0");
+}
+
+/// CLOCK_MONOTONIC in ns; 0 off Linux or on failure (the waits then never sleep).
+fn monoNs() u64 {
+    if (@import("builtin").os.tag != .linux) return 0;
+    var ts: std.os.linux.timespec = undefined;
+    if (std.os.linux.errno(std.os.linux.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return 0;
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
