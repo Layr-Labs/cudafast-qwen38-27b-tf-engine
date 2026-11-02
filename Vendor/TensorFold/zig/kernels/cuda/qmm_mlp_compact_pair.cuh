@@ -7,7 +7,10 @@ __device__ __forceinline__ uint32_t compact_load_a(const __nv_bfloat16* p) {
     return word;
 }
 
-template <int STAGES = 2, int BN = 256, bool KMAJOR = true>
+// COPACK (tf_copack_pair): each part's w is its co-packed twin, one record a (group, CTA) of the CTA's two weight
+// panels then its index bytes; the loads read the same bytes from there (only their addresses change), so every value
+// is the same bits.
+template <int STAGES = 2, int BN = 256, bool KMAJOR = true, bool COPACK = false>
 __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
                                               const Parts& parts, __nv_bfloat16* __restrict__ act,
                                               float* __restrict__ as, int M, int K, int ldx, int rows_t) {
@@ -33,27 +36,42 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     const int rows = min(BM, M - m0);
     constexpr int TILE_BYTES = 64 * GS / 2;
     constexpr int WC = (T::W / 16 + T::THREADS - 1) / T::THREADS;
+    static_assert(KMAJOR && BN == 256 && WN == 4);
+    const int code0 = parts.p[0].first, code1 = parts.p[1].first;
+    const int bits0 = dict_bits(code0), bits1 = dict_bits(code1);
+    const int run0 = bits0, run1 = bits1;
+    // COPACK: a part's record is its two panels (TILE_BYTES each) then its run of 16-byte index chunks; the records
+    // of a group lie CTA by CTA (npad / 128 of them), the groups one after another
+    const size_t rec0 = 2 * TILE_BYTES + 16 * run0, rec1 = 2 * TILE_BYTES + 16 * run1;
     const unsigned char* wsrc[WC];
+    size_t wstep[WC];
     int wdst[WC];
     bool wok[WC];
 #pragma unroll
     for (int j = 0; j < WC; ++j) {
         const int c = tid + j * T::THREADS, t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
         wok[j] = c < T::W / 16;
-        wsrc[j] = reinterpret_cast<const unsigned char*>(parts.p[t / (BN / 128)].w) + static_cast<size_t>(n0 / 64 + t % (BN / 128)) * (KMAJOR ? 1 : KG) * TILE_BYTES +
-                  off * 16;
+        if constexpr (COPACK) {
+            const size_t rec = t / (BN / 128) ? rec1 : rec0;
+            wsrc[j] = reinterpret_cast<const unsigned char*>(parts.p[t / (BN / 128)].w) + static_cast<size_t>(tile) * rec +
+                      (t % (BN / 128)) * TILE_BYTES + off * 16;
+            wstep[j] = static_cast<size_t>(P.npad / 128) * rec;
+        } else {
+            wsrc[j] = reinterpret_cast<const unsigned char*>(parts.p[t / (BN / 128)].w) + static_cast<size_t>(n0 / 64 + t % (BN / 128)) * (KMAJOR ? 1 : KG) * TILE_BYTES +
+                      off * 16;
+            wstep[j] = static_cast<size_t>(KMAJOR ? P.npad / 64 : 1) * TILE_BYTES;
+        }
         wdst[j] = T::X + c * 16;
     }
-    static_assert(KMAJOR && BN == 256 && WN == 4);
-    const int code0 = parts.p[0].first, code1 = parts.p[1].first;
-    const int bits0 = dict_bits(code0), bits1 = dict_bits(code1);
-    const int run0 = bits0, run1 = bits1;
     const bool dok = tid < run0 + run1;
     const int dpart = tid < run0 ? 0 : 1, dchunk = tid < run0 ? tid : tid - run0;
     const int dstep = dict_step(dpart ? code1 : code0);
-    const unsigned char* dsrc = reinterpret_cast<const unsigned char*>(parts.p[dpart].scales) +
-                                static_cast<size_t>(n0 / 64) * dstep + dchunk * 16;
-    const int dpitch = P.npad / 64 * dstep;
+    const unsigned char* dsrc = COPACK
+        ? reinterpret_cast<const unsigned char*>(parts.p[dpart].w) + static_cast<size_t>(tile) * (dpart ? rec1 : rec0) +
+              2 * TILE_BYTES + dchunk * 16
+        : reinterpret_cast<const unsigned char*>(parts.p[dpart].scales) + static_cast<size_t>(n0 / 64) * dstep + dchunk * 16;
+    const size_t dpitch = COPACK ? static_cast<size_t>(P.npad / 128) * (dpart ? rec1 : rec0)
+                                 : static_cast<size_t>(P.npad / 64 * dstep);
     const int ddst = T::X + T::W + (dpart ? 16 * run0 : 0) + dchunk * 16;
     const int mpart = wn / 2, mbits = mpart ? bits1 : bits0;
     const uint32_t mmask = (1u << mbits) - 1u;
@@ -74,7 +92,7 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
         unsigned char* p = stage(s);
 #pragma unroll
         for (int j = 0; j < WC; ++j)
-            if (wok[j]) cp16(p + wdst[j], wsrc[j] + static_cast<size_t>(g) * (KMAJOR ? P.npad / 64 : 1) * TILE_BYTES);
+            if (wok[j]) cp16(p + wdst[j], wsrc[j] + static_cast<size_t>(g) * wstep[j]);
         if (dok) cp16(p + ddst, dsrc + static_cast<size_t>(g) * dpitch);
     };
     uint32_t mask;
@@ -234,4 +252,10 @@ extern "C" __global__ void __launch_bounds__(128, 3) tf_qmm_mlp_single16_compact
  const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,
  __nv_bfloat16* act,float* sums,int M,int K,int ldx,int rows_t) {
  tf_qmm_mlp_single::mlp_single_compact_body<>(x,xs,parts,act,sums,M,K,ldx,rows_t);
+}
+// tf_qmm_mlp_single16_compact_pair on the co-packed records (each part's w: tf_copack_pair's twin).
+extern "C" __global__ void __launch_bounds__(128, 3) tf_qmm_mlp_single16_compact_pair_copack(
+ const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,
+ __nv_bfloat16* act,float* sums,int M,int K,int ldx,int rows_t) {
+ tf_qmm_mlp_single::mlp_single_compact_body<2,256,true,true>(x,xs,parts,act,sums,M,K,ldx,rows_t);
 }

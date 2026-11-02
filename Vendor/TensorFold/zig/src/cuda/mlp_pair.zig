@@ -39,6 +39,7 @@ pub const Kernels = struct {
     single32_dict_fn: ?Function = null, // tf_qmm_mlp_single32_dict: dictionary-coded twin on the K-major panels
     dict_fn: ?Function = null, // GB10: tf_qmm_mlp_pair's twin, taken when gate and up are both coded (tile-major)
     compact_pair_fn: ?Function = null,
+    copack_fn: ?Function = null, // tf_qmm_mlp_single16_compact_pair_copack: the same on the co-packed records
     single_dict_fn: ?Function = null, // tf_qmm_mlp_single16's, when both are coded on the K-major panel's layout
 
     /// From the loaded qmm_group module; `pdl` as the decode tiles' launches (GB10).
@@ -58,6 +59,10 @@ pub const Kernels = struct {
             // three CTAs an SM need the 100 KiB carveout on GB10 (3 x 21632 bytes and their reserve exceed 64 KiB)
             try fc.setAttribute(.preferred_shared_memory_carveout, 100);
             k.compact_pair_fn = fc;
+            const fp = try group_mod.function("tf_qmm_mlp_single16_compact_pair_copack");
+            try fp.allowDynamicShared(compact_pair_smem);
+            try fp.setAttribute(.preferred_shared_memory_carveout, 100);
+            k.copack_fn = fp;
         }
         return k;
     }
@@ -71,6 +76,13 @@ pub const Kernels = struct {
     /// tf_qmm_mlp_single16's shared table bytes for q: a pair code's table is read through L2 there (none).
     fn singleTab(q: Affine4) u32 {
         return if (qlinear.pairCode(q.code)) 0 else q.tabBytes();
+    }
+
+    /// Whether a projection pair's compact launch can read co-packed records: both K-major pair-coded (the compact
+    /// kernel's dictionary form), 17408 x 5120. cuda_verify_weights.zig builds the records only for these.
+    pub fn copackable(gate: Affine4, up: Affine4) bool {
+        return gate.n == 17408 and gate.k == 5120 and up.n == 17408 and up.k == 5120 and gate.npad == up.npad and
+            gate.npad % 128 == 0 and coded(gate, up, true) and qlinear.pairCode(gate.code) and qlinear.pairCode(up.code);
     }
 
     /// Whether `pair` takes this gate and up: one shape whose decode() is group_kernel's one-slice tile.
@@ -140,6 +152,12 @@ pub const Kernels = struct {
             parts.p[0].w = gate.verify_w;
             parts.p[1].w = up.verify_w;
         }
+        // the compact kernel on both projections' co-packed records (the same bytes, one stream a projection)
+        const copack = compact and gate.copack_w != 0 and up.copack_w != 0 and kk.copack_fn != null;
+        if (copack) {
+            parts.p[0].w = gate.copack_w;
+            parts.p[1].w = up.copack_w;
+        }
         var g: launch_.Args = .{};
         g.add(x);
         g.add(xs);
@@ -147,7 +165,7 @@ pub const Kernels = struct {
         g.add(act);
         g.add(as);
         for ([_]usize{ rows, gate.k, gate.k, rows_t }) |v| g.add(@as(c_int, @intCast(v)));
-        const f = if (compact) kk.compact_pair_fn.? else if (sdict) kk.single_dict_fn.? else if (major) kk.kmajor_fn.? else if (dict) kk.dict_fn.? else kk.pair_fn;
+        const f = if (copack) kk.copack_fn.? else if (compact) kk.compact_pair_fn.? else if (sdict) kk.single_dict_fn.? else if (major) kk.kmajor_fn.? else if (dict) kk.dict_fn.? else kk.pair_fn;
         const shared: u32 = if (compact) compact_pair_smem else if (sdict) single_smem + single_dict_dec + singleTab(gate) + singleTab(up) else if (single) single_smem else if (major) kmajor_smem else if (dict) smem + qlinear.dict_dec + @max(gate.tabBytes(), up.tabBytes()) else smem;
         try launch_.launch(f, .{ .grid = .{ .x = @intCast(@as(usize, if (single) 1 else 2) * rows_t * tiles) }, .block = .{ .x = 128 }, .shared = shared, .cluster = if (single) null else .{ .x = 2 }, .pdl = kk.pdl }, s, &g);
     }

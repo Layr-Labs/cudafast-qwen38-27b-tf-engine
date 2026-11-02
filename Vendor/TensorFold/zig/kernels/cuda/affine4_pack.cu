@@ -82,6 +82,24 @@ extern "C" __global__ void tf_pack_kmajor(const uint32_t* input, uint32_t* outpu
     output[(group*tiles+tile)*512+at%512]=input[at];
 }
 
+// The compact gate/up kernel's co-packed twin (cuda_verify_weights.zig, qmm_mlp_compact_pair.cuh COPACK): for each
+// group g and each 128-column CTA c, one record of the CTA's two K-major weight panels (tf_pack_kmajor's (g, 2c) and
+// (g, 2c + 1), 4096 bytes) followed by its dictionary index bytes (the K-major index stream's (g, 2c) run of 16 * bits
+// bytes), so a CTA reads one contiguous record a group in place of a panel stream and an index stream. Byte copies.
+extern "C" __global__ void tf_copack_pair(const uint4* __restrict__ panels, const uint4* __restrict__ index,
+                                          uint4* __restrict__ out, int groups, int tiles, int run) {
+    const int pairs = tiles / 2, chunks = 256 + run;  // 16-byte chunks a record
+    const long long total = static_cast<long long>(groups) * pairs * chunks;
+    for (long long at = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x; at < total;
+         at += static_cast<long long>(gridDim.x) * blockDim.x) {
+        const long long rec = at / chunks;
+        const int ch = static_cast<int>(at % chunks);
+        const long long g = rec / pairs, c = rec % pairs;
+        out[at] = ch < 256 ? panels[(g * tiles + 2 * c) * 128 + ch]
+                           : index[(g * tiles * 8 * run + c * 16 * run) / 16 + (ch - 256)];
+    }
+}
+
 // Dictionary coding of the tiled scales and biases (qmm_dict.cuh), built at engine open from their own values.
 // tf_dict_mark: a presence bit for every 16-bit value of a (kg, npad) array (2048 words, zeroed by the caller).
 extern "C" __global__ void tf_dict_mark(const uint16_t* __restrict__ v, long long count, uint32_t* __restrict__ bitmap) {

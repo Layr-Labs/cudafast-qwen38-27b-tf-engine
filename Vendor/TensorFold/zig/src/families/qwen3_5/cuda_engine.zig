@@ -356,7 +356,7 @@ pub const Engine = struct {
         const streams = gb10 and g.hidden == 5120 and g.layers == 64 and g.experts == 0 and g.pocket == 0 and (output_stream or gdn_stream);
         // the decode copies on the fastest pieces of free memory (cuda_fastpool.zig); TF_FASTPOOL=0 keeps one buffer each
         if (gb10 and (panels or streams) and !envOff("TF_FASTPOOL")) {
-            var sizes: [2 * 64 + 6 * 64]usize = undefined;
+            var sizes: [4 * 64 + 6 * 64]usize = undefined; // panels, co-packed records, streams
             var n: usize = 0;
             if (panels) n += verify_weight_layout.copySizes(e, sizes[n..]);
             if (streams) n += projection_stream_layout.copySizes(e, gdn_stream, output_stream, sizes[n..]);
