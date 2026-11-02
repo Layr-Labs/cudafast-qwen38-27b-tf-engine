@@ -71,9 +71,9 @@ fn ropeQk(d: anytype, xq: u64, wq: u64, outq: u64, xk: u64, wk: u64, outk: u64, 
 pub fn attention(d: anytype, rows: usize, layer: usize) !void {
     const c = d.c;
     const partial = .{ d.q, d.kb, d.vb, d.segments, @as(c_int, @intCast(c.block)), @as(c_int, @intCast(c.heads)), @as(c_int, @intCast(c.kv_heads)), @as(c_int, @intCast(c.ringRows())), @as(c_int, @intCast(c.window)), @as(c_int, @intCast(layer)), d.pm, d.pl, d.po };
-    // four query heads a key head (128 wide): a block takes four rows of a stream and a key head's heads, so each
-    // staged key and value serves 16 (row, head) partials; the same bits as tf_q35d_attn_partial's
-    if (c.heads == 4 * c.kv_heads and c.head_dim == 128 and c.block % 4 == 0)
+    if (c.heads == 4 * c.kv_heads and c.head_dim == 128 and c.block % 8 == 0 and rows >= 8 and rows % 8 == 0)
+        try launch(d, d.fns.attn_partial_rows8, sig.draft_partial_rows8, .{ rows / 8, c.kv_heads, chunks }, .{ 256, 1, 1 }, partial)
+    else if (c.heads == 4 * c.kv_heads and c.head_dim == 128 and c.block % 4 == 0)
         try launch(d, d.fns.attn_partial_rows4, sig.draft_partial_rows, .{ rows / 4, c.kv_heads, chunks }, .{ 128, 1, 1 }, partial)
     else
         try launch(d, d.fns.attn_partial, sig.draft_partial, .{ rows, c.heads, chunks }, .{ 128, 1, 1 }, partial);
@@ -91,9 +91,9 @@ fn paired(l: anytype, B: usize) bool {
     return draft.pairedMlp() and B > 0 and B <= 16 and cuda.mlp_pair.Kernels.fits(l.gate, l.up);
 }
 
-/// Whether the MLP's input conv writes the pair's input sums itself (one 256-channel pass, whole groups a block).
-fn convSums(d: anytype, l: anytype, B: usize) bool {
-    return paired(l, B) and d.c.hidden % 256 == 0 and l.gate.k == d.c.hidden and !std.mem.eql(u8, std.mem.span(@import("sys").c.getenv("TF_DRAFT_CONV_SUMS") orelse ""), "0");
+/// A 256-channel convolution tile writes four complete 64-group sums without changing their addition order.
+fn convSums(d: anytype, B: usize) bool {
+    return B > 0 and B <= 16 and d.c.hidden % 256 == 0 and !std.mem.eql(u8, std.mem.span(@import("sys").c.getenv("TF_DRAFT_CONV_SUMS") orelse ""), "0");
 }
 
 /// Reuse the native fused pair while keeping its input sums separate from its output sums; `summed`: the conv that
@@ -124,15 +124,16 @@ fn body(d: anytype, n: usize, narrow_: bool) !?u64 {
     for (d.w.layers, 0..) |l, i| {
         try d.norm(d.h, l.input_norm, d.x, B);
         try d.projAgain(l.attn_conv, d.x, d.dyn, B);
-        try conv(d, d.x, l.attn_base, 0, d.xin, B, 0, 0);
-        try d.projMany(&.{ l.q, l.k, l.v }, d.xin, &.{ d.qraw, d.kraw, d.vb }, B);
+        const qkv_summed = convSums(d, B) and l.q.k == c.hidden and l.k.k == c.hidden and l.v.k == c.hidden;
+        try conv(d, d.x, l.attn_base, 0, d.xin, B, 0, if (qkv_summed) d.xs else 0);
+        try d.projMany(&.{ l.q, l.k, l.v }, d.xin, &.{ d.qraw, d.kraw, d.vb }, B, qkv_summed);
         try ropeQk(d, d.qraw, l.q_norm, d.q, d.kraw, l.k_norm, d.kb, B);
         try attention(d, B, i);
         try d.proj(l.o, d.att, d.o, B);
         try conv(d, d.o, l.attn_base, d.h, d.h2, B, 1, 0);
         try d.norm(d.h2, l.post_norm, d.x, B);
         try d.projAgain(l.mlp_conv, d.x, d.dyn, B);
-        const summed = convSums(d, l, B);
+        const summed = paired(l, B) and l.gate.k == c.hidden and convSums(d, B);
         try conv(d, d.x, l.mlp_base, 0, d.xin, B, 0, if (summed) d.xs else 0);
         try mlp(d, l, B, summed);
         try conv(d, d.o, l.mlp_base, d.h2, d.h, B, 1, 0);

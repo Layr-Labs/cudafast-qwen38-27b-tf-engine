@@ -60,15 +60,13 @@ test "Draft frames: legacy live absorption groups all K/V outputs with disjoint 
     defer d.streams.deinit(T.allocator);
     d.c = .{ .hidden = 5120, .intermediate = 17408, .layers = 1, .vocab = 256, .heads = 32, .kv_heads = 8, .head_dim = 128, .block = 16, .mask = 255, .window = 2048, .group = 16, .rank = 2, .topk = 2, .eps = 1e-6, .theta = 10000000, .taps = @splat(0), .n_taps = 1 };
     d.fns.gather_taps = function(&driver);
-    d.fns.norm_rope = function(&driver);
-    d.fns.ring_put = .{ .d = &driver, .handle = @ptrFromInt(3) };
+    d.fns.norm_rope = .{ .d = &driver, .handle = @ptrFromInt(3) };
     d.taps_in = 60000;
     d.th = 70000;
     d.thn = 10000;
     d.xs = 20000;
     d.kabs = 30000;
     d.vabs = 40000;
-    d.kn = 50000;
     d.w.hidden_norm = 1;
     d.w.fc = .{ .w = 1, .s = 2, .b = 3, .n = 256, .k = 256, .npad = 256 };
     var layers: [8]@TypeOf(d.w.layers[0]) = undefined;
@@ -167,7 +165,7 @@ test "Draft frames: paired MLP keeps input sums live and passes disjoint output 
     l.down = .{ .w = 1, .s = 2, .b = 3, .n = 5120, .k = 17408, .npad = 5120 };
     for ([_]usize{ 1, 8, 16 }) |rows| {
         MlpRecord.reset();
-        try q.draft.frame.mlp(&d, l, rows);
+        try q.draft.frame.mlp(&d, l, rows, false);
         try T.expectEqual(@as(usize, 1), MlpRecord.sums);
         try T.expectEqual(@as(usize, 1), MlpRecord.pairs);
         try T.expectEqual(@as(usize, 0), MlpRecord.activations);
@@ -175,14 +173,14 @@ test "Draft frames: paired MLP keeps input sums live and passes disjoint output 
         try T.expectEqual(d.gate, MlpRecord.down_sums);
     }
     MlpRecord.reset();
-    try q.draft.frame.mlp(&d, l, 32);
+    try q.draft.frame.mlp(&d, l, 32, false);
     try T.expectEqual(@as(usize, 0), MlpRecord.pairs);
     try T.expectEqual(@as(usize, 1), MlpRecord.activations);
     try T.expectEqual(@as(usize, 2), MlpRecord.downs);
     try T.expectEqual(d.xs + 16 * (17408 / 64) * 4, MlpRecord.down_sums);
     _ = setenv("TF_DRAFT_MLP_PAIR", "0", 1);
     MlpRecord.reset();
-    try q.draft.frame.mlp(&d, l, 16);
+    try q.draft.frame.mlp(&d, l, 16, false);
     try T.expectEqual(@as(usize, 0), MlpRecord.pairs);
     try T.expectEqual(@as(usize, 1), MlpRecord.activations);
     try T.expectEqual(d.xs, MlpRecord.down_sums);

@@ -24,7 +24,7 @@ const lp_top = 20;
 pub const Config = @import("cuda_draft_config.zig").Config;
 pub const frame = @import("cuda_draft_frame.zig");
 pub const memory = @import("cuda_draft_memory.zig");
-const Fns = struct { gather_taps: cuda.Function, gather_rows: cuda.Function, dyn_conv: cuda.Function, norm_rope: cuda.Function, ring_put: cuda.Function, attn: cuda.Function, dyn_conv_batch: cuda.Function, norm_rope_batch: cuda.Function, norm_rope_qk_batch: cuda.Function, mask_rows: cuda.Function, attn_partial: cuda.Function, attn_partial_rows4: cuda.Function, attn_merge: cuda.Function, head2_pack: cuda.Function, head2_screen: cuda.Function, head2_select: cuda.Function, head2_rescore: cuda.Function };
+const Fns = struct { gather_taps: cuda.Function, gather_rows: cuda.Function, dyn_conv: cuda.Function, norm_rope: cuda.Function, attn: cuda.Function, dyn_conv_batch: cuda.Function, norm_rope_batch: cuda.Function, norm_rope_qk_batch: cuda.Function, mask_rows: cuda.Function, attn_partial: cuda.Function, attn_partial_rows4: cuda.Function, attn_partial_rows8: cuda.Function, attn_merge: cuda.Function, head2_pack: cuda.Function, head2_screen: cuda.Function, head2_select: cuda.Function, head2_rescore: cuda.Function };
 
 /// qwen35_draft.cu's TapRows.
 const TapRows = extern struct { n: c_int, rows: [engine.most_window]c_int };
@@ -71,7 +71,6 @@ pub const Draft = struct {
     th: u64,
     thn: u64,
     kabs: u64,
-    kn: u64,
     vabs: u64,
     xs: u64, // 64-group sums for the projections (f32)
     h: u64,
@@ -125,7 +124,7 @@ pub const Draft = struct {
         const c = try Config.read(gpa, io, dir, e.g);
         const d = try gpa.create(Draft);
         errdefer gpa.destroy(d);
-        d.* = .{ .gpa = gpa, .io = io, .e = e, .c = c, .w = undefined, .mod = undefined, .fns = undefined, .scratch = undefined, .taps_in = 0, .th = 0, .thn = 0, .kabs = 0, .kn = 0, .vabs = 0, .xs = 0, .h = 0, .h2 = 0, .x = 0, .xin = 0, .dyn = 0, .qraw = 0, .q = 0, .kraw = 0, .kb = 0, .vb = 0, .att = 0, .o = 0, .gate = 0, .up = 0, .act = 0, .logits = 0, .words = 0, .parts = 0, .hp = 0, .ids = 0, .staged = undefined };
+        d.* = .{ .gpa = gpa, .io = io, .e = e, .c = c, .w = undefined, .mod = undefined, .fns = undefined, .scratch = undefined, .taps_in = 0, .th = 0, .thn = 0, .kabs = 0, .vabs = 0, .xs = 0, .h = 0, .h2 = 0, .x = 0, .xin = 0, .dyn = 0, .qraw = 0, .q = 0, .kraw = 0, .kb = 0, .vb = 0, .att = 0, .o = 0, .gate = 0, .up = 0, .act = 0, .logits = 0, .words = 0, .parts = 0, .hp = 0, .ids = 0, .staged = undefined };
         d.mod = try cuda.Module.load(e.d, cuda.kernels.qwen35_draft);
         errdefer d.mod.unload();
         inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(d.fns, name) = try d.mod.function("tf_q35d_" ++ name);
@@ -216,7 +215,7 @@ pub const Draft = struct {
         const R = @max(max_rows, B);
         const sizes = .{
             .{ "taps_in", try bytes(.{ R, c.n_taps, c.hidden, 2 }) },                 .{ "th", try bytes(.{ R, c.hidden, 2 }) },              .{ "thn", try bytes(.{ R, c.hidden, 2 }) },                         .{ "kabs", try bytes(.{ R, c.layers, c.kvWidth(), 2 }) },
-            .{ "kn", try bytes(.{ R, c.kvWidth(), 2 }) },                             .{ "vabs", try bytes(.{ R, c.layers, c.kvWidth(), 2 }) },         .{ "xs", try bytes(.{ R, c.n_taps, (c.hidden / 64), 4 }) },         .{ "h", try bytes(.{ B, c.hidden, 2 }) },
+            .{ "vabs", try bytes(.{ R, c.layers, c.kvWidth(), 2 }) },         .{ "xs", try bytes(.{ R, c.n_taps, (c.hidden / 64), 4 }) },         .{ "h", try bytes(.{ B, c.hidden, 2 }) },
             .{ "h2", try bytes(.{ B, c.hidden, 2 }) },                                .{ "x", try bytes(.{ B, c.hidden, 2 }) },               .{ "xin", try bytes(.{ B, c.hidden, 2 }) },                         .{ "dyn", try bytes(.{ B, c.dynamic(), 2 }) },
             .{ "qraw", try bytes(.{ B, c.qWidth(), 2 }) },                            .{ "q", try bytes(.{ B, c.qWidth(), 2 }) },             .{ "kraw", try bytes(.{ B, c.kvWidth(), 2 }) },                     .{ "kb", try bytes(.{ B, c.kvWidth(), 2 }) },
             .{ "vb", try bytes(.{ B, c.kvWidth(), 2 }) },                             .{ "att", try bytes(.{ B, c.qWidth(), 2 }) },           .{ "o", try bytes(.{ B, c.hidden, 2 }) },                           .{ "gate", try bytes(.{ B, c.intermediate, 2 }) },
@@ -295,14 +294,14 @@ pub const Draft = struct {
         return d.projSums(l, x, out, rows, false);
     }
 
-    /// proj of each of `ls` into `outs` over one x, its group sums taken once; decode() keeps each one's bits.
-    pub fn projMany(d: *Draft, ls: []const cuda.qlinear.Affine4, x: u64, outs: []const u64, rows: usize) !void {
+    /// proj over one x; `summed` means its producer already wrote the same rows' 64-group sums into xs.
+    pub fn projMany(d: *Draft, ls: []const cuda.qlinear.Affine4, x: u64, outs: []const u64, rows: usize, summed: bool) !void {
         const e = d.e;
         if (rows > 16 or ls.len > cuda.qlinear.Affine4Kernels.segs_max) {
-            for (ls, outs, 0..) |l, out, i| try d.projSums(l, x, out, rows, i == 0);
+            for (ls, outs, 0..) |l, out, i| try d.projSums(l, x, out, rows, i == 0 and !summed);
             return;
         }
-        try e.runAfter(e.fns.sums, .{ rows, (ls[0].k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ x, d.xs, @as(c_int, @intCast(ls[0].k)), @as(u64, 0) });
+        if (!summed) try e.runAfter(e.fns.sums, .{ rows, (ls[0].k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ x, d.xs, @as(c_int, @intCast(ls[0].k)), @as(u64, 0) });
         var many: [cuda.qlinear.Affine4Kernels.segs_max]cuda.qlinear.Affine4Kernels.Out = undefined;
         for (ls, outs, many[0..ls.len]) |l, out, *m| m.* = .{ .q = l, .out = out };
         try e.affine.decodeMany(e.stream, x, d.xs, many[0..ls.len], rows);
@@ -322,9 +321,6 @@ pub const Draft = struct {
         try d.e.runAfter(d.fns.dyn_conv, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ x, dyn, base, res, out, @as(c_int, @intCast(d.c.hidden)), @as(c_int, @intCast(d.c.group)), @as(c_int, @intCast(branch)) });
     }
 
-    fn normRope(d: *Draft, x: u64, w: u64, out: u64, rows: usize, heads: usize, pos0: u64) !void {
-        try d.e.runAfter(d.fns.norm_rope, .{ rows * heads, 1, 1 }, .{ 32, 1, 1 }, .{ x, w, out, @as(c_int, @intCast(heads)), @as(c_int, @intCast(heads * d.c.head_dim)), @as(c_longlong, @intCast(pos0)), d.c.eps, d.c.theta });
-    }
 
     /// Target rows [start, start + n) from the tap ring into the context; with `rows`, ring rows start + rows[i].
     fn absorb(d: *Draft, ctx: *Ctx, tap_ring: u64, start_: u64, n_: usize, rows_: ?[]const u32, prompt: bool) !void {
@@ -389,9 +385,8 @@ pub const Draft = struct {
                 const kabs = d.kabs + i * kv;
                 const vabs = d.vabs + i * kv;
                 if (!grouped and !grouped_live) try d.projAgain(l.k, d.thn, kabs, rows);
-                try d.normRope(kabs, l.k_norm, d.kn, rows, c.kv_heads, start);
                 if (!grouped and !grouped_live) try d.projAgain(l.v, d.thn, vabs, rows);
-                try e.runAfter(d.fns.ring_put, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ d.kn, vabs, d.ringK(ctx, i), d.ringV(ctx, i), @as(c_int, @intCast(c.kvWidth())), @as(c_longlong, @intCast(start)), @as(c_int, @intCast(c.ringRows())) });
+                try e.runAfter(d.fns.norm_rope, .{ rows * c.kv_heads, 1, 1 }, .{ 32, 1, 1 }, .{ kabs, l.k_norm, vabs, d.ringK(ctx, i), d.ringV(ctx, i), @as(c_int, @intCast(c.kv_heads)), @as(c_longlong, @intCast(start)), @as(c_int, @intCast(c.ringRows())), c.eps, c.theta });
             }
             start += rows;
             n -= rows;
