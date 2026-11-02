@@ -456,7 +456,8 @@ pub const Draft = struct {
                 }
                 if (best_draft >= 3 and best_hist + best_draft >= 6) {
                     const avail = hist.len - (best_pos + 1);
-                    const copy_rows: usize = if (best_draft >= 10 and avail > rows) @min(@as(usize, 31), avail) else rows;
+                    const room: usize = @intCast(@max(1, it.stream.draftRoom()));
+                    const copy_rows = @min(room, if (best_draft >= 10 and avail > rows) @min(engine.most_window - 1, avail) else rows);
                     for (0..copy_rows) |r| {
                         ctx.held[r] = if (best_pos + 1 + r < hist.len) hist[best_pos + 1 + r] else ch[@min(r, rows - 1)];
                         ctx.parents[r] = @as(i32, @intCast(r)) - 1;

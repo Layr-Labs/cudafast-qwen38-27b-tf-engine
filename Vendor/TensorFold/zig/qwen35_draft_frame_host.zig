@@ -435,4 +435,65 @@ test "Draft frames: landing observations end with the last released stream" {
     try std.testing.expectEqualDeep(q.draft.tree.Landing{}, d.landing);
 }
 
+test "Draft frames: a matched history tail uses only available verifier rows" {
+    _ = setenv("TF_DRAFT_NODES", "15", 1);
+    defer _ = unsetenv("TF_DRAFT_NODES");
+    const F = q.draft.frame;
+    var d: q.draft.Draft = undefined;
+    d.c = config();
+    d.c.block = 16;
+    d.c.rank = 1;
+    d.c.topk = 1;
+    d.selection_base = 0;
+    d.streams = .empty;
+    defer d.streams.deinit(a);
+    var storage: [F.stagedLen(1)]u8 align(16) = @splat(0);
+    d.staged = .{ .d = undefined, .bytes = &storage };
+    var books: [256]u16 = @splat(0);
+    d.w.predecessor = &books;
+    d.w.successor = &books;
+    const words = std.mem.bytesAsSlice(u32, storage[F.words_at..][0 .. 15 * 43 * 4]);
+    for (0..15) |r| {
+        words[r * 43 + 2] = @intCast(10 + r);
+        words[r * 43 + 22] = @bitCast(@as(f32, 1));
+    }
+    for ([_]usize{ 15, 16, 31, 32, 63, 64, 127, 128, 192 }) |available| {
+        var history: [256]u32 = @splat(200);
+        @memcpy(history[0..4], &[_]u32{ 6, 7, 8, 9 });
+        for (0..@min(15, available - 4)) |r| history[4 + r] = @intCast(10 + r);
+        @memcpy(history[available..][0..4], &[_]u32{ 6, 7, 8, 9 });
+        for ([_]u32{ 1, 2, 16, 20, 31, 32, 46, 64, 128 }) |remaining| {
+            var stream = try lanes.Stream.init(a, .{ .id = "history-tail", .prompt = history[0 .. available - 3], .max_new = remaining + 7 });
+            defer stream.deinit(a);
+            try std.testing.expectEqual(@as(usize, 7), try stream.commit(a, history[available - 3 .. available + 4], &.{}));
+            var ctx: q.draft.Ctx = .{ .ring = undefined };
+            @memset(&ctx.held, 0xdeadbeef);
+            @memset(&ctx.parents, -99);
+            try d.selectHold(&ctx, .{ .stream = &stream, .pending = 9, .position = available + 4, .depth = 1, .tokens = stream.context.items });
+            const expected = @min(available, q.engine.most_window - 1, remaining);
+            try std.testing.expectEqual(expected, ctx.grown);
+            try std.testing.expectEqual(expected, ctx.held_n);
+            try std.testing.expectEqualSlices(u32, history[4..][0..expected], ctx.held[0..expected]);
+            for (ctx.parents[0..expected], ctx.own[0..expected], 0..) |parent, own, r| {
+                try std.testing.expectEqual(@as(i32, @intCast(r)) - 1, parent);
+                try std.testing.expectEqual(@as(f64, 0), own);
+            }
+            try std.testing.expectEqual(@as(u32, 0xdeadbeef), ctx.held[@max(expected, 15)]);
+            try std.testing.expectEqual(@as(i32, -99), ctx.parents[@max(expected, 15)]);
+            try d.streams.put(a, &stream, &ctx);
+            defer _ = d.streams.remove(&stream);
+            var first: [1]u32 = undefined;
+            try d.drafter().held(&.{&stream}, &.{&first});
+            try std.testing.expectEqual(@as(u32, 10), first[0]);
+            try d.selectHold(&ctx, .{ .stream = &stream, .pending = 9, .position = available + 4, .depth = 0, .tokens = stream.context.items });
+            try std.testing.expectEqual(@as(usize, 0), ctx.grown);
+            try std.testing.expectEqual(@as(usize, 0), ctx.held_n);
+        }
+    }
+    var weak: q.draft.Ctx = .{ .ring = undefined };
+    try d.selectHold(&weak, .{ .stream = undefined, .pending = 9, .position = 12, .depth = 1, .tokens = &.{ 6, 7, 8, 9, 10, 11, 99, 70, 6, 7, 8, 9 } });
+    try std.testing.expectEqual(@as(usize, 15), weak.grown);
+    for (weak.held[0..15], 0..) |token, row| try std.testing.expectEqual(@as(u32, @intCast(10 + row)), token);
+}
+
 test { _ = @import("qwen35_draft_legacy_host.zig"); }

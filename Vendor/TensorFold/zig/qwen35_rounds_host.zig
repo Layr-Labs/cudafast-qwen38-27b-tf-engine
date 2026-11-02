@@ -119,8 +119,7 @@ test "Verify width calibration: narrow slot specialization has a proven plan and
     };
 }
 
-test "Verify width calibration: actual keep launches carry the complete 64-row path" {
-    try std.testing.expectEqual(@as(usize, 260), @sizeOf(q.round.Path));
+test "Verify width calibration: keep commits full and rejected chain prefixes within 64 rows" {
     var d: cuda.Driver = undefined;
     d.api.cuLaunchKernel = Capture.launch;
     var e: q.engine.Engine = undefined;
@@ -134,18 +133,22 @@ test "Verify width calibration: actual keep launches carry the complete 64-row p
     e.kv8 = false;
     e.n_taps = 0;
     const buffer: cuda.DeviceBuffer = .{ .d = &d, .ptr = 0x1000, .len = 1 << 20 };
-    var cache: q.engine.Cache = .{ .state = buffer, .kv = buffer, .log = buffer, .logits = &.{}, .cap = 128, .len = 69, .last = .{ .start = 5, .rows = 64 } };
     var path: [64]u32 = undefined;
     for (&path, 0..) |*row, i| row.* = @intCast(i);
-    try cache.keep(&e, &path);
-    try std.testing.expectEqual(@as(c_int, 64), Capture.kept.n);
-    try std.testing.expectEqual(@as(c_int, 63), Capture.kept.rows[63]);
-    try std.testing.expectEqual(@as(usize, 69), cache.len);
-    cache.last = .{ .start = 5, .rows = 64 };
-    try cache.keep(&e, &.{ 0, 2, 33, 63 });
-    try std.testing.expectEqual(@as(usize, 3), Capture.id);
-    try std.testing.expectEqual(@as(c_int, 63), Capture.kept.rows[3]);
-    try std.testing.expectEqual(@as(usize, 9), cache.len);
+    for ([_]usize{ 0, 1, 4, 31, 32, 63, 64 }) |kept| {
+        var cache: q.engine.Cache = .{ .state = buffer, .kv = buffer, .log = buffer, .logits = &.{}, .cap = 128, .len = 69, .last = .{ .start = 5, .rows = 64 } };
+        try cache.keep(&e, path[0..kept]);
+        try std.testing.expectEqual(@as(usize, 5 + kept), cache.len);
+        try std.testing.expect(cache.last == null);
+        try std.testing.expectEqual(@as(c_int, @intCast(kept)), cache.pend);
+    }
+    var no_log = buffer;
+    no_log.len = 0;
+    var branch: q.engine.Cache = .{ .state = buffer, .kv = buffer, .log = no_log, .logits = &.{}, .cap = 128, .len = 69, .last = .{ .start = 5, .rows = 64 } };
+    try branch.keep(&e, &.{ 0, 2, 33, 63 });
+    try std.testing.expectEqual(@as(usize, 9), branch.len);
+    try std.testing.expect(branch.last == null);
+    try std.testing.expectEqual(@as(c_int, 0), branch.pend);
 }
 
 const Verify = struct {
