@@ -521,8 +521,9 @@ pub const Affine4Kernels = struct {
         const gdn_streamed = narrow16(rows) or (rows > 16 and rows <= 32 and a.gdn_stream32_fn != null);
         if (!gdn_streamed or !a.pdl or a.gdn_stream16_fn == null) return false;
         for (outs) |o| if (o.q.k != 5120 or o.q.stream_w == 0) return false;
-        // attention's q (with its gate half), k and v of one input (TF_ATTN_STREAM=0: their mixed cluster launch)
-        if (outs.len == 3 and rows == 16 and attnStreams())
+        // attention's q (with its gate half), k and v of one input (TF_ATTN_STREAM=0: their mixed cluster launch); a
+        // window narrower than 16 rows takes the same 16-row twin, as the GDN group already does (it bounds its own rows)
+        if (outs.len == 3 and narrow16(rows) and attnStreams())
             return outs[0].q.n == 12288 and outs[1].q.n == 1024 and outs[2].q.n == 1024;
         return outs.len == 4 and outs[0].q.n == 10240 and outs[1].q.n == 6144 and outs[2].q.n == 48 and outs[3].q.n == 48;
     }
