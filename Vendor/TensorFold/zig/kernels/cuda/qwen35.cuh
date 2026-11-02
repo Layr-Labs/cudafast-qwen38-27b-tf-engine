@@ -101,13 +101,19 @@ __device__ __forceinline__ bool past_rows(const int* P, int m) { return P != nul
 // M-RoPE's interleaved sections (mrope_section 11, 11, 10): frequency i turns by the t, h or w position.
 __device__ __forceinline__ int mrope_axis(int i) { return (i % 3 == 1 && i < 33) ? 1 : ((i % 3 == 2 && i < 30) ? 2 : 0); }
 
+__device__ __forceinline__ float2 rope_coeff(int i, const int pos[3]) {
+    const float angle = (float)pos[mrope_axis(i)] * powf(10000000.0f, -(float)i / 32.0f);
+    float2 sc;
+    sincosf(angle, &sc.x, &sc.y);
+    return sc;
+}
+
 // RoPE on the first 64 of HD: pairs (i, i + 32) turned by pos[axis(i)] * theta^(-i / 32); text has one position.
 __device__ __forceinline__ __nv_bfloat16 rotate(const __nv_bfloat16* x, int d, const int pos[3]) {
     if (d >= 64) return x[d];
     const int i = d % 32;
-    const float angle = (float)pos[mrope_axis(i)] * powf(10000000.0f, -(float)i / 32.0f);
-    float sn, cs;
-    sincosf(angle, &sn, &cs);
+    const float2 sc = rope_coeff(i, pos);
+    const float sn = sc.x, cs = sc.y;
     const float a = bf(x[i]), b = bf(x[i + 32]);
     return __float2bfloat16_rn(d < 32 ? a * cs - b * sn : b * cs + a * sn);
 }
