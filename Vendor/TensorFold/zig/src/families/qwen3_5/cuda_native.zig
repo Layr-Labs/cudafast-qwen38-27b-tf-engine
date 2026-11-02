@@ -414,6 +414,8 @@ const Lanes = struct {
     fn closeDrafts(self: *Lanes) u64 {
         if (self.draft) |draft| {
             draft.landing = .{};
+            var contexts = draft.streams.valueIterator();
+            while (contexts.next()) |ctx| ctx.*.acceptance_history.reset();
             while (draft.pool.pop()) |ctx| {
                 if (ctx.ring.borrowed) ctx.ring.free() else cache_mod.giveBlock(&ctx.ring);
                 draft.gpa.destroy(ctx);

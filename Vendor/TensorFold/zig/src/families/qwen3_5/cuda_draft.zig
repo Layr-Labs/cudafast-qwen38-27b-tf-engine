@@ -6,6 +6,7 @@ const lanes = @import("lanes");
 const engine = @import("cuda_engine.zig");
 const weights = @import("cuda_draft_weights.zig");
 pub const tree = @import("cuda_draft_tree.zig");
+const acceptance = @import("cuda_acceptance_history.zig");
 const profile = @import("cuda_startup_profile.zig");
 pub const precision = @import("cuda_draft_precision.zig");
 
@@ -39,6 +40,7 @@ pub const Ctx = struct {
     // a grown tree's parents (-1: the pending token) and nodes' log-chances under them; 0 nodes: a chain
     parents: [engine.most_window]i32 = undefined,
     own: [engine.most_window]f64 = undefined,
+    acceptance_history: acceptance.History = .{},
     grown: usize = 0,
     // the stream's tokens draft_frame has read, and whether more than 1 in 32 lay outside its spans (then drafts take
     // the whole head)
@@ -101,6 +103,7 @@ pub const Draft = struct {
     pool: std.ArrayList(*Ctx) = .empty,
     /// Grown trees' nodes offered and landed, by own chance: the nodes' chances the round loop prices.
     landing: tree.Landing = .{},
+    history_enabled: bool = true,
     /// One level of a hold (a hold drafts every level at once; timed at load, over the block's levels).
     step_ms: f64 = 1.0,
     /// The target's window ms by rows (cuda_native.zig times them), for the round loop's prices.
@@ -126,6 +129,7 @@ pub const Draft = struct {
         const d = try gpa.create(Draft);
         errdefer gpa.destroy(d);
         d.* = .{ .gpa = gpa, .io = io, .e = e, .c = c, .w = undefined, .mod = undefined, .fns = undefined, .scratch = undefined, .taps_in = 0, .th = 0, .thn = 0, .kabs = 0, .kn = 0, .vabs = 0, .xs = 0, .h = 0, .h2 = 0, .x = 0, .xin = 0, .dyn = 0, .qraw = 0, .q = 0, .kraw = 0, .kb = 0, .vb = 0, .att = 0, .o = 0, .gate = 0, .up = 0, .act = 0, .logits = 0, .words = 0, .parts = 0, .hp = 0, .ids = 0, .staged = undefined };
+        d.history_enabled = !std.mem.eql(u8, std.mem.span(platform.c.getenv("TF_TREE_HISTORY") orelse "1"), "0");
         d.mod = try cuda.Module.load(e.d, cuda.kernels.qwen35_draft);
         errdefer d.mod.unload();
         inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(d.fns, name) = try d.mod.function("tf_q35d_" ++ name);
@@ -432,7 +436,10 @@ pub const Draft = struct {
         if (limit > 0) {
             // the whole budget whenever drafts are asked: the block's forward costs the same at any depth
             const n = if (it.depth == 0) 0 else limit;
-            ctx.grown = tree.grow(d.candidates(rows), it.pending, rows, n, &ctx.held, &ctx.parents, &ctx.own);
+            var candidates_ = d.candidates(rows);
+            if (d.history_enabled and limit == acceptance.default_nodes and it.sampling == null)
+                candidates_.pricing_scale = ctx.acceptance_history.scale();
+            ctx.grown = tree.grow(candidates_, it.pending, rows, n, &ctx.held, &ctx.parents, &ctx.own);
             if (n >= rows and it.tokens.len >= 4) {
                 var ch: [engine.most_window]u32 = undefined;
                 tree.chain(d.candidates(rows), it.pending, ch[0..rows]);
@@ -515,17 +522,22 @@ pub const Draft = struct {
         for (items) |it| {
             const ctx = d.streams.get(it.stream) orelse return error.UnknownStream;
             if (it.features.space != .device or it.features.dtype != .bf16) return error.UnsupportedFeatures;
+            var accepted: ?u8 = null;
             if (it.offered > 0 and ctx.grown > 0 and ctx.own[0] < 0) {
                 var prefix: [engine.most_window]u32 = undefined;
                 for (prefix[0..@min(it.follow.len, prefix.len)], 0..) |*x, i| x.* = @intCast(i);
                 const kept = it.rows orelse prefix[0..@min(it.follow.len, prefix.len)];
                 d.landing.observeTree(it.stream.sampling != null, ctx.parents[0..ctx.grown], ctx.own[0..ctx.grown], it.offered, kept);
+                if (d.history_enabled and !it.prompt and it.stream.sampling == null)
+                    accepted = acceptance.acceptedDepth(ctx.parents[0..ctx.grown], it.offered, kept);
             }
             ctx.grown = 0;
             // the target's features: its ring, `offset` the first row's position (cuda_native.zig's featuresFn)
             if (it.rows) |rs| {
                 try d.absorb(ctx, it.features.buffer, it.features.offset, rs.len, rs, it.prompt);
             } else try d.absorb(ctx, it.features.buffer, it.features.offset, it.features.rows, null, it.prompt);
+            // Update only after a successful absorb; prompt ingestion is an explicit policy reset.
+            if (it.prompt) ctx.acceptance_history.reset() else if (accepted) |depth| ctx.acceptance_history.observe(depth);
         }
     }
 
@@ -577,6 +589,7 @@ pub const Draft = struct {
     fn releaseFn(p: *anyopaque, s: *Stream) void {
         const d = cast(p);
         if (d.streams.fetchRemove(s)) |kv| {
+            kv.value.acceptance_history.reset(); // pooled or borrowed contexts cannot carry policy to another stream
             if (d.streams.count() == 0) d.landing = .{};
             if (kv.value.ring.borrowed) return d.gpa.destroy(kv.value); // its lane's run goes back with the lane
             d.pool.append(d.gpa, kv.value) catch d.drop(kv.value);
