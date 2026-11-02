@@ -344,8 +344,9 @@ pub const Engine = struct {
             try weights.load(e, &ck, &stage);
         }
         if (e.dict) |ds| if (ds.pair != .off) std.debug.print("info: pair dictionary ({s}): {d} projections encoded, {d} declined, {d} mismatching cells; index streams {d} B (separate coding {d} B); largest table {d} entries; projections by index bits {any}\n", .{ @tagName(ds.pair), ds.pair_coded, ds.pair_declined, ds.pair_bad, ds.pair_bytes, ds.pair_separate_bytes, ds.pair_np_max, ds.pair_pbits });
+        // Wide K-major panels (17-32 row windows) are on by default; TF_WIDE_KMAJOR=0 turns them off.
         if (gb10 and g.hidden == 5120 and g.layers == 64 and g.experts == 0 and
-            @import("sys").c.getenv("TF_WIDE_KMAJOR") != null and !envOff("TF_WIDE_KMAJOR"))
+            !envOff("TF_WIDE_KMAJOR"))
             e.wide_words = try wide_weight_layout.prepare(e);
         e.verify_weights = null;
         const layout = @import("sys").c.getenv("TF_MLP_KMAJOR") orelse "2";
