@@ -145,7 +145,8 @@ fn body(d: anytype, n: usize, narrow_: bool) !?u64 {
     }
     try d.norm(masked, d.w.final_norm, d.x, rows);
     const spanned = if (narrow_) try head(d, rows) else try full(d, rows);
-    if (spanned != null and d.head2 != null)
+    // the screen's tiles hold 16 rows: wider frames (several streams) keep the span head (head() agrees)
+    if (spanned != null and d.head2 != null and rows <= 16)
         try topkScreened(d, spanned.?, rows)
     else
         try e.draws.topkRows(e.stream, spanned orelse d.logits, if (spanned != null) span_width else c.vocab, @intCast(c.topk), d.parts, d.words, rows);
@@ -176,6 +177,9 @@ fn run(d: anytype, n: usize, narrow_: bool) !?u64 {
         var captured = captured_;
         defer captured.deinit();
         exec = captured.instantiate() catch null;
+        // the drafter frame's first replay of this key had the driver upload its resources inline; as a stream
+        // command that setup now lands ahead of the replay, on the stream the replay is already queued behind
+        if (exec) |x| x.upload(e.stream) catch {};
     } else |_| {}
     try d.graphs.put(d.gpa, key, .{ .exec = exec, .spanned = spanned });
     if (exec) |x| try x.launchOn(e.stream) else _ = try body(d, n, narrow_);
@@ -245,7 +249,8 @@ fn head(d: anytype, rows: usize) !?u64 {
     const b = a + rows * first.n * 2;
     const out = b + rows * tail.n * 2;
     const skip = spans[1][0] - tail_tile;
-    if (d.head2) |h2| {
+    if (d.head2 != null and rows <= 16) {
+        const h2 = d.head2.?;
         // the first span's columns screened straight into the packed rows; the tail exact, as below
         try screen(d, h2, rows, out);
         try e.project(layers.Proj{ .a4 = tail }, d.x, d.xs, b, rows, false, 0, false);
@@ -344,6 +349,9 @@ fn topkScreened(d: anytype, logits: u64, rows: usize) !void {
     const n: usize = head2_cap;
     const pv = d.parts;
     const pi = d.parts + rows * n * 4;
+    // the select reads the packed rows sixteen bytes at a time
+    comptime std.debug.assert(span_width % 8 == 0);
+    if (logits % 16 != 0) return error.BadDraftFrame;
     var a: cuda.Args = .{};
     a.add(logits);
     a.add(@as(c_int, @intCast(span_width)));
