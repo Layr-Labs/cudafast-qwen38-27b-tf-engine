@@ -21,9 +21,9 @@ pub const Layer = struct {
     gate: Affine4,
     up: Affine4,
     down: Affine4,
-    attn_conv: Affine4, // kernel_projection: hidden -> 4 * groups dynamic coefficients
+    attn_conv: cuda.qmmf.Weight, // pinned BF16 kernel_projection: hidden -> 4 * groups coefficients
     attn_base: u64, // base_kernel (2 branches, 2 lags, hidden) bf16
-    mlp_conv: Affine4,
+    mlp_conv: cuda.qmmf.Weight,
     mlp_base: u64,
 };
 
@@ -37,8 +37,12 @@ pub const Weights = struct {
     layers: []Layer,
     arena: DeviceBuffer,
     arena_at: usize = 0,
+    /// The fastest screened pieces of the free memory left after the target, holding the copies every draft reads (the MLP
+    /// gate and up panels, the down and o streams); null without one (TF_DRAFT_FASTPOOL=0: the copies stay in the arena).
+    fast: ?engine.fast_placement.Pool = null,
 
     pub fn deinit(w: *Weights, gpa: std.mem.Allocator) void {
+        if (w.fast) |*p| p.free();
         w.arena.free();
         gpa.free(w.predecessor);
         gpa.free(w.successor);
@@ -51,7 +55,42 @@ pub const Weights = struct {
         w.arena_at = at + bytes;
         return w.arena.ptr + at;
     }
+
+    /// A per-draft copy: on the drafter's fast pool when it has room (asked for in fastSizes' order), else in the arena.
+    fn allocCopy(w: *Weights, bytes: usize) !u64 {
+        if (w.fast) |*p| if (p.alloc(bytes)) |at| return at;
+        return w.alloc(bytes);
+    }
 };
+
+fn fastPoolOn() bool {
+    const v = @import("sys").c.getenv("TF_DRAFT_FASTPOOL") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
+
+/// The per-draft copies `linear` makes, in the order it makes them (each layer's o stream, gate and up panels, down
+/// stream), for the drafter's fast pool screen; returns how many.
+fn fastSizes(e: *const Engine, s: Shape, out: []usize) usize {
+    var n: usize = 0;
+    const panels = e.mlp_pair.kmajor_fn != null and s.intermediate == 17408 and s.hidden == 5120;
+    const streams = e.affine.stream16_fns[0] != null and s.hidden == 5120;
+    for (0..s.layers) |_| {
+        if (streams and s.q_width == 4096 and oStream()) {
+            out[n] = Affine4.layout(s.hidden, s.q_width).words;
+            n += 1;
+        }
+        if (panels) {
+            out[n] = Affine4.layout(s.intermediate, s.hidden).words;
+            out[n + 1] = out[n];
+            n += 2;
+        }
+        if (streams and s.intermediate == 17408) {
+            out[n] = Affine4.layout(s.hidden, s.intermediate).words;
+            n += 1;
+        }
+    }
+    return n;
+}
 
 /// The drafter's widths the loader needs (cuda_draft.zig's Config).
 pub const Shape = struct { hidden: usize, intermediate: usize, layers: usize, vocab: usize, q_width: usize, kv_width: usize, head_dim: usize, dynamic: usize, rank: usize, taps: usize };
@@ -78,7 +117,7 @@ pub fn stageBytes(s: Shape) usize {
 pub fn total(s: Shape) usize {
     var t = packedBytes(s.hidden, s.taps * s.hidden) + packedBytes(s.rank, s.hidden) + 2 * aligned(s.hidden * 2);
     t += s.layers * (2 * aligned(s.hidden * 2) + packedBytes(s.q_width, s.hidden) + 2 * packedBytes(s.kv_width, s.hidden) + packedBytes(s.hidden, s.q_width) +
-        2 * aligned(s.head_dim * 2) + 2 * packedBytes(s.intermediate, s.hidden) + packedBytes(s.hidden, s.intermediate) + 2 * packedBytes(s.dynamic, s.hidden) + 2 * aligned(4 * s.hidden * 2) +
+        2 * aligned(s.head_dim * 2) + 2 * packedBytes(s.intermediate, s.hidden) + packedBytes(s.hidden, s.intermediate) + 2 * aligned(((s.dynamic + 127) / 128 * 128) * s.hidden * 2) + 2 * aligned(4 * s.hidden * 2) +
         2 * aligned(Affine4.layout(s.intermediate, s.hidden).words) + aligned(Affine4.layout(s.hidden, s.intermediate).words) +
         aligned(Affine4.layout(s.hidden, s.q_width).words)); // the o projection's stream view (oStream)
     return t;
@@ -234,12 +273,12 @@ fn linear(gpa: std.mem.Allocator, e: *Engine, stage: *DeviceBuffer, w: *Weights,
     var out: Affine4 = .{ .w = try w.alloc(l.words), .s = try w.alloc(l.scales), .b = try w.alloc(l.scales), .n = n, .k = k, .npad = l.npad };
     try e.affine.pack(e.stream, raw[0], raw[1], raw[2], out);
     if (e.mlp_pair.kmajor_fn != null and n == 17408 and k == 5120) {
-        out.verify_w = try w.alloc(l.words);
+        out.verify_w = try w.allocCopy(l.words);
         const pack = try e.mods[3].function("tf_pack_kmajor");
         const words = l.npad * k / 8;
         try e.run(pack, .{ (words + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ out.w, out.verify_w, @as(c_int, @intCast(k / 64)), @as(c_int, @intCast(l.npad / 64)) });
     } else if (e.affine.stream16_fns[0] != null and n == 5120 and (k == 17408 or (k == 4096 and oStream()))) {
-        out.stream_w = try w.alloc(l.words);
+        out.stream_w = try w.allocCopy(l.words);
         const pack = try e.mods[3].function("tf_pack_kmajor");
         const words = l.npad * k / 8;
         try e.run(pack, .{ (words + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ out.w, out.stream_w, @as(c_int, @intCast(k / 64)), @as(c_int, @intCast(l.npad / 64)) });
@@ -252,6 +291,19 @@ fn linear(gpa: std.mem.Allocator, e: *Engine, stage: *DeviceBuffer, w: *Weights,
     };
     try e.stream.synchronize();
     return out;
+}
+
+/// A coefficient projection keeps the checkpoint's BF16 values in qmmf's native tensor-core tile order.
+fn coefficient(gpa: std.mem.Allocator, w: *Weights, ck: *core.Checkpoint, name: []const u8, n: usize, k: usize) !cuda.qmmf.Weight {
+    const input = try hostBf16(gpa, ck, name, &.{ n, k });
+    defer gpa.free(input);
+    const npad = (n + 127) / 128 * 128;
+    const tile_words = try gpa.alloc(u16, npad * k);
+    defer gpa.free(tile_words);
+    cuda.qmmf.packBf16(tile_words, input, n, k);
+    const ptr = try w.alloc(tile_words.len * 2);
+    try w.arena.upload(ptr - w.arena.ptr, std.mem.sliceAsBytes(tile_words));
+    return .{ .mode = .bf16, .codes = ptr, .scales = 0, .n = @intCast(n), .k = @intCast(k), .npad = @intCast(npad) };
 }
 
 fn vector(w: *Weights, ck: *core.Checkpoint, name: []const u8, shape: []const usize) !u64 {
@@ -278,6 +330,14 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: *Engine, dir: []const u8, s: 
     try w.arena.fill8(0, null);
     var stage = try DeviceBuffer.alloc(e.d, stageBytes(s));
     defer stage.free();
+    // the per-draft copies on the fastest pieces of what the target left free, screened as the target's (cuda_fastpool.zig);
+    // the copies hold the same words wherever they sit
+    if (fastPoolOn() and s.layers <= 16) {
+        var sizes: [4 * 16]usize = undefined;
+        const n = fastSizes(e, s, &sizes);
+        if (n > 0) w.fast = engine.fast_placement.screen(e.d, e.stream, try e.mods[3].function("tf_fastpool_read"), sizes[0..n]);
+    }
+    errdefer if (w.fast) |*p| p.free();
     w.layers = try gpa.alloc(Layer, s.layers);
     errdefer gpa.free(w.layers);
     w.fc = try linear(gpa, e, &stage, &w, &ck, "fc.weight", s.hidden, s.taps * s.hidden);
@@ -310,9 +370,9 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: *Engine, dir: []const u8, s: 
             .gate = try linear(gpa, e, &stage, &w, &ck, try nm.of("mlp.gate_proj.weight"), s.intermediate, s.hidden),
             .up = try linear(gpa, e, &stage, &w, &ck, try nm.of("mlp.up_proj.weight"), s.intermediate, s.hidden),
             .down = try linear(gpa, e, &stage, &w, &ck, try nm.of("mlp.down_proj.weight"), s.hidden, s.intermediate),
-            .attn_conv = try linear(gpa, e, &stage, &w, &ck, try nm.of("attention_conv.kernel_projection.weight"), s.dynamic, s.hidden),
+            .attn_conv = try coefficient(gpa, &w, &ck, try nm.of("attention_conv.kernel_projection.weight"), s.dynamic, s.hidden),
             .attn_base = try vector(&w, &ck, try nm.of("attention_conv.base_kernel"), &.{ 2, 2, s.hidden }),
-            .mlp_conv = try linear(gpa, e, &stage, &w, &ck, try nm.of("mlp_conv.kernel_projection.weight"), s.dynamic, s.hidden),
+            .mlp_conv = try coefficient(gpa, &w, &ck, try nm.of("mlp_conv.kernel_projection.weight"), s.dynamic, s.hidden),
             .mlp_base = try vector(&w, &ck, try nm.of("mlp_conv.base_kernel"), &.{ 2, 2, s.hidden }),
         };
     }
@@ -333,7 +393,6 @@ test "bf16 rounding of a quantized group's scale and bias" {
     try std.testing.expectEqual(@as(u16, 0x3f80), q.biases[0]);
     try std.testing.expectEqual(@as(u32, 0), q.words[0]);
 }
-
 
 test "drafter refit preserves flat groups and improves a linear weight ramp" {
     const flat: [64]u16 = @splat(0x3f80);
