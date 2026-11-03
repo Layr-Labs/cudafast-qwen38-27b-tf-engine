@@ -352,10 +352,27 @@ const Run = struct {
     }
 
     fn wait(run: *Run) !void {
-        while (!run.done.load(.acquire)) std.Thread.yield() catch {};
+        // 20 us sleeps instead of yield-spinning a core for the whole request (GB10's CPU and GPU share one package);
+        // TF_BENCH_WAIT=yield: the yield loop
+        if (!benchWaitYield()) {
+            const req: std.c.timespec = .{ .sec = 0, .nsec = 20_000 };
+            while (!run.done.load(.acquire)) _ = std.c.nanosleep(&req, null);
+        } else while (!run.done.load(.acquire)) std.Thread.yield() catch {};
         if (run.failed) return error.EngineFailed;
     }
 };
+
+/// TF_BENCH_WAIT=yield, read once. With the sleeping wait (the default) the waiting thread's timer slack drops to 1 ns
+/// the first time: Linux's default slack of 50 us otherwise stretches each 20 us sleep to about 70 us, so a finished
+/// request is noticed later than the 20 us poll intends. Wait timing only: no engine call or value changes.
+var bench_wait_yield: ?bool = null;
+fn benchWaitYield() bool {
+    if (bench_wait_yield) |v| return v;
+    const v = std.mem.eql(u8, std.mem.span(std.c.getenv("TF_BENCH_WAIT") orelse ""), "yield");
+    if (!v and builtin.os.tag == .linux) _ = std.os.linux.prctl(@intFromEnum(std.os.linux.PR.SET_TIMERSLACK), 1, 0, 0, 0);
+    bench_wait_yield = v;
+    return v;
+}
 
 fn submit(a: *Adapter, tokens: []const u32, steps: u32, out: []u32) !void {
     if (out.len < steps) return error.OutputTooSmall;
