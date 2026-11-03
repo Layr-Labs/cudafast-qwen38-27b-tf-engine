@@ -35,13 +35,13 @@ fn size(p: layers.Proj) usize {
     return q.npad * q.k / 2;
 }
 
-/// Whether candidate `index` of `layer` goes on the fast pool: every stream but an attention layer's q, k and v, whose
-/// copies stay on ordinary memory so the pool's fastest pieces keep holding what they held before them
-/// (TF_ATTN_COPIES_POOLED=1: those too).
+/// Whether candidate `index` of `layer` goes on the fast pool: every stream, an attention layer's q, k and v included, so
+/// the pieces `screen` keeps hold every one of a decode round's projection reads and no copy of them streams out of the
+/// side buffer the driver placed with no read of its own (TF_ATTN_COPIES_POOLED=0: those three on the side buffer).
 fn pooled(layer: *const layers.Layer, index: usize) bool {
     if (layer.mixer != .attention or index < 2) return true;
-    const v = @import("sys").c.getenv("TF_ATTN_COPIES_POOLED") orelse return false;
-    return @import("std").mem.eql(u8, @import("std").mem.span(v), "1");
+    const v = @import("sys").c.getenv("TF_ATTN_COPIES_POOLED") orelse return true;
+    return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
 }
 
 /// The streams' sizes in the order `prepare` places them on the fast pool (for its screen); returns how many.
