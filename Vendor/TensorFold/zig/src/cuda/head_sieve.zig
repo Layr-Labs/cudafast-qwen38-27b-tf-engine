@@ -68,6 +68,9 @@ pub const HeadSieve = struct {
     approx: u64, // check mode: every (id, row)'s approximate logit and spread
     rounds: usize = 0,
     next_log: usize = 1,
+    /// Whether `after` brings the counters back to the host (TF_SIEVE_LOG=1). Off: the scored decode's round loop
+    /// keeps its stream and launches the next graph without waiting for a synchronous copy of a diagnosis.
+    log_on: bool = false,
 
     /// Whether the sieve takes q: the vocabulary head's tile-major words in 256-id CTAs.
     pub fn fits(q: Affine4) bool {
@@ -110,6 +113,7 @@ pub const HeadSieve = struct {
         h.pdl = pdl;
         h.rounds = 0;
         h.next_log = 1;
+        h.log_on = @import("sys").c.getenv("TF_SIEVE_LOG") != null;
         h.code = if (linear.pairCode(q.code)) q.code else 0;
         const tab_bytes: u32 = if (h.code != 0) ((h.code >> 5 & 0x1FFF) * 4 + 15) / 16 * 16 else 0;
         h.tab_smem = if (tab_bytes <= tab_room) tab_bytes else 0;
@@ -289,7 +293,10 @@ pub const HeadSieve = struct {
     }
 
     /// After a verify that ran the sieve, its stream drained: the counters at rounds 1, 2, 4, .. (check: every 8th).
+    /// Only under TF_SIEVE_LOG=1 (or a check run, which exists to print them): the download is a synchronous copy
+    /// between two decode rounds, and no token depends on it.
     pub fn after(h: *HeadSieve) void {
+        if (!h.log_on and h.mode != .check) return;
         h.rounds += 1;
         if (h.rounds != h.next_log) return;
         h.next_log = if (h.mode == .check) h.rounds + 8 else h.rounds * 2;
