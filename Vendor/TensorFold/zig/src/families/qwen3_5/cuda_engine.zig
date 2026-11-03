@@ -709,6 +709,8 @@ pub const Engine = struct {
                 var captured = try cuda.graph.endCapture(e.stream);
                 defer captured.deinit();
                 gop.value_ptr.* = try captured.instantiate();
+                // Same for the round's graph: its setup rides the stream instead of the first launch's host path.
+                gop.value_ptr.upload(e.stream) catch {};
                 if (e.cut_head) |h| {
                     e.heads.put(e.gpa, shape.key(), h) catch |err| {
                         gop.value_ptr.deinit();

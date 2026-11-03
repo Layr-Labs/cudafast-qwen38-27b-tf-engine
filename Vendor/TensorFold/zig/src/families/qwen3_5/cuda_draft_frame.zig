@@ -176,6 +176,10 @@ fn run(d: anytype, n: usize, narrow_: bool) !?u64 {
         var captured = captured_;
         defer captured.deinit();
         exec = captured.instantiate() catch null;
+        // The setup a graph's first launch would otherwise run on the host thread is streamed ahead of it.
+        if (exec) |x| {
+            x.upload(e.stream) catch {};
+        }
     } else |_| {}
     try d.graphs.put(d.gpa, key, .{ .exec = exec, .spanned = spanned });
     if (exec) |x| try x.launchOn(e.stream) else _ = try body(d, n, narrow_);
