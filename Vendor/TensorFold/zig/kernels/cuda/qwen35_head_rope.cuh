@@ -47,17 +47,18 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_head_rope_warp(
     row_positions(sg, rowanc[row], row, M, pos);
     const int slot = sg.len + (int)row - sg.row0;
     const StoreBf16 store{layer, geo.kvh};
+    const float table_angle = (float)pos[mrope_axis(lane)] * powf(10000000.0f, -(float)lane / 32.0f);
+    float table_sn, table_cs;
+    sincosf(table_angle, &table_sn, &table_cs);
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const int d = 4 * lane + i;
         const float own = bf(normalized[0][i]);
         const float partner = __shfl_xor_sync(0xffffffffu, own, 8);
+        const float sn = __shfl_sync(0xffffffffu, table_sn, d % 32);
+        const float cs = __shfl_sync(0xffffffffu, table_cs, d % 32);
         __nv_bfloat16 low = normalized[0][i];
         if (d < 64) {
-            const int frequency = d % 32;
-            const float angle = (float)pos[mrope_axis(frequency)] * powf(10000000.0f, -(float)frequency / 32.0f);
-            float sn, cs;
-            sincosf(angle, &sn, &cs);
             const float a = d < 32 ? own : partner, b = d < 32 ? partner : own;
             low = __float2bfloat16_rn(d < 32 ? a * cs - b * sn : b * cs + a * sn);
         }

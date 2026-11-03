@@ -112,6 +112,23 @@ __device__ __forceinline__ __nv_bfloat16 rotate(const __nv_bfloat16* x, int d, c
     return __float2bfloat16_rn(d < 32 ? a * cs - b * sn : b * cs + a * sn);
 }
 
+__device__ __forceinline__ void rope_table(float* sn_tab, float* cs_tab, const int pos[3], int t) {
+    if (t >= 32) return;
+    const float angle = (float)pos[mrope_axis(t)] * powf(10000000.0f, -(float)t / 32.0f);
+    float sn, cs;
+    sincosf(angle, &sn, &cs);
+    sn_tab[t] = sn;
+    cs_tab[t] = cs;
+}
+
+__device__ __forceinline__ __nv_bfloat16 rotate_pre(const __nv_bfloat16* x, const float* sn_tab, const float* cs_tab, int d) {
+    if (d >= 64) return x[d];
+    const int i = d % 32;
+    const float sn = sn_tab[i], cs = cs_tab[i];
+    const float a = bf(x[i]), b = bf(x[i + 32]);
+    return __float2bfloat16_rn(d < 32 ? a * cs - b * sn : b * cs + a * sn);
+}
+
 // A tree uses all 64 ancestor bits; prompt chains keep their depth separately, including rows past 64.
 struct Ancestor { unsigned long long bits; unsigned depth, chain; };
 __device__ __forceinline__ int rows_seen(Ancestor anc) { return anc.chain ? (int)anc.depth + 1 : __popcll(anc.bits); }

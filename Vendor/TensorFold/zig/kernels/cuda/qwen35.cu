@@ -747,6 +747,7 @@ __device__ __forceinline__ void norm_rope_rows(const Geo& geo, const __nv_bfloat
                                                const int* __restrict__ M, float eps, Store store, uint2 wpre = make_uint2(0, 0)) {
     __shared__ float sums[2];
     __shared__ __align__(16) __nv_bfloat16 xs[HD];
+    __shared__ float rot_sn[32], rot_cs[32];
     const int QH = geo.qh, KVH = geo.kvh;
     if (past_rows(P, blockIdx.x)) return;
     const size_t m = blockIdx.x;
@@ -756,6 +757,10 @@ __device__ __forceinline__ void norm_rope_rows(const Geo& geo, const __nv_bfloat
     const __nv_bfloat16* x = query ? QRAW + m * (2 * QH * HD) + head * (2 * HD) : KRAW + m * (KVH * HD) + head * HD;
     const __nv_bfloat16* W = query ? WQ : WK;
     float v[4], acc = 0.0f;
+    const Seg sg = segs[rowseg[m]];
+    int pos[3];
+    row_positions(sg, rowanc[m], m, M, pos);
+    rope_table(rot_sn, rot_cs, pos, t);
     if (t < 64) {
 #pragma unroll
         for (int i = 0; i < 4; i++) {
@@ -777,12 +782,9 @@ __device__ __forceinline__ void norm_rope_rows(const Geo& geo, const __nv_bfloat
         }
     }
     __syncthreads();
-    const Seg sg = segs[rowseg[m]];
-    int pos[3];
-    row_positions(sg, rowanc[m], m, M, pos);
     const int slot = sg.len + (int)m - sg.row0;
-    if (query) Qn[(m * QH + head) * HD + t] = rotate(xs, t, pos);
-    else store(sg, head, slot, t, rotate(xs, t, pos), Vr[(m * KVH + head) * HD + t]);
+    if (query) Qn[(m * QH + head) * HD + t] = rotate_pre(xs, rot_sn, rot_cs, t);
+    else store(sg, head, slot, t, rotate_pre(xs, rot_sn, rot_cs, t), Vr[(m * KVH + head) * HD + t]);
 }
 
 extern "C" __global__ void __launch_bounds__(256) tf_q35_norm_rope(Geo geo, const __nv_bfloat16* __restrict__ QRAW, const __nv_bfloat16* __restrict__ KRAW,
