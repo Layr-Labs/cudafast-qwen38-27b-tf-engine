@@ -860,20 +860,8 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_attn_pair(Geo geo, cons
         const int keys = segs[rowseg[m]].len + rows_seen(rowanc[m]), ck = chunk_keys(keys);
         most = max(most, (keys + ck - 1) / ck);
     }
-    const int G = geo.qh / geo.kvh;
     bool first = true;
-    for (int c = blockIdx.y; c < MAXCH; c += gridDim.y) {
-        if (c >= most) {
-            // past both rows' keys: attn_partial's empty chunk for each short row
-            for (int j = 0; j < 2; j++) {
-                const size_t m = 2 * (size_t)blockIdx.x + j;
-                if (past_rows(P, (int)m) || segs[rowseg[m]].len >= tf_q35_tc::GROUP_LEN || (int)threadIdx.x >= G) continue;
-                const size_t at = (m * geo.qh + (size_t)blockIdx.z * G + threadIdx.x) * MAXCH + c;
-                PM[at] = -INFINITY;
-                PL[at] = 0.0f;
-            }
-            continue;
-        }
+    for (int c = blockIdx.y; c < most; c += gridDim.y) {
         if (!first) __syncthreads();
         first = false;
         tf_q35_tc::attn_two<tf_q35_tc::Bf16Tiles1<128>>({attn_tiles, nullptr, nullptr, nullptr}, geo, Q, segs, rowseg, rowanc, layer, P, scale, PM, PL, PO, c);
