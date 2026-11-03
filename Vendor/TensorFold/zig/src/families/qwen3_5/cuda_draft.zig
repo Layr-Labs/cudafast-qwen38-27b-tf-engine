@@ -56,6 +56,7 @@ pub const Draft = struct {
     w: weights.Weights,
     mod: cuda.Module,
     fns: Fns,
+    selector_kernels: cuda.qwen35_bf16_rows.Kernels,
     scratch: DeviceBuffer,
     /// The span head's 2-bit screen (cuda_draft_frame.zig head2): codes, screen scales, exact column scales (null: off).
     head2: ?DeviceBuffer = null,
@@ -125,10 +126,12 @@ pub const Draft = struct {
         const c = try Config.read(gpa, io, dir, e.g);
         const d = try gpa.create(Draft);
         errdefer gpa.destroy(d);
-        d.* = .{ .gpa = gpa, .io = io, .e = e, .c = c, .w = undefined, .mod = undefined, .fns = undefined, .scratch = undefined, .taps_in = 0, .th = 0, .thn = 0, .kabs = 0, .kn = 0, .vabs = 0, .xs = 0, .h = 0, .h2 = 0, .x = 0, .xin = 0, .dyn = 0, .qraw = 0, .q = 0, .kraw = 0, .kb = 0, .vb = 0, .att = 0, .o = 0, .gate = 0, .up = 0, .act = 0, .logits = 0, .words = 0, .parts = 0, .hp = 0, .ids = 0, .staged = undefined };
+        d.* = .{ .gpa = gpa, .io = io, .e = e, .c = c, .w = undefined, .mod = undefined, .fns = undefined, .selector_kernels = undefined, .scratch = undefined, .taps_in = 0, .th = 0, .thn = 0, .kabs = 0, .kn = 0, .vabs = 0, .xs = 0, .h = 0, .h2 = 0, .x = 0, .xin = 0, .dyn = 0, .qraw = 0, .q = 0, .kraw = 0, .kb = 0, .vb = 0, .att = 0, .o = 0, .gate = 0, .up = 0, .act = 0, .logits = 0, .words = 0, .parts = 0, .hp = 0, .ids = 0, .staged = undefined };
         d.mod = try cuda.Module.load(e.d, cuda.kernels.qwen35_draft);
         errdefer d.mod.unload();
         inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(d.fns, name) = try d.mod.function("tf_q35d_" ++ name);
+        d.selector_kernels = try cuda.qwen35_bf16_rows.Kernels.load(e.d);
+        errdefer d.selector_kernels.unload();
         d.w = try weights.load(gpa, io, e, dir, .{ .hidden = c.hidden, .intermediate = c.intermediate, .layers = c.layers, .vocab = c.vocab, .q_width = c.qWidth(), .kv_width = c.kvWidth(), .head_dim = c.head_dim, .dynamic = c.dynamic(), .rank = c.rank, .taps = c.n_taps });
         errdefer d.w.deinit(gpa);
         d.scratch = try DeviceBuffer.alloc(e.d, try d.scratchBytes());
@@ -159,6 +162,7 @@ pub const Draft = struct {
         try d.pool.append(gpa, ctx);
         d.startup.warmups += profile.elapsed(io, warm_start);
         d.startup.load = profile.elapsed(io, started) - d.startup.reserve - d.startup.warmups;
+        try e.enableOverlap();
         return d;
     }
 
@@ -193,6 +197,7 @@ pub const Draft = struct {
         if (d.head2) |*h| h.free();
         d.scratch.free();
         d.w.deinit(d.gpa);
+        d.selector_kernels.unload();
         d.mod.unload();
         d.gpa.destroy(d);
     }
@@ -215,14 +220,14 @@ pub const Draft = struct {
         const B = c.block * d.frame_streams;
         const R = @max(max_rows, B);
         const sizes = .{
-            .{ "taps_in", try bytes(.{ R, c.n_taps, c.hidden, 2 }) },                 .{ "th", try bytes(.{ R, c.hidden, 2 }) },              .{ "thn", try bytes(.{ R, c.hidden, 2 }) },                         .{ "kabs", try bytes(.{ R, c.layers, c.kvWidth(), 2 }) },
-            .{ "kn", try bytes(.{ R, c.kvWidth(), 2 }) },                             .{ "vabs", try bytes(.{ R, c.layers, c.kvWidth(), 2 }) },         .{ "xs", try bytes(.{ R, c.n_taps, (c.hidden / 64), 4 }) },         .{ "h", try bytes(.{ B, c.hidden, 2 }) },
-            .{ "h2", try bytes(.{ B, c.hidden, 2 }) },                                .{ "x", try bytes(.{ B, c.hidden, 2 }) },               .{ "xin", try bytes(.{ B, c.hidden, 2 }) },                         .{ "dyn", try bytes(.{ B, c.dynamic(), 2 }) },
-            .{ "qraw", try bytes(.{ B, c.qWidth(), 2 }) },                            .{ "q", try bytes(.{ B, c.qWidth(), 2 }) },             .{ "kraw", try bytes(.{ B, c.kvWidth(), 2 }) },                     .{ "kb", try bytes(.{ B, c.kvWidth(), 2 }) },
-            .{ "vb", try bytes(.{ B, c.kvWidth(), 2 }) },                             .{ "att", try bytes(.{ B, c.qWidth(), 2 }) },           .{ "o", try bytes(.{ B, c.hidden, 2 }) },                           .{ "gate", try bytes(.{ B, c.intermediate, 2 }) },
-            .{ "up", try bytes(.{ B, c.intermediate, 2 }) },                          .{ "act", try bytes(.{ B, c.intermediate, 2 }) },       .{ "logits", try bytes(.{ B, c.vocab, 2 }) },                       .{ "words", try bytes(.{ B, lp_words, 4 }) },
-            .{ "segments", try bytes(.{ d.frame_streams, @sizeOf(frame.Segment) }) }, .{ "pm", try bytes(.{ B, c.heads, frame.chunks, 4 }) }, .{ "pl", try bytes(.{ B, c.heads, frame.chunks, 4 }) },             .{ "po", try bytes(.{ B, c.heads, frame.chunks, c.head_dim, 4 }) },
-            .{ "hp", try bytes(.{ B, c.rank, 2 }) },                                  .{ "ids", try bytes(.{ B, 4 }) },                       .{ "parts", cuda.sample.Draws.topkPartsBytes(c.vocab, c.topk, B) },
+            .{ "taps_in", try bytes(.{ R, c.n_taps, c.hidden, 2 }) },                 .{ "th", try bytes(.{ R, c.hidden, 2 }) },                .{ "thn", try bytes(.{ R, c.hidden, 2 }) },                         .{ "kabs", try bytes(.{ R, c.layers, c.kvWidth(), 2 }) },
+            .{ "kn", try bytes(.{ R, c.kvWidth(), 2 }) },                             .{ "vabs", try bytes(.{ R, c.layers, c.kvWidth(), 2 }) }, .{ "xs", try bytes(.{ R, c.n_taps, (c.hidden / 64), 4 }) },         .{ "h", try bytes(.{ B, c.hidden, 2 }) },
+            .{ "h2", try bytes(.{ B, c.hidden, 2 }) },                                .{ "x", try bytes(.{ B, c.hidden, 2 }) },                 .{ "xin", try bytes(.{ B, c.hidden, 2 }) },                         .{ "dyn", try bytes(.{ B, c.dynamic(), 2 }) },
+            .{ "qraw", try bytes(.{ B, c.qWidth(), 2 }) },                            .{ "q", try bytes(.{ B, c.qWidth(), 2 }) },               .{ "kraw", try bytes(.{ B, c.kvWidth(), 2 }) },                     .{ "kb", try bytes(.{ B, c.kvWidth(), 2 }) },
+            .{ "vb", try bytes(.{ B, c.kvWidth(), 2 }) },                             .{ "att", try bytes(.{ B, c.qWidth(), 2 }) },             .{ "o", try bytes(.{ B, c.hidden, 2 }) },                           .{ "gate", try bytes(.{ B, c.intermediate, 2 }) },
+            .{ "up", try bytes(.{ B, c.intermediate, 2 }) },                          .{ "act", try bytes(.{ B, c.intermediate, 2 }) },         .{ "logits", try bytes(.{ B, c.vocab, 2 }) },                       .{ "words", try bytes(.{ B, lp_words, 4 }) },
+            .{ "segments", try bytes(.{ d.frame_streams, @sizeOf(frame.Segment) }) }, .{ "pm", try bytes(.{ B, c.heads, frame.chunks, 4 }) },   .{ "pl", try bytes(.{ B, c.heads, frame.chunks, 4 }) },             .{ "po", try bytes(.{ B, c.heads, frame.chunks, c.head_dim, 4 }) },
+            .{ "hp", try bytes(.{ B, c.rank, 2 }) },                                  .{ "ids", try bytes(.{ B, 4 }) },                         .{ "parts", cuda.sample.Draws.topkPartsBytes(c.vocab, c.topk, B) },
         };
         var total: usize = 0;
         inline for (sizes) |s| {
@@ -326,8 +331,26 @@ pub const Draft = struct {
         try d.e.runAfter(d.fns.norm_rope, .{ rows * heads, 1, 1 }, .{ 32, 1, 1 }, .{ x, w, out, @as(c_int, @intCast(heads)), @as(c_int, @intCast(heads * d.c.head_dim)), @as(c_longlong, @intCast(pos0)), d.c.eps, d.c.theta });
     }
 
+    /// `absorbRows`; a prompt's absorb right after its last cut (cuda_engine.zig Overlap) runs on the engine's side
+    /// stream once that cut's last layer is done, while the cut's head runs on, and the engine stream waits for it before
+    /// anything launched after it.
+    fn absorb(d: *Draft, ctx: *Ctx, tap_ring: u64, start: u64, n: usize, rows: ?[]const u32, prompt: bool) !void {
+        const e = d.e;
+        if (!(prompt and e.overlap.tail_pending)) return d.absorbRows(ctx, tap_ring, start, n, rows, prompt);
+        e.overlap.tail_pending = false;
+        const main = e.stream;
+        const side = e.overlap.side.?;
+        try e.d.check(e.d.api.cuStreamWaitEvent(side.handle, e.overlap.tail_done, 0), "cuStreamWaitEvent");
+        e.stream = side;
+        errdefer e.stream = main;
+        try d.absorbRows(ctx, tap_ring, start, n, rows, prompt);
+        e.stream = main;
+        try e.d.check(e.d.api.cuEventRecord(e.overlap.absorb_done, side.handle), "cuEventRecord");
+        try e.d.check(e.d.api.cuStreamWaitEvent(main.handle, e.overlap.absorb_done, 0), "cuStreamWaitEvent");
+    }
+
     /// Target rows [start, start + n) from the tap ring into the context; with `rows`, ring rows start + rows[i].
-    fn absorb(d: *Draft, ctx: *Ctx, tap_ring: u64, start_: u64, n_: usize, rows_: ?[]const u32, prompt: bool) !void {
+    fn absorbRows(d: *Draft, ctx: *Ctx, tap_ring: u64, start_: u64, n_: usize, rows_: ?[]const u32, prompt: bool) !void {
         const previous = d.projection_role;
         defer d.projection_role = previous;
         d.projection_role = if (prompt) .prompt else .live;
