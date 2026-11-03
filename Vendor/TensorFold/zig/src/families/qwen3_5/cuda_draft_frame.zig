@@ -176,6 +176,11 @@ fn run(d: anytype, n: usize, narrow_: bool) !?u64 {
         var captured = captured_;
         defer captured.deinit();
         exec = captured.instantiate() catch null;
+        // the driver's resource upload for a fresh executable graph rides the stream ahead of its first launch,
+        // instead of being paid inline by that launch on the host thread
+        if (exec) |x| {
+            x.upload(e.stream) catch {};
+        }
     } else |_| {}
     try d.graphs.put(d.gpa, key, .{ .exec = exec, .spanned = spanned });
     if (exec) |x| try x.launchOn(e.stream) else _ = try body(d, n, narrow_);

@@ -709,6 +709,9 @@ pub const Engine = struct {
                 var captured = try cuda.graph.endCapture(e.stream);
                 defer captured.deinit();
                 gop.value_ptr.* = try captured.instantiate();
+                // the fresh executable graph's resource upload is enqueued on the stream ahead of the launches
+                // below, so the round's first launch does not pay it inline on the host thread
+                gop.value_ptr.upload(e.stream) catch {};
                 if (e.cut_head) |h| {
                     e.heads.put(e.gpa, shape.key(), h) catch |err| {
                         gop.value_ptr.deinit();
