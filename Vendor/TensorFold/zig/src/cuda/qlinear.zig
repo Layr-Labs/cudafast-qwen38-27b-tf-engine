@@ -288,7 +288,8 @@ pub const symbols = struct {
 };
 
 /// qmm_group.cu's Part and Parts, passed by value: four projections at most, one used here.
-pub const Part = extern struct { w: u64, scales: u64, biases: u64, out: u64, n: c_int, npad: c_int, sk: c_int, tiles: c_int, first: c_int };
+/// merge_h: the wide verify windows' residual merge (qmm_group.cu's put), null in every other launch.
+pub const Part = extern struct { w: u64, scales: u64, biases: u64, out: u64, n: c_int, npad: c_int, sk: c_int, tiles: c_int, first: c_int, merge_h: u64 = 0 };
 pub const Parts = extern struct { p: [4]Part, count: c_int };
 
 /// lane_gemv.cu's Part: one projection whose column tiles the CTAs share out.
@@ -306,7 +307,7 @@ pub const PromptPart = extern struct { w: u64, scales: u64, biases: u64, out: u6
 pub const PromptParts = extern struct { p: [4]PromptPart, count: c_int };
 
 comptime {
-    std.debug.assert(@sizeOf(Part) == 56 and @sizeOf(Parts) == 232 and @sizeOf(GemvPart) == 48);
+    std.debug.assert(@sizeOf(Part) == 64 and @sizeOf(Parts) == 264 and @sizeOf(GemvPart) == 48);
     std.debug.assert(@sizeOf(Seg) == 64 and @sizeOf(Segs) == 264 and @sizeOf(Many) == 216);
     std.debug.assert(@sizeOf(PromptPart) == 48 and @sizeOf(PromptParts) == 200);
 }
