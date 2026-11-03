@@ -89,6 +89,24 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
         break :blk f;
     };
     try out.allowDynamicShared(35328);
+    // the twins' 32-row windows (TF_OUT32=0: the verify tiles keep the 17-32-row output/down)
+    const out32off = if (@import("sys").c.getenv("TF_OUT32")) |v| @import("std").mem.eql(u8, @import("std").mem.span(v), "0") else false;
+    if (output and !out32off) {
+        const down32 = try e.mods[0].function("tf_qmm_output_stream32");
+        try down32.allowDynamicShared(cuda.qlinear.out32_smem);
+        // two CTAs an SM (launch_bounds(512, 2)) take the 100 KiB carveout
+        try down32.setAttribute(.preferred_shared_memory_carveout, 100);
+        const out32 = try e.mods[0].function("tf_qmm_output_prefetch32");
+        try out32.allowDynamicShared(cuda.qlinear.out32_smem);
+        try out32.setAttribute(.preferred_shared_memory_carveout, 100);
+        e.affine.stream32_fns = .{ down32, out32 };
+        if (e.affine.dict != null) {
+            const down32_dict = try e.mods[0].function("tf_qmm_output_stream32_dict");
+            try down32_dict.allowDynamicShared(cuda.qlinear.out32_smem + @as(u32, @max(cuda.qlinear.dict_tab_max, cuda.qlinear.out_pair_tab_max)));
+            try down32_dict.setAttribute(.preferred_shared_memory_carveout, 100);
+            e.affine.stream32_dict_fn = down32_dict;
+        }
+    }
     var buffer: ?cuda.DeviceBuffer = null;
     if (e.fast == null) {
         buffer = try cuda.DeviceBuffer.alloc(e.d, bytes);
@@ -144,7 +162,7 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
             e.affine.gdn_stream32_fn = g32;
             if (e.affine.dict != null) {
                 const gd32 = try e.mods[0].function("tf_qmm_gdn_stream32_dict");
-                try gd32.allowDynamicShared(cuda.qlinear.Affine4Kernels.gdn_stream32_smem + 4 * 128 + @as(u32, @max(cuda.qlinear.dict_tab_max, cuda.qlinear.gdn_pair_tab_max)));
+                try gd32.allowDynamicShared(cuda.qlinear.Affine4Kernels.gdn_stream32_smem + 4 * 256 + @as(u32, @max(cuda.qlinear.dict_tab_max, cuda.qlinear.gdn_pair_tab_max)));
                 e.affine.gdn_stream32_dict_fn = gd32;
             }
         }
