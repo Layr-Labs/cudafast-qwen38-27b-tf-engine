@@ -35,12 +35,13 @@ fn size(p: layers.Proj) usize {
     return q.npad * q.k / 2;
 }
 
-/// Whether candidate `index` of `layer` goes on the fast pool: every stream but an attention layer's q, k and v, whose
-/// copies stay on ordinary memory so the pool's fastest pieces keep holding what they held before them
-/// (TF_ATTN_COPIES_POOLED=1: those too).
+/// Whether candidate `index` of `layer` goes on the fast pool: every stream, an attention layer's q, k and v included.
+/// The screen keeps the fastest pieces that hold *every* requested copy, so asking for these three as well moves no
+/// other stream off a piece it had: the kept set only grows, by the pieces these copies need
+/// (TF_ATTN_COPIES_POOLED=0: q, k and v stay on ordinary memory, as before).
 fn pooled(layer: *const layers.Layer, index: usize) bool {
     if (layer.mixer != .attention or index < 2) return true;
-    const v = @import("sys").c.getenv("TF_ATTN_COPIES_POOLED") orelse return false;
+    const v = @import("sys").c.getenv("TF_ATTN_COPIES_POOLED") orelse return true;
     return @import("std").mem.eql(u8, @import("std").mem.span(v), "1");
 }
 
