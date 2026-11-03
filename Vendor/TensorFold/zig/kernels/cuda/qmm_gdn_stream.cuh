@@ -213,59 +213,68 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
         }
         const __nv_bfloat16* ps = reinterpret_cast<const __nv_bfloat16*>(DICT ? dec : p + T::X + T::W);
         const float* px = reinterpret_cast<const float*>(p + T::X + T::W + 2 * T::S);
-        uint32_t words[NT][GS / 32];
-#pragma unroll
-        for (int j = 0; j < NT; ++j)
-#pragma unroll
-            for (int v = 0; v < GS / 32; ++v) words[j][v] = pw[((wn * NT + j) * 32 + lane) * (GS / 32) + v];
-        float d[NT][4];
-#pragma unroll
-        for (int kt = 0; kt < GS / 16; ++kt) {
-            uint32_t a[4];
-            const int r = (lane & 7) + ((lane >> 3) & 1) * 8, ch = kt * 2 + (lane >> 4);
-            ldmatrix4(a, p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16);
-#pragma unroll
-            for (int j = 0; j < NT; ++j) {
-                const uint32_t b0 = pairm(words[j][kt / 2], (kt & 1) * 8, mask);
-                const uint32_t b1 = pairm(words[j][kt / 2], (kt & 1) * 8 + 4, mask);
-                if (kt == 0) mma0(d[j], a, b0, b1);
-                else mma(d[j], a, b0, b1);
-            }
-        }
         const int row = lane >> 2;
         const float xv[2] = {px[row], px[row + 8]};
+        // Keep the small tiles intact; wider tiles consume four output chains at a time.
+        // A shared input fragment is reloaded per strip, never reassociated within a chain.
+        constexpr int STRIP = NT < 4 ? NT : 4;
+        static_assert(NT % STRIP == 0, "whole output strips");
 #pragma unroll
-        for (int j = 0; j < NT; ++j) {
-            float sv[2], bv[2];
-            if constexpr (DICT) {
-                if constexpr (BN >= 128) {
-                    const int pass = j / 4, jj = j % 4, c0 = jj * 8 + (lane & 3) * 2;
-                    const float sf = __bfloat162float(__ushort_as_bfloat16(static_cast<unsigned short>(dv[pass])));
-                    const float bf = __bfloat162float(__ushort_as_bfloat16(static_cast<unsigned short>(dv[BN / 128 + pass])));
-                    sv[0] = __shfl_sync(0xffffffffu, sf, c0);
-                    sv[1] = __shfl_sync(0xffffffffu, sf, c0 + 1);
-                    bv[0] = __shfl_sync(0xffffffffu, bf, c0);
-                    bv[1] = __shfl_sync(0xffffffffu, bf, c0 + 1);
-                } else {
-                    const int c0 = j * 8 + (lane & 3) * 2;
-                    const float dval = __bfloat162float(__ushort_as_bfloat16(static_cast<unsigned short>(dv[0])));
-                    sv[0] = __shfl_sync(0xffffffffu, dval, c0);
-                    sv[1] = __shfl_sync(0xffffffffu, dval, c0 + 1);
-                    bv[0] = __shfl_sync(0xffffffffu, dval, 16 + c0);
-                    bv[1] = __shfl_sync(0xffffffffu, dval, 16 + c0 + 1);
+        for (int first = 0; first < NT; first += STRIP) {
+            uint32_t words[STRIP][GS / 32];
+#pragma unroll
+            for (int jj = 0; jj < STRIP; ++jj)
+#pragma unroll
+                for (int v = 0; v < GS / 32; ++v)
+                    words[jj][v] = pw[((wn * NT + first + jj) * 32 + lane) * (GS / 32) + v];
+            float d[STRIP][4];
+#pragma unroll
+            for (int kt = 0; kt < GS / 16; ++kt) {
+                uint32_t a[4];
+                const int r = (lane & 7) + ((lane >> 3) & 1) * 8, ch = kt * 2 + (lane >> 4);
+                ldmatrix4(a, p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16);
+#pragma unroll
+                for (int jj = 0; jj < STRIP; ++jj) {
+                    const uint32_t b0 = pairm(words[jj][kt / 2], (kt & 1) * 8, mask);
+                    const uint32_t b1 = pairm(words[jj][kt / 2], (kt & 1) * 8 + 4, mask);
+                    if (kt == 0) mma0(d[jj], a, b0, b1);
+                    else mma(d[jj], a, b0, b1);
                 }
-            } else {
-                const int col = wn * (BN / 4) + j * 8 + (lane & 3) * 2;
-                const __nv_bfloat162 s2 = *reinterpret_cast<const __nv_bfloat162*>(ps + col);
-                const __nv_bfloat162 b2 = *reinterpret_cast<const __nv_bfloat162*>(ps + BN + col);
-                sv[0] = __low2float(s2);
-                sv[1] = __high2float(s2);
-                bv[0] = __low2float(b2);
-                bv[1] = __high2float(b2);
             }
 #pragma unroll
-            for (int e = 0; e < 4; ++e)
-                acc[j][e] = __fmaf_rn(xv[e >> 1], bv[e & 1], __fmaf_rn(d[j][e], sv[e & 1], acc[j][e]));
+            for (int jj = 0; jj < STRIP; ++jj) {
+                const int j = first + jj;
+                float sv[2], bv[2];
+                if constexpr (DICT) {
+                    if constexpr (BN >= 128) {
+                        const int pass = j / 4, jj = j % 4, c0 = jj * 8 + (lane & 3) * 2;
+                        const float sf = __bfloat162float(__ushort_as_bfloat16(static_cast<unsigned short>(dv[pass])));
+                        const float bf = __bfloat162float(__ushort_as_bfloat16(static_cast<unsigned short>(dv[BN / 128 + pass])));
+                        sv[0] = __shfl_sync(0xffffffffu, sf, c0);
+                        sv[1] = __shfl_sync(0xffffffffu, sf, c0 + 1);
+                        bv[0] = __shfl_sync(0xffffffffu, bf, c0);
+                        bv[1] = __shfl_sync(0xffffffffu, bf, c0 + 1);
+                    } else {
+                        const int c0 = j * 8 + (lane & 3) * 2;
+                        const float dval = __bfloat162float(__ushort_as_bfloat16(static_cast<unsigned short>(dv[0])));
+                        sv[0] = __shfl_sync(0xffffffffu, dval, c0);
+                        sv[1] = __shfl_sync(0xffffffffu, dval, c0 + 1);
+                        bv[0] = __shfl_sync(0xffffffffu, dval, 16 + c0);
+                        bv[1] = __shfl_sync(0xffffffffu, dval, 16 + c0 + 1);
+                    }
+                } else {
+                    const int col = wn * (BN / 4) + j * 8 + (lane & 3) * 2;
+                    const __nv_bfloat162 s2 = *reinterpret_cast<const __nv_bfloat162*>(ps + col);
+                    const __nv_bfloat162 b2 = *reinterpret_cast<const __nv_bfloat162*>(ps + BN + col);
+                    sv[0] = __low2float(s2);
+                    sv[1] = __high2float(s2);
+                    bv[0] = __low2float(b2);
+                    bv[1] = __high2float(b2);
+                }
+#pragma unroll
+                for (int e = 0; e < 4; ++e)
+                    acc[j][e] = __fmaf_rn(xv[e >> 1], bv[e & 1], __fmaf_rn(d[jj][e], sv[e & 1], acc[j][e]));
+            }
         }
         after(it);
     }
@@ -618,7 +627,8 @@ __device__ __forceinline__ void body(const __nv_bfloat16* x,const float* xs,cons
 #pragma unroll
     for(int i=1;i<4;++i)if(int(blockIdx.x)>=parts.p[i].first)which=i;
     const auto p=parts.p[which];int t=int(blockIdx.x)-p.first;const bool coded=DICT&&p.tiles>0;
-    if(which<2){if(coded)tile<128,true>(x,xs,p,t,M,K,ldx);else tile<128>(x,xs,p,t,M,K,ldx);}
+    // qkv and z on the 16-row twin's 256-column CTAs (both m16 row tiles share each weight stage)
+    if(which<2){if(coded)tile<256,true>(x,xs,p,t,M,K,ldx);else tile<256>(x,xs,p,t,M,K,ldx);}
     else{if(coded)tile<64,true>(x,xs,p,t,M,K,ldx);else tile<64>(x,xs,p,t,M,K,ldx);}
 }
 }
