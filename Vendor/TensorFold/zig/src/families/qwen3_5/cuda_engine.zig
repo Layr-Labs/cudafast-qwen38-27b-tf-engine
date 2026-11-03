@@ -183,6 +183,8 @@ pub const Engine = struct {
     picks: u64, // drawRows' slice scratch: most_verify rows of cuda.sample.Draws.row_scratch
     // per-forward tables (ids, segments, rows' segment, parent and ancestors, the draws' rules) staged in pinned memory
     tables: DeviceBuffer,
+    /// The token table's zeroed padding tail is already on the device: a text forward stages only its own rows.
+    tables_primed: bool,
     staged: cuda.HostBuffer,
     host_logits: cuda.HostBuffer,
     /// The kept rows' device draws, when forward was given them.
@@ -253,6 +255,7 @@ pub const Engine = struct {
         e.rec_scratch = recurrent.Pool.init(gpa, @intFromPtr(e));
         e.n_taps = 0;
         e.features = 0;
+        e.tables_primed = false;
         e.head_argmax = !envOff("TF_HEAD_ARGMAX");
         e.sieve = null;
         e.stream = try cuda.Stream.init(d, true);
@@ -610,7 +613,9 @@ pub const Engine = struct {
         // the tables
         const st = e.staged.bytes;
         @memcpy(std.mem.bytesAsSlice(u32, st[ids_at..][0 .. total * 4]), ids);
-        @memset(st[ids_at + total * 4 .. ids_at + max_rows * 4], 0); // a bucket's padding rows read token 0
+        // a bucket's padding rows read token 0: the zeroed tail reaches the device with the table's first text
+        // forward (tables_primed) and is never staged again, so a round stages only the rows it uses
+        if (!e.tables_primed) @memset(st[ids_at + total * 4 .. ids_at + max_rows * 4], 0);
         const segs = std.mem.bytesAsSlice(Seg, st[segs_at..][0 .. parts.len * @sizeOf(Seg)]);
         // past 1 row a window's scan carries each parent's state in the registers to its first child
         // (tree_slots.carried: one slot fewer, -2 steps); TF_CARRIED=0 restores build's plans
@@ -653,7 +658,17 @@ pub const Engine = struct {
             @memcpy(std.mem.bytesAsSlice(i32, st[src_at..][0 .. total * 4]), im.src[p0..][0..total]);
             Round.stageImageTables(st, im, p0, total);
         }
-        try e.tables.uploadAsync(0, st[0..if (images != null) tables_len else src_at], e.stream.handle); // text: as before
+        if (images != null) {
+            try e.tables.uploadAsync(0, st[0..tables_len], e.stream.handle);
+        } else if (e.tables_primed) {
+            // the token table's padding tail already holds its zeroes on the device: a text forward copies its own
+            // rows and the plan arrays, not the max_rows-wide tail of the id rows it does not use
+            try e.tables.uploadAsync(0, st[0 .. ids_at + total * 4], e.stream.handle);
+            try e.tables.uploadAsync(segs_at, st[segs_at..src_at], e.stream.handle);
+        } else {
+            try e.tables.uploadAsync(0, st[0..src_at], e.stream.handle); // text: as before
+            e.tables_primed = true;
+        }
         // carried plans of 2..32 rows (at most 3 slots) scan four value rows a warp on qwen35_slots_lean.cuh (slots_3's
         // arithmetic, its addressing hoisted; 2 slots where they suffice); TF_SLOTS_LEAN=0 keeps prior dispatch
         const lean = record and total > 1 and total <= 32 and e.affine.pdl and !envOff("TF_SLOTS_LEAN");
