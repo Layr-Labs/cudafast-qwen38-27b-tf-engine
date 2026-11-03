@@ -497,6 +497,11 @@ const Lanes = struct {
         const self = cast(ptr);
         const cache = try self.cacheOf(stream);
         if (position != cache.len) return error.InvalidQwenPosition;
+        // the prompt pass took its token from the head sieve (greedy, no grammar): no logits were kept
+        if (cache.first) |t| {
+            if (mask.len != 0 or stream.sampling != null) return error.NoAllowedQwenToken;
+            return t;
+        }
         return try draws.draw(self.gpa, cache.logits, stream.sampling, position, mask);
     }
 
@@ -521,6 +526,7 @@ const Lanes = struct {
     fn firstRowFn(ptr: *anyopaque, stream: *lanes.Stream) anyerror!lanes.LogprobRow {
         const self = cast(ptr);
         const cache = try self.cacheOf(stream);
+        if (cache.first != null) return error.InvalidQwenPosition; // a sieved prompt kept no logits (never with logprobs)
         const pick_ = try draws.draw(self.gpa, cache.logits, stream.sampling, cache.len, &.{});
         return lanes.LogprobRow.fromBf16(cache.logits, pick_, stream.logprobs.?);
     }
