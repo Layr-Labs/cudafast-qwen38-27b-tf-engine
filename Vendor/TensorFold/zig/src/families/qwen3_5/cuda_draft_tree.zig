@@ -6,8 +6,27 @@ const engine = @import("cuda_engine.zig");
 
 /// Children a node, the selector's weight, the softmax scale, and the nodes a tree takes by default.
 const branch = 12;
+/// TF_DRAFT_BRANCH: children a node opens (default 12).
+fn branchWidth() usize {
+    const v = platform.c.getenv("TF_DRAFT_BRANCH") orelse return branch;
+    const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return branch;
+    return @min(@as(usize, 20), if (n == 0) branch else n);
+}
 const edge_weight = 0.6;
+/// TF_EDGE_WEIGHT (percent): the selector term's weight against the unary (default 60).
+fn edgeWeight() f64 {
+    const v = platform.c.getenv("TF_EDGE_WEIGHT") orelse return edge_weight;
+    const pct = std.fmt.parseFloat(f64, std.mem.span(v)) catch return edge_weight;
+    return if (pct <= 0) edge_weight else pct / 100.0;
+}
 const scale = 1.5;
+/// TF_TREE_SCALE (percent): the row softmax's scale, which sets how a row's normaliser contrasts
+/// against the path cost (default 150).
+fn softScale() f64 {
+    const v = platform.c.getenv("TF_TREE_SCALE") orelse return scale;
+    const pct = std.fmt.parseFloat(f64, std.mem.span(v)) catch return scale;
+    return if (pct <= 0) scale else pct / 100.0;
+}
 /// A sampled stream's candidates carry the draw's own Gumbel noise at this weight (the 27B engine's draft_tree).
 const noise_weight = 0.7;
 const default_nodes = 15;
@@ -25,6 +44,9 @@ pub const Candidates = struct {
     // a sampled stream's rule and its first draft's position: row r's candidates scored as the target's draw at r
     sampling: ?lanes.Sampling = null,
     position: u64 = 0,
+    // Only observations from this stream, reset with its context. A null table
+    // is the uncalibrated tree; own[] always keeps the raw model log-chance.
+    landing: ?*const Landing = null,
 };
 
 /// A candidate's score as the target's draw sees it: its logit at the stream's temperature plus the draw's noise.
@@ -187,7 +209,7 @@ fn chancesAfterFast(c: Candidates, r: usize, pred: u32, out: *[lp_top]f64) void 
     for (0..vec_n) |v| edge[v * lanes_f64 ..][0..lanes_f64].* = acc[v];
     var most: f64 = -std.math.inf(f64);
     for (0..c.topk) |j| {
-        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edge_weight * edge[j]) / scale;
+        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edgeWeight() * edge[j]) / softScale();
         most = @max(most, out[j]);
     }
     var total: f64 = 0;
@@ -211,7 +233,7 @@ fn chancesAfter(c: Candidates, r: usize, pred: u32, out: *[lp_top]f64) void {
         for (edge[0..c.topk], succ[0..c.topk]) |*e, row| e.* += ph * bf16(row[k]);
     }
     for (0..c.topk) |j| {
-        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edge_weight * edge[j]) / scale;
+        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edgeWeight() * edge[j]) / softScale();
         most = @max(most, out[j]);
     }
     var total: f64 = 0;
@@ -244,17 +266,26 @@ pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32
                     std.debug.print("TF_TREE_CHECK mismatch row {d}: {e} vs {e}\n", .{ row, x, y });
                 };
             }
+            var score = lc;
+            if (c.landing) |l| {
+                for (score[0..c.topk], lc[0..c.topk]) |*v, raw| {
+                    if (!std.math.isFinite(raw)) continue;
+                    // No observation: retain the exact prior and its tie order.
+                    if (l.counts[@intFromBool(c.sampling != null)][Landing.bin(raw)][0] > 0)
+                        v.* = @log(l.chance(c.sampling != null, raw));
+                }
+            }
             var order: [lp_top]usize = undefined;
             for (order[0..c.topk], 0..) |*o, i| o.* = i;
-            std.mem.sort(usize, order[0..c.topk], &lc, struct {
+            std.mem.sort(usize, order[0..c.topk], &score, struct {
                 fn more(v: *const [lp_top]f64, a: usize, b: usize) bool {
                     return v[a] > v[b] or (v[a] == v[b] and a < b);
                 }
             }.more);
             const w = ids(c, row);
-            for (order[0..@min(branch, c.topk)]) |j| {
-                if (!std.math.isFinite(lc[j]) or n_open == open.len) break;
-                open[n_open] = .{ .cost = path - lc[j], .parent = parent, .token = w[2 + j], .row = row, .own = lc[j] };
+            for (order[0..@min(branchWidth(), c.topk)]) |j| {
+                if (!std.math.isFinite(score[j]) or n_open == open.len) break;
+                open[n_open] = .{ .cost = path - score[j], .parent = parent, .token = w[2 + j], .row = row, .own = lc[j] };
                 n_open += 1;
             }
         }
@@ -320,3 +351,4 @@ test "best first: a node's children follow it, the cheapest open node first, cha
     for (parents[0..n], 0..) |p, i| try std.testing.expect(p < @as(i32, @intCast(i)));
     for (tokens[0..n], parents[0..n]) |t, p| try std.testing.expectEqual(p >= 0, t >= 10); // row 1's ids under row 0's
 }
+// draw 28 of 4e2b427a
