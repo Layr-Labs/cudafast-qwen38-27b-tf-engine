@@ -106,7 +106,8 @@ extern "C" __global__ void tf_q35d_dyn_conv(const __nv_bfloat16* __restrict__ X0
             if (t - l < 0) continue;
             const float x = bf(X[(size_t)(t - l) * D + c]);
             total = rbf(total + rbf(bf(BASE[(branch * 2 + l) * D + c]) * x));
-            total = rbf(total + rbf(bf(DYN[(size_t)t * (4 * groups) + (branch * 2 + l) * groups + g]) * x));
+            // PyTorch DFlash2 uses addcmul: FP32 dynamic multiply-add, then one BF16 rounding.
+            total = rbf(fmaf(bf(DYN[(size_t)t * (4 * groups) + (branch * 2 + l) * groups + g]), x, total));
         }
         if (RES != nullptr) total = rbf(total + bf(RES[(size_t)t * D + c]));
         OUT[(size_t)t * D + c] = __float2bfloat16_rn(total);
