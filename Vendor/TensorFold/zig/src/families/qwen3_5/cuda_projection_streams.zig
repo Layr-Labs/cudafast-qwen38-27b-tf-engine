@@ -35,22 +35,28 @@ fn size(p: layers.Proj) usize {
     return q.npad * q.k / 2;
 }
 
-/// Whether candidate `index` of `layer` goes on the fast pool: every stream but an attention layer's q, k and v, whose
-/// copies stay on ordinary memory so the pool's fastest pieces keep holding what they held before them
-/// (TF_ATTN_COPIES_POOLED=1: those too).
+/// Whether candidate `index` of `layer` goes on the fast pool: every stream, an attention layer's q, k and v included
+/// (TF_ATTN_COPIES_POOLED=0: those stay on ordinary memory, as they did before them).
 fn pooled(layer: *const layers.Layer, index: usize) bool {
     if (layer.mixer != .attention or index < 2) return true;
-    const v = @import("sys").c.getenv("TF_ATTN_COPIES_POOLED") orelse return false;
-    return @import("std").mem.eql(u8, @import("std").mem.span(v), "1");
+    const v = @import("sys").c.getenv("TF_ATTN_COPIES_POOLED") orelse return true;
+    return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
+}
+
+/// The copies the pool places after every other one: an attention layer's q, k and v. Every layer's other streams are
+/// allocated first, so the fastest pieces keep holding exactly what they held before them and these ride the pieces
+/// the pool kept past those.
+fn late(layer: *const layers.Layer, index: usize) bool {
+    return layer.mixer == .attention and index >= 2 and pooled(layer, index);
 }
 
 /// The streams' sizes in the order `prepare` places them on the fast pool (for its screen); returns how many.
 pub fn copySizes(e: anytype, input: bool, output: bool, out: []usize) usize {
     var n: usize = 0;
-    for (e.layers) |*layer| for (candidates(layer, input, output), 0..) |maybe, index| {
+    for (0..2) |pass| for (e.layers) |*layer| for (candidates(layer, input, output), 0..) |maybe, index| {
         if (maybe) |p| {
             const nbytes = size(p.*);
-            if (nbytes == 0 or !pooled(layer, index)) continue;
+            if (nbytes == 0 or !pooled(layer, index) or late(layer, index) != (pass == 1)) continue;
             out[n] = nbytes;
             n += 1;
         }
@@ -103,10 +109,10 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     var places: [6 * 64]u64 = undefined;
     var count: usize = 0;
     var at: usize = 0; // the next stream's offset in `buffer` (all of them without a pool, the unpooled ones with it)
-    for (e.layers) |*layer| for (candidates(layer, input, output), 0..) |maybe, index| {
+    for (0..2) |pass| for (e.layers) |*layer| for (candidates(layer, input, output), 0..) |maybe, index| {
         if (maybe) |p| {
             const nbytes = size(p.*);
-            if (nbytes == 0) continue;
+            if (nbytes == 0 or late(layer, index) != (pass == 1)) continue;
             if (count == places.len) return error.TooManyStreams;
             const in_pool = e.fast != null and pooled(layer, index);
             const dst = if (in_pool) blk: {
@@ -124,10 +130,10 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     };
     try e.stream.synchronize();
     count = 0;
-    for (e.layers) |*layer| for (candidates(layer, input, output)) |maybe| {
+    for (0..2) |pass| for (e.layers) |*layer| for (candidates(layer, input, output), 0..) |maybe, index| {
         if (maybe) |p| {
             const nbytes = size(p.*);
-            if (nbytes == 0) continue;
+            if (nbytes == 0 or late(layer, index) != (pass == 1)) continue;
             p.a4.stream_w = places[count];
             count += 1;
         }
