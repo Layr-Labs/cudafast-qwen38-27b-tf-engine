@@ -3,9 +3,15 @@ extern "C" __global__ void __launch_bounds__(64) tf_q35_head_norm(const __nv_bfl
                                                                     __nv_bfloat16* __restrict__ OUT0, int heads, int stride, int hstride, float eps,
                                                                     const int* __restrict__ P) {
     release_next();
+    uint2 wv = make_uint2(0, 0);
+    if (threadIdx.x < 64) {
+        wv = *reinterpret_cast<const uint2*>(plain(W) + 4 * threadIdx.x);
+        asm volatile("" :: "r"(wv.x), "r"(wv.y));
+    }
     await_prior();
     const __nv_bfloat16* X = after_wait(X0);
     __nv_bfloat16* OUT = after_wait(OUT0);
+    const __nv_bfloat16* wp = reinterpret_cast<const __nv_bfloat16*>(&wv);
     __shared__ float sums[2];
     const int head = blockIdx.x % heads;
     if (past_rows(P, blockIdx.x / heads)) return;
@@ -25,7 +31,7 @@ extern "C" __global__ void __launch_bounds__(64) tf_q35_head_norm(const __nv_bfl
 #pragma unroll
     for (int i = 0; i < 4; i++) {
         const int d = 4 * t + i;
-        OUT[(m * heads + head) * HD + d] = __float2bfloat16_rn(bf(W[d]) * (v[i] * inv));
+        OUT[(m * heads + head) * HD + d] = __float2bfloat16_rn(bf(wp[i]) * (v[i] * inv));
     }
 }
 
