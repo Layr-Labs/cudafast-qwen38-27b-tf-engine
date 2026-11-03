@@ -290,6 +290,9 @@ pub const HeadSieve = struct {
 
     /// After a verify that ran the sieve, its stream drained: the counters at rounds 1, 2, 4, .. (check: every 8th).
     pub fn after(h: *HeadSieve) void {
+        // the page below is the instrument that picked kappa and cap: no production consumer, and its copy is the
+        // synchronous cuMemcpyDtoH that drains the stream, so a scored decode (mode .on) never takes it
+        if (h.mode != .check) return;
         h.rounds += 1;
         if (h.rounds != h.next_log) return;
         h.next_log = if (h.mode == .check) h.rounds + 8 else h.rounds * 2;
