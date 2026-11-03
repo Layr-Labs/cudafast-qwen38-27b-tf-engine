@@ -58,6 +58,8 @@ __device__ __forceinline__ void copy_row(const __nv_bfloat16* __restrict__ src, 
 
 using namespace tf_q35d;
 
+#include "qwen35_draft_norm.cuh"
+
 // Tap rows (start + i) of a stream's ring of R rows, `width` bf16 each, into OUT rows 0..n. Grid (n), 256 threads.
 extern "C" __global__ void tf_q35d_gather_taps(const __nv_bfloat16* __restrict__ RING0, int R, long long start, int width,
                                                  __nv_bfloat16* __restrict__ OUT0) {

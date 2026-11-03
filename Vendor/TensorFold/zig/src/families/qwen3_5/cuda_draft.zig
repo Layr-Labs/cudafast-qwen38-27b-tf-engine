@@ -24,7 +24,7 @@ const lp_top = 20;
 pub const Config = @import("cuda_draft_config.zig").Config;
 pub const frame = @import("cuda_draft_frame.zig");
 pub const memory = @import("cuda_draft_memory.zig");
-const Fns = struct { gather_taps: cuda.Function, gather_rows: cuda.Function, dyn_conv: cuda.Function, norm_rope: cuda.Function, ring_put: cuda.Function, attn: cuda.Function, dyn_conv_batch: cuda.Function, norm_rope_batch: cuda.Function, norm_rope_qk_batch: cuda.Function, mask_rows: cuda.Function, attn_partial: cuda.Function, attn_partial_rows4: cuda.Function, attn_merge: cuda.Function, head2_pack: cuda.Function, head2_screen: cuda.Function, head2_select: cuda.Function, head2_rescore: cuda.Function };
+const Fns = struct { norm: cuda.Function, gather_taps: cuda.Function, gather_rows: cuda.Function, dyn_conv: cuda.Function, norm_rope: cuda.Function, ring_put: cuda.Function, attn: cuda.Function, dyn_conv_batch: cuda.Function, norm_rope_batch: cuda.Function, norm_rope_qk_batch: cuda.Function, mask_rows: cuda.Function, attn_partial: cuda.Function, attn_partial_rows4: cuda.Function, attn_merge: cuda.Function, head2_pack: cuda.Function, head2_screen: cuda.Function, head2_select: cuda.Function, head2_rescore: cuda.Function };
 
 /// qwen35_draft.cu's TapRows.
 const TapRows = extern struct { n: c_int, rows: [engine.most_window]c_int };
@@ -159,6 +159,7 @@ pub const Draft = struct {
         try d.pool.append(gpa, ctx);
         d.startup.warmups += profile.elapsed(io, warm_start);
         d.startup.load = profile.elapsed(io, started) - d.startup.reserve - d.startup.warmups;
+        try e.enableOverlap();
         return d;
     }
 
@@ -315,7 +316,7 @@ pub const Draft = struct {
     /// out = the normed h, and its group sums into xs for a projAgain over out.
     pub fn norm(d: *Draft, h: u64, w: u64, out: u64, rows: usize) !void {
         const e = d.e;
-        try e.runAfter(e.fns.norm, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ h, @as(u64, 0), w, out, d.c.eps, @as(c_int, @intCast(d.c.hidden)), @as(u64, 0), d.xs });
+        try e.runAfter(d.fns.norm, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ h, @as(u64, 0), w, out, d.c.eps, @as(c_int, @intCast(d.c.hidden)), @as(u64, 0), d.xs });
     }
 
     fn dynConv(d: *Draft, x: u64, dyn: u64, base: u64, res: u64, out: u64, rows: usize, branch: usize) !void {
@@ -326,8 +327,26 @@ pub const Draft = struct {
         try d.e.runAfter(d.fns.norm_rope, .{ rows * heads, 1, 1 }, .{ 32, 1, 1 }, .{ x, w, out, @as(c_int, @intCast(heads)), @as(c_int, @intCast(heads * d.c.head_dim)), @as(c_longlong, @intCast(pos0)), d.c.eps, d.c.theta });
     }
 
+    /// `absorbRows`; a prompt's absorb right after its last cut (cuda_engine.zig Overlap) runs on the engine's side
+    /// stream once that cut's last layer is done, while the cut's head runs on, and the engine stream waits for it before
+    /// anything launched after it.
+    fn absorb(d: *Draft, ctx: *Ctx, tap_ring: u64, start: u64, n: usize, rows: ?[]const u32, prompt: bool) !void {
+        const e = d.e;
+        if (!(prompt and e.overlap.tail_pending)) return d.absorbRows(ctx, tap_ring, start, n, rows, prompt);
+        e.overlap.tail_pending = false;
+        const main = e.stream;
+        const side = e.overlap.side.?;
+        try e.d.check(e.d.api.cuStreamWaitEvent(side.handle, e.overlap.tail_done, 0), "cuStreamWaitEvent");
+        e.stream = side;
+        errdefer e.stream = main;
+        try d.absorbRows(ctx, tap_ring, start, n, rows, prompt);
+        e.stream = main;
+        try e.d.check(e.d.api.cuEventRecord(e.overlap.absorb_done, side.handle), "cuEventRecord");
+        try e.d.check(e.d.api.cuStreamWaitEvent(main.handle, e.overlap.absorb_done, 0), "cuStreamWaitEvent");
+    }
+
     /// Target rows [start, start + n) from the tap ring into the context; with `rows`, ring rows start + rows[i].
-    fn absorb(d: *Draft, ctx: *Ctx, tap_ring: u64, start_: u64, n_: usize, rows_: ?[]const u32, prompt: bool) !void {
+    fn absorbRows(d: *Draft, ctx: *Ctx, tap_ring: u64, start_: u64, n_: usize, rows_: ?[]const u32, prompt: bool) !void {
         const previous = d.projection_role;
         defer d.projection_role = previous;
         d.projection_role = if (prompt) .prompt else .live;
@@ -355,7 +374,7 @@ pub const Draft = struct {
             const kv = rows * c.kvWidth() * 2; // a layer's k (v) rows in kabs (vabs)
             // a prompt piece: every layer's k and v project the same normed taps, up to four a prompt GEMM launch
             const grouped = precision.prompt(d.projection_role, rows, precision.dflash_projection_prompt_cutoff);
-            try e.runAfter(e.fns.norm, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ d.th, @as(u64, 0), d.w.hidden_norm, d.thn, d.c.eps, @as(c_int, @intCast(d.c.hidden)), @as(u64, 0), if (grouped) @as(u64, 0) else d.xs });
+            try e.runAfter(d.fns.norm, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ d.th, @as(u64, 0), d.w.hidden_norm, d.thn, d.c.eps, @as(c_int, @intCast(d.c.hidden)), @as(u64, 0), if (grouped) @as(u64, 0) else d.xs });
             const grouped_live = liveGroups() and !grouped and rows <= 16;
             if (grouped) {
                 const P = cuda.prompt_many;
