@@ -102,10 +102,11 @@ __device__ __forceinline__ bool past_rows(const int* P, int m) { return P != nul
 __device__ __forceinline__ int mrope_axis(int i) { return (i % 3 == 1 && i < 33) ? 1 : ((i % 3 == 2 && i < 30) ? 2 : 0); }
 
 // RoPE on the first 64 of HD: pairs (i, i + 32) turned by pos[axis(i)] * theta^(-i / 32); text has one position.
-__device__ __forceinline__ __nv_bfloat16 rotate(const __nv_bfloat16* x, int d, const int pos[3]) {
+__device__ __forceinline__ __nv_bfloat16 rotate(const __nv_bfloat16* x, int d, const int pos[3], const float* rope_freq = nullptr) {
     if (d >= 64) return x[d];
     const int i = d % 32;
-    const float angle = (float)pos[mrope_axis(i)] * powf(10000000.0f, -(float)i / 32.0f);
+    const float frequency = rope_freq ? rope_freq[i] : powf(10000000.0f, -(float)i / 32.0f);
+    const float angle = (float)pos[mrope_axis(i)] * frequency;
     float sn, cs;
     sincosf(angle, &sn, &cs);
     const float a = bf(x[i]), b = bf(x[i + 32]);
@@ -146,15 +147,18 @@ __device__ __forceinline__ void rope_rows(const Geo& geo, __nv_bfloat16* __restr
     int pos[3];
     row_positions(sg, rowanc[m], m, M, pos);
     const int slot = sg.len + (int)m - sg.row0;
+    __shared__ float rope_freq[32];
+    if (d < 32) rope_freq[d] = powf(10000000.0f, -(float)d / 32.0f);
+    __syncthreads();
     const int h = blockIdx.y;
     if (h < QH) {
         __shared__ __nv_bfloat16 qs[HD];
         qs[d] = Qn[(m * QH + h) * HD + d];
         __syncthreads();
-        Qn[(m * QH + h) * HD + d] = rotate(qs, d, pos);
+        Qn[(m * QH + h) * HD + d] = rotate(qs, d, pos, rope_freq);
     } else if (h < QH + KVH) {
         const int kh = h - QH;
-        store(sg, kh, slot, d, rotate(Kn + (m * KVH + kh) * HD, d, pos), Vr[(m * KVH + kh) * HD + d]);
+        store(sg, kh, slot, d, rotate(Kn + (m * KVH + kh) * HD, d, pos, rope_freq), Vr[(m * KVH + kh) * HD + d]);
     }
 }
 

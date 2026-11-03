@@ -781,8 +781,11 @@ __device__ __forceinline__ void norm_rope_rows(const Geo& geo, const __nv_bfloat
     int pos[3];
     row_positions(sg, rowanc[m], m, M, pos);
     const int slot = sg.len + (int)m - sg.row0;
-    if (query) Qn[(m * QH + head) * HD + t] = rotate(xs, t, pos);
-    else store(sg, head, slot, t, rotate(xs, t, pos), Vr[(m * KVH + head) * HD + t]);
+    __shared__ float rope_freq[32];
+    if (t < 32) rope_freq[t] = powf(10000000.0f, -(float)t / 32.0f);
+    __syncthreads();
+    if (query) Qn[(m * QH + head) * HD + t] = rotate(xs, t, pos, rope_freq);
+    else store(sg, head, slot, t, rotate(xs, t, pos, rope_freq), Vr[(m * KVH + head) * HD + t]);
 }
 
 extern "C" __global__ void __launch_bounds__(256) tf_q35_norm_rope(Geo geo, const __nv_bfloat16* __restrict__ QRAW, const __nv_bfloat16* __restrict__ KRAW,
