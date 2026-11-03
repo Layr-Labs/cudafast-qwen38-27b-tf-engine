@@ -74,6 +74,8 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 // a prompt chunk: the chain convolves the value heads and takes their decay and strength in its stages,
                 // so gdn_pre runs the q and k heads and conv_commit follows the chain (TF_CHAIN_CONV=0: as before)
                 const conv_in_chain = prompt and nseg == 1 and !record and chainConvOn();
+                // a recorded window's early lean scan runs the layer's gdn_post on each head's last CTA
+                const fused_post = record and !prompt and E.Engine.fusedPost(shape.slots);
                 const pre_heads = if (conv_in_chain) 2 * g.k_heads else 2 * g.k_heads + g.v_heads;
                 try e.runAfter(e.fns.gdn_pre, .{ 1, pre_heads, pre_blocks }, .{ 32, pre_rows, 1 }, .{ geo, e.qkv, t_segs, t_rows, t_par, layer, m.conv, e.a, e.b, m.a_log, m.dt_bias, e.q, e.k, e.v, e.g_, e.beta, t_params });
                 // one recorded window of 2+ rows: gdn_pre logged its tails, conv_commit would only return
@@ -82,9 +84,9 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 if (conv_in_chain) {
                     try @import("cuda_prompt.zig").deltaConv(e, di, total, m);
                     if (commit) try e.runAfter(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
-                } else if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else try e.deltaScan(record, shape.slots, nseg, layer);
+                } else if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else if (fused_post) try e.leanScanPost(shape.slots, nseg, layer, m.norm, sums) else try e.deltaScan(record, shape.slots, nseg, layer);
                 // a prompt chunk: eight rows a warp, their loads in flight together (TF_PROMPT_ILP=0: a row a warp)
-                if (prompt and total > 16 and promptIlpOn())
+                if (fused_post) {} else if (prompt and total > 16 and promptIlpOn())
                     try e.runAfter(e.fns.gdn_post_ilp, .{ 1, g.v_heads, (total + 31) / 32 }, .{ 32, 4, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums })
                 else
                     try e.runAfter(e.fns.gdn_post, .{ 1, g.v_heads, post_blocks }, .{ 32, post_rows, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums });
@@ -184,8 +186,10 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
         if (shape.taps) for (e.taps[0..e.n_taps], 0..) |t, ti| if (t == i) {
             try e.runAfter(e.fns.tap, .{ total, (g.hidden + 2047) / 2048, 1 }, .{ 256, 1, 1 }, .{ e.h, e.r, t_segs, t_rows, @as(c_int, @intCast(ti)), @as(c_int, @intCast(g.hidden)), t_params });
         };
-        // a captured forward's first layer is a graph of its own (cuda_engine.zig's cutCapture)
-        if (i == 0) try e.cutCapture();
+        // a prompt chunk's captured forward keeps its first layer a graph of its own (cuda_engine.zig's cutCapture):
+        // the drafter's absorb starts once the last layer is done. A verify window's replay has no tail to overlap,
+        // so its capture stays one graph and its round pays one launch, not two.
+        if (i == 0 and prompt) try e.cutCapture();
     }
     try finish(e, total, heads, shape.hidden, if (@hasField(@TypeOf(shape), "amax")) shape.amax else false);
 }
