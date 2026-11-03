@@ -253,9 +253,11 @@ pub const Affine4Kernels = struct {
         return !std.mem.eql(u8, std.mem.span(v), "0");
     }
 
+    /// H43: the 16-row stream16 launch runs packed (raw smem, four CTAs an SM) by default; TF_GDN_SPREAD=1
+    /// restores the spread floor that caps it at two CTAs an SM.
     fn spreadOn() bool {
-        const v = @import("sys").c.getenv("TF_GDN_SPREAD") orelse return true;
-        return !std.mem.eql(u8, std.mem.span(v), "0");
+        const v = @import("sys").c.getenv("TF_GDN_SPREAD") orelse return false;
+        return std.mem.eql(u8, std.mem.span(v), "1");
     }
 
     fn streamed(a: *const Affine4Kernels, q: Affine4, rows: usize, sk: usize) bool {
@@ -521,8 +523,9 @@ pub const Affine4Kernels = struct {
         const gdn_streamed = narrow16(rows) or (rows > 16 and rows <= 32 and a.gdn_stream32_fn != null);
         if (!gdn_streamed or !a.pdl or a.gdn_stream16_fn == null) return false;
         for (outs) |o| if (o.q.k != 5120 or o.q.stream_w == 0) return false;
-        // attention's q (with its gate half), k and v of one input (TF_ATTN_STREAM=0: their mixed cluster launch)
-        if (outs.len == 3 and rows == 16 and attnStreams())
+        // attention's q (with its gate half), k and v of one input (TF_ATTN_STREAM=0: their mixed cluster launch); a
+        // window narrower than 16 rows takes the same 16-row twin, as the GDN group already does (it bounds its own rows)
+        if (outs.len == 3 and narrow16(rows) and attnStreams())
             return outs[0].q.n == 12288 and outs[1].q.n == 1024 and outs[2].q.n == 1024;
         return outs.len == 4 and outs[0].q.n == 10240 and outs[1].q.n == 6144 and outs[2].q.n == 48 and outs[3].q.n == 48;
     }
@@ -564,7 +567,8 @@ pub const Affine4Kernels = struct {
             const base: u32 = if (rows32) gdn_stream32_smem else 22656;
             // a 16-row launch takes at least the output stream's 35328 bytes (qlinear.out16_smem): two CTAs an SM at most,
             // so its CTAs spread over GB10's 48 SMs instead of packing four an SM (an allocation only; the kernel reads
-            // and writes the same bytes, the same bits). TF_GDN_SPREAD=0 keeps the packed launch.
+            // and writes the same bytes, the same bits). H43: packed (raw, four an SM) is the default now; the floor
+            // stays only under TF_GDN_SPREAD=1 (the kernel's offsets are compile-time, the extra dynamic bytes pad).
             const raw: u32 = if (dict) base + 4 * @as(u32, @intCast(bn)) + tab else base;
             const shared: u32 = if (rows32 or !spreadOn()) raw else @max(raw, linear.out16_smem);
             const f = if (dict) dict_fn.? else if (rows32) a.gdn_stream32_fn.? else a.gdn_stream16_fn.?;
@@ -604,6 +608,38 @@ pub const Affine4Kernels = struct {
         for ([_]usize{ rows, outs[0].q.k, outs[0].q.k, 1, cs }) |v| args.add(int(v));
         try launch_.launch(if (dict) a.dict.?.group else a.group_fn, .{ .grid = .{ .x = u(clusters * cs) }, .block = .{ .x = 128 },
             .shared = if (dict) group_smem + linear.dict_dec + tab else group_smem, .cluster = .{ .x = u(cs) }, .pdl = a.pdl }, s, &args);
+    }
+
+    /// Projections of one input in one cluster launch, each part at its own K-slice count: decodeAttentionMixed's
+    /// mapping (part i takes ceil(tiles_i * sk_i / C) clusters of C = the widest slice count, a cluster holding one
+    /// part), so a part's (tile, slice) pairs and their CTA order are its own launch's — with the wide path's rows
+    /// (rows_t = 1) every projection's CTAs divide by C exactly, and each CTA computes what its own launch's CTA
+    /// computed (the same m16 tiles, K slices, fma chains and slice-order DSM sums: the same bits). The wide path has
+    /// no BM > 16 dictionary twin, so the parts read their plain scales and biases, as their own launches did.
+    pub fn groupMixed(a: *const Affine4Kernels, f: Function, shared: u32, s: Stream, x: u64, xs: u64, outs: []const Out, rows: usize, rows_t: usize) !void {
+        if (outs.len == 0 or outs.len > segs_max) return error.TooManyParts;
+        const k = outs[0].q.k;
+        var cs: usize = 1;
+        for (outs) |o| {
+            if (o.q.k != k) return error.InputMismatch;
+            cs = @max(cs, splitK(o.q.n, k));
+        }
+        var parts: Parts = std.mem.zeroes(Parts);
+        var clusters: usize = 0;
+        for (outs) |o| {
+            const tiles = (o.q.n + 63) / 64;
+            const sk = splitK(o.q.n, k);
+            const at: usize = @intCast(parts.count);
+            parts.p[at] = groupPart(o.q, false, o.out, sk, tiles, clusters);
+            parts.count += 1;
+            clusters += (tiles * sk + cs - 1) / cs;
+        }
+        var g: launch_.Args = .{};
+        g.add(x);
+        g.add(xs);
+        g.add(parts);
+        for ([_]usize{ rows, k, k, rows_t, cs }) |v| g.add(int(v));
+        try launch_.launch(f, .{ .grid = .{ .x = u(clusters * cs) }, .block = .{ .x = 128 }, .shared = shared, .cluster = if (cs > 1) .{ .x = u(cs) } else null, .pdl = a.pdl }, s, &g);
     }
 
     /// decode()'s kernels a projection, grouped by kernel: each part's blocks compute exactly what its own launch's would.
