@@ -25,6 +25,24 @@ pub fn projectMany(e: *Engine, ls: []const Proj, x: u64, xs: u64, outs: []const 
         if (l != .a4 or l.inputs() != ls[0].inputs()) break false;
     } else true;
     if (!segmented) {
+        // GB10's wide path (rows past 32, verify windows): one cluster launch of up to four parts at their own
+        // K-slice counts (groupMixed) in place of a launch a projection — the GDN a/b 8-CTA launches join the
+        // qkv and z CTAs, the same per-CTA arithmetic (TF_GDN_PMERGE=0 keeps the separate launches).
+        const merged = !prompt and e.affine.pdl and pmergeOn() and rows > 32 and ls.len <= A.segs_max and for (ls) |l| {
+            if (l != .a4 or l.inputs() != ls[0].inputs()) break false;
+        } else true;
+        if (merged) {
+            const k = ls[0].inputs();
+            if (sums) try e.runAfter(e.fns.sums, .{ rows, (k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ x, xs, @as(c_int, @intCast(k)), params });
+            var at: usize = 0;
+            while (at < rows) : (at += e.affine.verifyRows()) {
+                const n = @min(e.affine.verifyRows(), rows - at);
+                var many: [A.segs_max]A.Out = undefined;
+                for (ls, outs, many[0..ls.len]) |l, out, *m| m.* = .{ .q = l.a4, .out = out + at * l.outputs() * 2 };
+                if (n <= 64) try e.affine.groupMixed(e.affine.verify64_fn, cuda.qlinear.verify64_smem, e.stream, x + at * k * 2, xs + at * (k / 64) * 4, many[0..ls.len], n, 1) else try e.affine.groupMixed(e.affine.verify128_fn, cuda.qlinear.verify128_smem, e.stream, x + at * k * 2, xs + at * (k / 64) * 4, many[0..ls.len], n, 1);
+            }
+            return;
+        }
         for (ls, outs, 0..) |l, out, i| try e.project(l, x, xs, out, rows, prompt, params, sums and i == 0);
         return;
     }
@@ -52,4 +70,10 @@ pub fn projectMany(e: *Engine, ls: []const Proj, x: u64, xs: u64, outs: []const 
 
 fn mixedAttention() bool {
     return true;
+}
+
+/// TF_GDN_PMERGE=0 restores the wide path's separate per-projection launches.
+fn pmergeOn() bool {
+    const v = @import("sys").c.getenv("TF_GDN_PMERGE") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
 }
