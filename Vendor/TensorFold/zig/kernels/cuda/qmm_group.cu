@@ -21,6 +21,10 @@ struct Part {
     const __nv_bfloat16* biases;
     void* out;
     int n, npad, sk, tiles, first;
+    // When non-null, the epilogue stores the residual merge bf16(h + bf16(acc)) into merge_h (the hidden row)
+    // in place of the plain projection output: the standalone tf_q35_norm's own store bits, one boundary earlier
+    // (the norm launch this fusion removes). Only the wide verify windows' launches set it.
+    const __nv_bfloat16* merge_h;
 };
 
 struct Parts {
@@ -254,6 +258,14 @@ __global__ void __launch_bounds__(WM * WN * 32) group_kernel(
     const int N = P.n;
     auto put = [&](int row, int col, float v) {
         if (row >= M || col >= N) return;
+        if (P.merge_h != nullptr) {
+            // The residual merge the skipped tf_q35_norm would have done, its exact ops: the projection's store
+            // rounding r = bf16(v) first, then h = bf16(h + r) (two bf16 floats added, rounded once).
+            __nv_bfloat16* hp = const_cast<__nv_bfloat16*>(P.merge_h) + static_cast<size_t>(row) * N + col;
+            const __nv_bfloat16 rb = __float2bfloat16_rn(v);
+            *hp = __float2bfloat16_rn(__bfloat162float(*hp) + __bfloat162float(rb));
+            return;
+        }
         if (F32) reinterpret_cast<float*>(P.out)[static_cast<size_t>(row) * N + col] = v;
         else reinterpret_cast<__nv_bfloat16*>(P.out)[static_cast<size_t>(row) * N + col] = __float2bfloat16_rn(v);
     };
@@ -594,6 +606,14 @@ __global__ void __launch_bounds__(WM * WN * 32) group_kernel_dict(
     const int N = P.n;
     auto put = [&](int row, int col, float v) {
         if (row >= M || col >= N) return;
+        if (P.merge_h != nullptr) {
+            // The residual merge the skipped tf_q35_norm would have done, its exact ops: the projection's store
+            // rounding r = bf16(v) first, then h = bf16(h + r) (two bf16 floats added, rounded once).
+            __nv_bfloat16* hp = const_cast<__nv_bfloat16*>(P.merge_h) + static_cast<size_t>(row) * N + col;
+            const __nv_bfloat16 rb = __float2bfloat16_rn(v);
+            *hp = __float2bfloat16_rn(__bfloat162float(*hp) + __bfloat162float(rb));
+            return;
+        }
         if (F32) reinterpret_cast<float*>(P.out)[static_cast<size_t>(row) * N + col] = v;
         else reinterpret_cast<__nv_bfloat16*>(P.out)[static_cast<size_t>(row) * N + col] = __float2bfloat16_rn(v);
     };
@@ -740,10 +760,57 @@ __device__ __forceinline__ float act_group_sum(const __nv_bfloat16* x) {   // qw
     return s;
 }
 
-template <int STAGES, bool DICT = false>
+// The standalone tf_q35_norm's per-row scale, its exact reduction order, over the norm-fused kernel's merged rows
+// (the o projection's merge epilogue already put h = h + r there, the rounded value the norm would have squared):
+// the norm's 256 threads each own the contiguous E = D / 256-entry segment xrow + t * E (its uint2 square loop,
+// elements ascending, one fmaf each), a 128-thread CTA carries virtual threads t and t + 128, warp_sum's xor
+// butterfly sums each virtual warp, the eight warp partials are added in order, scale = rsqrtf(sum / D + eps).
+// Bit-identical to the norm kernel's scale (the (E & 3) == 0 fast path; the 27B's D = 5120 gives E = 20).
+template <int THREADS>
+__device__ __forceinline__ void nf_scales(const __nv_bfloat16* h, int rows, int D, float eps, float* red16, float* sc) {
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int seg = D / 256;
+    for (int row = 0; row < rows; ++row) {
+        const __nv_bfloat16* hr = h + static_cast<size_t>(row) * D;
+        float sa = 0.0f, sb = 0.0f;
+        {
+            const __nv_bfloat16* mine = hr + tid * seg;               // virtual thread tid
+            for (int i = 0; i < seg; ++i) {
+                const float v = __bfloat162float(mine[i]);
+                sa = fmaf(v, v, sa);
+            }
+        }
+        {
+            const __nv_bfloat16* mine = hr + (tid + THREADS) * seg;   // virtual thread tid + THREADS
+            for (int i = 0; i < seg; ++i) {
+                const float v = __bfloat162float(mine[i]);
+                sb = fmaf(v, v, sb);
+            }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) sa = __fadd_rn(sa, __shfl_xor_sync(0xffffffffu, sa, off));
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) sb = __fadd_rn(sb, __shfl_xor_sync(0xffffffffu, sb, off));
+        if (lane == 0) {
+            red16[row * 8 + (tid >> 5)] = sa;
+            red16[row * 8 + (tid >> 5) + 4] = sb;
+        }
+        __syncthreads();
+    }
+    for (int row = 0; row < rows; ++row) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) sum += red16[row * 8 + i];
+        sc[row] = rsqrtf(sum / (float)D + eps);
+    }
+}
+
+template <int STAGES, bool DICT = false, bool NF = false>
 __device__ __forceinline__ void mlp_pair_body(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
                                               const Parts& parts, __nv_bfloat16* __restrict__ act,
-                                              float* __restrict__ as, int M, int K, int ldx, int rows_t) {
+                                              float* __restrict__ as, int M, int K, int ldx, int rows_t,
+                                              const __nv_bfloat16* __restrict__ nw = nullptr, float eps = 0.0f) {
     constexpr int GS = 64, BM = 16, BN = 64, WM = 1, WN = 4;
     using T = LaneTile<GS, BM, BN, WM, WN, STAGES>;
     constexpr int I = T::MT, J = T::NT;
@@ -793,8 +860,31 @@ __device__ __forceinline__ void mlp_pair_body(const __nv_bfloat16* __restrict__ 
     }();
     const bool xsok = tid < rows;
     const float* xssrc = xs + static_cast<size_t>(m0 + min(tid, rows - 1)) * KG;
+    // NF: the rows' rms scales and the reduction's warp partials live past the gate-tile handoff area (the
+    // launch reserves 640 more shared bytes than the plain pair kernel: 8 x rows partials then rows scales).
+    float* nf_red = reinterpret_cast<float*>(buf + T::SMEM + 2048);
+    float* nf_sc = nf_red + 8 * rows;
     auto load_x = [&](int s, int g) {
         unsigned char* p = stage(s);
+        if constexpr (NF) {
+            // The A operand the standalone norm would have staged: x = bf16(w * (h * scale)), h already carrying
+            // the merge, each element the norm's own ops (h * scale first, then the weight, one bf16 rounding).
+            const int r = tid / T::CHUNKS, ch = tid % T::CHUNKS;
+            if (r < rows) {
+                const uint4 hv = *reinterpret_cast<const uint4*>(x + static_cast<size_t>(m0 + r) * ldx + g * GS + ch * 8);
+                const uint4 wv = *reinterpret_cast<const uint4*>(nw + g * GS + ch * 8);
+                const __nv_bfloat16* hb = reinterpret_cast<const __nv_bfloat16*>(&hv);
+                const __nv_bfloat16* wb = reinterpret_cast<const __nv_bfloat16*>(&wv);
+                uint4 ov;
+                __nv_bfloat16* ob = reinterpret_cast<__nv_bfloat16*>(&ov);
+                const float sr = nf_sc[r];
+#pragma unroll
+                for (int k = 0; k < 8; ++k)
+                    ob[k] = __float2bfloat16_rn(__bfloat162float(wb[k]) * (__bfloat162float(hb[k]) * sr));
+                *reinterpret_cast<uint4*>(p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16) = ov;
+            }
+            return;
+        }
 #pragma unroll
         for (int j = 0; j < XC; ++j)
             if (xok[j]) cp16(p + xdst[j], xsrc[j] + g * GS);
@@ -837,6 +927,7 @@ __device__ __forceinline__ void mlp_pair_body(const __nv_bfloat16* __restrict__ 
     }
     grid_wait();
     qmm_dict::x_keep_l2(x + static_cast<size_t>(m0) * ldx, rows, K, ldx);
+    if constexpr (NF) nf_scales<T::THREADS>(x + static_cast<size_t>(m0) * ldx, rows, K, eps, nf_red, nf_sc);
 #pragma unroll
     for (int s = 0; s < STAGES - 1; ++s) {
         if (s < per) load_x(s, g0 + s);
@@ -847,12 +938,29 @@ __device__ __forceinline__ void mlp_pair_body(const __nv_bfloat16* __restrict__ 
     for (int it = 0; it < per; ++it) {
         wait<STAGES - 2>();
         __syncthreads();
+        if constexpr (NF) {
+            // This stage's per-row group sums in group_sum's own sequence over the staged normed values, into
+            // the slot the uncoded path cp4s them to; the sync below orders them before the epilogue reads them.
+            unsigned char* pc = stage(it % STAGES);
+            if (tid < rows) {
+                float s = 0.0f;
+#pragma unroll
+                for (int ch = 0; ch < (int)T::CHUNKS; ++ch) {
+                    const uint4 w = *reinterpret_cast<const uint4*>(pc + tid * T::ROW + swz<T::CHUNKS>(tid, ch) * 16);
+                    const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&w);
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) s += __bfloat162float(b[k]);
+                }
+                *reinterpret_cast<float*>(pc + T::X + T::W + 2 * T::S + tid * 4) = s;
+            }
+        }
         const int next = it + STAGES - 1;
         if (next < per) {
             load_x(next % STAGES, g0 + next);
             load_w(next % STAGES, g0 + next);
         }
         commit();
+        if constexpr (NF) __syncthreads();
         const unsigned char* p = stage(it % STAGES);
         const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
         // the lane's scale or bias, fetched now and stored after the MMAs (a global pair table's latency)
@@ -971,6 +1079,16 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_pair(const __nv_bfl
         const float* __restrict__ xs, const __grid_constant__ tf_qmm_group::Parts parts, __nv_bfloat16* __restrict__ act,
         float* __restrict__ as, int M, int K, int ldx, int rows_t) {
     tf_qmm_group::mlp_pair_body<8>(x, xs, parts, act, as, M, K, ldx, rows_t);
+}
+
+// The norm-fused twin of tf_qmm_mlp_pair (NF = true): x carries the un-normalized hidden rows (the skipped
+// tf_q35_norm's post-merge H, the o projection's merge epilogue having added its r), xs is unused, and nw/eps are
+// the boundary's norm weight and epsilon. Every staged A value, its group sum and the scales themselves are the
+// standalone kernel's own bits (nf_scales and the staging transform above); xs must be null or past-the-end safe.
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_pair_nf(const __nv_bfloat16* __restrict__ x,
+        const float* __restrict__ xs, const __grid_constant__ tf_qmm_group::Parts parts, __nv_bfloat16* __restrict__ act,
+        float* __restrict__ as, int M, int K, int ldx, int rows_t, const __nv_bfloat16* __restrict__ nw, float eps) {
+    tf_qmm_group::mlp_pair_body<8, false, true>(x, xs, parts, act, as, M, K, ldx, rows_t, nw, eps);
 }
 
 #include "qmm_wide_kmajor.cuh"

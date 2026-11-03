@@ -163,6 +163,7 @@ pub const Engine = struct {
     beta: u64,
     y: u64,
     mix: u64,
+    chain_flags: u64 = 0, // a prompt chain's progress words, two a value head (cuda_prompt.zig deltaConv, gdn_post_follow)
     qraw: u64,
     kraw: u64,
     vraw: u64,
@@ -323,6 +324,10 @@ pub const Engine = struct {
         e.plan = try cuda.grouped.Router.resolve(e.mods[10]);
         e.moe = try cuda.moe.Fns.resolve(e.mods[13]);
         inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(e.fns, name) = try e.mods[4].function("tf_q35_" ++ name);
+        // the U3/U4 escapes: TF_NORM_U0=1 binds the baseline norm (the residual's loads held across the past_rows
+        // return), TF_NORMROPE_U0=1 the baseline norm+rope tail (a per-thread rotate, no pair fold); unset keeps both
+        if (@import("sys").c.getenv("TF_NORM_U0") != null) e.fns.norm = try e.mods[4].function("tf_q35_norm_u0");
+        if (@import("sys").c.getenv("TF_NORMROPE_U0") != null) e.fns.norm_rope = try e.mods[4].function("tf_q35_norm_rope_u0");
         try e.fns.attn_partial.allowDynamicShared(@import("cuda_forward.zig").attn_tiles); // bf16 tiles' two buffers
         try e.fns.attn_rows.allowDynamicShared(@import("cuda_forward.zig").attn_tiles);
         inline for (@typeInfo(Keeps).@"struct".field_names) |name| @field(e.keeps, name) = try e.mods[6].function("tf_q35k_" ++ name);
@@ -484,6 +489,7 @@ pub const Engine = struct {
         e.xs = try t.alloc(R * (@max(g.intermediate, wide) / 64) * 4);
         inline for (.{ "a", "b", "beta" }) |name| @field(e, name) = try t.alloc(R * g.v_heads * 2);
         e.g_ = try t.alloc(R * g.v_heads * 4);
+        e.chain_flags = try t.alloc(2 * g.v_heads * 128);
         e.qraw = try t.alloc(R * 2 * g.attnWidth() * 2);
         e.qn = try t.alloc(R * g.attnWidth() * 2);
         inline for (.{ "kraw", "vraw", "kn" }) |name| @field(e, name) = try t.alloc(R * g.kv_heads * head_dim * 2);
@@ -528,6 +534,7 @@ pub const Engine = struct {
     pub const proj = @import("cuda_projection.zig").proj;
     pub const projSums = @import("cuda_projection.zig").projSums;
     pub const projAgain = @import("cuda_projection.zig").projAgain;
+    pub const projAgainMerge = @import("cuda_projection.zig").projAgainMerge;
     pub const projMany = @import("cuda_projection.zig").projMany;
     pub const projManySums = @import("cuda_projection.zig").projManySums;
     pub const projectMany = @import("cuda_projection.zig").projectMany;
@@ -655,11 +662,17 @@ pub const Engine = struct {
         }
         try e.tables.uploadAsync(0, st[0..if (images != null) tables_len else src_at], e.stream.handle); // text: as before
         // carried plans of 2..32 rows (at most 3 slots) scan four value rows a warp on qwen35_slots_lean.cuh (slots_3's
-        // arithmetic, its addressing hoisted; 2 slots where they suffice); TF_SLOTS_LEAN=0 keeps prior dispatch
+        // arithmetic, its addressing hoisted; 2 slots where they suffice); TF_SLOTS_LEAN=0 keeps prior dispatch.
+        // H42: single-row verify rounds too — qwen35_slots_lean.cuh's arithmetic is q35_slots's with the same per-channel
+        // spread_sum trees at R=4, and both kernels' sg.rows==1 paths write the same state, before and record; the
+        // carried steps a 1-row round stages (read_slot -1, write_slot 0) run unchanged on lean. TF_LEAN_ALL=0 (or
+        // TF_SLOTS_LEAN=0) restores the stock selector
         const lean = record and total > 1 and total <= 32 and e.affine.pdl and !envOff("TF_SLOTS_LEAN");
+        const lean1 = record and total == 1 and e.affine.pdl and !envOff("TF_SLOTS_LEAN") and !envOff("TF_LEAN_ALL");
         const wide = total > 16 and total <= 32 and e.affine.pdl and !envOff("TF_WIDE_SLOTS");
         const slot_variant: usize = if (lean and carry and slot_peak <= 3)
             (if (slot_peak <= 2) 37 else 38)
+        else if (lean1) 37
         else if (wide and slot_peak == 3) 3 else Round.narrowVariant(total, slot_peak, record and e.affine.pdl and !envOff("TF_GDN16"));
         var shape = Shape.init(total, parts.len, record, e.n_taps > 0, @intCast(slot_variant));
         if (record and @import("cuda_round_timing.zig").Trace.enabled())
@@ -755,7 +768,7 @@ pub const Engine = struct {
     pub const Shape = @import("cuda_shapes.zig").Shape;
 
     /// The same scan selected by body, exposed for host launch-contract fixtures.
-    pub fn deltaScan(e: *Engine, record: bool, slot_count: u8, segments: usize, layer: c_int) !void {
+    pub fn deltaScan(e: *Engine, record: bool, slot_count: u8, segments: usize, layer: c_int, next: ?Proj) !void {
         const scan = if (!record) e.fns.gdn_chain else switch (slot_count) {
             1 => e.fns.gdn_slots_1,
             2 => e.fns.gdn_slots_2,
@@ -772,7 +785,31 @@ pub const Engine = struct {
         const input = e.tables.ptr + @as(usize, if (record) Round.steps_at else rowpar_at);
         // qwen35_slots.cuh: up to four slots scan two value rows a warp, so a block covers eight
         const rows_a_warp: usize = if (record and (slot_count == 3 or slot_count == 35 or slot_count == 37 or slot_count == 38)) 4 else if (record and slot_count <= 4) 2 else 1;
-        try e.runAfter(scan, .{ 1, geometry.dk / (4 * rows_a_warp), e.g.v_heads * segments }, .{ 32, 4, 1 }, .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, input, layer, e.y, e.tables.ptr + params_at });
+        const grid = .{ 1, geometry.dk / (4 * rows_a_warp), e.g.v_heads * segments };
+        const base = .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, input, layer, e.y, e.tables.ptr + params_at };
+        // the slots kernels that declare the warm-up's four trailing parameters (qwen35_slots.cuh, qwen35_slots16.cuh):
+        // the lean scans (37, 38) do not, so a window on them keeps plain launches
+        if (!record or slot_count == 37 or slot_count == 38) return e.runAfter(scan, grid, .{ 32, 4, 1 }, base);
+        const pf = warmOf(next, warm_gdn);
+        return e.runAfter(scan, grid, .{ 32, 4, 1 }, base ++ .{ pf.w, pf.tile, pf.tiles, pf.take });
+    }
+
+    /// Shares (of 64) of each 64-column tile of the next lane projection warmed into L2 during the latency-bound kernel before it.
+    pub const warm_gdn: usize = 40;
+    pub const warm_attn: usize = 40;
+
+    pub const Warm = struct { w: u64 = 0, tile: c_int = 0, tiles: c_int = 0, take: c_int = 0 };
+
+    /// The L2 warm-up of `next`'s weight words (tile-major, k / 64 tiles of 2 KiB a 64-column tile): cache state only.
+    pub fn warmOf(next: ?Proj, share: usize) Warm {
+        if (envOff("TF_WARM")) return .{};
+        const p = next orelse return .{};
+        if (p != .a4) return .{};
+        const q = p.a4;
+        if (q.k % 64 != 0 or q.n % 64 != 0) return .{};
+        const tile = q.k / 64 * 2048;
+        const take = tile * share / 64 / 16 * 16;
+        return .{ .w = q.w, .tile = @intCast(tile), .tiles = @intCast(q.npad / 64), .take = @intCast(take) };
     }
 
     /// The launches of a forward of `shape`, from the embedding to the kept rows' logits (captured once a shape).
