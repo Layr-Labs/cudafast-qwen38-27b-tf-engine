@@ -292,12 +292,11 @@ pub const HeadSieve = struct {
     pub fn after(h: *HeadSieve) void {
         h.rounds += 1;
         if (h.rounds != h.next_log) return;
-        h.next_log = if (h.mode == .check) h.rounds + 8 else h.rounds * 2;
+        h.next_log = h.rounds + 8;
         var st: [stats_words]u64 = undefined;
         h.buf.download(@intCast(h.stats - h.buf.ptr), std.mem.sliceAsBytes(&st)) catch return;
         const r = @max(st[0], 1);
         std.debug.print("[sieve] rounds={d} rows={d} rescored_n8 avg={d} max={d} overflow={d}\n", .{ st[0], st[4], st[1] / r, st[2], st[3] });
-        if (h.mode != .check) return;
         const rows = @max(st[4], 1);
         const margin = unorder(st[50]);
         std.debug.print("[sieve] check true-token error (exact - a)/s in [{d:.3}, {d:.3}]\n", .{ unorder(st[52]), unorder(st[51]) });
