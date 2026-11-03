@@ -1,3 +1,4 @@
+// draw 7
 //! A hold's drafts from its rows' candidates: a chain, the planner's lanes, or a best-first tree as the 27B engine's.
 const std = @import("std");
 const platform = @import("sys");
