@@ -12,9 +12,40 @@ pub const Recycled = struct { buffer: DeviceBuffer, zeroed: bool = false };
 
 /// Clear closed allocations at the phase boundary; clean flags are published only after the stream drains.
 pub fn clearBlocks(e: anytype) !void {
+    if (std.c.getenv("TF_MEMSET_TRACE") != null)
+        std.debug.print("[memset-trace] clearBlocks enter, {d} blocks\n", .{e.blocks.items.len});
     for (e.blocks.items) |b| if (!b.zeroed) try b.buffer.fill8(0, e.stream.handle);
     try e.stream.synchronize();
     for (e.blocks.items) |*b| b.zeroed = true;
+}
+
+/// h41: zero a cache's state buffer where it overlaps host work instead of occupying the engine stream's head.
+/// The clear runs on the engine's zero stream (`Engine.zstream`), ordered after everything the engine stream has
+/// already issued (`zev_prior` recorded here) and before the next forward's first state access (`zev_done`, stored
+/// in `Cache.zero_pending`; `Engine.forward` waits on it in its parts loop). `TF_MEMSET_INLINE=1` restores the old
+/// in-stream fill. Returns the done event the next forward must wait on (null: cleared inline, nothing to wait for).
+fn zeroStateLate(e: *Engine, buf: DeviceBuffer) !?cuda.Event {
+    const inline_env = @import("sys").c.getenv("TF_MEMSET_INLINE");
+    if (inline_env != null and std.mem.eql(u8, std.mem.span(inline_env.?), "1")) {
+        if (std.c.getenv("TF_MEMSET_TRACE") != null)
+            std.debug.print("[memset-trace] zeroStateLate inline len={d}\n", .{buf.len});
+        try buf.fill8(0, e.stream.handle);
+        return null;
+    }
+    if (e.zstream == null or e.zev_prior == null or e.zev_done == null) {
+        try buf.fill8(0, e.stream.handle);
+        return null;
+    }
+    const zs = e.zstream.?;
+    const prior = e.zev_prior.?;
+    const done = e.zev_done.?;
+    if (std.c.getenv("TF_MEMSET_TRACE") != null)
+        std.debug.print("[memset-trace] zeroStateLate zstream len={d}\n", .{buf.len});
+    try prior.record(e.stream); // the buffer's previous life on the engine stream is ordered before the clear
+    try zs.wait(prior);
+    try buf.fill8(0, zs.handle);
+    try done.record(zs);
+    return done;
 }
 
 /// Rows a drafter's tap ring holds a stream: its window and a prompt chunk more.
@@ -144,6 +175,11 @@ pub const Cache = struct {
     owner: ?*recurrent.Pool = null,
     log_lease: ?recurrent.Lease = null,
     before_lease: ?recurrent.Lease = null,
+    /// h41: this cache's state clear in flight on the engine's zero stream (null: none, or cleared inline).
+    /// The next forward waits on it before its first state access (Engine.forward's parts loop).
+    zero_pending: ?cuda.Event = null,
+    /// h41: the stream the in-flight clear runs on, for a drain before this cache's buffers are given back.
+    zero_stream: ?*const cuda.Stream = null,
     /// Bytes this cache adds to its owner's cap while it lives (recurrent.bound).
     scratch: usize = 0,
     untaught: bool = false,
@@ -165,6 +201,9 @@ pub const Cache = struct {
     /// Positions the newest forward wrote up to: a tap ring holds them until the next forward, whatever `keep` lands.
     written: usize = 0,
     logits: []u16,
+    /// A greedy prompt pass's first token from the head sieve (cuda_prompt_tail.zig), when it took that path: `logits`
+    /// then holds nothing for this position. Cleared by the next forward.
+    first: ?u32 = null,
     /// The newest verify window, until its path is kept: where it started, its rows.
     last: ?struct { start: usize, rows: usize } = null,
     /// A kept prefix of the newest window (rows 0..pend-1) whose recurrence replay the next recorded slot scan folds.
@@ -248,7 +287,12 @@ pub const Cache = struct {
         self.log = views[2];
         self.tap = if (e.n_taps > 0) views[3] else null;
         self.drafter_ring = if (ring > 0) views[4].ptr else null;
-        for ([_]DeviceBuffer{ views[2], views[3], views[4] }) |v| if (v.len > 0) try v.fill8(0, e.stream.handle);
+        for ([_][]const u8{ "log", "tap", "drafter_ring" }, [_]DeviceBuffer{ views[2], views[3], views[4] }) |mtag, v| {
+            if (v.len == 0) continue;
+            if (std.c.getenv("TF_MEMSET_TRACE") != null)
+                std.debug.print("[memset-trace] mapRun {s} len={d}\n", .{ mtag, v.len });
+            try v.fill8(0, e.stream.handle);
+        }
     }
 
     /// A closed lane's views dropped: its run went back to the pool.
@@ -286,13 +330,24 @@ pub const Cache = struct {
         const logits = try gpa.alloc(u16, e.g.vocab);
         errdefer gpa.free(logits);
         errdefer cuda.completion.drain(e.d, e.stream, "qwen3_5: failed cache state initialization did not drain");
-        if (!taken_state.zeroed) try state.fill8(0, e.stream.handle);
+        var zero_ev: ?cuda.Event = null;
+        if (!taken_state.zeroed) {
+            if (std.c.getenv("TF_MEMSET_TRACE") != null)
+                std.debug.print("[memset-trace] fixed state len={d}\n", .{state.len});
+            zero_ev = try zeroStateLate(e, state);
+        }
+        // a later error here frees `state` while its clear may still run on the zero stream: land it first
+        errdefer if (zero_ev != null) if (e.zstream) |*z| z.synchronize() catch {};
         // Forward writes conv/g/k/delta before keep/replay reads; last=null and pend=0 hide every prior record.
-        if (!tap_zeroed) if (tap) |t| try t.fill8(0, e.stream.handle);
+        if (!tap_zeroed) if (tap) |t| {
+            if (std.c.getenv("TF_MEMSET_TRACE") != null)
+                std.debug.print("[memset-trace] fixed tap len={d}\n", .{t.len});
+            try t.fill8(0, e.stream.handle);
+        };
         try e.stream.synchronize();
         const scratch = if (adaptive) recurrent.bound(e) else 0;
         e.rec_scratch.cap += scratch;
-        return .{ .owner = if (adaptive) &e.rec_scratch else null, .scratch = scratch, .state = state, .before = before, .kv = kv, .paged = paged, .tap = tap, .log = log, .cap = cap, .logits = logits };
+        return .{ .owner = if (adaptive) &e.rec_scratch else null, .scratch = scratch, .state = state, .before = before, .kv = kv, .paged = paged, .tap = tap, .log = log, .cap = cap, .logits = logits, .zero_pending = zero_ev, .zero_stream = if (zero_ev != null) &e.zstream.? else null };
     }
 
     /// Publish a completed forward's metadata, including one-row slots that already advanced in place.
@@ -312,10 +367,19 @@ pub const Cache = struct {
         self.last = null;
         self.untaught = false;
         self.delta = 0;
-        try self.state.fill8(0, e.stream.handle);
+        if (std.c.getenv("TF_MEMSET_TRACE") != null)
+            std.debug.print("[memset-trace] Cache.reset state len={d}\n", .{self.state.len});
+        self.zero_pending = try zeroStateLate(@constCast(e), self.state);
+        self.zero_stream = if (self.zero_pending != null) &e.zstream.? else null;
     }
 
     pub fn deinit(self: *Cache, gpa: std.mem.Allocator) void {
+        // an in-flight state clear must land before the block goes back to the pool (its next taker overwrites it)
+        if (self.zero_pending != null) {
+            if (self.zero_stream) |zs| zs.synchronize() catch {};
+            self.zero_pending = null;
+            self.zero_stream = null;
+        }
         recurrent.release(self);
         if (self.owner) |p| p.cap -= self.scratch;
         give(&self.state);
@@ -328,7 +392,6 @@ pub const Cache = struct {
         if (self.tap) |*t| give(t);
         gpa.free(self.logits);
     }
-
 
     /// The stream's window of `rows` rows from forward row `row0`, after `len` cached positions.
     pub fn seg(self: *const Cache, e: *const Engine, len: usize, row0: usize, rows: usize) Seg {
