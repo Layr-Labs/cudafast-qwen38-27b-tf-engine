@@ -16,8 +16,9 @@ pub const Sig = struct {
     params: []const Kind,
 };
 
-/// The bf16 decode partial: a block a (row, chunk, key head) of the query heads' rows.
-pub const attn_partial = Sig{ .name = "attn_partial", .handle = "e.fns.attn_partial", .symbol = "tf_q35_attn_partial", .params = &.{ .geo, .ptr, .ptr, .ptr, .ptr, .i32, .ptr, .f32, .ptr, .ptr, .ptr } };
+/// The bf16 decode partial: a block a (row, chunk, key head) of the query heads' rows; its last four parameters warm
+/// the next out-projection's weight tiles into L2 (cuda_engine.zig's warmOf; a null w or a non-positive take: none).
+pub const attn_partial = Sig{ .name = "attn_partial", .handle = "e.fns.attn_partial", .symbol = "tf_q35_attn_partial", .params = &.{ .geo, .ptr, .ptr, .ptr, .ptr, .i32, .ptr, .f32, .ptr, .ptr, .ptr, .ptr, .i32, .i32, .i32 } };
 /// attn_partial's row pairs: a block a (row pair, chunk, key head), attn_partial's parameters.
 pub const attn_pair = Sig{ .name = "attn_pair", .handle = "e.fns.attn_pair", .symbol = "tf_q35_attn_pair", .params = &.{ .geo, .ptr, .ptr, .ptr, .ptr, .i32, .ptr, .f32, .ptr, .ptr, .ptr } };
 
