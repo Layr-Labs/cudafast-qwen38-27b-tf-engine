@@ -108,8 +108,7 @@ pub fn mlp(d: anytype, l: anytype, B: usize, summed: bool) !void {
         try e.mlp_pair.pair(e.stream, d.xin, d.xs, l.gate, l.up, d.act, act_sums, B);
         try draft.precision.affine(e, l.down, d.act, act_sums, d.o, B, false, d.projection_role);
     } else {
-        try d.proj(l.gate, d.xin, d.gate, B);
-        try d.projAgain(l.up, d.xin, d.up, B);
+        try d.projMany(&.{ l.gate, l.up }, d.xin, &.{ d.gate, d.up }, B);
         try e.runAfter(e.fns.mlp_act, .{ (B * c.intermediate + 1023) / 1024, 1, 1 }, .{ 256, 1, 1 }, .{ d.gate, d.up, d.act, @as(c_longlong, @intCast(B * c.intermediate)), @as(u64, 0), @as(c_int, @intCast(c.intermediate)), d.xs });
         try d.projAgain(l.down, d.act, d.o, B);
     }
