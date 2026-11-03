@@ -64,6 +64,21 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     var di: usize = 0;
     var ai: c_int = 0;
     for (e.layers, 0..) |l, i| {
+        // The norm-fused MLP boundary (TF_NORM_FUSE, decode verify windows of 33..128 rows only): this layer's
+        // post-norm folds into its gate and up projection. The mixer's output projection merges its residual with
+        // the wide verify epilogue (bf16(h + bf16(acc)), the norm's own bits) and tf_qmm_mlp_pair_nf stages
+        // bf16(w * (h * scale)) itself, the standalone norm's exact reduction order and rounding throughout. Every
+        // other shape (narrow windows, coded or K-major panels, learning, pockets) keeps the standalone kernel.
+        const fused_mlp = blk: {
+            if (prompt or total <= 32 or total > E.most_verify or e.learning != null or e.mlp != null or
+                e.affine.split != null or !nfOn() or e.pockets.any()) break :blk false;
+            switch (l.mlp) {
+                .dense => |m| break :blk m.gate == .a4 and m.up == .a4 and
+                    cuda.mlp_pair.Kernels.fits(m.gate.a4, m.up.a4) and m.gate.a4.n == g.intermediate and
+                    !cuda.mlp_pair.Kernels.dictCoded(m.gate.a4, m.up.a4) and e.mlp_pair.nf_fn != null,
+                else => break :blk false,
+            }
+        };
         try e.normInput(i != 0, l.input_norm, total, prompt);
         if (e.learning) |k| try k.input(i, e.h, total);
         switch (l.mixer) {
@@ -79,16 +94,20 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 // one recorded window of 2+ rows: gdn_pre logged its tails, conv_commit would only return
                 const commit = !(record and nseg == 1 and total > 1);
                 if (commit and !conv_in_chain) try e.runAfter(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
+                // the chain's dependent gdn_post (gdn_post_ilp's rows and bits) takes each row as both of its head's
+                // chain blocks publish it, during the chain (TF_POST_FOLLOW=0: gdn_post after the chain)
+                const follow = conv_in_chain and total > 16 and promptIlpOn() and postFollowOn();
                 if (conv_in_chain) {
-                    try @import("cuda_prompt.zig").deltaConv(e, di, total, m);
+                    try @import("cuda_prompt.zig").deltaConv(e, di, total, m, if (follow) e.chain_flags else 0);
+                    if (follow) try e.runAfter(e.fns.gdn_post_follow, .{ follow_blocks, 1, 1 }, .{ 32, 4, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums, e.chain_flags, @as(c_int, @intCast(total)) });
                     if (commit) try e.runAfter(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
-                } else if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else try e.deltaScan(record, shape.slots, nseg, layer);
+                } else if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else try e.deltaScan(record, shape.slots, nseg, layer, if (prompt) null else m.out);
                 // a prompt chunk: eight rows a warp, their loads in flight together (TF_PROMPT_ILP=0: a row a warp)
-                if (prompt and total > 16 and promptIlpOn())
+                if (follow) {} else if (prompt and total > 16 and promptIlpOn())
                     try e.runAfter(e.fns.gdn_post_ilp, .{ 1, g.v_heads, (total + 31) / 32 }, .{ 32, 4, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums })
                 else
                     try e.runAfter(e.fns.gdn_post, .{ 1, g.v_heads, post_blocks }, .{ 32, post_rows, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums });
-                try e.projAgain(m.out, e.mix, e.r, total, prompt);
+                if (fused_mlp) try e.projAgainMerge(m.out, e.mix, e.h, total, prompt) else try e.projAgain(m.out, e.mix, e.r, total, prompt);
                 di += 1;
             },
             .attention => |m| {
@@ -121,6 +140,9 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     try @import("cuda_prompt.zig").run(e, @intCast(ai), total);
                 } else {
                     const args = .{ geo, e.qn, t_segs, t_rows, t_anc, @as(c_int, ai), t_params, @as(f32, 1.0 / 16.0), e.pm, e.pl, e.po };
+                    // attn_partial's warm-up of the out-projection's weights (prompt rows warm nothing): cache state only
+                    const pf = E.Engine.warmOf(if (prompt) null else m.o, E.Engine.warm_attn);
+                    const args_pf = .{ geo, e.qn, t_segs, t_rows, t_anc, @as(c_int, ai), t_params, @as(f32, 1.0 / 16.0), e.pm, e.pl, e.po, pf.w, pf.tile, pf.tiles, pf.take };
                     const groups = (total + 64 / group - 1) / (64 / group);
                     const rows_args = .{ geo, e.qn, t_segs, t_rows, t_anc, @as(c_int, ai), t_params, @as(f32, 1.0 / 16.0), @as(c_int, @intCast(total)), e.pm, e.pl, e.po };
                     if (e.kv8) {
@@ -132,7 +154,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                         if (record and total >= 2 and 2 * group <= 16 and pairOn())
                             try sharedSized(e, e.fns.attn_pair, sig.attn_pair, .{ (total + 1) / 2, partial_chunks, g.kv_heads }, 128, attn_tile, args)
                         else
-                            try sharedSized(e, e.fns.attn_partial, sig.attn_partial, .{ total, partial_chunks, g.kv_heads }, 128, attn_tile, args);
+                            try sharedSized(e, e.fns.attn_partial, sig.attn_partial, .{ total, partial_chunks, g.kv_heads }, 128, attn_tile, args_pf);
                         // streams of caches no longer than GROUP_LEN have no row for attn_rows (its blocks would only return)
                         if (!shape.short) try shared(e, e.fns.attn_rows, sig.attn_rows, .{ groups, max_chunks, g.kv_heads }, 256, rows_args);
                     }
@@ -147,11 +169,11 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                         try launchAfter(e, e.fns.attn_gate, sig.attn_gate, .{ (total * aw + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.y, e.qraw, e.mix, @as(c_int, @intCast(total)), t_params, sums });
                 }
                 if (e.learning) |k| try k.gated(i, e.mix, total);
-                try e.projAgain(m.o, e.mix, e.r, total, prompt);
+                if (fused_mlp) try e.projAgainMerge(m.o, e.mix, e.h, total, prompt) else try e.projAgain(m.o, e.mix, e.r, total, prompt);
                 ai += 1;
             },
         }
-        try e.normInput(true, l.post_norm, total, prompt);
+        if (!fused_mlp) try e.normInput(true, l.post_norm, total, prompt);
         if (e.learning) |k| try k.post(i, e.h, e.x, total);
         switch (l.mlp) {
             .dense => |m| {
@@ -166,9 +188,12 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 {
                     // a window: gate, up and the activation in one launch, act's group sums past the norm's (which gate
                     // and up still read; most_verify rows of each fit xs), then down over them; every bit as the two
-                    // projections, mlp_act and down give
+                    // projections, mlp_act and down give. The norm-fused form stages the normed A values itself.
                     const act_sums = e.xs + E.most_verify * (g.hidden / 64) * 4;
-                    try e.mlp_pair.pair(e.stream, e.x, e.xs, m.gate.a4, m.up.a4, e.act, act_sums, total);
+                    if (fused_mlp)
+                        try e.mlp_pair.pairNF(e.stream, e.h, e.xs, l.post_norm, g.eps, m.gate.a4, m.up.a4, e.act, act_sums, total)
+                    else
+                        try e.mlp_pair.pair(e.stream, e.x, e.xs, m.gate.a4, m.up.a4, e.act, act_sums, total);
                     try e.project(m.down, e.act, act_sums, e.r, total, prompt, t_params, false);
                 } else {
                     try e.projMany(&.{ m.gate, m.up }, e.x, &.{ e.gate, e.up }, total, prompt);
@@ -196,6 +221,15 @@ fn chainConvOn() bool {
     return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
 }
 
+/// gdn_post_follow's persistent blocks of four row warps beside the chain (GB10: one an SM).
+const follow_blocks = 48;
+
+/// TF_POST_FOLLOW=0: a prompt chunk's gdn_post runs after its chain instead of following it.
+fn postFollowOn() bool {
+    const v = @import("sys").c.getenv("TF_POST_FOLLOW") orelse return true;
+    return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
+}
+
 /// TF_GDN_ROWS4=0: 16..64-row windows keep one row warp a block in tf_q35_gdn_pre.
 /// TF_PROMPT_ILP=0: a prompt chunk keeps gdn_post's and attn_gate's one-row (one-entry) launches.
 fn promptIlpOn() bool {
@@ -216,6 +250,12 @@ fn rows4On() bool {
 /// TF_ATTN_PAIR=0: 2..64-row windows keep tf_q35_attn_partial (a block a row).
 fn pairOn() bool {
     const v = @import("sys").c.getenv("TF_ATTN_PAIR") orelse return true;
+    return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
+}
+
+/// TF_NORM_FUSE=0: the decode verify's post-norm stays a standalone tf_q35_norm launch, every bit the crown's flow.
+fn nfOn() bool {
+    const v = @import("sys").c.getenv("TF_NORM_FUSE") orelse return true;
     return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
 }
 
