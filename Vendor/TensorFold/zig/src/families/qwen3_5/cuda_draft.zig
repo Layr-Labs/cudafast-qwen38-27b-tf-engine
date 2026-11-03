@@ -406,8 +406,20 @@ pub const Draft = struct {
         try frame.forward(d, &.{item}, &.{ctx});
     }
 
-    fn candidates(d: *const Draft, rows: usize) tree.Candidates {
-        const base = d.selection_base;
+    /// TF_TREE_TRUST / TF_TREE_DEPTH_LAM: the offline search's winner knobs. V2 default: trust 1.0 (R4's
+    /// landing-chance tree weighting on with no env set); TF_TREE_TRUST=0 restores the crown-identical tree.
+    fn treeTune(l: *const tree.Landing, sampled: bool) tree.Tune {
+        const S = struct {
+            var trust: ?f64 = null;
+            var lam: ?f64 = null;
+        };
+        if (S.trust == null) S.trust = if (platform.c.getenv("TF_TREE_TRUST")) |v| std.fmt.parseFloat(f64, std.mem.span(v)) catch 1.0 else 1.0;
+        if (S.lam == null) S.lam = if (platform.c.getenv("TF_TREE_DEPTH_LAM")) |v| std.fmt.parseFloat(f64, std.mem.span(v)) catch 0 else 0;
+        const tc = tree.TrustCtx{ .l = l, .sampled = sampled };
+        return .{ .trust = S.trust.?, .lam = S.lam.?, .ctx = &tc, .chance_fn = if (S.trust.? > 0) tree.landingChance else null };
+    }
+
+    fn candidates(d: *const Draft, rows: usize) tree.Candidates {        const base = d.selection_base;
         return .{ .words = d.staged.bytes[words_at + base * lp_words * 4 ..][0 .. rows * lp_words * 4], .projected = d.staged.bytes[hp_at + base * d.c.rank * 2 ..][0 .. rows * d.c.rank * 2], .topk = d.c.topk, .rank = d.c.rank, .predecessor = d.w.predecessor, .successor = d.w.successor, .sampling = d.drawn.sampling, .position = d.drawn.position };
     }
 
@@ -432,7 +444,7 @@ pub const Draft = struct {
         if (limit > 0) {
             // the whole budget whenever drafts are asked: the block's forward costs the same at any depth
             const n = if (it.depth == 0) 0 else limit;
-            ctx.grown = tree.grow(d.candidates(rows), it.pending, rows, n, &ctx.held, &ctx.parents, &ctx.own);
+            ctx.grown = tree.grow(d.candidates(rows), it.pending, rows, n, &ctx.held, &ctx.parents, &ctx.own, treeTune(&d.landing, it.sampling != null));
             if (n >= rows and it.tokens.len >= 4) {
                 var ch: [engine.most_window]u32 = undefined;
                 tree.chain(d.candidates(rows), it.pending, ch[0..rows]);
@@ -515,11 +527,12 @@ pub const Draft = struct {
         for (items) |it| {
             const ctx = d.streams.get(it.stream) orelse return error.UnknownStream;
             if (it.features.space != .device or it.features.dtype != .bf16) return error.UnsupportedFeatures;
-            if (it.offered > 0 and ctx.grown > 0 and ctx.own[0] < 0) {
+            if (it.offered > 0 and ctx.grown > 0) {
                 var prefix: [engine.most_window]u32 = undefined;
                 for (prefix[0..@min(it.follow.len, prefix.len)], 0..) |*x, i| x.* = @intCast(i);
                 const kept = it.rows orelse prefix[0..@min(it.follow.len, prefix.len)];
-                d.landing.observeTree(it.stream.sampling != null, ctx.parents[0..ctx.grown], ctx.own[0..ctx.grown], it.offered, kept);
+                if (tree.r4log()) tree.dumpTree(ctx.parents[0..ctx.grown], ctx.own[0..ctx.grown], ctx.held[0..ctx.grown], it.offered, kept, it.stream.sampling != null);
+                if (ctx.own[0] < 0) d.landing.observeTree(it.stream.sampling != null, ctx.parents[0..ctx.grown], ctx.own[0..ctx.grown], it.offered, kept);
             }
             ctx.grown = 0;
             // the target's features: its ring, `offset` the first row's position (cuda_native.zig's featuresFn)
