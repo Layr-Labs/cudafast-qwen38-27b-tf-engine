@@ -738,7 +738,9 @@ pub const Engine = struct {
                 try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(e.host_logits.bytes.ptr, toks, total * 4, e.stream.handle), "cuMemcpyDtoHAsync");
                 try e.stream.synchronize();
                 @memcpy(e.tokens[0..total], e.host_logits.slice(u32)[0..total]);
-                if (shape.amax) if (e.sieve) |*sv| sv.after();
+                // The statistics page is an instrument, not a decode step: nothing in the scored path consumes it, so
+                // only check mode pays the blocking read and the log lines it produces.
+                if (shape.amax) if (e.sieve) |*sv| if (sv.mode == .check) sv.after();
             },
             .logits, .last => {
                 const out = e.host_logits.bytes[0 .. heads * g.vocab * 2];
