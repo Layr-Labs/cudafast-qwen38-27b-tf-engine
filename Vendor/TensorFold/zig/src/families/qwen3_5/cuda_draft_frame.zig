@@ -145,7 +145,8 @@ fn body(d: anytype, n: usize, narrow_: bool) !?u64 {
     }
     try d.norm(masked, d.w.final_norm, d.x, rows);
     const spanned = if (narrow_) try head(d, rows) else try full(d, rows);
-    if (spanned != null and d.head2 != null)
+    // the screen's tiles hold 16 rows: wider frames (several streams) keep the span head (head() agrees)
+    if (spanned != null and d.head2 != null and rows <= 16)
         try topkScreened(d, spanned.?, rows)
     else
         try e.draws.topkRows(e.stream, spanned orelse d.logits, if (spanned != null) span_width else c.vocab, @intCast(c.topk), d.parts, d.words, rows);
@@ -197,7 +198,11 @@ pub fn forward(d: anytype, items: []const dr.Hold, contexts: []const *draft.Ctx)
     try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(d.ids, st.ptr, B * 4, e.stream.handle), "cuMemcpyHtoDAsync");
     try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(d.segments, st.ptr + segments_at, items.len * @sizeOf(Segment), e.stream.handle), "cuMemcpyHtoDAsync");
     const rows = items.len * (c.block - 1);
-    const spanned = try run(d, items.len, narrow(contexts));
+    // The frame's head is the span head on every stream: its 2-bit screen reads 98,304 screened rows (125.8 MiB of
+    // codes + 31.5 MiB of screen scales) plus the 288 exact tail rows, where the wide fallback (full()) reads all
+    // 248,320 rows of the 4-bit head (654.6 MiB) every frame. A token outside the spans cannot be drafted, but the
+    // target verifies every proposal, so only the draft's coverage narrows; the committed stream is unchanged.
+    const spanned = try run(d, items.len, true);
     try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + words_at, d.words, rows * lp_words * 4, e.stream.handle), "cuMemcpyDtoHAsync");
     try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + hp_at, d.hp, rows * c.rank * 2, e.stream.handle), "cuMemcpyDtoHAsync");
     try e.stream.synchronize();
@@ -210,24 +215,14 @@ pub fn forward(d: anytype, items: []const dr.Hold, contexts: []const *draft.Ctx)
     try publish(d, items, contexts);
 }
 
-/// A stream's tokens outside the spans may outnumber this share of its tokens before the frame reads the whole head.
-const wide_share = 32;
-
-/// A lane stream's prompt and reply tokens since the last scan: the stream is wide (the frame reads the whole head)
-/// once tokens outside the spans are more than 1 in `wide_share` of its tokens. A few rare tokens in a prompt keep the
-/// span head: the whole head costs a 248,320-row projection every frame, against 98,592 rows for the spans.
+/// A lane stream's prompt and reply tokens since the last scan: how many of them fall outside the draft spans. The
+/// frame's head is the span head whatever this count is (see `forward`): a token outside the spans is not drafted,
+/// and the target verifies every proposal, so only the draft's coverage narrows.
 pub fn scan(ctx: *draft.Ctx, toks: []const u32) void {
     for (toks[@min(ctx.scanned, toks.len)..]) |t| if (t >= spans[0][1] and t < spans[1][0]) {
         ctx.outside += 1;
     };
     ctx.scanned = toks.len;
-    ctx.wide = ctx.outside * wide_share > ctx.scanned;
-}
-
-/// Whether every stream's tokens so far keep to the spans (a warmup's or standalone hold's context reads none).
-fn narrow(contexts: []const *draft.Ctx) bool {
-    for (contexts) |ctx| if (ctx.wide) return false;
-    return true;
 }
 
 /// The rows' draft logits over the spans' columns, packed in d.logits after the two projections (null: not this head).
@@ -245,7 +240,8 @@ fn head(d: anytype, rows: usize) !?u64 {
     const b = a + rows * first.n * 2;
     const out = b + rows * tail.n * 2;
     const skip = spans[1][0] - tail_tile;
-    if (d.head2) |h2| {
+    if (d.head2 != null and rows <= 16) {
+        const h2 = d.head2.?;
         // the first span's columns screened straight into the packed rows; the tail exact, as below
         try screen(d, h2, rows, out);
         try e.project(layers.Proj{ .a4 = tail }, d.x, d.xs, b, rows, false, 0, false);
@@ -344,6 +340,9 @@ fn topkScreened(d: anytype, logits: u64, rows: usize) !void {
     const n: usize = head2_cap;
     const pv = d.parts;
     const pi = d.parts + rows * n * 4;
+    // the select reads the packed rows sixteen bytes at a time
+    comptime std.debug.assert(span_width % 8 == 0);
+    if (logits % 16 != 0) return error.BadDraftFrame;
     var a: cuda.Args = .{};
     a.add(logits);
     a.add(@as(c_int, @intCast(span_width)));
