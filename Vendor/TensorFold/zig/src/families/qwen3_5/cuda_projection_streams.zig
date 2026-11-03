@@ -81,14 +81,14 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     };
     const down = try e.mods[0].function("tf_qmm_output_stream16");
     const out = try e.mods[0].function("tf_qmm_output_prefetch16");
-    try down.allowDynamicShared(35328);
+    try down.allowDynamicShared(cuda.qlinear.out16_direct_smem);
     // its twin for a dictionary-coded down/out/o projection: the table past the stages
     const down_dict: ?cuda.Function = if (e.affine.dict == null) null else blk: {
         const f = try e.mods[0].function("tf_qmm_output_stream16_dict");
-        try f.allowDynamicShared(35328 + @as(u32, @max(cuda.qlinear.dict_tab_max, cuda.qlinear.out_pair_tab_max)));
+        try f.allowDynamicShared(cuda.qlinear.out16_direct_smem + @as(u32, @max(cuda.qlinear.dict_tab_max, cuda.qlinear.out_pair_tab_max)));
         break :blk f;
     };
-    try out.allowDynamicShared(35328);
+    try out.allowDynamicShared(cuda.qlinear.out16_direct_smem);
     var buffer: ?cuda.DeviceBuffer = null;
     if (e.fast == null) {
         buffer = try cuda.DeviceBuffer.alloc(e.d, bytes);
