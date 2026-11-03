@@ -103,6 +103,12 @@ pub const Engine = struct {
     g: Geometry,
     geo: Geo,
     stream: cuda.Stream,
+    /// h41: cache state clears run here, overlapping host work between rounds instead of the engine stream's head
+    /// (cuda_cache.zig `zeroStateLate`; `TF_MEMSET_INLINE=1` restores the in-stream fill). `forward` waits on
+    /// `zev_done` before a part's first state access.
+    zstream: ?cuda.Stream = null,
+    zev_prior: ?cuda.Event = null, // records the engine stream when a clear is armed
+    zev_done: ?cuda.Event = null, // records the clear's completion on zstream
     blocks: std.ArrayListUnmanaged(caches.Recycled) = .empty, // closed streams' device blocks (cuda_cache.zig take/give)
     mods: [19]cuda.Module,
     kv8: bool, // attention caches as e4m3 rows with a scale each
@@ -163,6 +169,7 @@ pub const Engine = struct {
     beta: u64,
     y: u64,
     mix: u64,
+    chain_flags: u64 = 0, // a prompt chain's progress words, two a value head (cuda_prompt.zig deltaConv, gdn_post_follow)
     qraw: u64,
     kraw: u64,
     vraw: u64,
@@ -257,6 +264,20 @@ pub const Engine = struct {
         e.sieve = null;
         e.stream = try cuda.Stream.init(d, true);
         errdefer e.stream.deinit();
+        e.zstream = null; // the field's default does not apply: Allocation(Engine).create leaves the engine undefined
+        e.zev_prior = null;
+        e.zev_done = null;
+        if (recurrent.enabled(e) and !envOff("TF_MEMSET_INLINE")) {
+            e.zstream = cuda.Stream.init(d, true) catch null;
+            if (e.zstream != null) e.zev_prior = cuda.Event.init(d, false) catch null;
+            if (e.zev_prior != null) e.zev_done = cuda.Event.init(d, false) catch null;
+            if (e.zev_done == null) {
+                if (e.zev_prior) |*x| x.deinit();
+                e.zev_prior = null;
+                if (e.zstream) |*x| x.deinit();
+                e.zstream = null;
+            }
+        }
         e.blocks = .empty; // the field's default does not apply: Allocation(Engine).create leaves the engine undefined
         var ck = try core.Checkpoint.openModel(gpa, io, dir);
         defer ck.close();
@@ -323,6 +344,10 @@ pub const Engine = struct {
         e.plan = try cuda.grouped.Router.resolve(e.mods[10]);
         e.moe = try cuda.moe.Fns.resolve(e.mods[13]);
         inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(e.fns, name) = try e.mods[4].function("tf_q35_" ++ name);
+        // the U3/U4 escapes: TF_NORM_U0=1 binds the baseline norm (the residual's loads held across the past_rows
+        // return), TF_NORMROPE_U0=1 the baseline norm+rope tail (a per-thread rotate, no pair fold); unset keeps both
+        if (@import("sys").c.getenv("TF_NORM_U0") != null) e.fns.norm = try e.mods[4].function("tf_q35_norm_u0");
+        if (@import("sys").c.getenv("TF_NORMROPE_U0") != null) e.fns.norm_rope = try e.mods[4].function("tf_q35_norm_rope_u0");
         try e.fns.attn_partial.allowDynamicShared(@import("cuda_forward.zig").attn_tiles); // bf16 tiles' two buffers
         try e.fns.attn_rows.allowDynamicShared(@import("cuda_forward.zig").attn_tiles);
         inline for (@typeInfo(Keeps).@"struct".field_names) |name| @field(e.keeps, name) = try e.mods[6].function("tf_q35k_" ++ name);
@@ -430,6 +455,9 @@ pub const Engine = struct {
         e.int8.deinit();
         if (e.mo) |*m| m.unload();
         for (&e.mods) |*m| m.unload();
+        if (e.zev_done) |*x| x.deinit();
+        if (e.zev_prior) |*x| x.deinit();
+        if (e.zstream) |*x| x.deinit(); // synchronizes: an in-flight state clear lands before the buffers free
         e.stream.deinit();
         e.gpa.destroy(e);
     }
@@ -484,6 +512,7 @@ pub const Engine = struct {
         e.xs = try t.alloc(R * (@max(g.intermediate, wide) / 64) * 4);
         inline for (.{ "a", "b", "beta" }) |name| @field(e, name) = try t.alloc(R * g.v_heads * 2);
         e.g_ = try t.alloc(R * g.v_heads * 4);
+        e.chain_flags = try t.alloc(2 * g.v_heads * 128);
         e.qraw = try t.alloc(R * 2 * g.attnWidth() * 2);
         e.qn = try t.alloc(R * g.attnWidth() * 2);
         inline for (.{ "kraw", "vraw", "kn" }) |name| @field(e, name) = try t.alloc(R * g.kv_heads * head_dim * 2);
@@ -528,6 +557,7 @@ pub const Engine = struct {
     pub const proj = @import("cuda_projection.zig").proj;
     pub const projSums = @import("cuda_projection.zig").projSums;
     pub const projAgain = @import("cuda_projection.zig").projAgain;
+    pub const projAgainMerge = @import("cuda_projection.zig").projAgainMerge;
     pub const projMany = @import("cuda_projection.zig").projMany;
     pub const projManySums = @import("cuda_projection.zig").projManySums;
     pub const projectMany = @import("cuda_projection.zig").projectMany;
@@ -617,6 +647,13 @@ pub const Engine = struct {
         const carry = record and total > 1 and !envOff("TF_CARRIED");
         const slot_peak = try Round.buildCarried(st, parts, record, carry);
         for (parts) |p| {
+            // h41: a state clear armed at cache open runs on the zero stream; every state access below (a keep's
+            // conv/apply, the slot scans) is ordered after it here. The clear overlaps the host's between-round work.
+            if (p.cache.zero_pending) |zv| {
+                try e.stream.wait(zv);
+                p.cache.zero_pending = null;
+                p.cache.zero_stream = null;
+            }
             try p.cache.settle(e);
             // a pending kept prefix rides in this forward's slot scan only when its log half survives `prepare`
             if (!(record and keep != .hidden and recurrent.logStays(e, p.cache, p.rows))) try p.cache.flush(e);
@@ -755,7 +792,7 @@ pub const Engine = struct {
     pub const Shape = @import("cuda_shapes.zig").Shape;
 
     /// The same scan selected by body, exposed for host launch-contract fixtures.
-    pub fn deltaScan(e: *Engine, record: bool, slot_count: u8, segments: usize, layer: c_int) !void {
+    pub fn deltaScan(e: *Engine, record: bool, slot_count: u8, segments: usize, layer: c_int, next: ?Proj) !void {
         const scan = if (!record) e.fns.gdn_chain else switch (slot_count) {
             1 => e.fns.gdn_slots_1,
             2 => e.fns.gdn_slots_2,
@@ -772,7 +809,31 @@ pub const Engine = struct {
         const input = e.tables.ptr + @as(usize, if (record) Round.steps_at else rowpar_at);
         // qwen35_slots.cuh: up to four slots scan two value rows a warp, so a block covers eight
         const rows_a_warp: usize = if (record and (slot_count == 3 or slot_count == 35 or slot_count == 37 or slot_count == 38)) 4 else if (record and slot_count <= 4) 2 else 1;
-        try e.runAfter(scan, .{ 1, geometry.dk / (4 * rows_a_warp), e.g.v_heads * segments }, .{ 32, 4, 1 }, .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, input, layer, e.y, e.tables.ptr + params_at });
+        const grid = .{ 1, geometry.dk / (4 * rows_a_warp), e.g.v_heads * segments };
+        const base = .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, input, layer, e.y, e.tables.ptr + params_at };
+        // the slots kernels that declare the warm-up's four trailing parameters (qwen35_slots.cuh, qwen35_slots16.cuh):
+        // the lean scans (37, 38) do not, so a window on them keeps plain launches
+        if (!record or slot_count == 37 or slot_count == 38) return e.runAfter(scan, grid, .{ 32, 4, 1 }, base);
+        const pf = warmOf(next, warm_gdn);
+        return e.runAfter(scan, grid, .{ 32, 4, 1 }, base ++ .{ pf.w, pf.tile, pf.tiles, pf.take });
+    }
+
+    /// Shares (of 64) of each 64-column tile of the next lane projection warmed into L2 during the latency-bound kernel before it.
+    pub const warm_gdn: usize = 40;
+    pub const warm_attn: usize = 40;
+
+    pub const Warm = struct { w: u64 = 0, tile: c_int = 0, tiles: c_int = 0, take: c_int = 0 };
+
+    /// The L2 warm-up of `next`'s weight words (tile-major, k / 64 tiles of 2 KiB a 64-column tile): cache state only.
+    pub fn warmOf(next: ?Proj, share: usize) Warm {
+        if (envOff("TF_WARM")) return .{};
+        const p = next orelse return .{};
+        if (p != .a4) return .{};
+        const q = p.a4;
+        if (q.k % 64 != 0 or q.n % 64 != 0) return .{};
+        const tile = q.k / 64 * 2048;
+        const take = tile * share / 64 / 16 * 16;
+        return .{ .w = q.w, .tile = @intCast(tile), .tiles = @intCast(q.npad / 64), .take = @intCast(take) };
     }
 
     /// The launches of a forward of `shape`, from the embedding to the kept rows' logits (captured once a shape).
