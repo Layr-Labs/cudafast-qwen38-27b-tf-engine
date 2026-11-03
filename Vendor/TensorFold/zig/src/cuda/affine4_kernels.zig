@@ -728,8 +728,18 @@ pub const Affine4Kernels = struct {
             if (weight.wide_w != 0) return a.packed32(s, x, xs, weight, out, rows);
             return a.cluster32(s, x, xs, weight, out, rows);
         }
-        if (rows <= 64) return a.wide(a.verify64_fn, linear.verify64_smem, 64, s, x, xs, weight, out, rows);
-        return a.wide(a.verify128_fn, linear.verify128_smem, 128, s, x, xs, weight, out, rows);
+        if (rows <= 64) return a.wide(a.verify64_fn, linear.verify64_smem, 64, s, x, xs, weight, out, rows, 0);
+        return a.wide(a.verify128_fn, linear.verify128_smem, 128, s, x, xs, weight, out, rows, 0);
+    }
+
+    /// verify() whose wide epilogue merges the projection into the hidden rows instead of storing them: each
+    /// element becomes bf16(h + bf16(acc)), the skipped tf_q35_norm's own store (qmm_group.cu's merge Part field).
+    /// Windows at which the merge carries (33 up, the wide() launches) only; narrower ones keep the norm kernel.
+    pub fn verifyMerge(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, weight: Affine4, out: u64, rows: usize) !void {
+        if (rows == 0 or rows > a.verifyRows()) return error.WindowTooWide;
+        if (rows <= 32) return error.WindowTooWide;
+        if (rows <= 64) return a.wide(a.verify64_fn, linear.verify64_smem, 64, s, x, xs, weight, out, rows, out);
+        return a.wide(a.verify128_fn, linear.verify128_smem, 128, s, x, xs, weight, out, rows, out);
     }
 
     /// Whether headArgmax takes q at `rows`: decode()'s dictionary cluster tile without K slices (the vocabulary head).
@@ -765,7 +775,7 @@ pub const Affine4Kernels = struct {
 
     /// The same ordered group and K-slice chains as decode(), with both row tiles reusing the loaded weights.
     pub fn cluster32(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, weight: Affine4, out: u64, rows: usize) !void {
-        return a.wide(a.verify_fn, linear.verify_smem, 32, s, x, xs, weight, out, rows);
+        return a.wide(a.verify_fn, linear.verify_smem, 32, s, x, xs, weight, out, rows, 0);
     }
 
     /// Projections of one 17 to 32-row input, grouped only with projections of the same K-slice count.
@@ -829,20 +839,21 @@ pub const Affine4Kernels = struct {
     /// cluster32 with four (64) or eight (128) m16 row tiles a weight panel.
     pub fn clusterRows(a: *const Affine4Kernels, tile: usize, s: Stream, x: u64, xs: u64, weight: Affine4, out: u64, rows: usize) !void {
         return switch (tile) {
-            64 => a.wide(a.verify64_fn, linear.verify64_smem, 64, s, x, xs, weight, out, rows),
-            128 => a.wide(a.verify128_fn, linear.verify128_smem, 128, s, x, xs, weight, out, rows),
+            64 => a.wide(a.verify64_fn, linear.verify64_smem, 64, s, x, xs, weight, out, rows, 0),
+            128 => a.wide(a.verify128_fn, linear.verify128_smem, 128, s, x, xs, weight, out, rows, 0),
             else => error.WindowTooWide,
         };
     }
 
     /// One CTA a column tile (a cluster of its K slices), all of `rows` in its m16 row tiles over each loaded panel.
-    fn wide(a: *const Affine4Kernels, f: Function, shared: u32, most: usize, s: Stream, x: u64, xs: u64, weight: Affine4, out: u64, rows: usize) !void {
+    /// merge: when non-zero, the epilogue stores bf16(h + bf16(acc)) into those hidden rows in place of `out`.
+    fn wide(a: *const Affine4Kernels, f: Function, shared: u32, most: usize, s: Stream, x: u64, xs: u64, weight: Affine4, out: u64, rows: usize, merge: u64) !void {
         if (rows == 0 or rows > most) return error.WindowTooWide;
         const tiles = (weight.n + 63) / 64;
         const sk = splitK(weight.n, weight.k);
         var parts: Parts = std.mem.zeroes(Parts);
         parts.count = 1;
-        parts.p[0] = .{ .w = weight.w, .scales = weight.s, .biases = weight.b, .out = out, .n = int(weight.n), .npad = int(weight.npad), .sk = int(sk), .tiles = int(tiles), .first = 0 };
+        parts.p[0] = .{ .w = weight.w, .scales = weight.s, .biases = weight.b, .out = out, .n = int(weight.n), .npad = int(weight.npad), .sk = int(sk), .tiles = int(tiles), .first = 0, .merge_h = merge };
         var g: launch_.Args = .{};
         g.add(x);
         g.add(xs);

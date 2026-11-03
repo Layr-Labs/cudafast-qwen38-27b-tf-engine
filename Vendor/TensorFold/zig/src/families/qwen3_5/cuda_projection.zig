@@ -21,6 +21,21 @@ pub fn projAgain(e: *Engine, l: Proj, x: u64, out: u64, rows: usize, prompt: boo
     return project(e, l, x, e.xs, out, rows, prompt, e.tables.ptr + Engine.params_at, false);
 }
 
+/// `projAgain` whose wide verify epilogue merges the projection into the hidden rows `out` instead of storing it:
+/// bf16(h + bf16(acc)) per element, the residual add of the norm launch the caller skips (TF_NORM_FUSE's flow).
+/// Only the wide windows carry the merge; anything narrower errors, and callers gate on the same predicate.
+pub fn projAgainMerge(e: *Engine, l: Proj, x: u64, out: u64, rows: usize, prompt: bool) !void {
+    if (l != .a4 or prompt or rows <= 32 or rows > e.affine.verifyRows()) return error.InputMismatch;
+    const n_out = l.outputs();
+    const k = l.inputs();
+    const tile: usize = e.affine.verifyRows();
+    var at: usize = 0;
+    while (at < rows) : (at += tile) {
+        const n = @min(tile, rows - at);
+        try e.affine.verifyMerge(e.stream, x + at * k * 2, e.xs + at * (k / 64) * 4, l.a4, out + at * n_out * 2, n);
+    }
+}
+
 /// `projAgain` of each of `ls` into `outs` over one x; on the split form's GPUs one segmented launch a row tile.
 pub fn projMany(e: *Engine, ls: []const Proj, x: u64, outs: []const u64, rows: usize, prompt: bool) !void {
     return projectMany(e, ls, x, e.xs, outs, rows, prompt, e.tables.ptr + Engine.params_at, false);
