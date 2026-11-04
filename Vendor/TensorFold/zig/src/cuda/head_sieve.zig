@@ -6,7 +6,7 @@
 //! the best of those exact values: the full head's token whenever the best id's dropped bits' term exceeds the first
 //! tile's best-approximate id's by less than kappa spreads.
 //! TF_HEAD_SIEVE=0: the full head; =check: the full head writes the tokens and the sieve runs beside it, compared.
-//! TF_HEAD_SIEVE_K: kappa (10); TF_HEAD_SIEVE_CAP: the most n8 tiles rescored before every tile is (4096).
+//! TF_HEAD_SIEVE_K: kappa (10); TF_HEAD_SIEVE_CAP: the most n8 tiles rescored before every tile is (every tile, n / 8).
 const std = @import("std");
 const linear = @import("qlinear.zig");
 const Driver = @import("driver.zig").Driver;
@@ -27,6 +27,8 @@ pub const Mode = enum { on, check };
 pub const HeadSieve = struct {
     pub const rows_max = 16;
     pub const sieve_smem: u32 = 4 * (2048 + 4 * 1024 + 4 * 256 + 128); // tf_head_sieve::SMEM
+    pub const prompt_sieve_smem: u32 = 4 * 4 * (1024 + 256); // prompt-only warp-private stages
+    const prompt_tab_room: u32 = 102400 / 3 - 1024 - prompt_sieve_smem;
     pub const rescore_smem: u32 = 8 * (2048 + 4 * 288 + 64); // tf_head_sieve::RS_SMEM
     /// The pair table in shared memory when three scan CTAs an SM still fit (GB10: 100 KiB an SM, 1 KiB a CTA).
     const tab_room: u32 = 102400 / 3 - 1024 - sieve_smem;
@@ -37,6 +39,7 @@ pub const HeadSieve = struct {
     pack_fn: Function,
     prep_fn: Function,
     sieve_fn: Function,
+    prompt_sieve_fn: Function,
     top_fn: Function,
     select_fn: Function,
     rescore_fn: Function,
@@ -52,6 +55,7 @@ pub const HeadSieve = struct {
     ctas: usize,
     code: u32, // the head's pair code, or 0: the sieve reads the (kg, npad) arrays
     tab_smem: u32,
+    prompt_tab_smem: u32,
     pdl: bool,
     w2: u64,
     afr: u64,
@@ -89,12 +93,13 @@ pub const HeadSieve = struct {
         }
         var kappa: f32 = 10.0;
         if (@import("sys").c.getenv("TF_HEAD_SIEVE_K")) |v| kappa = std.fmt.parseFloat(f32, std.mem.span(v)) catch 10.0;
-        var cap: usize = 4096;
-        if (@import("sys").c.getenv("TF_HEAD_SIEVE_CAP")) |v| cap = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 4096;
+        var cap: usize = q.n / 8; // every n8 tile: a window lists only what it rescores, so no overflow reads the whole head
+        if (@import("sys").c.getenv("TF_HEAD_SIEVE_CAP")) |v| cap = std.fmt.parseInt(usize, std.mem.span(v), 10) catch q.n / 8;
         var h: HeadSieve = undefined;
         h.pack_fn = try group_mod.function("tf_head_sieve_pack");
         h.prep_fn = try group_mod.function("tf_head_sieve_prep");
         h.sieve_fn = try group_mod.function("tf_head_sieve_scan");
+        h.prompt_sieve_fn = try group_mod.function("tf_head_sieve_scan_prompt");
         h.top_fn = try group_mod.function("tf_head_sieve_top");
         h.select_fn = try group_mod.function("tf_head_sieve_select");
         h.rescore_fn = try group_mod.function("tf_head_sieve_rescore");
@@ -114,6 +119,8 @@ pub const HeadSieve = struct {
         const tab_bytes: u32 = if (h.code != 0) ((h.code >> 5 & 0x1FFF) * 4 + 15) / 16 * 16 else 0;
         h.tab_smem = if (tab_bytes <= tab_room) tab_bytes else 0;
         try h.sieve_fn.allowDynamicShared(sieve_smem + h.tab_smem);
+        h.prompt_tab_smem = if (tab_bytes <= prompt_tab_room) tab_bytes else 0;
+        try h.prompt_sieve_fn.allowDynamicShared(prompt_sieve_smem + h.prompt_tab_smem);
         try h.rescore_fn.allowDynamicShared(rescore_smem);
         // the buffer: 2-bit words, A fragments, group sums, the sieve's bests, list, count, bests, tokens, counters
         var at: usize = 0;
@@ -177,7 +184,19 @@ pub const HeadSieve = struct {
     /// A greedy verify's head over `rows` rows of x (bf16, k wide) with group sums xs: each row's token into toks
     /// (check mode: into the sieve's own, compared with toks, which the full head has written).
     pub fn run(h: *const HeadSieve, s: Stream, x: u64, xs: u64, q: Affine4, rows: usize, toks: u64) !void {
+        return h.runWith(false, s, x, xs, q, rows, toks);
+    }
+
+    /// Only the prompt-tail call site uses this entry. Verify/decode retain the base scan and allocation.
+    pub fn runPromptTail(h: *const HeadSieve, s: Stream, x: u64, xs: u64, q: Affine4, toks: u64) !void {
+        return h.runWith(true, s, x, xs, q, 1, toks);
+    }
+
+    fn runWith(h: *const HeadSieve, comptime prompt_tail: bool, s: Stream, x: u64, xs: u64, q: Affine4, rows: usize, toks: u64) !void {
         if (rows == 0 or rows > rows_max) return error.WindowTooWide;
+        const scan_tab = if (prompt_tail) h.prompt_tab_smem else h.tab_smem;
+        const scan_fn = if (prompt_tail) h.prompt_sieve_fn else h.sieve_fn;
+        const scan_smem = if (prompt_tail) prompt_sieve_smem else sieve_smem;
         const out = if (h.mode == .check) h.toks else toks;
         {
             var a: launch_.Args = .{};
@@ -200,7 +219,7 @@ pub const HeadSieve = struct {
             a.add(q.sb);
             a.add(q.tab);
             a.add(@as(c_int, @bitCast(h.code)));
-            a.add(@as(c_int, @intCast(h.tab_smem)));
+            a.add(@as(c_int, @intCast(scan_tab)));
             a.add(q.s);
             a.add(q.b);
             a.add(int(q.npad));
@@ -210,7 +229,7 @@ pub const HeadSieve = struct {
             a.add(h.himax);
             a.add(h.himid);
             a.add(h.approx);
-            try launch_.launch(h.sieve_fn, .{ .grid = .{ .x = @intCast(h.ctas) }, .block = .{ .x = 128 }, .shared = sieve_smem + h.tab_smem, .pdl = h.pdl }, s, &a);
+            try launch_.launch(scan_fn, .{ .grid = .{ .x = @intCast(h.ctas) }, .block = .{ .x = 128 }, .shared = scan_smem + scan_tab, .pdl = h.pdl }, s, &a);
         }
         // each row's first tile (its best a) exactly; the row's threshold the lower of its exact best and its best a
         {
