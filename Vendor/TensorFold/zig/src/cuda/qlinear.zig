@@ -17,7 +17,10 @@ const Stream = stream_.Stream;
 
 /// MLX affine 4-bit tiled for qmm: packed words, (kg, npad) scales and biases, n outputs from k inputs.
 pub const proposal = @import("proposal_head.zig");
+pub const BitplaneView = extern struct { blob: u64 = 0, offsets: u64 = 0, table: u64 = 0, mapping: u64 = 0 };
+pub const BitplanePair = extern struct { p: [2]BitplaneView };
 pub const Affine4 = struct {
+    bitplane: BitplaneView = .{}, // lossless weight-only view, absent on every non-compact consumer
     stream_w: u64 = 0, // immutable K-major words for native ordered-slice projection streams
     wide_w: u64 = 0, // weight-only group-major view for 17 to 32-row verification
     wide_kind: u8 = 0, // 1 attention inputs, 2 down, 3 head

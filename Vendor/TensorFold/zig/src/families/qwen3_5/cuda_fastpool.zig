@@ -72,11 +72,16 @@ fn piecesFor(sizes: []const usize) usize {
 /// `passes` times by `probe` (affine4_pack.cu's tf_fastpool_read), and every candidate not kept is freed here.
 pub fn screen(d: *const cuda.Driver, stream: cuda.Stream, probe: cuda.Function, sizes: []const usize) ?Pool {
     if (comptime builtin.os.tag != .linux) return null;
+    var buf: [16384]u8 = undefined;
+    const free_bytes = memFree(read("/proc/meminfo", &buf) orelse return null) orelse return null;
+    return screenWithFree(d, stream, probe, sizes, free_bytes);
+}
+
+/// Same screen with an explicit free-memory snapshot, permitting deterministic reserve/cleanup tests.
+pub fn screenWithFree(d: *const cuda.Driver, stream: cuda.Stream, probe: cuda.Function, sizes: []const usize, free_bytes: usize) ?Pool {
     const timing = @import("sys").c.getenv("TF_TIMING") != null;
     const want = piecesFor(sizes);
     if (want == 0 or want > most) return null;
-    var buf: [16384]u8 = undefined;
-    const free_bytes = memFree(read("/proc/meminfo", &buf) orelse return null) orelse return null;
     if (free_bytes <= keep_free) return null;
     const count = @min((free_bytes - keep_free) / piece, most);
     if (count < want) return null;
@@ -84,6 +89,8 @@ pub fn screen(d: *const cuda.Driver, stream: cuda.Stream, probe: cuda.Function, 
     var cand: [most]u64 = @splat(0);
     var n: usize = 0;
     defer {
+        // Early null returns can follow asynchronous commits/probes. Prove completion before any candidate is freed.
+        cuda.completion.drain(d, stream, "fastpool candidates did not drain");
         for (cand[0..n]) |p| {
             if (p != 0) _ = d.api.cuMemFree_v2(p);
         }
