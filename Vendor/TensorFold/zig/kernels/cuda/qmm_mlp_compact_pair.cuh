@@ -1,5 +1,6 @@
 #pragma once
 #include "qmm_mlp_single_dict.cuh"
+#include "qmm_bitplane54.cuh"
 namespace tf_qmm_mlp_single {
 __device__ __forceinline__ uint32_t compact_load_a(const __nv_bfloat16* p) {
     uint32_t word;
@@ -7,19 +8,18 @@ __device__ __forceinline__ uint32_t compact_load_a(const __nv_bfloat16* p) {
     return word;
 }
 
-template <int STAGES = 2, int BN = 256, bool KMAJOR = true>
+template <int STAGES = 2, int BN = 256, bool KMAJOR = true, bool BP54 = false>
 __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
                                               const Parts& parts, __nv_bfloat16* __restrict__ act,
-                                              float* __restrict__ as, int M, int K, int ldx, int rows_t) {
+                                              float* __restrict__ as, int M, int K, int ldx, int rows_t, const tf_bp54::Pair* bp = nullptr) {
     constexpr int GS = 64, BM = 16, WM = 1, WN = 4;
     using Base = LaneTile<GS, BM, BN, WM, WN, STAGES>;
     struct T : Base {
-        // XT: the group's x tile (BM rows of 64 bf16), staged with the weights
-        enum { X = 0, W = BN * GS / 2, S = 256, XT = W + 2 * S + BM * 4, STAGE = XT + BM * GS * 2,
+        enum { X = 0, W = BN * GS / 2, S = 256, STAGE = W + 2 * S + BM * 4,
                SMEM = STAGES * STAGE };
     };
     constexpr int PASSES = BN / WN / 32;
-    static_assert(T::SMEM == 21632, "compact pair pipeline footprint");
+    static_assert(T::SMEM == 17536, "compact pair pipeline footprint");
     constexpr int I = T::MT, J = T::NT;
     extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -61,20 +61,19 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     const uint32_t* const mgtab = reinterpret_cast<const uint32_t*>(parts.p[mpart].biases);
     const bool xsok = tid < rows;
     const float* xssrc = xs + static_cast<size_t>(m0 + min(tid, rows - 1)) * KG;
-    // x's 16 rows of the group: 16-byte chunk ch of row r at slot ch ^ (r & 7) (rows past M repeat the last one: their
-    // products are never stored); the fragments below read the same bf16 words the x rows hold
-    const int xr = tid >> 3, xch = tid & 7;
-    const __nv_bfloat16* xtsrc = x + static_cast<size_t>(m0 + min(xr, rows - 1)) * ldx + xch * 8;
-    const int xtdst = T::XT + xr * 128 + ((xch ^ (xr & 7)) * 16);
     auto load_x = [&](int s, int g) {
         if (xsok) cp4(stage(s) + T::W + 2 * T::S + tid * 4, xssrc + g);
-        cp16(stage(s) + xtdst, xtsrc + g * GS);
     };
     auto load_w = [&](int s, int g) {
         unsigned char* p = stage(s);
+        if constexpr (BP54) {
+            const unsigned panel = static_cast<unsigned>(g) * (P.npad / 64) + n0 / 64 + (warp & 1);
+            tf_bp54::decode_panel(bp->p[warp / 2], panel, reinterpret_cast<uint32_t*>(p + T::X) + warp * 512);
+        } else {
 #pragma unroll
-        for (int j = 0; j < WC; ++j)
-            if (wok[j]) cp16(p + wdst[j], wsrc[j] + static_cast<size_t>(g) * (KMAJOR ? P.npad / 64 : 1) * TILE_BYTES);
+            for (int j = 0; j < WC; ++j)
+                if (wok[j]) cp16(p + wdst[j], wsrc[j] + static_cast<size_t>(g) * (KMAJOR ? P.npad / 64 : 1) * TILE_BYTES);
+        }
         if (dok) cp16(p + ddst, dsrc + static_cast<size_t>(g) * dpitch);
     };
     uint32_t mask;
@@ -105,24 +104,6 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     for (int it = 0; it < per; ++it) {
         wait<0>();
         __syncthreads();
-        uint32_t av[GS / 16][I][4];
-        {
-            const unsigned char* xt = stage(it % STAGES) + T::XT;
-            const int b = (2 * (lane & 3)) * 2;
-#pragma unroll
-            for (int kt = 0; kt < GS / 16; ++kt)
-#pragma unroll
-                for (int i = 0; i < I; ++i) {
-                    const int r = wm * (BM / WM) + i * 16 + (lane >> 2);
-                    auto at = [&](int row, int ch) {
-                        return *reinterpret_cast<const uint32_t*>(xt + row * 128 + ((ch ^ (row & 7)) * 16) + b);
-                    };
-                    av[kt][i][0] = at(r, 2 * kt);
-                    av[kt][i][1] = at(r + 8, 2 * kt);
-                    av[kt][i][2] = at(r, 2 * kt + 1);
-                    av[kt][i][3] = at(r + 8, 2 * kt + 1);
-                }
-        }
         const int next = it + 1;
         if (next < per) { load_x(next % STAGES, next); load_w(next % STAGES, next); }
         commit();
@@ -143,6 +124,20 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
         for (int j = 0; j < T::NT; ++j)
 #pragma unroll
             for (int v = 0; v < GS / 32; ++v) words[j][v] = pw[((wn * T::NT + j) * 32 + lane) * (GS / 32) + v];
+        uint32_t av[GS / 16][I][4];
+#pragma unroll
+        for (int kt = 0; kt < GS / 16; ++kt)
+#pragma unroll
+            for (int i = 0; i < I; ++i) {
+                const int r = wm * (BM / WM) + i * 16 + (lane >> 2);
+                const int c = it * GS + kt * 16 + 2 * (lane & 3);
+                const __nv_bfloat16* a0 = x_ready + static_cast<size_t>(m0 + r) * ldx + c;
+                const __nv_bfloat16* a1 = a0 + 8 * ldx;
+                av[kt][i][0] = compact_load_a(a0);
+                av[kt][i][1] = compact_load_a(a1);
+                av[kt][i][2] = compact_load_a(a0 + 8);
+                av[kt][i][3] = compact_load_a(a1 + 8);
+            }
         float xv[I][2];
 #pragma unroll
         for (int i = 0; i < I; ++i) {
@@ -234,4 +229,11 @@ extern "C" __global__ void __launch_bounds__(128, 3) tf_qmm_mlp_single16_compact
  const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,
  __nv_bfloat16* act,float* sums,int M,int K,int ldx,int rows_t) {
  tf_qmm_mlp_single::mlp_single_compact_body<>(x,xs,parts,act,sums,M,K,ldx,rows_t);
+}
+
+// Opt-in entry point; host dispatch remains original until model-load integration.
+extern "C" __global__ void __launch_bounds__(128, 3) tf_qmm_mlp_single16_bitplane54(
+ const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,
+ __nv_bfloat16* act,float* sums,int M,int K,int ldx,int rows_t,const __grid_constant__ tf_bp54::Pair bp) {
+ tf_qmm_mlp_single::mlp_single_compact_body<2,256,true,true>(x,xs,parts,act,sums,M,K,ldx,rows_t,&bp);
 }
