@@ -331,6 +331,10 @@ pub const dict_pair_max: u32 = 8191;
 /// The lane twins' (lane_gemv.cu) and gdn_stream16 twin's (qmm_gdn_stream.cuh) shared pair-table room at two CTAs an SM.
 pub const lane_pair_tab_max: u32 = 14592;
 pub const out16_smem: u32 = 35328;
+/// The 32-row output stream twin's stages (qmm_output_stream.cuh, tf_qmm_output_stream32): four slices x two stages x
+/// (32 staged input rows x 128 bytes + 2048 weight bytes); its sums, index windows and pair table come through L2, so
+/// two CTAs fit an SM.
+pub const out32_smem: u32 = 49152;
 pub const out_pair_tab_max: u32 = 14336;
 pub const gdn_pair_tab_max: u32 = 26496;
 /// group_kernel_dict's (qmm_group.cu GROUP_PAIR_SMEM, GROUP_PAIR_SMEM_ONE): two CTAs an SM in a cluster launch; any
