@@ -14,12 +14,11 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     constexpr int GS = 64, BM = 16, WM = 1, WN = 4;
     using Base = LaneTile<GS, BM, BN, WM, WN, STAGES>;
     struct T : Base {
-        // XT: the group's x tile (BM rows of 64 bf16), staged with the weights
-        enum { X = 0, W = BN * GS / 2, S = 256, XT = W + 2 * S + BM * 4, STAGE = XT + BM * GS * 2,
+        enum { X = 0, W = BN * GS / 2, S = 256, STAGE = W + 2 * S + BM * 4,
                SMEM = STAGES * STAGE };
     };
     constexpr int PASSES = BN / WN / 32;
-    static_assert(T::SMEM == 21632, "compact pair pipeline footprint");
+    static_assert(T::SMEM == 17536, "compact pair pipeline footprint");
     constexpr int I = T::MT, J = T::NT;
     extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -61,14 +60,8 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     const uint32_t* const mgtab = reinterpret_cast<const uint32_t*>(parts.p[mpart].biases);
     const bool xsok = tid < rows;
     const float* xssrc = xs + static_cast<size_t>(m0 + min(tid, rows - 1)) * KG;
-    // x's 16 rows of the group: 16-byte chunk ch of row r at slot ch ^ (r & 7) (rows past M repeat the last one: their
-    // products are never stored); the fragments below read the same bf16 words the x rows hold
-    const int xr = tid >> 3, xch = tid & 7;
-    const __nv_bfloat16* xtsrc = x + static_cast<size_t>(m0 + min(xr, rows - 1)) * ldx + xch * 8;
-    const int xtdst = T::XT + xr * 128 + ((xch ^ (xr & 7)) * 16);
     auto load_x = [&](int s, int g) {
         if (xsok) cp4(stage(s) + T::W + 2 * T::S + tid * 4, xssrc + g);
-        cp16(stage(s) + xtdst, xtsrc + g * GS);
     };
     auto load_w = [&](int s, int g) {
         unsigned char* p = stage(s);
@@ -105,24 +98,6 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     for (int it = 0; it < per; ++it) {
         wait<0>();
         __syncthreads();
-        uint32_t av[GS / 16][I][4];
-        {
-            const unsigned char* xt = stage(it % STAGES) + T::XT;
-            const int b = (2 * (lane & 3)) * 2;
-#pragma unroll
-            for (int kt = 0; kt < GS / 16; ++kt)
-#pragma unroll
-                for (int i = 0; i < I; ++i) {
-                    const int r = wm * (BM / WM) + i * 16 + (lane >> 2);
-                    auto at = [&](int row, int ch) {
-                        return *reinterpret_cast<const uint32_t*>(xt + row * 128 + ((ch ^ (row & 7)) * 16) + b);
-                    };
-                    av[kt][i][0] = at(r, 2 * kt);
-                    av[kt][i][1] = at(r + 8, 2 * kt);
-                    av[kt][i][2] = at(r, 2 * kt + 1);
-                    av[kt][i][3] = at(r + 8, 2 * kt + 1);
-                }
-        }
         const int next = it + 1;
         if (next < per) { load_x(next % STAGES, next); load_w(next % STAGES, next); }
         commit();
@@ -143,6 +118,20 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
         for (int j = 0; j < T::NT; ++j)
 #pragma unroll
             for (int v = 0; v < GS / 32; ++v) words[j][v] = pw[((wn * T::NT + j) * 32 + lane) * (GS / 32) + v];
+        uint32_t av[GS / 16][I][4];
+#pragma unroll
+        for (int kt = 0; kt < GS / 16; ++kt)
+#pragma unroll
+            for (int i = 0; i < I; ++i) {
+                const int r = wm * (BM / WM) + i * 16 + (lane >> 2);
+                const int c = it * GS + kt * 16 + 2 * (lane & 3);
+                const __nv_bfloat16* a0 = x_ready + static_cast<size_t>(m0 + r) * ldx + c;
+                const __nv_bfloat16* a1 = a0 + 8 * ldx;
+                av[kt][i][0] = compact_load_a(a0);
+                av[kt][i][1] = compact_load_a(a1);
+                av[kt][i][2] = compact_load_a(a0 + 8);
+                av[kt][i][3] = compact_load_a(a1 + 8);
+            }
         float xv[I][2];
 #pragma unroll
         for (int i = 0; i < I; ++i) {
@@ -186,45 +175,51 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
         }
     }
     wait<0>();
-    __nv_bfloat16* own = reinterpret_cast<__nv_bfloat16*>(buf);
-    __syncthreads();
-#pragma unroll
-    for (int i = 0; i < I; ++i)
+    // The last iteration's CTA rendezvous retired the previous stage's reads.
+    // Its sibling, per % STAGES, has no outstanding writes or current readers.
+    // Reuse that dead ring stage, not buf (which may still be the live stage).
+    static_assert(STAGES == 2 && I == 1 && WM == 1 && WN == 4 && BN == 256);
+    static_assert(BM * (BN / 2) * sizeof(__nv_bfloat16) <= T::STAGE);
+    __nv_bfloat16* own = reinterpret_cast<__nv_bfloat16*>(stage(per % STAGES));
+    if (wn < WN / 2) {
 #pragma unroll
         for (int j = 0; j < J; ++j)
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
-                const int r = wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8;
+                const int r = (lane >> 2) + h * 8;
                 const int c = wn * (BN / WN) + j * 8 + (lane & 3) * 2;
-                *reinterpret_cast<__nv_bfloat162*>(own + r * BN + c) =
-                    __floats2bfloat162_rn(acc[i][j][2*h], acc[i][j][2*h+1]);
+                *reinterpret_cast<__nv_bfloat162*>(own + r * (BN / 2) + c) =
+                    __floats2bfloat162_rn(acc[0][j][2*h], acc[0][j][2*h+1]);
             }
+    }
+    // Gate fragments cross warp boundaries once. Up fragments stay registers.
     __syncthreads();
     if (wn >= WN / 2) {
 #pragma unroll
-        for (int i = 0; i < I; ++i)
+        for (int j = 0; j < J; ++j)
 #pragma unroll
-            for (int j = 0; j < J; ++j)
+            for (int h = 0; h < 2; ++h) {
+                const int r = (lane >> 2) + h * 8;
+                const int c = (wn - WN / 2) * (BN / WN) + j * 8 + (lane & 3) * 2;
+                const __nv_bfloat162 g2 = *reinterpret_cast<const __nv_bfloat162*>(own + r * (BN / 2) + c);
+                const __nv_bfloat162 u2 = __floats2bfloat162_rn(acc[0][j][2*h], acc[0][j][2*h+1]);
+                const float gf[2] = {__low2float(g2), __high2float(g2)};
+                const float uf[2] = {__low2float(u2), __high2float(u2)};
+                __nv_bfloat16 o[2];
 #pragma unroll
-                for (int h = 0; h < 2; ++h) {
-                    const int r = wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8;
-                    const int c = wn * (BN / WN) + j * 8 + (lane & 3) * 2 - BN / 2;
-                    const __nv_bfloat162 g2 = *reinterpret_cast<const __nv_bfloat162*>(own + r * BN + c);
-                    const __nv_bfloat162 u2 = *reinterpret_cast<const __nv_bfloat162*>(own + r * BN + c + BN / 2);
-                    const float gf[2] = {__low2float(g2), __high2float(g2)};
-                    const float uf[2] = {__low2float(u2), __high2float(u2)};
-                    __nv_bfloat16 o[2];
-#pragma unroll
-                    for (int e = 0; e < 2; ++e) o[e] = __float2bfloat16_rn(gf[e] / (1.0f + expf(-gf[e])) * uf[e]);
-                    const __nv_bfloat162 o2 = __halves2bfloat162(o[0], o[1]);
-                    *reinterpret_cast<__nv_bfloat162*>(own + r * BN + c) = o2;
-                    if (m0 + r < M) *reinterpret_cast<__nv_bfloat162*>(act + static_cast<size_t>(m0 + r) * P.n + n0 + c) = o2;
-                }
-    }
-    __syncthreads();
-    if (tid < rows * (BN / 128)) {
-        const int r = tid / (BN / 128), group = tid % (BN / 128);
-        as[static_cast<size_t>(m0 + r) * (P.n / 64) + n0 / 64 + group] = act_group_sum(own + r * BN + group * 64);
+                for (int e = 0; e < 2; ++e) o[e] = __float2bfloat16_rn(gf[e] / (1.0f + expf(-gf[e])) * uf[e]);
+                const __nv_bfloat162 o2 = __halves2bfloat162(o[0], o[1]);
+                *reinterpret_cast<__nv_bfloat162*>(own + r * (BN / 2) + c) = o2;
+                if (m0 + r < M) *reinterpret_cast<__nv_bfloat162*>(act + static_cast<size_t>(m0 + r) * P.n + n0 + c) = o2;
+            }
+        // A single up warp owns every element of its 64-column group. Preserve
+        // the baseline's scalar sum order, with no CTA-wide output handoff.
+        __syncwarp();
+        if (lane < rows) {
+            const int group = wn - WN / 2;
+            as[static_cast<size_t>(m0 + lane) * (P.n / 64) + n0 / 64 + group] =
+                act_group_sum(own + lane * (BN / 2) + group * 64);
+        }
     }
 
 }
