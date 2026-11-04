@@ -71,6 +71,7 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     };
     if (bytes == 0) return null;
     const pack = try e.mods[3].function("tf_pack_kmajor");
+    const output_pack = try e.mods[3].function("tf_pack_output_lanevec");
     const grouped = try e.mods[0].function("tf_qmm_gdn_stream16");
     try grouped.allowDynamicShared(cuda.qlinear.out16_smem); // decodeMany's 16-row launch floor (35328 >= 22656)
     // its twin for dictionary-coded parts: a 256-column CTA's decoded scales and biases and its part's table
@@ -81,14 +82,14 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     };
     const down = try e.mods[0].function("tf_qmm_output_stream16");
     const out = try e.mods[0].function("tf_qmm_output_prefetch16");
-    try down.allowDynamicShared(35328);
+    try down.allowDynamicShared(cuda.qlinear.out16_lane_smem);
     // its twin for a dictionary-coded down/out/o projection: the table past the stages
     const down_dict: ?cuda.Function = if (e.affine.dict == null) null else blk: {
         const f = try e.mods[0].function("tf_qmm_output_stream16_dict");
-        try f.allowDynamicShared(35328 + @as(u32, @max(cuda.qlinear.dict_tab_max, cuda.qlinear.out_pair_tab_max)));
+        try f.allowDynamicShared(cuda.qlinear.out16_lane_smem + @as(u32, @max(cuda.qlinear.dict_tab_max, cuda.qlinear.out_pair_tab_max)));
         break :blk f;
     };
-    try out.allowDynamicShared(35328);
+    try out.allowDynamicShared(cuda.qlinear.out16_lane_smem);
     var buffer: ?cuda.DeviceBuffer = null;
     if (e.fast == null) {
         buffer = try cuda.DeviceBuffer.alloc(e.d, bytes);
@@ -118,7 +119,7 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
             count += 1;
             const q = p.a4;
             const words = q.npad * q.k / 8;
-            try e.run(pack, .{ (words + 255) / 256, 1, 1 }, .{ 256, 1, 1 },
+            try e.run(if (index < 2) output_pack else pack, .{ (words + 255) / 256, 1, 1 }, .{ 256, 1, 1 },
                 .{ q.w, dst, @as(c_int, @intCast(q.k / 64)), @as(c_int, @intCast(q.npad / 64)) });
         }
     };

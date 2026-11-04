@@ -4,9 +4,11 @@
 #include "qmm_dict.cuh"
 namespace tf_qmm_output_stream {
 using namespace qmm_frag;
-constexpr int Stage=4416, SliceBytes=Stage*2, Bytes=SliceBytes*4, OUT_PAIR_SMEM=14336;
+// Each lane directly reads its four immutable code words from a 16-byte-aligned lane-vector stream.
+// Shared stages retain only input rows, metadata and sums; native arithmetic and ownership are unchanged.
+constexpr int Stage=2368, SliceBytes=Stage*2, Bytes=SliceBytes*4, OUT_PAIR_SMEM=14336;
 
-// A dictionary-coded part (qmm_dict.cuh): a stage's 256 bytes at 4096 hold the group's index window in place of its
+// A dictionary-coded part (qmm_dict.cuh): a stage's 256 bytes at 2048 hold the group's index window in place of its
 // scales and biases; each slice decodes its group in registers via __shfl_sync, from the one table after Bytes.
 // The part's npad holds the code, so the word stream's tile count is the grid's (one CTA a 64-column tile).
 // (pair codes too: qmm_dict::dict_fetch_raw reads the column's pair entry, from the table here or through L2)
@@ -19,6 +21,8 @@ template<int FutureGroups,int Slices=4,int Rolling=0,bool DICT=false>
 __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const float* __restrict__ xs,
         const tf_qmm_group::Parts& parts,int M,int K,int ldx) {
     static_assert(!DICT||Rolling==0,"coded rolling prefetch is not implemented");
+    static_assert(Bytes>=Slices*2*4*128*sizeof(float),"ordered partials must fit retired stages");
+    static_assert(Slices==4,"slice-local barrier IDs require four native K slices");
     extern __shared__ __align__(128) unsigned char buf[];
     const auto p=parts.p[0];
     const int slice=threadIdx.x/128,tid=threadIdx.x%128,lane=tid&31,wn=tid>>5;
@@ -33,16 +37,17 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
     unsigned char* table=buf+Bytes;
     auto load_w=[&](int it){
         auto* dst=stage(it);const int g=g0+it;
-        cp16(dst+2048+tid*16,weight(g)+tid*16);
-        if constexpr(DICT){if(D.ok)cp16(dst+4096+tid*16,D.src+qmm_dict::dict_window(D,g));}
-        else if(tid<16){const auto* table=tid<8?p.scales:p.biases;cp16(dst+4096+tid*16,table+size_t(g)*p.npad+n0+(tid%8)*8);}
+        if constexpr(DICT){if(D.ok)cp16(dst+2048+tid*16,D.src+qmm_dict::dict_window(D,g));}
+        else if(tid<16){const auto* table=tid<8?p.scales:p.biases;cp16(dst+2048+tid*16,table+size_t(g)*p.npad+n0+(tid%8)*8);}
     };
     auto load_x=[&](int it){
         auto* dst=stage(it);const int row=tid/8,ch=tid%8,g=g0+it;
         cp16z(dst+row*128+swz<8>(row,ch)*16,x+size_t(min(row,rows-1))*ldx+g*64+ch*8,row<rows);
-        if(tid<16){if(tid<rows)cp4(dst+4352+tid*4,xs+size_t(tid)*KG+g);else *reinterpret_cast<float*>(dst+4352+tid*4)=0;}
+        if(tid<16){if(tid<rows)cp4(dst+2304+tid*4,xs+size_t(tid)*KG+g);else *reinterpret_cast<float*>(dst+2304+tid*4)=0;}
     };
     if constexpr(DICT)qmm_dict::dict_table<Slices*128>(p,table,threadIdx.x,OUT_PAIR_SMEM);
+    auto load_words=[&](int it){return *reinterpret_cast<const uint4*>(weight(g0+it)+tid*16);};
+    uint4 current_words=load_words(0), next_words=load_words(1); // match the original two-group lookahead
     load_w(0);commit();
 #if __CUDA_ARCH__ >= 900
     if(tid==0) {
@@ -66,6 +71,9 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
     float acc[2][4]{};
     const int b_off=DICT?(D.pair?0:16):0;
     for(int it=0;it<per;++it){
+        const uint4 words_now=current_words;
+        current_words=next_words;
+        if(it+2<per)next_words=load_words(it+2);
         #if __CUDA_ARCH__ >= 900
         if constexpr(Rolling>0)if(tid==0&&it+Rolling<per){
             const int g=g0+it+Rolling;const auto* w=weight(g);
@@ -75,17 +83,25 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
             asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(b) : "memory");
         }
 #endif
-        wait<0>();__syncthreads();
+        wait<0>();
+        // The immutable dictionary table is initialized by all CTA threads. After the
+        // first wait/barrier, each slice owns its two stages until the final reduction.
+        // A slice-local rendezvous publishes completed copies and protects stage reuse
+        // without forcing four independent K ranges to advance in lockstep.
+        if(it==0)__syncthreads();
+        else {
+            // Immediate IDs avoid reserving all sixteen named barriers for a dynamic ID.
+            if(slice==0)asm volatile("bar.sync 1, 128;" ::: "memory");
+            else if(slice==1)asm volatile("bar.sync 2, 128;" ::: "memory");
+            else if(slice==2)asm volatile("bar.sync 3, 128;" ::: "memory");
+            else asm volatile("bar.sync 4, 128;" ::: "memory");
+        }
         if(it+1<per){load_w(it+1);load_x(it+1);}commit();
-        const auto* at=stage(it);const auto* wp=reinterpret_cast<const uint32_t*>(at+2048);
+        const auto* at=stage(it);
         // the lane's scale or bias, fetched now and stored after the MMAs (a global pair table's latency)
-        uint32_t dv=0;if constexpr(DICT)dv=qmm_dict::dict_fetch_raw(D,at+4096,table,g0+it);
-        const auto* sp=reinterpret_cast<const __nv_bfloat16*>(DICT?dec:at+4096);const auto* sums=reinterpret_cast<const float*>(at+4352);
-        uint32_t words[2][2];
-#pragma unroll
-        for(int j=0;j<2;++j)
-#pragma unroll
-            for(int v=0;v<2;++v)words[j][v]=wp[((wn*2+j)*32+lane)*2+v];
+        uint32_t dv=0;if constexpr(DICT)dv=qmm_dict::dict_fetch_raw(D,at+2048,table,g0+it);
+        const auto* sp=reinterpret_cast<const __nv_bfloat16*>(DICT?dec:at+2048);const auto* sums=reinterpret_cast<const float*>(at+2304);
+        const uint32_t words[2][2]={{words_now.x,words_now.y},{words_now.z,words_now.w}};
         float d[2][4];
 #pragma unroll
         for(int kt=0;kt<4;++kt){

@@ -82,6 +82,17 @@ extern "C" __global__ void tf_pack_kmajor(const uint32_t* input, uint32_t* outpu
     output[(group*tiles+tile)*512+at%512]=input[at];
 }
 
+// Output-only K-major view: [group][tile][128 native threads][j=2][v=2].
+// A permutation of whole uint32 words, not a re-quantization. GDN and verify views stay unchanged.
+extern "C" __global__ void tf_pack_output_lanevec(const uint32_t* input, uint32_t* output, int groups, int tiles) {
+    const size_t at=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(at>=size_t(groups)*tiles*512)return;
+    const size_t panel=at/512,tile=panel/groups,group=panel%groups;
+    const int within=at%512,v=within&1,lane=(within>>1)&31,j=(within>>6)&7;
+    const int tid=(j/2)*32+lane;
+    output[(group*tiles+tile)*512+tid*4+(j&1)*2+v]=input[at];
+}
+
 // Dictionary coding of the tiled scales and biases (qmm_dict.cuh), built at engine open from their own values.
 // tf_dict_mark: a presence bit for every 16-bit value of a (kg, npad) array (2048 words, zeroed by the caller).
 extern "C" __global__ void tf_dict_mark(const uint16_t* __restrict__ v, long long count, uint32_t* __restrict__ bitmap) {
