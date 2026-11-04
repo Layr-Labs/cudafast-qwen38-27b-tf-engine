@@ -11,7 +11,10 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q0,
         const __nv_bfloat16* v0, const float* g0, const __nv_bfloat16* beta0, const Seg* segs,
         const SlotStep* steps, int layer, __nv_bfloat16* y0, const int* P) {
     constexpr int R = 4;
-    __shared__ float4 kept[4][SLOTS * R * 32];
+    // Each slot entry is written and read by the same lane. The two-slot scan
+    // keeps those lane-private snapshots in registers; the wider scan is unchanged.
+    __shared__ float4 kept[4][SLOTS == 2 ? 1 : SLOTS * R * 32];
+    float4 lane_slots[2][R];
     const int NK = geo.nk, NV = geo.nv;
     if (!EARLY) await_prior();
     if (past_windows(P, blockIdx.z / NV)) return;
@@ -139,7 +142,11 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q0,
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             if (step.read_slot >= 0 && step.read_slot != live_slot) {
-                const float4 t = slots[(step.read_slot * R + r) * 32 + dk];
+                float4 t;
+                if constexpr (SLOTS == 2)
+                    t = step.read_slot == 0 ? lane_slots[0][r] : lane_slots[1][r];
+                else
+                    t = slots[(step.read_slot * R + r) * 32 + dk];
                 state[r][0] = t.x;
                 state[r][1] = t.y;
                 state[r][2] = t.z;
@@ -184,7 +191,13 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q0,
                 state[r][i] = fmaf(kc[i], delta[r], state[r][i]);
                 pend[r] += state[r][i] * qc[i];
             }
-            if (step.write_slot >= 0) slots[(step.write_slot * R + r) * 32 + dk] = make_float4(state[r][0], state[r][1], state[r][2], state[r][3]);
+            if (step.write_slot >= 0) {
+                const float4 snapshot = make_float4(state[r][0], state[r][1], state[r][2], state[r][3]);
+                if constexpr (SLOTS == 2) {
+                    if (step.write_slot == 0) lane_slots[0][r] = snapshot;
+                    else lane_slots[1][r] = snapshot;
+                } else slots[(step.write_slot * R + r) * 32 + dk] = snapshot;
+            }
         }
         live_slot = step.write_slot >= 0 ? step.write_slot : -2;
         pend_row = row;
