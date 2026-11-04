@@ -43,6 +43,7 @@ pub const Kernels = struct {
     slots: usize,
     /// Native MLP, two-row normal/split projection, and three-row grouped projection.
     persistent_fns: [4]?Function = @splat(null),
+    tma_mlp: ?Function = null,
 
     /// From a loaded qmm_prefill module, on a device of `sms` SMs.
     pub fn resolve(prefill_mod: module.Module, sms: usize) !Kernels {
@@ -66,6 +67,12 @@ pub const Kernels = struct {
                 try kernel.allowDynamicShared(smem);
                 dest.* = kernel;
             }
+        }
+        if (sms == 48 and !disabled) {
+            if (prefill_mod.function("tf_qmm_prompt_mlp_tma")) |tf| {
+                try tf.allowDynamicShared(43008);
+                result.tma_mlp = tf;
+            } else |_| {}
         }
         return result;
     }
@@ -128,8 +135,19 @@ pub const Kernels = struct {
         g.add(act);
         for ([_]usize{ rows, k, k, group }) |v| g.add(@as(c_int, @intCast(v)));
         const blocks = rows_t * (gate.n / 64);
-        if (kk.slots == 96 and blocks > kk.slots and gate.n == 17408 and gate.k == 5120) if (kk.persistent_fns[0]) |f|
-            return kk.persistent(f, s, x, parts, act, rows, k, group, -1, blocks);
+        if (kk.slots == 96 and blocks > kk.slots and gate.n == 17408 and gate.k == 5120) {
+            if (kk.tma_mlp) |tf| if (tensorMap(s, x, rows, k)) |amap| {
+                var a: launch_.Args = .{};
+                a.add(x);
+                a.add(parts);
+                a.add(act);
+                for ([_]c_int{ @intCast(rows), @intCast(k), @intCast(k), @intCast(group), -1, @intCast(blocks), 1 }) |v| a.add(v);
+                a.add(amap);
+                try launch_.launch(tf, .{ .grid = .{ .x = @intCast(kk.slots) }, .block = .{ .x = threads }, .shared = 43008 }, s, &a);
+                return;
+            };
+            if (kk.persistent_fns[0]) |f| return kk.persistent(f, s, x, parts, act, rows, k, group, -1, blocks);
+        }
         try launch_.launch(kk.mlp_fn, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = threads }, .shared = smem }, s, &g);
     }
 
@@ -175,3 +193,21 @@ pub const Kernels = struct {
         try launch_.launch(kk.many_fn, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = threads }, .shared = smem }, s, &g);
     }
 };
+
+/// CUDA's opaque 128-byte tensor-map ABI. Encode for this launch's live BF16
+/// input; no descriptor or data is retained across phases or jobs.
+const TensorMap = extern struct { words: [16]u64 align(128) };
+const EncodeTiled = *const fn (*TensorMap, c_int, u32, ?*anyopaque, [*]const u64, [*]const u64, [*]const u32, [*]const u32, c_int, c_int, c_int, c_int) callconv(.c) c_int;
+fn tensorMap(s: Stream, x: u64, rows: usize, k: usize) ?TensorMap {
+    if (x % 16 != 0 or k % 64 != 0) return null;
+    var lib = s.d.lib;
+    const encode = lib.lookup(EncodeTiled, "cuTensorMapEncodeTiled") orelse return null;
+    var map: TensorMap = undefined;
+    const dims = [2]u64{ k, rows };
+    const strides = [1]u64{k * 2};
+    const box = [2]u32{ 64, 128 };
+    const steps = [2]u32{ 1, 1 };
+    // BFLOAT16=9; no interleave; 128-byte XOR swizzle=3; default L2/OOB.
+    if (encode(&map, 9, 2, @ptrFromInt(x), &dims, &strides, &box, &steps, 0, 3, 0, 0) != 0) return null;
+    return map;
+}

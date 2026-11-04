@@ -22,7 +22,7 @@ pub const Args = struct {
     pub const max_args = 48;
     pub const max_bytes = 2048;
 
-    storage: [max_bytes]u8 align(16) = undefined,
+    storage: [max_bytes]u8 align(128) = undefined,
     offsets: [max_args]u16 = undefined,
     sizes: [max_args]u16 = undefined,
     ptrs: [max_args]?*anyopaque = undefined,
