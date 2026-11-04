@@ -96,9 +96,16 @@ struct Stage {
     __align__(16) __nv_bfloat16 vs[STEPS][ROWS];
 };
 
-template <int ROWS, int STEPS, class Stager>
+// A follower's progress word: the rows of y this block has written, published with release semantics (the block's
+// earlier y stores are ordered before it by the barrier that precedes the publishing thread's store).
+__device__ __forceinline__ void publish(int* flag, int rows) {
+    asm volatile("st.global.release.gpu.b32 [%0], %1;\n" ::"l"(flag), "r"(rows) : "memory");
+}
+
+template <int ROWS, int STEPS, bool POST = false, class Stager>
 __device__ __forceinline__ void chain_body(Stager& pf, Stage<ROWS, STEPS>& sm, const float* state, float* last,
-                                           __nv_bfloat16* __restrict__ y, int W, int hv) {
+                                           __nv_bfloat16* __restrict__ y, int W, int hv, int* flag = nullptr,
+                                           const __nv_bfloat16* z = nullptr, const __nv_bfloat16* nw = nullptr, float eps = 0.0f) {
     const int sub = threadIdx.x & 3, h = sub >> 1, p = sub & 1;
     const int lr = 2 * (threadIdx.x >> 2);
     const int head = blockIdx.x, row = blockIdx.y * ROWS + lr;
@@ -119,6 +126,9 @@ __device__ __forceinline__ void chain_body(Stager& pf, Stage<ROWS, STEPS>& sm, c
     for (int t0 = 0; t0 < W; t0 += STEPS) {
         const int n = min(STEPS, W - t0);
         __syncthreads();
+        // a followed chain: every second stage, the rows before it (all written: every thread passed the barrier
+        // since). Here thread 0's fence waits only for its last y stores (its prefetch loads landed long ago).
+        if (flag != nullptr && threadIdx.x == 0 && t0 > 0 && (t0 / STEPS) % 2 == 0) publish(flag, t0);
         pf.store(sm);
         __syncthreads();
         if (t0 + STEPS < W) pf.fetch(t0 + STEPS);
@@ -176,10 +186,53 @@ __device__ __forceinline__ void chain_body(Stager& pf, Stage<ROWS, STEPS>& sm, c
                 out[r] = out[r] + __shfl_xor_sync(0xffffffffu, out[r], 1);
                 out[r] = out[r] + __shfl_xor_sync(0xffffffffu, out[r], 2);
             }
-            if (sub == 0)
-                *reinterpret_cast<__nv_bfloat162*>(y + (static_cast<size_t>(t0 + tt) * hv + head) * DV + row) =
-                        __floats2bfloat162_rn(out[0], out[1]);
+            if (sub == 0) {
+                // Preserve the shipped BF16 Y boundary, but keep a whole head in
+                // the stage after its V values have been consumed.
+                __nv_bfloat16* dst;
+                if constexpr (POST) dst = &sm.vs[tt][lr];
+                else dst = y + (static_cast<size_t>(t0 + tt) * hv + head) * DV + row;
+                *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(out[0], out[1]);
+            }
         }
+        if constexpr (POST) {
+            static_assert(ROWS == DV, "post requires a whole value head");
+            __syncthreads();
+            const int lane = threadIdx.x & 31;
+            const uint2 weights = *reinterpret_cast<const uint2*>(nw + lane * 4);
+            const __nv_bfloat16* wp = reinterpret_cast<const __nv_bfloat16*>(&weights);
+            // One warp per temporal row, exactly the follower's four adjacent
+            // channels per lane and XOR 16,8,4,2,1 reduction tree.
+            for (int tt = threadIdx.x / 32; tt < n; tt += 2 * ROWS / 32) {
+                const size_t at = (static_cast<size_t>(t0 + tt) * hv + head) * DV + lane * 4;
+                const uint2 yw = *reinterpret_cast<const uint2*>(&sm.vs[tt][lane * 4]);
+                const uint2 zw = *reinterpret_cast<const uint2*>(z + at);
+                const __nv_bfloat16* yp = reinterpret_cast<const __nv_bfloat16*>(&yw);
+                const __nv_bfloat16* zp = reinterpret_cast<const __nv_bfloat16*>(&zw);
+                float yv[4], ss = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    yv[j] = __bfloat162float(yp[j]);
+                    ss += yv[j] * yv[j];
+                }
+#pragma unroll
+                for (int m = 16; m; m >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, m);
+                const float inv = rsqrtf(ss / (float)DV + eps);
+                uint2 ow;
+                __nv_bfloat16* op = reinterpret_cast<__nv_bfloat16*>(&ow);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float x = __bfloat162float(__float2bfloat16_rn(__bfloat162float(wp[j]) * (yv[j] * inv)));
+                    const float zf = __bfloat162float(zp[j]);
+                    op[j] = __float2bfloat16_rn(zf / (1.0f + expf(-zf)) * x);
+                }
+                *reinterpret_cast<uint2*>(y + at) = ow;
+            }
+        }
+    }
+    if (flag != nullptr) {
+        __syncthreads();
+        if (threadIdx.x == 0) publish(flag, W);
     }
 #pragma unroll
     for (int r = 0; r < 2; ++r) {
@@ -324,8 +377,20 @@ extern "C" __global__ void __launch_bounds__(128) tf_gdn_chain_conv(
         const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ qkv,
         const __nv_bfloat16* __restrict__ cw, const __nv_bfloat16* __restrict__ tail, const int* __restrict__ rowpar,
         const __nv_bfloat16* __restrict__ ain, const __nv_bfloat16* __restrict__ bin, const float* __restrict__ alog,
-        const __nv_bfloat16* __restrict__ dt, float* state, __nv_bfloat16* __restrict__ y, int W, int hk, int hv) {
+        const __nv_bfloat16* __restrict__ dt, float* state, __nv_bfloat16* __restrict__ y, int W, int hk, int hv,
+        int* flags) {
     constexpr int ROWS = 64, STEPS = 16;
+    // flags (may be null): each block's progress word for qwen35.cu's tf_q35_gdn_post_follow, cleared before the
+    // follower can launch (programmatic dependent launch: once every block has passed launch_dependents)
+    int* flag = flags == nullptr ? nullptr : flags + 32 * (blockIdx.x * gridDim.y + blockIdx.y);  // a 128-byte line each
+    if (flag != nullptr) {
+        if (threadIdx.x == 0) {
+            *reinterpret_cast<volatile int*>(flag) = 0;
+            __threadfence();
+        }
+        __syncthreads();
+        asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+    }
     __shared__ __align__(16) Stage<ROWS, STEPS> sm;
     __shared__ __align__(16) __nv_bfloat16 xs[STEPS + 3][ROWS];
     const int head = blockIdx.x, C = (2 * hk + hv) * DK, c0 = 2 * hk * DK + head * DK + blockIdx.y * ROWS;
@@ -348,7 +413,40 @@ extern "C" __global__ void __launch_bounds__(128) tf_gdn_chain_conv(
     st.neg_a = -expf(alog[head]);
     st.dt = bf(dt[head]);
     st.wv = *reinterpret_cast<const uint2*>(cw + static_cast<size_t>(c0 + threadIdx.x % ROWS) * 4);
-    chain_body<ROWS, STEPS>(st, sm, state, state, y, W, hv);
+    chain_body<ROWS, STEPS>(st, sm, state, state, y, W, hv, flag);
+}
+
+// Whole-head prompt specialization: shared BF16 Y, no polling follower.
+extern "C" __global__ void __launch_bounds__(256) tf_gdn_chain_conv_post(
+        const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ qkv,
+        const __nv_bfloat16* __restrict__ cw, const __nv_bfloat16* __restrict__ tail, const int* __restrict__ rowpar,
+        const __nv_bfloat16* __restrict__ ain, const __nv_bfloat16* __restrict__ bin, const float* __restrict__ alog,
+        const __nv_bfloat16* __restrict__ dt, float* state, __nv_bfloat16* __restrict__ y, int W, int hk, int hv,
+        const __nv_bfloat16* __restrict__ z, const __nv_bfloat16* __restrict__ nw, float eps) {
+    constexpr int ROWS = 128, STEPS = 16;
+    __shared__ __align__(16) Stage<ROWS, STEPS> sm;
+    __shared__ __align__(16) __nv_bfloat16 xs[STEPS + 3][ROWS];
+    const int head = blockIdx.x, C = (2 * hk + hv) * DK, c0 = 2 * hk * DK + head * DK + blockIdx.y * ROWS;
+    Convolved<ROWS, STEPS> st;
+    st.xs = xs;
+    st.q = q;
+    st.k = k;
+    st.qkv = qkv;
+    st.tail = tail;
+    st.rowpar = rowpar;
+    st.ain = ain;
+    st.bin = bin;
+    st.W = W;
+    st.hk = hk;
+    st.hv = hv;
+    st.head = head;
+    st.key_head = head / (hv / hk);
+    st.C = C;
+    st.c0 = c0;
+    st.neg_a = -expf(alog[head]);
+    st.dt = bf(dt[head]);
+    st.wv = *reinterpret_cast<const uint2*>(cw + static_cast<size_t>(c0 + threadIdx.x % ROWS) * 4);
+    chain_body<ROWS, STEPS, true>(st, sm, state, state, y, W, hv, nullptr, z, nw, eps);
 }
 
 } // namespace tf_gdn_prefill
