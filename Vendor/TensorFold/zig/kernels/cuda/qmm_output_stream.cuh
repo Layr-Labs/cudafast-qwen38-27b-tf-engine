@@ -19,6 +19,7 @@ template<int FutureGroups,int Slices=4,int Rolling=0,bool DICT=false>
 __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const float* __restrict__ xs,
         const tf_qmm_group::Parts& parts,int M,int K,int ldx) {
     static_assert(!DICT||Rolling==0,"coded rolling prefetch is not implemented");
+    static_assert(Slices==4,"slice-local barrier IDs require four native K slices");
     extern __shared__ __align__(128) unsigned char buf[];
     const auto p=parts.p[0];
     const int slice=threadIdx.x/128,tid=threadIdx.x%128,lane=tid&31,wn=tid>>5;
@@ -75,17 +76,27 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
             asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(b) : "memory");
         }
 #endif
-        wait<0>();__syncthreads();
+        wait<0>();
+        // The immutable dictionary table is initialized by all CTA threads. After the
+        // first wait/barrier, each slice owns its two stages until the final reduction.
+        // A slice-local rendezvous publishes completed copies and protects stage reuse
+        // without forcing four independent K ranges to advance in lockstep.
+        if(it==0)__syncthreads();
+        else {
+            // Immediate IDs avoid reserving all sixteen named barriers for a dynamic ID.
+            if(slice==0)asm volatile("bar.sync 1, 128;" ::: "memory");
+            else if(slice==1)asm volatile("bar.sync 2, 128;" ::: "memory");
+            else if(slice==2)asm volatile("bar.sync 3, 128;" ::: "memory");
+            else asm volatile("bar.sync 4, 128;" ::: "memory");
+        }
         if(it+1<per){load_w(it+1);load_x(it+1);}commit();
-        const auto* at=stage(it);const auto* wp=reinterpret_cast<const uint32_t*>(at+2048);
+        const auto* at=stage(it);
+        // Producer cp16 and consumer uint4 share one lane's full word vector in immutable order.
+        const uint4 word_vector=*reinterpret_cast<const uint4*>(at+2048+tid*16);
         // the lane's scale or bias, fetched now and stored after the MMAs (a global pair table's latency)
         uint32_t dv=0;if constexpr(DICT)dv=qmm_dict::dict_fetch_raw(D,at+4096,table,g0+it);
         const auto* sp=reinterpret_cast<const __nv_bfloat16*>(DICT?dec:at+4096);const auto* sums=reinterpret_cast<const float*>(at+4352);
-        uint32_t words[2][2];
-#pragma unroll
-        for(int j=0;j<2;++j)
-#pragma unroll
-            for(int v=0;v<2;++v)words[j][v]=wp[((wn*2+j)*32+lane)*2+v];
+        const uint32_t words[2][2]={{word_vector.x,word_vector.y},{word_vector.z,word_vector.w}};
         float d[2][4];
 #pragma unroll
         for(int kt=0;kt<4;++kt){
