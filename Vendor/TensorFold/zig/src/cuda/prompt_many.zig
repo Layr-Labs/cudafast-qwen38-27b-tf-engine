@@ -22,6 +22,12 @@ pub const tile_n = 128;
 pub const threads = 128;
 /// Tile<64, 128, 128, 2, 2, 2>::SMEM: two stages of 128 input rows, 128 columns' words, scales and biases.
 pub const smem: u32 = 2 * (128 * 128 + 128 * 32 + 2 * 128 * 2);
+/// qmm_prompt_persist_wide.cuh: 256-column tiles on eight warps, one CTA an SM; two stages of 128 input rows and three
+/// of 256 columns' words, scales and biases.
+pub const wide_symbol = "_ZN22tf_qmm_persistent_wide6kernelILi128EEEvPK13__nv_bfloat16N14tf_qmm_prefill9ManyPartsEiiii";
+pub const wide_n = 256;
+pub const wide_threads = 256;
+pub const wide_smem: u32 = 2 * (128 * 128) + 3 * (256 * 32 + 2 * 256 * 2);
 
 /// qmm_prompt_many.cuh's ManyPart and ManyParts, passed by value.
 pub const Part = extern struct { w: u64, scales: u64, biases: u64, out: u64, n: c_int, npad: c_int, first: c_int };
@@ -29,7 +35,7 @@ pub const Parts = extern struct { p: [parts_max]Part, count: c_int };
 
 comptime {
     std.debug.assert(@sizeOf(Part) == 48 and @sizeOf(Parts) == 200);
-    std.debug.assert(smem == 41984);
+    std.debug.assert(smem == 41984 and wide_smem == 60416);
 }
 
 /// One projection of the shared input and its output rows.
@@ -43,6 +49,8 @@ pub const Kernels = struct {
     slots: usize,
     /// Native MLP, two-row normal/split projection, and three-row grouped projection.
     persistent_fns: [4]?Function = @splat(null),
+    /// The input projections' (GDN qkv, z, a, b; attention q, k, v) 256-column persistent kernel; TF_PROMPT_WIDE=0: none.
+    wide_fn: ?Function = null,
 
     /// From a loaded qmm_prefill module, on a device of `sms` SMs.
     pub fn resolve(prefill_mod: module.Module, sms: usize) !Kernels {
@@ -65,6 +73,12 @@ pub const Kernels = struct {
                 const kernel = try prefill_mod.function(name);
                 try kernel.allowDynamicShared(smem);
                 dest.* = kernel;
+            }
+            const no_wide = if (std.c.getenv("TF_PROMPT_WIDE")) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
+            if (!no_wide) {
+                const kernel = try prefill_mod.function(wide_symbol);
+                try kernel.allowDynamicShared(wide_smem);
+                result.wide_fn = kernel;
             }
         }
         return result;
@@ -165,6 +179,21 @@ pub const Kernels = struct {
             blocks += rows_t * ((o.q.n + tile_n - 1) / tile_n);
         }
         parts.count = @intCast(outs.len);
+        // GDN's and attention's input projections: 256-column tiles, each K group's input rows copied once for twice the
+        // columns (qmm_prompt_persist_wide.cuh), one CTA on each of the SMs
+        if (recurrentRole(outs) and kk.persistentRows(rows)) if (kk.wide_fn) |f| {
+            var wparts = parts;
+            var wblocks: usize = 0;
+            for (outs, 0..) |o, i| {
+                wparts.p[i].first = @intCast(wblocks);
+                wblocks += rows_t * ((o.q.n + wide_n - 1) / wide_n);
+            }
+            var g: launch_.Args = .{};
+            g.add(x);
+            g.add(wparts);
+            for ([_]usize{ rows, k, k, wblocks }) |v| g.add(@as(c_int, @intCast(v)));
+            return launch_.launch(f, .{ .grid = .{ .x = @intCast(@min(wblocks, kk.slots / 2)) }, .block = .{ .x = wide_threads }, .shared = wide_smem }, s, &g);
+        };
         const selected: ?usize = if (outputRole(outs)) 1 else if (recurrentRole(outs)) 3 else null;
         if (kk.persistentRows(rows) and blocks > kk.slots) if (selected) |index| if (kk.persistent_fns[index]) |f|
             return kk.persistent(f, s, x, parts, 0, rows, k, group, -1, blocks);

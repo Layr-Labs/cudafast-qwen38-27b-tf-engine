@@ -23,7 +23,7 @@ __device__ __forceinline__ void cp16p(void* dst, const void* src, bool p) {
 }
 
 // prompt_mlp_tile's outputs (gate and up through silu(gate) * up) with the barrier inside the group, two stages.
-template <int GS, int BM, int WM, int WN, int STAGES>
+template <int GS, int BM, int WM, int WN, int STAGES, int WD = 2>
 __device__ __forceinline__ void mlp_tile(const __nv_bfloat16* __restrict__ x, const ManyParts& parts, __nv_bfloat16* __restrict__ act, int M, int K,
         int ldx, int m0, int n0) {
     constexpr int BN = 128;
@@ -40,6 +40,11 @@ __device__ __forceinline__ void mlp_tile(const __nv_bfloat16* __restrict__ x, co
     const int N = G.n, npad = G.npad;
     const int KG = K / GS, per = KG, g0 = 0;
     auto stage = [&](int s) { return buf + s * T::STAGE; };
+    // WD = 3: the input rows keep two stages, the weights, scales and biases three (each read two groups after its copy
+    // is issued, the inputs one): input stage s at buf + s X, weight stage s after both input stages
+    static_assert(WD == 2 || WD == 3, "two or three weight stages");
+    auto xstage = [&](int s) { return WD == 2 ? stage(s) : buf + s * T::X; };
+    auto wstage = [&](int s) { return WD == 2 ? stage(s) + T::X : buf + 2 * T::X + s * (T::W + 2 * T::S); };
     constexpr int XC = BM * T::CHUNKS / T::THREADS, RSTEP = T::THREADS / T::CHUNKS;
     static_assert(T::THREADS % T::CHUNKS == 0 && XC * T::THREADS == BM * T::CHUNKS && RSTEP % T::CHUNKS == 0, "whole chunks");
     constexpr int TILE_BYTES = 64 * GS / 2, WC = (T::W / 16 + T::THREADS - 1) / T::THREADS;
@@ -62,15 +67,21 @@ __device__ __forceinline__ void mlp_tile(const __nv_bfloat16* __restrict__ x, co
     unsigned xok = 0;
 #pragma unroll
     for (int i = 0; i < XC; ++i) xok |= (m0 + r0 + i * RSTEP < M ? 1u : 0u) << i;
-    auto load = [&](int s, int g, bool go) {
-        unsigned char* p = stage(s);
+    auto load_x = [&](int s, int g, bool go) {
+        unsigned char* p = xstage(s);
 #pragma unroll
         for (int i = 0; i < XC; ++i)
             cp16p(p + xdst + i * RSTEP * T::ROW, xsrc + static_cast<size_t>(i * RSTEP) * ldx + g * GS, go && (xok >> i & 1u));
-        unsigned char* pw = p + T::X;
+    };
+    auto load_w = [&](int s, int g, bool go) {
+        unsigned char* pw = wstage(s);
 #pragma unroll
         for (int k = 0; k < WC; ++k) cp16p(pw + (tid + k * T::THREADS) * 16, wsrc[k] + static_cast<size_t>(g) * TILE_BYTES, go && wok[k]);
         cp16p(pw + T::W + sdst, ssrc + static_cast<size_t>(g) * npad, go && sok);
+    };
+    auto load = [&](int s, int g, bool go) {
+        load_x(s, g, go);
+        load_w(s, g, go);
     };
 
     float acc[T::MT][T::NT][4];
@@ -81,9 +92,9 @@ __device__ __forceinline__ void mlp_tile(const __nv_bfloat16* __restrict__ x, co
 #pragma unroll
             for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
     uint32_t words[T::NT][GS / 32], sv[T::NT], bv[T::NT];
-    auto read_w = [&](const unsigned char* p) {
-        const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
-        const uint16_t* ps = reinterpret_cast<const uint16_t*>(p + T::X + T::W);
+    auto read_w = [&](const unsigned char* q) {
+        const uint32_t* pw = reinterpret_cast<const uint32_t*>(q);
+        const uint16_t* ps = reinterpret_cast<const uint16_t*>(q + T::W);
 #pragma unroll
         for (int j = 0; j < T::NT; ++j) {
 #pragma unroll
@@ -104,23 +115,40 @@ __device__ __forceinline__ void mlp_tile(const __nv_bfloat16* __restrict__ x, co
                           fma2(pair(words[j][kt / 2], (kt & 1) * 8 + 4), sv[j], bv[j]));
     };
     // stage 0 in, visible, and its first operands in registers
-    load(0, g0, true);
-    commit();
-    wait<0>();
+    if constexpr (WD == 2) {
+        load(0, g0, true);
+        commit();
+        wait<0>();
+    } else {
+        load(0, g0, true);
+        commit();
+        load_w(1, g0 + (per > 1 ? 1 : 0), per > 1);
+        commit();
+        wait<1>();
+    }
     __syncthreads();
-    read_w(stage(0));
+    read_w(wstage(0));
 #pragma unroll
-    for (int i = 0; i < T::MT; ++i) load_a_row(stage(0), 0, i);
+    for (int i = 0; i < T::MT; ++i) load_a_row(xstage(0), 0, i);
     uint2 b[2];
     b[0] = weight_pair(0, 0);
     for (int it = 0; it < per; ++it) {
-        const unsigned char* p = stage(it & 1);
-        const unsigned char* pn = stage((it + 1) & 1);
+        const unsigned char* p = xstage(it & 1);
+        const unsigned char* pn = xstage((it + 1) & 1);
+        const unsigned char* wnext = wstage(WD == 2 ? (it + 1) & 1 : (it + 1) % 3);
         const bool more = it + 1 < per;
         // the other stage's last reader passed the barrier of the previous group (or the prologue's); a tile's last
         // group copies nothing
-        load((it + 1) & 1, g0 + (more ? it + 1 : it), more);
-        commit();
+        if constexpr (WD == 2) {
+            load((it + 1) & 1, g0 + (more ? it + 1 : it), more);
+            commit();
+        } else {
+            const bool ahead = it + 2 < per;
+            load_x((it + 1) & 1, g0 + (more ? it + 1 : it), more);
+            commit();
+            load_w((it + 2) % 3, g0 + (ahead ? it + 2 : it), ahead);
+            commit();
+        }
 #pragma unroll
         for (int kt = 0; kt < GS / 16; ++kt) {
 #pragma unroll
@@ -132,9 +160,10 @@ __device__ __forceinline__ void mlp_tile(const __nv_bfloat16* __restrict__ x, co
                     // every read of this stage is issued (A rows for this k16 step came in the previous one): the
                     // next stage may be read once landed, and this one refilled after the barrier. A tile's last
                     // group reads the other stage too; nothing uses what it reads.
-                    wait<0>();
+                    if constexpr (WD == 2) wait<0>();
+                    else wait<1>();
                     __syncthreads();
-                    read_w(pn);
+                    read_w(wnext);
                     b[slot ^ 1] = weight_pair(0, 0);
                 } else {
                     b[slot ^ 1] = weight_pair(next_j, next_kt);
@@ -176,7 +205,7 @@ __device__ __forceinline__ void mlp_tile(const __nv_bfloat16* __restrict__ x, co
 
 // prompt_tile's outputs (one projection, BN columns) with the barrier inside the group: mlp_tile's order (each A row
 // held for its k16 step and refilled after its last column, B pairs double buffered), two stages.
-template <int GS, int BM, int BN, int WM, int WN, int STAGES>
+template <int GS, int BM, int BN, int WM, int WN, int STAGES, int WD = 2>
 __device__ __forceinline__ void tile(
         const __nv_bfloat16* __restrict__ x, const uint32_t* __restrict__ w, const __nv_bfloat16* __restrict__ scales,
         const __nv_bfloat16* __restrict__ biases, void* __restrict__ out, int N, int npad, int M, int K, int ldx, int m0,
@@ -188,6 +217,11 @@ __device__ __forceinline__ void tile(
     const int wm = warp / WN, wn = warp % WN;
     const int KG = K / GS, per = KG, g0 = 0;
     auto stage = [&](int s) { return buf + s * T::STAGE; };
+    // WD = 3: the input rows keep two stages, the weights, scales and biases three (each read two groups after its copy
+    // is issued, the inputs one): input stage s at buf + s X, weight stage s after both input stages
+    static_assert(WD == 2 || WD == 3, "two or three weight stages");
+    auto xstage = [&](int s) { return WD == 2 ? stage(s) : buf + s * T::X; };
+    auto wstage = [&](int s) { return WD == 2 ? stage(s) + T::X : buf + 2 * T::X + s * (T::W + 2 * T::S); };
     static_assert(T::THREADS % T::CHUNKS == 0 && (BM * T::CHUNKS) % T::THREADS == 0, "whole input chunks a thread");
     constexpr int XC = BM * T::CHUNKS / T::THREADS, RSTEP = T::THREADS / T::CHUNKS;
     constexpr int TILE_BYTES = 64 * GS / 2, WC = (T::W / 16 + T::THREADS - 1) / T::THREADS;
@@ -209,15 +243,21 @@ __device__ __forceinline__ void tile(
     unsigned xok = 0;
 #pragma unroll
     for (int i = 0; i < XC; ++i) xok |= (m0 + r0 + i * RSTEP < M ? 1u : 0u) << i;
-    auto load = [&](int s, int g, bool go) {
-        unsigned char* p = stage(s);
+    auto load_x = [&](int s, int g, bool go) {
+        unsigned char* p = xstage(s);
 #pragma unroll
         for (int i = 0; i < XC; ++i)
             cp16p(p + xdst + i * RSTEP * T::ROW, xsrc + static_cast<size_t>(i * RSTEP) * ldx + g * GS, go && (xok >> i & 1u));
-        unsigned char* pw = p + T::X;
+    };
+    auto load_w = [&](int s, int g, bool go) {
+        unsigned char* pw = wstage(s);
 #pragma unroll
         for (int k = 0; k < WC; ++k) cp16p(pw + (tid + k * T::THREADS) * 16, wsrc[k] + static_cast<size_t>(g) * TILE_BYTES, go && wok[k]);
         cp16p(pw + T::W + sdst, ssrc + static_cast<size_t>(g) * npad, go && sok);
+    };
+    auto load = [&](int s, int g, bool go) {
+        load_x(s, g, go);
+        load_w(s, g, go);
     };
 
     float acc[T::MT][T::NT][4];
@@ -228,9 +268,9 @@ __device__ __forceinline__ void tile(
 #pragma unroll
             for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
     uint32_t words[T::NT][GS / 32], sv[T::NT], bv[T::NT];
-    auto read_w = [&](const unsigned char* p) {
-        const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
-        const uint16_t* ps = reinterpret_cast<const uint16_t*>(p + T::X + T::W);
+    auto read_w = [&](const unsigned char* q) {
+        const uint32_t* pw = reinterpret_cast<const uint32_t*>(q);
+        const uint16_t* ps = reinterpret_cast<const uint16_t*>(q + T::W);
 #pragma unroll
         for (int j = 0; j < T::NT; ++j) {
 #pragma unroll
@@ -250,22 +290,39 @@ __device__ __forceinline__ void tile(
         return make_uint2(fma2(pair(words[j][kt / 2], (kt & 1) * 8), sv[j], bv[j]),
                           fma2(pair(words[j][kt / 2], (kt & 1) * 8 + 4), sv[j], bv[j]));
     };
-    load(0, g0, true);
-    commit();
-    wait<0>();
+    if constexpr (WD == 2) {
+        load(0, g0, true);
+        commit();
+        wait<0>();
+    } else {
+        load(0, g0, true);
+        commit();
+        load_w(1, g0 + (per > 1 ? 1 : 0), per > 1);
+        commit();
+        wait<1>();
+    }
     __syncthreads();
-    read_w(stage(0));
+    read_w(wstage(0));
 #pragma unroll
-    for (int i = 0; i < T::MT; ++i) load_a_row(stage(0), 0, i);
+    for (int i = 0; i < T::MT; ++i) load_a_row(xstage(0), 0, i);
     uint2 b[2];
     b[0] = weight_pair(0, 0);
     static_assert((GS / 16 * T::NT) % 2 == 0, "B slots alternate evenly through a group");
     for (int it = 0; it < per; ++it) {
-        const unsigned char* p = stage(it & 1);
-        const unsigned char* pn = stage((it + 1) & 1);
+        const unsigned char* p = xstage(it & 1);
+        const unsigned char* pn = xstage((it + 1) & 1);
+        const unsigned char* wnext = wstage(WD == 2 ? (it + 1) & 1 : (it + 1) % 3);
         const bool more = it + 1 < per;
-        load((it + 1) & 1, g0 + (more ? it + 1 : it), more);
-        commit();
+        if constexpr (WD == 2) {
+            load((it + 1) & 1, g0 + (more ? it + 1 : it), more);
+            commit();
+        } else {
+            const bool ahead = it + 2 < per;
+            load_x((it + 1) & 1, g0 + (more ? it + 1 : it), more);
+            commit();
+            load_w((it + 2) % 3, g0 + (ahead ? it + 2 : it), ahead);
+            commit();
+        }
 #pragma unroll
         for (int kt = 0; kt < GS / 16; ++kt) {
 #pragma unroll
@@ -274,9 +331,10 @@ __device__ __forceinline__ void tile(
                 const int next_j = (j + 1) % T::NT, next_kt = kt + (j + 1 == T::NT);
                 const int slot = (kt * T::NT + j) & 1;
                 if (last) {
-                    wait<0>();
+                    if constexpr (WD == 2) wait<0>();
+                    else wait<1>();
                     __syncthreads();
-                    read_w(pn);
+                    read_w(wnext);
                     b[slot ^ 1] = weight_pair(0, 0);
                 } else {
                     b[slot ^ 1] = weight_pair(next_j, next_kt);
