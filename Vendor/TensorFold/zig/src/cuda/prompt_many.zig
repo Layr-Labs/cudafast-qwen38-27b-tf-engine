@@ -22,6 +22,9 @@ pub const tile_n = 128;
 pub const threads = 128;
 /// Tile<64, 128, 128, 2, 2, 2>::SMEM: two stages of 128 input rows, 128 columns' words, scales and biases.
 pub const smem: u32 = 2 * (128 * 128 + 128 * 32 + 2 * 128 * 2);
+/// The persistent kernels' tiles (qmm_prompt_pipe.cuh, WD = 3): two stages of input rows, three of words, scales and
+/// biases, so each group's weights are copied two groups ahead of their MMAs. Two CTAs still share a GB10 SM.
+pub const persistent_smem: u32 = 2 * (128 * 128) + 3 * (128 * 32 + 2 * 128 * 2);
 
 /// qmm_prompt_many.cuh's ManyPart and ManyParts, passed by value.
 pub const Part = extern struct { w: u64, scales: u64, biases: u64, out: u64, n: c_int, npad: c_int, first: c_int };
@@ -29,7 +32,7 @@ pub const Parts = extern struct { p: [parts_max]Part, count: c_int };
 
 comptime {
     std.debug.assert(@sizeOf(Part) == 48 and @sizeOf(Parts) == 200);
-    std.debug.assert(smem == 41984);
+    std.debug.assert(smem == 41984 and persistent_smem == 46592);
 }
 
 /// One projection of the shared input and its output rows.
@@ -63,7 +66,7 @@ pub const Kernels = struct {
             };
             for (names, &result.persistent_fns) |name, *dest| {
                 const kernel = try prefill_mod.function(name);
-                try kernel.allowDynamicShared(smem);
+                try kernel.allowDynamicShared(persistent_smem);
                 dest.* = kernel;
             }
         }
@@ -79,7 +82,7 @@ pub const Kernels = struct {
         g.add(full_cols);
         g.add(@as(c_int, @intCast(blocks)));
         g.add(@as(c_int, 1));
-        try launch_.launch(f, .{ .grid = .{ .x = @intCast(@min(blocks, kk.slots)) }, .block = .{ .x = threads }, .shared = smem }, s, &g);
+        try launch_.launch(f, .{ .grid = .{ .x = @intCast(@min(blocks, kk.slots)) }, .block = .{ .x = threads }, .shared = persistent_smem }, s, &g);
     }
 
     fn persistentRows(kk: *const Kernels, rows: usize) bool {
