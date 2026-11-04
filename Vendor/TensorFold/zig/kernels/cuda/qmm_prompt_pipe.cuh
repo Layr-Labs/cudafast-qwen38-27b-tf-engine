@@ -201,7 +201,9 @@ __device__ __forceinline__ void tile(
     for (int k = 0; k < WC; ++k) {
         const int c = tid + k * T::THREADS, t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
         wok[k] = c < T::W / 16 && n0 + t * 64 < npad;
-        wsrc[k] = reinterpret_cast<const unsigned char*>(w) + static_cast<size_t>(n0 / 64 + t) * KG * TILE_BYTES + off * 16;
+        // a 32-column tile starts at its column blocks inside the 64-column weight tile (each block 256 bytes a group)
+        const int within = BN < 64 ? ((n0 & 63) >> 3) * (TILE_BYTES / 8) : 0;
+        wsrc[k] = reinterpret_cast<const unsigned char*>(w) + static_cast<size_t>(n0 / 64 + t) * KG * TILE_BYTES + within + off * 16;
     }
     const bool sok = tid < 2 * (T::S / 16) && n0 + (tid % (T::S / 16)) * 8 < npad;
     const __nv_bfloat16* ssrc = ((tid / (T::S / 16)) ? biases : scales) + n0 + (tid % (T::S / 16)) * 8;

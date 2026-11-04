@@ -12,10 +12,12 @@ const qlinear = @import("qlinear.zig");
 const Function = module.Function;
 const Stream = stream_.Stream;
 const Affine4 = qlinear.Affine4;
+const bal = @import("prompt_bal.zig");
 
 pub const symbol = "tf_qmm_prompt_many";
 pub const mlp_symbol = "tf_qmm_prompt_mlp";
 pub const split_symbol = "tf_qmm_prompt_split";
+pub const bal_symbol = "_ZN21tf_qmm_persistent_bal6kernelILi128ELi1EEEvPK13__nv_bfloat16N14tf_qmm_prefill9ManyPartsENS_5SchedEiii";
 pub const parts_max = 4;
 pub const tile_m = 128;
 pub const tile_n = 128;
@@ -43,6 +45,8 @@ pub const Kernels = struct {
     slots: usize,
     /// Native MLP, two-row normal/split projection, and three-row grouped projection.
     persistent_fns: [4]?Function = @splat(null),
+    /// qmm_prompt_persist_bal.cuh: a 5120-column output projection of four row bands on the balanced slot lists.
+    bal_fn: ?Function = null,
 
     /// From a loaded qmm_prefill module, on a device of `sms` SMs.
     pub fn resolve(prefill_mod: module.Module, sms: usize) !Kernels {
@@ -65,6 +69,13 @@ pub const Kernels = struct {
                 const kernel = try prefill_mod.function(name);
                 try kernel.allowDynamicShared(smem);
                 dest.* = kernel;
+            }
+            // TF_PROMPT_BAL=0: the output projections keep the split schedule
+            const no_bal = if (std.c.getenv("TF_PROMPT_BAL")) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
+            if (!no_bal) {
+                const kernel = try prefill_mod.function(bal_symbol);
+                try kernel.allowDynamicShared(smem);
+                result.bal_fn = kernel;
             }
         }
         return result;
@@ -149,6 +160,19 @@ pub const Kernels = struct {
             g.add(part);
             for ([_]usize{ rows, k, k, group, full_cols }) |v| g.add(@as(c_int, @intCast(v)));
             const blocks = rows_t * (full_cols / tile_n) + rows_t * ((o.q.n - full_cols) / (tile_n / 2));
+            // four row bands of a 5120-column output projection: each SM's two slots take equal shares of 64- and
+            // 32-column tiles past the first 24 panels (prompt_bal.zig), where the split leaves a second wave a third full
+            if (kk.slots == bal.slots and rows_t == bal.bands and o.q.n == bal.cols and outputRole(outs)) if (kk.bal_fn) |f| {
+                var parts: Parts = std.mem.zeroes(Parts);
+                parts.count = 1;
+                parts.p[0] = part;
+                var g2: launch_.Args = .{};
+                g2.add(x);
+                g2.add(parts);
+                g2.add(bal.sched);
+                for ([_]usize{ rows, k, k }) |v| g2.add(@as(c_int, @intCast(v)));
+                return launch_.launch(f, .{ .grid = .{ .x = bal.slots }, .block = .{ .x = threads }, .shared = smem }, s, &g2);
+            };
             if (kk.persistentRows(rows) and outputRole(outs)) if (kk.persistent_fns[2]) |f| {
                 var parts: Parts = std.mem.zeroes(Parts);
                 parts.count = 1;
