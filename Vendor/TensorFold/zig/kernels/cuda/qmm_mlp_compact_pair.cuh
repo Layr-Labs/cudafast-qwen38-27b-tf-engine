@@ -13,69 +13,47 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
                                               float* __restrict__ as, int M, int K, int ldx, int rows_t) {
     constexpr int GS = 64, BM = 16, WM = 1, WN = 4;
     using Base = LaneTile<GS, BM, BN, WM, WN, STAGES>;
+    // Gate and up keep the original two-warp column ownership, each with its own ring and sums.
+    // Two groups advance independently; they meet only for the existing BF16 activation epilogue.
     struct T : Base {
-        // XT: the group's x tile (BM rows of 64 bf16), staged with the weights
-        enum { X = 0, W = BN * GS / 2, S = 256, XT = W + 2 * S + BM * 4, STAGE = XT + BM * GS * 2,
-               SMEM = STAGES * STAGE };
+        enum { X=0, W=BN*GS/4, S=128, STAGE=W+2*S+BM*4, SMEM=2*STAGES*STAGE };
     };
-    constexpr int PASSES = BN / WN / 32;
-    static_assert(T::SMEM == 21632, "compact pair pipeline footprint");
-    constexpr int I = T::MT, J = T::NT;
+    constexpr int PASSES=BN/WN/32;
+    static_assert(T::SMEM==17664,"two independent two-warp compact pair pipelines");
+    constexpr int I=T::MT,J=T::NT;
     extern __shared__ __align__(128) unsigned char buf[];
-    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const int wm = warp / WN, wn = warp % WN;
-    const int KG = K / GS, cid = blockIdx.x, rank = 0;
-    const Part P = parts.p[rank];
-    const int tile = cid / rows_t;
-    const int m0 = cid % rows_t * BM, n0 = tile * (BN / 2), per = KG, g0 = 0;
-
-    auto stage = [&](int s) { return buf + s * T::STAGE; };
-    const int rows = min(BM, M - m0);
-    constexpr int TILE_BYTES = 64 * GS / 2;
-    constexpr int WC = (T::W / 16 + T::THREADS - 1) / T::THREADS;
-    const unsigned char* wsrc[WC];
-    int wdst[WC];
-    bool wok[WC];
+    const int tid=threadIdx.x,lane=tid&31,warp=tid>>5;
+    const int wm=warp/WN,wn=warp%WN,mpart=wn/2,local_tid=tid&63;
+    const int KG=K/GS,cid=blockIdx.x,rank=0;
+    const Part P=parts.p[rank];
+    const int tile=cid/rows_t;
+    const int m0=cid%rows_t*BM,n0=tile*(BN/2),per=KG,g0=0;
+    auto stage=[&](int st){return buf+(mpart*STAGES+st)*T::STAGE;};
+    const int rows=min(BM,M-m0);
+    constexpr int TILE_BYTES=64*GS/2;
+    constexpr int WC=(T::W/16+63)/64;
+    const unsigned char* wsrc[WC];int wdst[WC];bool wok[WC];
 #pragma unroll
-    for (int j = 0; j < WC; ++j) {
-        const int c = tid + j * T::THREADS, t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
-        wok[j] = c < T::W / 16;
-        wsrc[j] = reinterpret_cast<const unsigned char*>(parts.p[t / (BN / 128)].w) + static_cast<size_t>(n0 / 64 + t % (BN / 128)) * (KMAJOR ? 1 : KG) * TILE_BYTES +
-                  off * 16;
-        wdst[j] = T::X + c * 16;
+    for(int j=0;j<WC;++j){
+        const int c=local_tid+j*64,t=c/(TILE_BYTES/16),off=c%(TILE_BYTES/16);
+        wok[j]=c<T::W/16;
+        wsrc[j]=reinterpret_cast<const unsigned char*>(parts.p[mpart].w)+size_t(n0/64+t)*(KMAJOR?1:KG)*TILE_BYTES+off*16;
+        wdst[j]=c*16;
     }
-    static_assert(KMAJOR && BN == 256 && WN == 4);
-    const int code0 = parts.p[0].first, code1 = parts.p[1].first;
-    const int bits0 = dict_bits(code0), bits1 = dict_bits(code1);
-    const int run0 = bits0, run1 = bits1;
-    const bool dok = tid < run0 + run1;
-    const int dpart = tid < run0 ? 0 : 1, dchunk = tid < run0 ? tid : tid - run0;
-    const int dstep = dict_step(dpart ? code1 : code0);
-    const unsigned char* dsrc = reinterpret_cast<const unsigned char*>(parts.p[dpart].scales) +
-                                static_cast<size_t>(n0 / 64) * dstep + dchunk * 16;
-    const int dpitch = P.npad / 64 * dstep;
-    const int ddst = T::X + T::W + (dpart ? 16 * run0 : 0) + dchunk * 16;
-    const int mpart = wn / 2, mbits = mpart ? bits1 : bits0;
-    const uint32_t mmask = (1u << mbits) - 1u;
-    const int mrun = mpart ? 16 * run0 : 0;
-    const uint32_t* const mgtab = reinterpret_cast<const uint32_t*>(parts.p[mpart].biases);
-    const bool xsok = tid < rows;
-    const float* xssrc = xs + static_cast<size_t>(m0 + min(tid, rows - 1)) * KG;
-    // x's 16 rows of the group: 16-byte chunk ch of row r at slot ch ^ (r & 7) (rows past M repeat the last one: their
-    // products are never stored); the fragments below read the same bf16 words the x rows hold
-    const int xr = tid >> 3, xch = tid & 7;
-    const __nv_bfloat16* xtsrc = x + static_cast<size_t>(m0 + min(xr, rows - 1)) * ldx + xch * 8;
-    const int xtdst = T::XT + xr * 128 + ((xch ^ (xr & 7)) * 16);
-    auto load_x = [&](int s, int g) {
-        if (xsok) cp4(stage(s) + T::W + 2 * T::S + tid * 4, xssrc + g);
-        cp16(stage(s) + xtdst, xtsrc + g * GS);
-    };
-    auto load_w = [&](int s, int g) {
-        unsigned char* p = stage(s);
+    const int code=parts.p[mpart].first,mbits=dict_bits(code),dstep=dict_step(code);
+    const bool dok=local_tid<mbits;
+    const auto* dsrc=reinterpret_cast<const unsigned char*>(parts.p[mpart].scales)+size_t(n0/64)*dstep+local_tid*16;
+    const int dpitch=P.npad/64*dstep;
+    const uint32_t mmask=(1u<<mbits)-1u;
+    const uint32_t* const mgtab=reinterpret_cast<const uint32_t*>(parts.p[mpart].biases);
+    const bool xsok=local_tid<rows;
+    const float* xssrc=xs+size_t(m0+min(local_tid,rows-1))*KG;
+    auto load_x=[&](int st,int g){if(xsok)cp4(stage(st)+T::W+2*T::S+local_tid*4,xssrc+g);};
+    auto load_w=[&](int st,int g){
+        auto* dst=stage(st);
 #pragma unroll
-        for (int j = 0; j < WC; ++j)
-            if (wok[j]) cp16(p + wdst[j], wsrc[j] + static_cast<size_t>(g) * (KMAJOR ? P.npad / 64 : 1) * TILE_BYTES);
-        if (dok) cp16(p + ddst, dsrc + static_cast<size_t>(g) * dpitch);
+        for(int j=0;j<WC;++j)if(wok[j])cp16(dst+wdst[j],wsrc[j]+size_t(g)*(KMAJOR?P.npad/64:1)*TILE_BYTES);
+        if(dok)cp16(dst+T::W+local_tid*16,dsrc+size_t(g)*dpitch);
     };
     uint32_t mask;
     asm volatile("mov.b32 %0, 0x000F000F;\n" : "=r"(mask));
@@ -104,31 +82,14 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     grid_launch();
     for (int it = 0; it < per; ++it) {
         wait<0>();
-        __syncthreads();
-        uint32_t av[GS / 16][I][4];
-        {
-            const unsigned char* xt = stage(it % STAGES) + T::XT;
-            const int b = (2 * (lane & 3)) * 2;
-#pragma unroll
-            for (int kt = 0; kt < GS / 16; ++kt)
-#pragma unroll
-                for (int i = 0; i < I; ++i) {
-                    const int r = wm * (BM / WM) + i * 16 + (lane >> 2);
-                    auto at = [&](int row, int ch) {
-                        return *reinterpret_cast<const uint32_t*>(xt + row * 128 + ((ch ^ (row & 7)) * 16) + b);
-                    };
-                    av[kt][i][0] = at(r, 2 * kt);
-                    av[kt][i][1] = at(r + 8, 2 * kt);
-                    av[kt][i][2] = at(r, 2 * kt + 1);
-                    av[kt][i][3] = at(r + 8, 2 * kt + 1);
-                }
-        }
+        if(mpart==0)asm volatile("bar.sync 1, 64;" ::: "memory");
+        else asm volatile("bar.sync 2, 64;" ::: "memory");
         const int next = it + 1;
         if (next < per) { load_x(next % STAGES, next); load_w(next % STAGES, next); }
         commit();
         const unsigned char* p = stage(it % STAGES);
         const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
-        const uint32_t* pk = reinterpret_cast<const uint32_t*>(p + T::X + T::W + mrun);
+        const uint32_t* pk = reinterpret_cast<const uint32_t*>(p + T::X + T::W);
         uint32_t pe[PASSES] = {};
         {
 #pragma unroll
@@ -142,7 +103,21 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
 #pragma unroll
         for (int j = 0; j < T::NT; ++j)
 #pragma unroll
-            for (int v = 0; v < GS / 32; ++v) words[j][v] = pw[((wn * T::NT + j) * 32 + lane) * (GS / 32) + v];
+            for (int v = 0; v < GS / 32; ++v) words[j][v] = pw[(((wn % 2) * T::NT + j) * 32 + lane) * (GS / 32) + v];
+        uint32_t av[GS / 16][I][4];
+#pragma unroll
+        for (int kt = 0; kt < GS / 16; ++kt)
+#pragma unroll
+            for (int i = 0; i < I; ++i) {
+                const int r = wm * (BM / WM) + i * 16 + (lane >> 2);
+                const int c = it * GS + kt * 16 + 2 * (lane & 3);
+                const __nv_bfloat16* a0 = x_ready + static_cast<size_t>(m0 + r) * ldx + c;
+                const __nv_bfloat16* a1 = a0 + 8 * ldx;
+                av[kt][i][0] = compact_load_a(a0);
+                av[kt][i][1] = compact_load_a(a1);
+                av[kt][i][2] = compact_load_a(a0 + 8);
+                av[kt][i][3] = compact_load_a(a1 + 8);
+            }
         float xv[I][2];
 #pragma unroll
         for (int i = 0; i < I; ++i) {
