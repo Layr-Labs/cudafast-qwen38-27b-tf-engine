@@ -96,9 +96,15 @@ struct Stage {
     __align__(16) __nv_bfloat16 vs[STEPS][ROWS];
 };
 
+// A follower's progress word: the rows of y this block has written, published with release semantics (the block's
+// earlier y stores are ordered before it by the barrier that precedes the publishing thread's store).
+__device__ __forceinline__ void publish(int* flag, int rows) {
+    asm volatile("st.global.release.gpu.b32 [%0], %1;\n" ::"l"(flag), "r"(rows) : "memory");
+}
+
 template <int ROWS, int STEPS, class Stager>
 __device__ __forceinline__ void chain_body(Stager& pf, Stage<ROWS, STEPS>& sm, const float* state, float* last,
-                                           __nv_bfloat16* __restrict__ y, int W, int hv) {
+                                           __nv_bfloat16* __restrict__ y, int W, int hv, int* flag = nullptr) {
     const int sub = threadIdx.x & 3, h = sub >> 1, p = sub & 1;
     const int lr = 2 * (threadIdx.x >> 2);
     const int head = blockIdx.x, row = blockIdx.y * ROWS + lr;
@@ -119,6 +125,9 @@ __device__ __forceinline__ void chain_body(Stager& pf, Stage<ROWS, STEPS>& sm, c
     for (int t0 = 0; t0 < W; t0 += STEPS) {
         const int n = min(STEPS, W - t0);
         __syncthreads();
+        // a followed chain: every second stage, the rows before it (all written: every thread passed the barrier
+        // since). Here thread 0's fence waits only for its last y stores (its prefetch loads landed long ago).
+        if (flag != nullptr && threadIdx.x == 0 && t0 > 0 && (t0 / STEPS) % 2 == 0) publish(flag, t0);
         pf.store(sm);
         __syncthreads();
         if (t0 + STEPS < W) pf.fetch(t0 + STEPS);
@@ -180,6 +189,10 @@ __device__ __forceinline__ void chain_body(Stager& pf, Stage<ROWS, STEPS>& sm, c
                 *reinterpret_cast<__nv_bfloat162*>(y + (static_cast<size_t>(t0 + tt) * hv + head) * DV + row) =
                         __floats2bfloat162_rn(out[0], out[1]);
         }
+    }
+    if (flag != nullptr) {
+        __syncthreads();
+        if (threadIdx.x == 0) publish(flag, W);
     }
 #pragma unroll
     for (int r = 0; r < 2; ++r) {
@@ -324,8 +337,20 @@ extern "C" __global__ void __launch_bounds__(128) tf_gdn_chain_conv(
         const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ qkv,
         const __nv_bfloat16* __restrict__ cw, const __nv_bfloat16* __restrict__ tail, const int* __restrict__ rowpar,
         const __nv_bfloat16* __restrict__ ain, const __nv_bfloat16* __restrict__ bin, const float* __restrict__ alog,
-        const __nv_bfloat16* __restrict__ dt, float* state, __nv_bfloat16* __restrict__ y, int W, int hk, int hv) {
+        const __nv_bfloat16* __restrict__ dt, float* state, __nv_bfloat16* __restrict__ y, int W, int hk, int hv,
+        int* flags) {
     constexpr int ROWS = 64, STEPS = 16;
+    // flags (may be null): each block's progress word for qwen35.cu's tf_q35_gdn_post_follow, cleared before the
+    // follower can launch (programmatic dependent launch: once every block has passed launch_dependents)
+    int* flag = flags == nullptr ? nullptr : flags + 32 * (blockIdx.x * gridDim.y + blockIdx.y);  // a 128-byte line each
+    if (flag != nullptr) {
+        if (threadIdx.x == 0) {
+            *reinterpret_cast<volatile int*>(flag) = 0;
+            __threadfence();
+        }
+        __syncthreads();
+        asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+    }
     __shared__ __align__(16) Stage<ROWS, STEPS> sm;
     __shared__ __align__(16) __nv_bfloat16 xs[STEPS + 3][ROWS];
     const int head = blockIdx.x, C = (2 * hk + hv) * DK, c0 = 2 * hk * DK + head * DK + blockIdx.y * ROWS;
@@ -348,7 +373,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_gdn_chain_conv(
     st.neg_a = -expf(alog[head]);
     st.dt = bf(dt[head]);
     st.wv = *reinterpret_cast<const uint2*>(cw + static_cast<size_t>(c0 + threadIdx.x % ROWS) * 4);
-    chain_body<ROWS, STEPS>(st, sm, state, state, y, W, hv);
+    chain_body<ROWS, STEPS>(st, sm, state, state, y, W, hv, flag);
 }
 
 } // namespace tf_gdn_prefill
