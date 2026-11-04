@@ -19,6 +19,7 @@ template<int FutureGroups,int Slices=4,int Rolling=0,bool DICT=false>
 __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const float* __restrict__ xs,
         const tf_qmm_group::Parts& parts,int M,int K,int ldx) {
     static_assert(!DICT||Rolling==0,"coded rolling prefetch is not implemented");
+    static_assert(Slices==4,"slice-local barrier IDs require four native K slices");
     extern __shared__ __align__(128) unsigned char buf[];
     const auto p=parts.p[0];
     const int slice=threadIdx.x/128,tid=threadIdx.x%128,lane=tid&31,wn=tid>>5;
@@ -75,7 +76,19 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
             asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(b) : "memory");
         }
 #endif
-        wait<0>();__syncthreads();
+        wait<0>();
+        // The immutable dictionary table is initialized by all CTA threads. After the
+        // first wait/barrier, each slice owns its two stages until the final reduction.
+        // A slice-local rendezvous publishes completed copies and protects stage reuse
+        // without forcing four independent K ranges to advance in lockstep.
+        if(it==0)__syncthreads();
+        else {
+            // Immediate IDs avoid reserving all sixteen named barriers for a dynamic ID.
+            if(slice==0)asm volatile("bar.sync 1, 128;" ::: "memory");
+            else if(slice==1)asm volatile("bar.sync 2, 128;" ::: "memory");
+            else if(slice==2)asm volatile("bar.sync 3, 128;" ::: "memory");
+            else asm volatile("bar.sync 4, 128;" ::: "memory");
+        }
         if(it+1<per){load_w(it+1);load_x(it+1);}commit();
         const auto* at=stage(it);const auto* wp=reinterpret_cast<const uint32_t*>(at+2048);
         // the lane's scale or bias, fetched now and stored after the MMAs (a global pair table's latency)
@@ -115,12 +128,17 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
             for(int e=0;e<4;++e)acc[j][e]=__fmaf_rn(xv[e>>1],bv[e&1],__fmaf_rn(d[j][e],sv[e&1],acc[j][e]));
         }
     }
-    wait<0>();__syncthreads();auto* partial=reinterpret_cast<float*>(buf);
+    wait<0>();
+    // The final loop-entry slice rendezvous retired the previous stage. With
+    // no future-group prefetch left, that sibling is free even while peers
+    // finish reading their current stage. Each slice owns a disjoint sibling.
+    static_assert(2 * 4 * 128 * sizeof(float) <= Stage);
+    auto* partial=reinterpret_cast<float*>(local+(per&1)*Stage);
     if(slice!=0){
 #pragma unroll
         for(int j=0;j<2;++j)
 #pragma unroll
-            for(int e=0;e<4;++e)partial[((slice*2+j)*4+e)*128+tid]=acc[j][e];
+            for(int e=0;e<4;++e)partial[(j*4+e)*128+tid]=acc[j][e];
     }
     __syncthreads();
     if(slice==0){
@@ -128,7 +146,7 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
 #pragma unroll
             for(int j=0;j<2;++j)
 #pragma unroll
-                for(int e=0;e<4;++e)acc[j][e]=acc[j][e]+partial[((peer*2+j)*4+e)*128+tid];
+                for(int e=0;e<4;++e)acc[j][e]=acc[j][e]+reinterpret_cast<const float*>(buf+peer*SliceBytes+(per&1)*Stage)[(j*4+e)*128+tid];
 #pragma unroll
         for(int j=0;j<2;++j)
 #pragma unroll
