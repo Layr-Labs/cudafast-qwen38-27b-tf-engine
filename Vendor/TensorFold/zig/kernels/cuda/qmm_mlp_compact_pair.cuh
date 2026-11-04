@@ -14,12 +14,12 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     constexpr int GS = 64, BM = 16, WM = 1, WN = 4;
     using Base = LaneTile<GS, BM, BN, WM, WN, STAGES>;
     struct T : Base {
-        // XT: the group's x tile (BM rows of 64 bf16), staged with the weights
-        enum { X = 0, W = BN * GS / 2, S = 256, XT = W + 2 * S + BM * 4, STAGE = XT + BM * GS * 2,
+        enum { X = 0, W = BN * GS / 2, S = 256, STAGE = W + 2 * S + BM * 4,
                SMEM = STAGES * STAGE };
     };
     constexpr int PASSES = BN / WN / 32;
-    static_assert(T::SMEM == 21632, "compact pair pipeline footprint");
+    static_assert(STAGES == 2, "pair lookahead uses a two-slot index ring");
+    static_assert(T::SMEM == 17536, "compact pair pipeline footprint");
     constexpr int I = T::MT, J = T::NT;
     extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -61,21 +61,27 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     const uint32_t* const mgtab = reinterpret_cast<const uint32_t*>(parts.p[mpart].biases);
     const bool xsok = tid < rows;
     const float* xssrc = xs + static_cast<size_t>(m0 + min(tid, rows - 1)) * KG;
-    // x's 16 rows of the group: 16-byte chunk ch of row r at slot ch ^ (r & 7) (rows past M repeat the last one: their
-    // products are never stored); the fragments below read the same bf16 words the x rows hold
-    const int xr = tid >> 3, xch = tid & 7;
-    const __nv_bfloat16* xtsrc = x + static_cast<size_t>(m0 + min(xr, rows - 1)) * ldx + xch * 8;
-    const int xtdst = T::XT + xr * 128 + ((xch ^ (xr & 7)) * 16);
     auto load_x = [&](int s, int g) {
         if (xsok) cp4(stage(s) + T::W + 2 * T::S + tid * 4, xssrc + g);
-        cp16(stage(s) + xtdst, xtsrc + g * GS);
     };
     auto load_w = [&](int s, int g) {
         unsigned char* p = stage(s);
 #pragma unroll
         for (int j = 0; j < WC; ++j)
             if (wok[j]) cp16(p + wdst[j], wsrc[j] + static_cast<size_t>(g) * (KMAJOR ? P.npad / 64 : 1) * TILE_BYTES);
-        if (dok) cp16(p + ddst, dsrc + static_cast<size_t>(g) * dpitch);
+    };
+    // Index transport is independent of packed weights: prime one group ahead.
+    auto load_idx = [&](int slot, int g) {
+        if (dok) cp16(stage(slot) + ddst, dsrc + static_cast<size_t>(g) * dpitch);
+    };
+    auto decode_idx = [&](int slot, uint32_t (&entries)[PASSES]) {
+        const uint32_t* pk = reinterpret_cast<const uint32_t*>(stage(slot) + T::X + T::W + mrun);
+#pragma unroll
+        for (int pass = 0; pass < PASSES; ++pass) {
+            const int c = (wn % 2) * (BN / WN) + pass * 32 + lane;
+            const int off = (c / 64 * 64 + c % 64) * mbits;
+            entries[pass] = __ldg(mgtab + (__funnelshift_r(pk[off >> 5], pk[(off >> 5) + 1], off & 31) & mmask));
+        }
     };
     uint32_t mask;
     asm volatile("mov.b32 %0, 0x000F000F;\n" : "=r"(mask));
@@ -90,6 +96,10 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
 #pragma unroll
     for (int s = 0; s < STAGES - 1; ++s) {
         if (s < per) load_w(s, g0 + s);
+        if (s == 0) {
+            if (per > 0) load_idx(0, 0);
+            if (per > 1) load_idx(1, 1);
+        }
         commit();
     }
     grid_wait();
@@ -102,47 +112,44 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
         commit();
     }
     grid_launch();
+    uint32_t pe[PASSES] = {};
+    wait<0>();
+    __syncthreads();
+    if (per > 0) decode_idx(0, pe);
     for (int it = 0; it < per; ++it) {
         wait<0>();
         __syncthreads();
-        uint32_t av[GS / 16][I][4];
-        {
-            const unsigned char* xt = stage(it % STAGES) + T::XT;
-            const int b = (2 * (lane & 3)) * 2;
-#pragma unroll
-            for (int kt = 0; kt < GS / 16; ++kt)
-#pragma unroll
-                for (int i = 0; i < I; ++i) {
-                    const int r = wm * (BM / WM) + i * 16 + (lane >> 2);
-                    auto at = [&](int row, int ch) {
-                        return *reinterpret_cast<const uint32_t*>(xt + row * 128 + ((ch ^ (row & 7)) * 16) + b);
-                    };
-                    av[kt][i][0] = at(r, 2 * kt);
-                    av[kt][i][1] = at(r + 8, 2 * kt);
-                    av[kt][i][2] = at(r, 2 * kt + 1);
-                    av[kt][i][3] = at(r + 8, 2 * kt + 1);
-                }
-        }
         const int next = it + 1;
         if (next < per) { load_x(next % STAGES, next); load_w(next % STAGES, next); }
+        // All warps consumed this slot's indices before the barrier above.
+        // Recycle it for g+2 while the already-staged g+1 dictionary entries
+        // are decoded into registers ahead of g's unchanged MMA arithmetic.
+        if (it + 2 < per) load_idx(it % STAGES, it + 2);
         commit();
+        uint32_t next_pe[PASSES] = {};
+        if (next < per) decode_idx(next % STAGES, next_pe);
         const unsigned char* p = stage(it % STAGES);
         const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
-        const uint32_t* pk = reinterpret_cast<const uint32_t*>(p + T::X + T::W + mrun);
-        uint32_t pe[PASSES] = {};
-        {
-#pragma unroll
-            for (int pass = 0; pass < PASSES; ++pass) {
-                const int c = (wn % 2) * (BN / WN) + pass * 32 + lane, off = (c / 64 * 64 + c % 64) * mbits;
-                pe[pass] = __ldg(mgtab + (__funnelshift_r(pk[off >> 5], pk[(off >> 5) + 1], off & 31) & mmask));
-            }
-        }
         const float* px = reinterpret_cast<const float*>(p + T::X + T::W + 2 * T::S);
         uint32_t words[T::NT][GS / 32];
 #pragma unroll
         for (int j = 0; j < T::NT; ++j)
 #pragma unroll
             for (int v = 0; v < GS / 32; ++v) words[j][v] = pw[((wn * T::NT + j) * 32 + lane) * (GS / 32) + v];
+        uint32_t av[GS / 16][I][4];
+#pragma unroll
+        for (int kt = 0; kt < GS / 16; ++kt)
+#pragma unroll
+            for (int i = 0; i < I; ++i) {
+                const int r = wm * (BM / WM) + i * 16 + (lane >> 2);
+                const int c = it * GS + kt * 16 + 2 * (lane & 3);
+                const __nv_bfloat16* a0 = x_ready + static_cast<size_t>(m0 + r) * ldx + c;
+                const __nv_bfloat16* a1 = a0 + 8 * ldx;
+                av[kt][i][0] = compact_load_a(a0);
+                av[kt][i][1] = compact_load_a(a1);
+                av[kt][i][2] = compact_load_a(a0 + 8);
+                av[kt][i][3] = compact_load_a(a1 + 8);
+            }
         float xv[I][2];
 #pragma unroll
         for (int i = 0; i < I; ++i) {
@@ -184,6 +191,8 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
                 }
             }
         }
+#pragma unroll
+        for (int pass = 0; pass < PASSES; ++pass) pe[pass] = next_pe[pass];
     }
     wait<0>();
     __nv_bfloat16* own = reinterpret_cast<__nv_bfloat16*>(buf);
