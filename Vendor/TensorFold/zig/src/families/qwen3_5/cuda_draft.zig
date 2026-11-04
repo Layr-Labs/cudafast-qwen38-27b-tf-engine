@@ -159,6 +159,7 @@ pub const Draft = struct {
         try d.pool.append(gpa, ctx);
         d.startup.warmups += profile.elapsed(io, warm_start);
         d.startup.load = profile.elapsed(io, started) - d.startup.reserve - d.startup.warmups;
+        try e.enableOverlap();
         return d;
     }
 
@@ -326,8 +327,26 @@ pub const Draft = struct {
         try d.e.runAfter(d.fns.norm_rope, .{ rows * heads, 1, 1 }, .{ 32, 1, 1 }, .{ x, w, out, @as(c_int, @intCast(heads)), @as(c_int, @intCast(heads * d.c.head_dim)), @as(c_longlong, @intCast(pos0)), d.c.eps, d.c.theta });
     }
 
+    /// `absorbRows`; a prompt's absorb right after its last cut (cuda_engine.zig Overlap) runs on the engine's side
+    /// stream once that cut's last layer is done, while the cut's head runs on, and the engine stream waits for it before
+    /// anything launched after it.
+    fn absorb(d: *Draft, ctx: *Ctx, tap_ring: u64, start: u64, n: usize, rows: ?[]const u32, prompt: bool) !void {
+        const e = d.e;
+        if (!(prompt and e.overlap.tail_pending)) return d.absorbRows(ctx, tap_ring, start, n, rows, prompt);
+        e.overlap.tail_pending = false;
+        const main = e.stream;
+        const side = e.overlap.side.?;
+        try e.d.check(e.d.api.cuStreamWaitEvent(side.handle, e.overlap.tail_done, 0), "cuStreamWaitEvent");
+        e.stream = side;
+        errdefer e.stream = main;
+        try d.absorbRows(ctx, tap_ring, start, n, rows, prompt);
+        e.stream = main;
+        try e.d.check(e.d.api.cuEventRecord(e.overlap.absorb_done, side.handle), "cuEventRecord");
+        try e.d.check(e.d.api.cuStreamWaitEvent(main.handle, e.overlap.absorb_done, 0), "cuStreamWaitEvent");
+    }
+
     /// Target rows [start, start + n) from the tap ring into the context; with `rows`, ring rows start + rows[i].
-    fn absorb(d: *Draft, ctx: *Ctx, tap_ring: u64, start_: u64, n_: usize, rows_: ?[]const u32, prompt: bool) !void {
+    fn absorbRows(d: *Draft, ctx: *Ctx, tap_ring: u64, start_: u64, n_: usize, rows_: ?[]const u32, prompt: bool) !void {
         const previous = d.projection_role;
         defer d.projection_role = previous;
         d.projection_role = if (prompt) .prompt else .live;
@@ -406,8 +425,20 @@ pub const Draft = struct {
         try frame.forward(d, &.{item}, &.{ctx});
     }
 
-    fn candidates(d: *const Draft, rows: usize) tree.Candidates {
-        const base = d.selection_base;
+    /// TF_TREE_TRUST / TF_TREE_DEPTH_LAM: the offline search's winner knobs. V3 default: trust 1.0 (R4's
+    /// landing-chance tree weighting on with no env set); TF_TREE_TRUST=0 restores the crown-identical tree.
+    fn treeTune(l: *const tree.Landing, sampled: bool) tree.Tune {
+        const S = struct {
+            var trust: ?f64 = null;
+            var lam: ?f64 = null;
+        };
+        if (S.trust == null) S.trust = if (platform.c.getenv("TF_TREE_TRUST")) |v| std.fmt.parseFloat(f64, std.mem.span(v)) catch 1.0 else 1.0;
+        if (S.lam == null) S.lam = if (platform.c.getenv("TF_TREE_DEPTH_LAM")) |v| std.fmt.parseFloat(f64, std.mem.span(v)) catch 0 else 0;
+        const tc = tree.TrustCtx{ .l = l, .sampled = sampled };
+        return .{ .trust = S.trust.?, .lam = S.lam.?, .ctx = &tc, .chance_fn = if (S.trust.? > 0) tree.landingChance else null };
+    }
+
+    fn candidates(d: *const Draft, rows: usize) tree.Candidates {        const base = d.selection_base;
         return .{ .words = d.staged.bytes[words_at + base * lp_words * 4 ..][0 .. rows * lp_words * 4], .projected = d.staged.bytes[hp_at + base * d.c.rank * 2 ..][0 .. rows * d.c.rank * 2], .topk = d.c.topk, .rank = d.c.rank, .predecessor = d.w.predecessor, .successor = d.w.successor, .sampling = d.drawn.sampling, .position = d.drawn.position };
     }
 
@@ -432,7 +463,7 @@ pub const Draft = struct {
         if (limit > 0) {
             // the whole budget whenever drafts are asked: the block's forward costs the same at any depth
             const n = if (it.depth == 0) 0 else limit;
-            ctx.grown = tree.grow(d.candidates(rows), it.pending, rows, n, &ctx.held, &ctx.parents, &ctx.own);
+            ctx.grown = tree.grow(d.candidates(rows), it.pending, rows, n, &ctx.held, &ctx.parents, &ctx.own, treeTune(&d.landing, it.sampling != null));
             if (n >= rows and it.tokens.len >= 4) {
                 var ch: [engine.most_window]u32 = undefined;
                 tree.chain(d.candidates(rows), it.pending, ch[0..rows]);
@@ -515,11 +546,12 @@ pub const Draft = struct {
         for (items) |it| {
             const ctx = d.streams.get(it.stream) orelse return error.UnknownStream;
             if (it.features.space != .device or it.features.dtype != .bf16) return error.UnsupportedFeatures;
-            if (it.offered > 0 and ctx.grown > 0 and ctx.own[0] < 0) {
+            if (it.offered > 0 and ctx.grown > 0) {
                 var prefix: [engine.most_window]u32 = undefined;
                 for (prefix[0..@min(it.follow.len, prefix.len)], 0..) |*x, i| x.* = @intCast(i);
                 const kept = it.rows orelse prefix[0..@min(it.follow.len, prefix.len)];
-                d.landing.observeTree(it.stream.sampling != null, ctx.parents[0..ctx.grown], ctx.own[0..ctx.grown], it.offered, kept);
+                if (tree.r4log()) tree.dumpTree(ctx.parents[0..ctx.grown], ctx.own[0..ctx.grown], ctx.held[0..ctx.grown], it.offered, kept, it.stream.sampling != null);
+                if (ctx.own[0] < 0) d.landing.observeTree(it.stream.sampling != null, ctx.parents[0..ctx.grown], ctx.own[0..ctx.grown], it.offered, kept);
             }
             ctx.grown = 0;
             // the target's features: its ring, `offset` the first row's position (cuda_native.zig's featuresFn)
@@ -571,8 +603,27 @@ pub const Draft = struct {
             const step = if (own >= 0) 0.99 else d.landing.chance(sampled, own);
             o.* = step * (if (parent >= 0) out[@intCast(parent)] else 1);
         }
+        // the gate on a wide window: a grown node past the 16-row band (node 15 on, row 17 on) counts its chance times
+        // TF_TREE_GATE (the allocator then widens the window only when the discounted tokens pay the measured 32-row
+        // cost); copied rows (own 0) keep theirs. Only the verified prefix changes, never the drafted tokens.
+        const gate = treeGate();
+        if (gate != 1.0 and out.len > gate_from) for (out[gate_from..], ctx.own[gate_from..out.len]) |*o, own| {
+            if (own < 0) o.* *= gate;
+        };
         return true;
     }
+
+    const gate_from = 15;
+
+    /// TF_TREE_GATE: the discount on a grown node's chance past the 16-row band (1: none).
+    fn treeGate() f64 {
+        const S = struct {
+            var v: ?f64 = null;
+        };
+        if (S.v == null) S.v = if (platform.c.getenv("TF_TREE_GATE")) |v| std.fmt.parseFloat(f64, std.mem.span(v)) catch default_gate else default_gate;
+        return S.v.?;
+    }
+    const default_gate = 1.0;
 
     fn releaseFn(p: *anyopaque, s: *Stream) void {
         const d = cast(p);
