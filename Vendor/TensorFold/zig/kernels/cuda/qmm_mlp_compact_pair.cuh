@@ -14,12 +14,11 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     constexpr int GS = 64, BM = 16, WM = 1, WN = 4;
     using Base = LaneTile<GS, BM, BN, WM, WN, STAGES>;
     struct T : Base {
-        // XT: the group's x tile (BM rows of 64 bf16), staged with the weights
-        enum { X = 0, W = BN * GS / 2, S = 256, XT = W + 2 * S + BM * 4, STAGE = XT + BM * GS * 2,
-               SMEM = STAGES * STAGE };
+        // Every column warp owns its packed panel and metadata in both stages.
+        enum { WARP_STAGE = 2048 + 256, SMEM = WN * STAGES * WARP_STAGE };
     };
     constexpr int PASSES = BN / WN / 32;
-    static_assert(T::SMEM == 21632, "compact pair pipeline footprint");
+    static_assert(T::SMEM == 18432, "warp-private compact pair footprint");
     constexpr int I = T::MT, J = T::NT;
     extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -29,53 +28,24 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     const int tile = cid / rows_t;
     const int m0 = cid % rows_t * BM, n0 = tile * (BN / 2), per = KG, g0 = 0;
 
-    auto stage = [&](int s) { return buf + s * T::STAGE; };
+    auto stage = [&](int s) { return buf + (wn * STAGES + s) * T::WARP_STAGE; };
     const int rows = min(BM, M - m0);
     constexpr int TILE_BYTES = 64 * GS / 2;
-    constexpr int WC = (T::W / 16 + T::THREADS - 1) / T::THREADS;
-    const unsigned char* wsrc[WC];
-    int wdst[WC];
-    bool wok[WC];
-#pragma unroll
-    for (int j = 0; j < WC; ++j) {
-        const int c = tid + j * T::THREADS, t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
-        wok[j] = c < T::W / 16;
-        wsrc[j] = reinterpret_cast<const unsigned char*>(parts.p[t / (BN / 128)].w) + static_cast<size_t>(n0 / 64 + t % (BN / 128)) * (KMAJOR ? 1 : KG) * TILE_BYTES +
-                  off * 16;
-        wdst[j] = T::X + c * 16;
-    }
-    static_assert(KMAJOR && BN == 256 && WN == 4);
+    static_assert(KMAJOR && BN == 256 && WN == 4 && WM == 1 && STAGES == 2);
     const int code0 = parts.p[0].first, code1 = parts.p[1].first;
-    const int bits0 = dict_bits(code0), bits1 = dict_bits(code1);
-    const int run0 = bits0, run1 = bits1;
-    const bool dok = tid < run0 + run1;
-    const int dpart = tid < run0 ? 0 : 1, dchunk = tid < run0 ? tid : tid - run0;
-    const int dstep = dict_step(dpart ? code1 : code0);
-    const unsigned char* dsrc = reinterpret_cast<const unsigned char*>(parts.p[dpart].scales) +
-                                static_cast<size_t>(n0 / 64) * dstep + dchunk * 16;
-    const int dpitch = P.npad / 64 * dstep;
-    const int ddst = T::X + T::W + (dpart ? 16 * run0 : 0) + dchunk * 16;
-    const int mpart = wn / 2, mbits = mpart ? bits1 : bits0;
+    const int mpart = wn / 2, mbits = dict_bits(mpart ? code1 : code0);
     const uint32_t mmask = (1u << mbits) - 1u;
-    const int mrun = mpart ? 16 * run0 : 0;
+    const int dstep = dict_step(mpart ? code1 : code0);
+    const auto* msrc = reinterpret_cast<const unsigned char*>(parts.p[mpart].scales) + size_t(n0/64)*dstep;
+    const auto* wsrc = reinterpret_cast<const unsigned char*>(parts.p[mpart].w) + size_t(n0/64+(wn&1))*TILE_BYTES;
     const uint32_t* const mgtab = reinterpret_cast<const uint32_t*>(parts.p[mpart].biases);
-    const bool xsok = tid < rows;
-    const float* xssrc = xs + static_cast<size_t>(m0 + min(tid, rows - 1)) * KG;
-    // x's 16 rows of the group: 16-byte chunk ch of row r at slot ch ^ (r & 7) (rows past M repeat the last one: their
-    // products are never stored); the fragments below read the same bf16 words the x rows hold
-    const int xr = tid >> 3, xch = tid & 7;
-    const __nv_bfloat16* xtsrc = x + static_cast<size_t>(m0 + min(xr, rows - 1)) * ldx + xch * 8;
-    const int xtdst = T::XT + xr * 128 + ((xch ^ (xr & 7)) * 16);
-    auto load_x = [&](int s, int g) {
-        if (xsok) cp4(stage(s) + T::W + 2 * T::S + tid * 4, xssrc + g);
-        cp16(stage(s) + xtdst, xtsrc + g * GS);
-    };
-    auto load_w = [&](int s, int g) {
-        unsigned char* p = stage(s);
+    auto load_x = [&](int, int) {}; // live input and sums are warp-private register loads
+    auto load_w = [&](int st, int g) {
+        auto* dst=stage(st);
 #pragma unroll
-        for (int j = 0; j < WC; ++j)
-            if (wok[j]) cp16(p + wdst[j], wsrc[j] + static_cast<size_t>(g) * (KMAJOR ? P.npad / 64 : 1) * TILE_BYTES);
-        if (dok) cp16(p + ddst, dsrc + static_cast<size_t>(g) * dpitch);
+        for(int j=0;j<4;++j) cp16(dst+(lane+j*32)*16,wsrc+(size_t(g)*(P.npad/64)*TILE_BYTES)+(lane+j*32)*16);
+        // Both 64-column halves of this part are one aligned packed-index run.
+        if(lane<mbits)cp16(dst+2048+lane*16,msrc+size_t(g)*(P.npad/64)*dstep+lane*16);
     };
     uint32_t mask;
     asm volatile("mov.b32 %0, 0x000F000F;\n" : "=r"(mask));
@@ -104,31 +74,13 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     grid_launch();
     for (int it = 0; it < per; ++it) {
         wait<0>();
-        __syncthreads();
-        uint32_t av[GS / 16][I][4];
-        {
-            const unsigned char* xt = stage(it % STAGES) + T::XT;
-            const int b = (2 * (lane & 3)) * 2;
-#pragma unroll
-            for (int kt = 0; kt < GS / 16; ++kt)
-#pragma unroll
-                for (int i = 0; i < I; ++i) {
-                    const int r = wm * (BM / WM) + i * 16 + (lane >> 2);
-                    auto at = [&](int row, int ch) {
-                        return *reinterpret_cast<const uint32_t*>(xt + row * 128 + ((ch ^ (row & 7)) * 16) + b);
-                    };
-                    av[kt][i][0] = at(r, 2 * kt);
-                    av[kt][i][1] = at(r + 8, 2 * kt);
-                    av[kt][i][2] = at(r, 2 * kt + 1);
-                    av[kt][i][3] = at(r + 8, 2 * kt + 1);
-                }
-        }
+        __syncwarp();
         const int next = it + 1;
         if (next < per) { load_x(next % STAGES, next); load_w(next % STAGES, next); }
         commit();
         const unsigned char* p = stage(it % STAGES);
-        const uint32_t* pw = reinterpret_cast<const uint32_t*>(p + T::X);
-        const uint32_t* pk = reinterpret_cast<const uint32_t*>(p + T::X + T::W + mrun);
+        const uint32_t* pw = reinterpret_cast<const uint32_t*>(p);
+        const uint32_t* pk = reinterpret_cast<const uint32_t*>(p + 2048);
         uint32_t pe[PASSES] = {};
         {
 #pragma unroll
@@ -137,18 +89,32 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
                 pe[pass] = __ldg(mgtab + (__funnelshift_r(pk[off >> 5], pk[(off >> 5) + 1], off & 31) & mmask));
             }
         }
-        const float* px = reinterpret_cast<const float*>(p + T::X + T::W + 2 * T::S);
+
         uint32_t words[T::NT][GS / 32];
 #pragma unroll
         for (int j = 0; j < T::NT; ++j)
 #pragma unroll
-            for (int v = 0; v < GS / 32; ++v) words[j][v] = pw[((wn * T::NT + j) * 32 + lane) * (GS / 32) + v];
+            for (int v = 0; v < GS / 32; ++v) words[j][v] = pw[(j * 32 + lane) * (GS / 32) + v];
+        uint32_t av[GS / 16][I][4];
+#pragma unroll
+        for (int kt = 0; kt < GS / 16; ++kt)
+#pragma unroll
+            for (int i = 0; i < I; ++i) {
+                const int r = wm * (BM / WM) + i * 16 + (lane >> 2);
+                const int c = it * GS + kt * 16 + 2 * (lane & 3);
+                const __nv_bfloat16* a0 = x_ready + static_cast<size_t>(m0 + r) * ldx + c;
+                const __nv_bfloat16* a1 = a0 + 8 * ldx;
+                av[kt][i][0] = compact_load_a(a0);
+                av[kt][i][1] = compact_load_a(a1);
+                av[kt][i][2] = compact_load_a(a0 + 8);
+                av[kt][i][3] = compact_load_a(a1 + 8);
+            }
         float xv[I][2];
 #pragma unroll
         for (int i = 0; i < I; ++i) {
             const int row = wm * (BM / WM) + i * 16 + (lane >> 2);
-            xv[i][0] = px[row];
-            xv[i][1] = px[row + 8];
+            xv[i][0] = row < rows ? xs[size_t(m0+row)*KG+(g0+it)] : 0.0f;
+            xv[i][1] = row+8 < rows ? xs[size_t(m0+row+8)*KG+(g0+it)] : 0.0f;
         }
         float d[I][J][4];
 #pragma unroll

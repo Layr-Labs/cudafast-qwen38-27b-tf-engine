@@ -26,7 +26,8 @@ constexpr int W2 = TILES * 1024;          // the tiles' 2-bit codes of a group
 constexpr int DW = TILES * 256;           // the tiles' dictionary index windows of a group
 constexpr int XV = 2 * ROWS * 4;          // a group's input sums, then sums of squares
 constexpr int STAGE = AFR + W2 + DW + XV;
-constexpr int SMEM = STAGES * STAGE;
+constexpr int SCAN_WARP_STAGE = 1024 + 256; // one column warp owns words and index windows
+constexpr int SMEM = STAGES * TILES * SCAN_WARP_STAGE;
 constexpr int RS_STAGES = 8;
 constexpr int RS_WARP = 256 + 32;         // a rescoring warp's stage: its n8 tile's words, then 8 scales and 8 biases
 constexpr int RS_STAGE = AFR + 4 * RS_WARP + 64;
@@ -134,32 +135,21 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int bits = code & 31, step = 8 * bits;
     const uint32_t imask = (1u << bits) - 1u;
-    unsigned char* tabs = buf + NS * STAGE;
+    unsigned char* tabs = buf + NS * TILES * SCAN_WARP_STAGE;
     for (int c = tid; c < tab_smem / 16; c += 128) qmm_frag::cp16(tabs + c * 16, reinterpret_cast<const unsigned char*>(tab) + c * 16);
     const size_t t0 = static_cast<size_t>(blockIdx.x) * TILES;
-    auto stage = [&](int s) { return buf + s * STAGE; };
-    auto load_w = [&](int s, int g) {
-        unsigned char* p = stage(s);
+    auto stage = [&](int st) { return buf + (warp * NS + st) * SCAN_WARP_STAGE; };
+    auto load_w = [&](int st, int g) {
+        auto* p=stage(st);
 #pragma unroll
-        for (int j = 0; j < 2; ++j) {
-            const int c = tid + j * 128, t = c >> 6, off = c & 63;
-            qmm_frag::cp16(p + AFR + t * 1024 + off * 16, reinterpret_cast<const unsigned char*>(w2) + ((t0 + t) * KG + g) * 1024 + off * 16);
-        }
-        if (tid < 64) {
-            const int t = tid >> 4, part = tid & 15;
-            if (code != 0)
-                qmm_frag::cp16(p + AFR + W2 + t * 256 + part * 16,
-                               sb + (t0 + t) * KG * step + (static_cast<size_t>(g) * step & ~static_cast<size_t>(63)) + part * 16);
-            else   // no pair code: the tile's 64 scales, then its 64 biases, from the (kg, npad) arrays
-                qmm_frag::cp16(p + AFR + W2 + t * 256 + part * 16,
-                               (part < 8 ? sc : bi) + static_cast<size_t>(g) * npad + (t0 + t) * 64 + (part & 7) * 8);
+        for(int j=0;j<2;++j)
+            qmm_frag::cp16(p+(lane+j*32)*16,reinterpret_cast<const unsigned char*>(w2)+((t0+warp)*KG+g)*1024+(lane+j*32)*16);
+        if(lane<16) {
+            if(code!=0)qmm_frag::cp16(p+1024+lane*16,sb+(t0+warp)*KG*step+(size_t(g)*step&~size_t(63))+lane*16);
+            else qmm_frag::cp16(p+1024+lane*16,(lane<8?sc:bi)+size_t(g)*npad+(t0+warp)*64+(lane&7)*8);
         }
     };
-    auto load_x = [&](int s, int g) {
-        unsigned char* p = stage(s);
-        qmm_frag::cp16(p + tid * 16, afr + static_cast<size_t>(g) * 128 + tid);
-        if (tid < 8) qmm_frag::cp16(p + AFR + W2 + DW + tid * 16, xv + static_cast<size_t>(g) * 32 + tid * 4);
-    };
+    auto load_x = [&](int, int) {}; // immutable prepared fragments/sums read by their consuming warp
 #pragma unroll
     for (int s = 0; s < NS - 1; ++s) {
         if (s < KG) load_w(s, s);
@@ -172,6 +162,8 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
         qmm_frag::commit();
     }
     qmm_frag::grid_launch();
+    qmm_frag::wait<0>();
+    __syncthreads(); // shared immutable pair table initialized across all four warps
     float acc[8][4], sg[8][4];
 #pragma unroll
     for (int i = 0; i < 8; ++i)
@@ -184,7 +176,7 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
     const bool stab = tab_smem > 0;
     for (int g = 0; g < KG; ++g) {
         qmm_frag::wait<NS - 2>();
-        __syncthreads();
+        __syncwarp();
         const int next = g + NS - 1;
         if (next < KG) {
             load_w(next % NS, next);
@@ -195,15 +187,15 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
         uint32_t a[4][4];
 #pragma unroll
         for (int kt = 0; kt < 4; ++kt) {
-            const uint4 v = reinterpret_cast<const uint4*>(p)[kt * 32 + lane];
+            const uint4 v = afr[size_t(g)*128+kt*32+lane];
             a[kt][0] = v.x;
             a[kt][1] = v.y;
             a[kt][2] = v.z;
             a[kt][3] = v.w;
         }
-        const uint4 wlo = reinterpret_cast<const uint4*>(p + AFR + warp * 1024)[lane];
-        const uint4 whi = reinterpret_cast<const uint4*>(p + AFR + warp * 1024 + 512)[lane];
-        const uint32_t* pk = reinterpret_cast<const uint32_t*>(p + AFR + W2 + warp * 256);
+        const uint4 wlo = reinterpret_cast<const uint4*>(p)[lane];
+        const uint4 whi = reinterpret_cast<const uint4*>(p+512)[lane];
+        const uint32_t* pk = reinterpret_cast<const uint32_t*>(p + 1024);
         const int base = (g * step & 63) * 8;
         uint32_t ent[2];
 #pragma unroll
@@ -217,7 +209,7 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
                 ent[hh] = static_cast<uint32_t>(ph[lane + 32 * hh]) | static_cast<uint32_t>(ph[64 + lane + 32 * hh]) << 16;
             }
         }
-        const float* pv = reinterpret_cast<const float*>(p + AFR + W2 + DW);
+        const float* pv = reinterpret_cast<const float*>(reinterpret_cast<const unsigned char*>(xv + size_t(g)*32));
         const float xs0 = pv[r0], xs1 = pv[r0 + 8], q0 = pv[16 + r0], q1 = pv[16 + r0 + 8];
 #pragma unroll
         for (int nt = 0; nt < 8; ++nt) {

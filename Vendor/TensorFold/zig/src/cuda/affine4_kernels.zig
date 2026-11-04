@@ -246,15 +246,15 @@ pub const Affine4Kernels = struct {
     /// A decode window the 16-row streams take: exactly 16 rows, or (TF_NARROW_STREAMS, on by default) any narrower
     /// window. The stream kernels bound their own rows (`min(16, M)`, zero-filled input rows, stores below M), so a
     /// narrow window reads the streams' coded index windows instead of the tile-major scales and biases.
+    fn spreadOn() bool {
+        const v = @import("sys").c.getenv("TF_GDN_SPREAD") orelse return true;
+        return !std.mem.eql(u8, std.mem.span(v), "0");
+    }
+
     fn narrow16(rows: usize) bool {
         if (rows == 16) return true;
         if (rows == 0 or rows > 16) return false;
         const v = @import("sys").c.getenv("TF_NARROW_STREAMS") orelse return true;
-        return !std.mem.eql(u8, std.mem.span(v), "0");
-    }
-
-    fn spreadOn() bool {
-        const v = @import("sys").c.getenv("TF_GDN_SPREAD") orelse return true;
         return !std.mem.eql(u8, std.mem.span(v), "0");
     }
 
@@ -521,8 +521,9 @@ pub const Affine4Kernels = struct {
         const gdn_streamed = narrow16(rows) or (rows > 16 and rows <= 32 and a.gdn_stream32_fn != null);
         if (!gdn_streamed or !a.pdl or a.gdn_stream16_fn == null) return false;
         for (outs) |o| if (o.q.k != 5120 or o.q.stream_w == 0) return false;
-        // attention's q (with its gate half), k and v of one input (TF_ATTN_STREAM=0: their mixed cluster launch)
-        if (outs.len == 3 and rows == 16 and attnStreams())
+        // attention's q (with its gate half), k and v of one input (TF_ATTN_STREAM=0: their mixed cluster launch); a
+        // window narrower than 16 rows takes the same 16-row twin, as the GDN group already does (it bounds its own rows)
+        if (outs.len == 3 and narrow16(rows) and attnStreams())
             return outs[0].q.n == 12288 and outs[1].q.n == 1024 and outs[2].q.n == 1024;
         return outs.len == 4 and outs[0].q.n == 10240 and outs[1].q.n == 6144 and outs[2].q.n == 48 and outs[3].q.n == 48;
     }
@@ -561,14 +562,14 @@ pub const Affine4Kernels = struct {
             var g: launch_.Args = .{};
             g.add(x); g.add(xs); g.add(parts);
             for ([_]usize{ rows, 5120, 5120 }) |v| g.add(int(v));
-            const base: u32 = if (rows32) gdn_stream32_smem else 22656;
+            const base: u32 = if (rows32) gdn_stream32_smem else 45312;
             // a 16-row launch takes at least the output stream's 35328 bytes (qlinear.out16_smem): two CTAs an SM at most,
             // so its CTAs spread over GB10's 48 SMs instead of packing four an SM (an allocation only; the kernel reads
             // and writes the same bytes, the same bits). TF_GDN_SPREAD=0 keeps the packed launch.
-            const raw: u32 = if (dict) base + 4 * @as(u32, @intCast(bn)) + tab else base;
+            const raw: u32 = if (dict) base + (if (rows32) 4 * @as(u32, @intCast(bn)) else @as(u32, 2048)) + tab else base;
             const shared: u32 = if (rows32 or !spreadOn()) raw else @max(raw, linear.out16_smem);
             const f = if (dict) dict_fn.? else if (rows32) a.gdn_stream32_fn.? else a.gdn_stream16_fn.?;
-            return launch_.launch(f, .{ .grid = .{ .x = u(first) }, .block = .{ .x = 128 }, .shared = shared, .pdl = true }, s, &g);
+            return launch_.launch(f, .{ .grid = .{ .x = u(first) }, .block = .{ .x = if (rows32) 128 else 256 }, .shared = shared, .pdl = true }, s, &g);
         }
         if (rows > max_rows) return error.WindowTooWide;
         const sp = a.split orelse return a.decodeGrouped(s, x, xs, outs, rows);

@@ -17,14 +17,20 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
     const int npad = DICT ? P.tiles : P.npad;
     static_assert(T::MT == 1 && T::THREADS == 128, "one m16 row tile, four column warps");
     constexpr int NT = T::NT;
-    extern __shared__ __align__(128) unsigned char buf[];
-    const int tid = threadIdx.x, lane = tid & 31, wn = tid >> 5;
+    extern __shared__ __align__(128) unsigned char arena[];
+    const int slice = threadIdx.x / 128;
+    auto* buf = arena + slice * 22656;
+    const int tid = threadIdx.x % 128, lane = tid & 31, wn = tid >> 5;
+    auto slice_sync = [&]() {
+        if(slice==0)asm volatile("bar.sync 1, 128;" ::: "memory");
+        else asm volatile("bar.sync 2, 128;" ::: "memory");
+    };
 #if __CUDA_ARCH__ >= 1200
-    __shared__ __align__(8) uint64_t weight_barriers[STAGES];
+    __shared__ __align__(8) uint64_t weight_barriers[2][STAGES];
     if (tid == 0)
 #pragma unroll
         for (int s = 0; s < STAGES; ++s)
-            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" :: "r"(smem(&weight_barriers[s])) : "memory");
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" :: "r"(smem(&weight_barriers[slice][s])) : "memory");
     __syncthreads();
 #endif
     const int KG = K / GS;
@@ -77,7 +83,7 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
                                   static_cast<size_t>(n0 / 64) * TILE_BYTES + (n0 % 64) * GS / 2;
 #if __CUDA_ARCH__ >= 1200
         if (tid == 0) {
-            const uint32_t barrier = smem(&weight_barriers[s]);
+            const uint32_t barrier = smem(&weight_barriers[slice][s]);
             const auto* src = wb + static_cast<size_t>(g) * (npad / 64) * TILE_BYTES;
             asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;\n"
                          :: "r"(barrier), "n"(T::W) : "memory");
@@ -103,17 +109,19 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
             if (sok[j]) cp16(p + sdst[j], (sbias[j] ? P.biases : P.scales) + n0 + soff[j] + static_cast<size_t>(g) * P.npad);
         }
     };
-    unsigned char* dec = buf + T::SMEM;  // DICT: BN decoded scales, BN biases, then the part's table
-    unsigned char* table = dec + 4 * BN;
+    unsigned char* dec = arena + 2 * 22656 + slice * 1024;  // DICT: BN decoded scales, BN biases, then the part's table
+    unsigned char* table = arena + 2 * 22656 + 2 * 1024;
     // a pair table of up to GDN_PAIR_SMEM bytes in shared memory (the twin's two-CTAs-an-SM room, qlinear.zig
     // gdn_pair_tab_max), else read through L2
     constexpr int GDN_PAIR_SMEM = 26496;
     [[maybe_unused]] const int pair_bytes = (qmm_dict::dict_np(P.npad) * 4 + 15) / 16 * 16;
     if constexpr (DICT) {
+        if(slice==0) {
         if (qmm_dict::dict_pair(P.npad) && pair_bytes <= GDN_PAIR_SMEM) {
             for (int c = tid; c < pair_bytes / 16; c += T::THREADS) cp16(table + c * 16, reinterpret_cast<const unsigned char*>(P.biases) + c * 16);
         } else {
             qmm_dict::dict_table<T::THREADS>(P, table, tid);
+        }
         }
     }
     uint32_t mask;
@@ -149,11 +157,13 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
         commit();
     }
     grid_launch();
+    wait<0>();
+    __syncthreads(); // only slice zero loaded the immutable shared dictionary table
     for (int it = 0; it < items; ++it) {
         wait<STAGES - 2>();
 #if __CUDA_ARCH__ >= 1200
         if (tid == 0) {
-            const uint32_t barrier = smem(&weight_barriers[it % STAGES]);
+            const uint32_t barrier = smem(&weight_barriers[slice][it % STAGES]);
             const uint32_t phase = (it / STAGES) & 1;
             asm volatile("{ .reg .pred ready;\n"
                          "wait_weight:\n"
@@ -162,7 +172,7 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
                          "}\n" :: "r"(barrier), "r"(phase) : "memory");
         }
 #endif
-        __syncthreads();
+        slice_sync();
         const int next = it + STAGES - 1;
         if (next < items) {
             load_x(next % STAGES, next);
@@ -270,11 +280,11 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
         after(it);
     }
 #if __CUDA_ARCH__ >= 1200
-    __syncthreads();
+    slice_sync();
     if (tid == 0)
 #pragma unroll
         for (int s = 0; s < STAGES; ++s)
-            asm volatile("mbarrier.inval.shared::cta.b64 [%0];\n" :: "r"(smem(&weight_barriers[s])) : "memory");
+            asm volatile("mbarrier.inval.shared::cta.b64 [%0];\n" :: "r"(smem(&weight_barriers[slice][s])) : "memory");
 #endif
 }
 
@@ -303,17 +313,40 @@ __device__ __forceinline__ void gemv_store(const Part& P, int M, int n0, Got got
 template<int BN,int FutureGroups,bool DICT=false>
 __device__ __forceinline__ void tile(const __nv_bfloat16* x,const float* xs,const tf_qmm_group::Part p,int t,int M,int K,int ldx){
     constexpr int NT=GemvTile<64,BN,2>::NT;
-    const auto original=p;
-    const int KG=K/64,per=KG/p.sk;float acc[NT][4]{},tot[NT][4]{};
-    wide_items<64,BN,2,FutureGroups,DICT>(x,xs,original,M,K,ldx,KG,[&](int g){return make_int2(g,t*BN);},acc,[&](int g){
-        if((g+1)%per!=0)return;bool first=g+1==per;
+    const int slice=threadIdx.x/128,tid=threadIdx.x%128;
+    const int KG=K/64,per=KG/p.sk;
+    const bool parallel=p.sk==2;
+    const int first_seg=parallel?slice:0;
+    const int items=parallel?per:(slice==0?KG:0);
+    float acc[NT][4]{},tot[NT][4]{};
+    wide_items<64,BN,2,FutureGroups,DICT>(x,xs,p,M,K,ldx,items,
+        [&](int g){return make_int2(first_seg*per+g,t*BN);},acc,[&](int g){
+        if((g+1)%per!=0)return;
+        const bool first=g+1==per;
 #pragma unroll
         for(int j=0;j<NT;++j)
 #pragma unroll
             for(int e=0;e<4;++e){tot[j][e]=first?acc[j][e]:tot[j][e]+acc[j][e];acc[j][e]=0;}
-        if(g!=KG-1)return;
-        gemv_store<BN,NT>(original,M,t*BN,[&](int j,int h,int,int){return make_float2(tot[j][2*h],tot[j][2*h+1]);});
     });
+    // The native two-slice chains meet only for their original ordered FP32 sum.
+    extern __shared__ __align__(128) unsigned char arena[];
+    __syncthreads();
+    if(parallel) {
+        auto* partial=reinterpret_cast<float*>(arena);
+        if(slice==1)
+#pragma unroll
+            for(int j=0;j<NT;++j)
+#pragma unroll
+                for(int e=0;e<4;++e)partial[(j*4+e)*128+tid]=tot[j][e];
+        __syncthreads();
+        if(slice==0)
+#pragma unroll
+            for(int j=0;j<NT;++j)
+#pragma unroll
+                for(int e=0;e<4;++e)tot[j][e]=tot[j][e]+partial[(j*4+e)*128+tid];
+    }
+    if(slice==0)
+        gemv_store<BN,NT>(p,M,t*BN,[&](int j,int h,int,int){return make_float2(tot[j][2*h],tot[j][2*h+1]);});
 }
 template<int FutureGroups>
 __device__ __forceinline__ void body(const __nv_bfloat16* x,const float* xs,const tf_qmm_group::Parts& parts,int M,int K,int ldx){
@@ -335,11 +368,11 @@ __device__ __forceinline__ void body_dict(const __nv_bfloat16* x,const float* xs
 }
 }
 
-extern "C" __global__ void __launch_bounds__(128) tf_qmm_gdn_stream16(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
+extern "C" __global__ void __launch_bounds__(256) tf_qmm_gdn_stream16(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
     tf_qmm_gdn_stream::body<0>(x,xs,parts,M,K,ldx);
 }
 // tf_qmm_gdn_stream16 with its dictionary-coded parts' index windows: the same loads, MMA chains, fmas and sums.
-extern "C" __global__ void __launch_bounds__(128) tf_qmm_gdn_stream16_dict(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
+extern "C" __global__ void __launch_bounds__(256) tf_qmm_gdn_stream16_dict(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
     tf_qmm_gdn_stream::body_dict(x,xs,parts,M,K,ldx);
 }
 
