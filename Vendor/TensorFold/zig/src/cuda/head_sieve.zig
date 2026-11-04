@@ -6,7 +6,7 @@
 //! the best of those exact values: the full head's token whenever the best id's dropped bits' term exceeds the first
 //! tile's best-approximate id's by less than kappa spreads.
 //! TF_HEAD_SIEVE=0: the full head; =check: the full head writes the tokens and the sieve runs beside it, compared.
-//! TF_HEAD_SIEVE_K: kappa (10); TF_HEAD_SIEVE_CAP: the most n8 tiles rescored before every tile is (4096).
+//! TF_HEAD_SIEVE_K: kappa (10); TF_HEAD_SIEVE_CAP: the most n8 tiles rescored before every tile is (every tile, n / 8).
 const std = @import("std");
 const linear = @import("qlinear.zig");
 const Driver = @import("driver.zig").Driver;
@@ -25,11 +25,15 @@ fn int(v: usize) c_int {
 pub const Mode = enum { on, check };
 
 pub const HeadSieve = struct {
-    pub const rows_max = 16;
+    pub const rows_max = 32; // the sieve's row tiles: 16-row windows on the 16-row kernels, 17-32 on their twins
     pub const sieve_smem: u32 = 4 * (2048 + 4 * 1024 + 4 * 256 + 128); // tf_head_sieve::SMEM
+    pub const sieve32_smem: u32 = 4 * (2 * 2048 + 4 * 1024 + 4 * 256 + 2 * 128); // the 32-row scan's stages
     pub const rescore_smem: u32 = 8 * (2048 + 4 * 288 + 64); // tf_head_sieve::RS_SMEM
+    pub const rescore32_smem: u32 = 8 * (2048 + 4 * 288 + 128); // the 32-row rescore's stages
     /// The pair table in shared memory when three scan CTAs an SM still fit (GB10: 100 KiB an SM, 1 KiB a CTA).
     const tab_room: u32 = 102400 / 3 - 1024 - sieve_smem;
+    /// The 32-row scan's room at two CTAs an SM (its stages double the A fragments and the group sums).
+    const tab32_room: u32 = 102400 / 2 - 1024 - sieve32_smem;
     const stats_words = 64;
     const rescore_ctas = 144; // three an SM (GB10: 48 SMs)
     const select_ctas = 48;
@@ -42,6 +46,13 @@ pub const HeadSieve = struct {
     rescore_fn: Function,
     finish_fn: Function,
     check_fn: Function,
+    prep32_fn: Function, // the 17-32-row windows' twins (the same per-row arithmetic, two m16 row tiles)
+    sieve32_fn: Function,
+    top32_fn: Function,
+    select32_fn: Function,
+    rescore32_fn: Function,
+    finish32_fn: Function,
+    check32_fn: Function,
     buf: DeviceBuffer,
     mode: Mode,
     kappa: f32,
@@ -52,6 +63,7 @@ pub const HeadSieve = struct {
     ctas: usize,
     code: u32, // the head's pair code, or 0: the sieve reads the (kg, npad) arrays
     tab_smem: u32,
+    tab32_smem: u32 = 0, // the 32-row scan's shared pair table (its two-CTAs-an-SM room)
     pdl: bool,
     w2: u64,
     afr: u64,
@@ -89,8 +101,8 @@ pub const HeadSieve = struct {
         }
         var kappa: f32 = 10.0;
         if (@import("sys").c.getenv("TF_HEAD_SIEVE_K")) |v| kappa = std.fmt.parseFloat(f32, std.mem.span(v)) catch 10.0;
-        var cap: usize = 4096;
-        if (@import("sys").c.getenv("TF_HEAD_SIEVE_CAP")) |v| cap = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 4096;
+        var cap: usize = q.n / 8; // every n8 tile: a window lists only what it rescores, so no overflow reads the whole head
+        if (@import("sys").c.getenv("TF_HEAD_SIEVE_CAP")) |v| cap = std.fmt.parseInt(usize, std.mem.span(v), 10) catch q.n / 8;
         var h: HeadSieve = undefined;
         h.pack_fn = try group_mod.function("tf_head_sieve_pack");
         h.prep_fn = try group_mod.function("tf_head_sieve_prep");
@@ -100,6 +112,13 @@ pub const HeadSieve = struct {
         h.rescore_fn = try group_mod.function("tf_head_sieve_rescore");
         h.finish_fn = try group_mod.function("tf_head_sieve_finish");
         h.check_fn = try group_mod.function("tf_head_sieve_check");
+        h.prep32_fn = try group_mod.function("tf_head_sieve_prep32");
+        h.sieve32_fn = try group_mod.function("tf_head_sieve_scan32");
+        h.top32_fn = try group_mod.function("tf_head_sieve_top32");
+        h.select32_fn = try group_mod.function("tf_head_sieve_select32");
+        h.rescore32_fn = try group_mod.function("tf_head_sieve_rescore32");
+        h.finish32_fn = try group_mod.function("tf_head_sieve_finish32");
+        h.check32_fn = try group_mod.function("tf_head_sieve_check32");
         h.mode = mode;
         h.kappa = kappa;
         h.cap = cap;
@@ -113,8 +132,11 @@ pub const HeadSieve = struct {
         h.code = if (linear.pairCode(q.code)) q.code else 0;
         const tab_bytes: u32 = if (h.code != 0) ((h.code >> 5 & 0x1FFF) * 4 + 15) / 16 * 16 else 0;
         h.tab_smem = if (tab_bytes <= tab_room) tab_bytes else 0;
+        h.tab32_smem = if (tab_bytes <= tab32_room) tab_bytes else 0;
         try h.sieve_fn.allowDynamicShared(sieve_smem + h.tab_smem);
+        try h.sieve32_fn.allowDynamicShared(sieve32_smem + h.tab32_smem);
         try h.rescore_fn.allowDynamicShared(rescore_smem);
+        try h.rescore32_fn.allowDynamicShared(rescore32_smem);
         // the buffer: 2-bit words, A fragments, group sums, the sieve's bests, list, count, bests, tokens, counters
         var at: usize = 0;
         const take = struct {
@@ -136,7 +158,7 @@ pub const HeadSieve = struct {
         const o_toks = take(&at, rows_max * 4);
         const o_stats = take(&at, stats_words * 8);
         const o_mrow = take(&at, rows_max * 4);
-        const o_approx = if (mode == .check) take(&at, q.n * 32 * 4) else 0;
+        const o_approx = if (mode == .check) take(&at, q.n * 2 * rows_max * 4) else 0;
         h.buf = try DeviceBuffer.alloc(d, at);
         errdefer h.buf.free();
         try h.buf.fill8(0, null);
@@ -178,6 +200,16 @@ pub const HeadSieve = struct {
     /// (check mode: into the sieve's own, compared with toks, which the full head has written).
     pub fn run(h: *const HeadSieve, s: Stream, x: u64, xs: u64, q: Affine4, rows: usize, toks: u64) !void {
         if (rows == 0 or rows > rows_max) return error.WindowTooWide;
+        // 17-32 rows run the twins: two m16 row tiles through the 16-row kernel's own per-row arithmetic
+        // (the same kappa, spreads, thresholds, key(a, id) rule and rescore list semantics a row)
+        const wide = rows > 16;
+        const prep_fn = if (wide) h.prep32_fn else h.prep_fn;
+        const sieve_fn = if (wide) h.sieve32_fn else h.sieve_fn;
+        const tab = if (wide) h.tab32_smem else h.tab_smem;
+        const sieve_shared = if (wide) sieve32_smem else sieve_smem;
+        const top_fn = if (wide) h.top32_fn else h.top_fn;
+        const select_fn = if (wide) h.select32_fn else h.select_fn;
+        const finish_fn = if (wide) h.finish32_fn else h.finish_fn;
         const out = if (h.mode == .check) h.toks else toks;
         {
             var a: launch_.Args = .{};
@@ -190,7 +222,7 @@ pub const HeadSieve = struct {
             a.add(h.best);
             a.add(h.pre);
             a.add(h.count);
-            try launch_.launch(h.prep_fn, .{ .grid = .{ .x = @intCast(h.kg) }, .block = .{ .x = 128 }, .pdl = h.pdl }, s, &a);
+            try launch_.launch(prep_fn, .{ .grid = .{ .x = @intCast(h.kg) }, .block = .{ .x = 128 }, .pdl = h.pdl }, s, &a);
         }
         {
             var a: launch_.Args = .{};
@@ -200,7 +232,7 @@ pub const HeadSieve = struct {
             a.add(q.sb);
             a.add(q.tab);
             a.add(@as(c_int, @bitCast(h.code)));
-            a.add(@as(c_int, @intCast(h.tab_smem)));
+            a.add(@as(c_int, @intCast(tab)));
             a.add(q.s);
             a.add(q.b);
             a.add(int(q.npad));
@@ -210,7 +242,7 @@ pub const HeadSieve = struct {
             a.add(h.himax);
             a.add(h.himid);
             a.add(h.approx);
-            try launch_.launch(h.sieve_fn, .{ .grid = .{ .x = @intCast(h.ctas) }, .block = .{ .x = 128 }, .shared = sieve_smem + h.tab_smem, .pdl = h.pdl }, s, &a);
+            try launch_.launch(sieve_fn, .{ .grid = .{ .x = @intCast(h.ctas) }, .block = .{ .x = 128 }, .shared = sieve_shared + tab, .pdl = h.pdl }, s, &a);
         }
         // each row's first tile (its best a) exactly; the row's threshold the lower of its exact best and its best a
         {
@@ -219,9 +251,9 @@ pub const HeadSieve = struct {
             a.add(int(rows));
             a.add(int(h.n8s));
             a.add(h.pre);
-            try launch_.launch(h.top_fn, .{ .grid = .{ .x = select_ctas }, .block = .{ .x = 256 }, .pdl = h.pdl }, s, &a);
+            try launch_.launch(top_fn, .{ .grid = .{ .x = select_ctas }, .block = .{ .x = 256 }, .pdl = h.pdl }, s, &a);
         }
-        try h.rescore(s, q, rows, h.pre);
+        try h.rescore(s, q, rows, h.pre, wide);
         {
             var a: launch_.Args = .{};
             a.add(h.himax);
@@ -234,9 +266,9 @@ pub const HeadSieve = struct {
             a.add(h.count);
             a.add(int(h.cap));
             a.add(h.mrow);
-            try launch_.launch(h.select_fn, .{ .grid = .{ .x = select_ctas }, .block = .{ .x = 256 }, .pdl = h.pdl }, s, &a);
+            try launch_.launch(select_fn, .{ .grid = .{ .x = select_ctas }, .block = .{ .x = 256 }, .pdl = h.pdl }, s, &a);
         }
-        try h.rescore(s, q, rows, 0);
+        try h.rescore(s, q, rows, 0, wide);
         {
             var a: launch_.Args = .{};
             a.add(h.best);
@@ -246,7 +278,7 @@ pub const HeadSieve = struct {
             a.add(int(h.cap));
             a.add(int(h.n8s));
             a.add(h.stats);
-            try launch_.launch(h.finish_fn, .{ .grid = .{ .x = 1 }, .block = .{ .x = 32 }, .pdl = h.pdl }, s, &a);
+            try launch_.launch(finish_fn, .{ .grid = .{ .x = 1 }, .block = .{ .x = 32 }, .pdl = h.pdl }, s, &a);
         }
         if (h.mode == .check) {
             var a: launch_.Args = .{};
@@ -258,12 +290,13 @@ pub const HeadSieve = struct {
             a.add(h.toks);
             a.add(h.best);
             a.add(h.stats);
-            try launch_.launch(h.check_fn, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 }, .pdl = h.pdl }, s, &a);
+            const check_fn = if (wide) h.check32_fn else h.check_fn;
+            try launch_.launch(check_fn, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 }, .pdl = h.pdl }, s, &a);
         }
     }
 
     /// The listed n8 tiles exactly (keys: each row's first tile instead), each row's best into best.
-    fn rescore(h: *const HeadSieve, s: Stream, q: Affine4, rows: usize, keys: u64) !void {
+    fn rescore(h: *const HeadSieve, s: Stream, q: Affine4, rows: usize, keys: u64, wide: bool) !void {
         var a: launch_.Args = .{};
         a.add(q.w);
         a.add(q.s);
@@ -280,7 +313,9 @@ pub const HeadSieve = struct {
         a.add(keys);
         a.add(h.best);
         const ctas: usize = if (keys != 0) (rows + 3) / 4 else rescore_ctas;
-        try launch_.launch(h.rescore_fn, .{ .grid = .{ .x = @intCast(ctas) }, .block = .{ .x = 128 }, .shared = rescore_smem, .pdl = h.pdl }, s, &a);
+        const f = if (wide) h.rescore32_fn else h.rescore_fn;
+        const smem: u32 = if (wide) rescore32_smem else rescore_smem;
+        try launch_.launch(f, .{ .grid = .{ .x = @intCast(ctas) }, .block = .{ .x = 128 }, .shared = smem, .pdl = h.pdl }, s, &a);
     }
 
     fn unorder(v: u64) f32 {
