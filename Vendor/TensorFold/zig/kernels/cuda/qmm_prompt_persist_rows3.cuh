@@ -9,6 +9,10 @@ __global__ void __launch_bounds__(WM*128) kernel(const __nv_bfloat16* __restrict
         const __grid_constant__ ManyParts parts,__nv_bfloat16* __restrict__ act,
         int M,int K,int ldx,int group,int full_cols,int total,int rotate) {
     constexpr int BN=128, STAGES=2;
+    // Fire the dependents at entry, as the decode grouped kernels do (qmm_group.cu's grid_launch) and as the
+    // tf_q35 glue after a prompt GEMM assumes of its predecessor: a runAfter-launched follower overlaps its launch
+    // and its static-weight prefetch (taken before await_prior) with this GEMM. No arithmetic or load moves.
+    grid_launch();
     for(int work=blockIdx.x;work<total;work+=gridDim.x){
         int tile=work;
         // Rotate row assignment between complete cohorts so short rows do
