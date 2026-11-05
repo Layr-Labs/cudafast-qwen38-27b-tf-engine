@@ -310,6 +310,10 @@ pub const Engine = struct {
         var plans = [_]Plan{try win.plan(e, s, copied)};
         if (plans[0].kind == .head and (e.cfg.node_probabilities or e.trim != null or lone_costs.enabled(e, plans[0]))) try win.allocate(e, &plans);
         try win.constrain(e, &plans[0]);
+        if (@import("sys").c.getenv("TF_PLANLOG") != null) {
+            const p = plans[0];
+            std.debug.print("[planlog] kind={s} n={d} held={d} toks={d} tree={} lanes={} branch={d} ctxcopy={} trim={} probe={d} alloc={} early={}\n", .{ @tagName(p.kind), p.count(), p.held, p.tokens.len, p.parents != null, p.lanes != null, p.branch_from, p.context_copy, e.trim != null, p.cost_probe_rows orelse 0, p.kind == .head and (e.cfg.node_probabilities or e.trim != null or lone_costs.enabled(e, p)), e.cfg.family_mtp and s.drafts and p.kind != .forced and e.cfg.speculate_early and p.parents == null and s.grammar == null });
+        }
         const plan = plans[0];
         const early = e.cfg.family_mtp and s.drafts and plan.kind != .forced and e.cfg.speculate_early and plan.parents == null and s.grammar == null;
         const windows = [_]be.Window{try win.build(e, plan, early)};
@@ -365,6 +369,9 @@ pub const Engine = struct {
         for (entries, plans) |s, *p| p.* = try win.plan(e, s, null);
         try win.allocate(e, plans);
         for (plans) |*p| try win.constrain(e, p);
+        if (@import("sys").c.getenv("TF_PLANLOG") != null) for (plans) |p| {
+            std.debug.print("[planlog] kind={s} n={d} held={d} toks={d} tree={} lanes={} branch={d} ctxcopy={} trim={} probe={d} mtp={} early={}\n", .{ @tagName(p.kind), p.count(), p.held, p.tokens.len, p.parents != null, p.lanes != null, p.branch_from, p.context_copy, e.trim != null, p.cost_probe_rows orelse 0, e.cfg.family_mtp, e.cfg.speculate_early });
+        };
         const windows = try a.alloc(be.Window, plans.len);
         const out = try a.alloc(be.Verified, plans.len);
         var total: u64 = 0;
