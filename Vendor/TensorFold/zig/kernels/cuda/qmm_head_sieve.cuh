@@ -564,6 +564,181 @@ extern "C" __global__ void __launch_bounds__(128) tf_head_sieve_rescore(const ui
     }
 }
 
+namespace tf_head_sieve {
+constexpr int RN_GROUP = 256 + 32;   // an n8 tile's group in the n8-major copy: its head words, 8 scales, 8 biases
+constexpr int RN_WARPS = 4;          // the n8-major rescore: four warps a CTA, an item a warp
+constexpr int RN_CH = 4;             // groups a stage (1152 contiguous bytes an item)
+constexpr int RN_STAGES = 3;
+constexpr int RN_KCH = 8;            // the first tiles' pass: eight groups a stage
+constexpr int rn_smem(int ch, int stages) { return stages * (ch * AFR + RN_WARPS * ch * RN_GROUP + ch * ROWS * 4); }
+}
+
+// The n8-major copy of the head for the rescore: n8 tile t's KG groups back to back, each the 256 bytes of head words
+// the rescore reads at tile * KG * 2048 + g * 2048 + nt * 256, then its 8 bf16 scales and its 8 bf16 biases.
+// Grid n8 tiles, 128 threads.
+extern "C" __global__ void __launch_bounds__(128) tf_head_sieve_pack_rn(const uint32_t* __restrict__ w,
+        const __nv_bfloat16* __restrict__ scales, const __nv_bfloat16* __restrict__ biases, int npad, int KG,
+        unsigned char* __restrict__ wr) {
+    using namespace tf_head_sieve;
+    const size_t t = blockIdx.x;
+    const size_t tile = t >> 3;
+    const int nt = static_cast<int>(t & 7);
+    const size_t col0 = tile * 64 + nt * 8;
+    const unsigned char* wsrc = reinterpret_cast<const unsigned char*>(w) + tile * KG * 2048 + nt * 256;
+    unsigned char* dst = wr + t * KG * RN_GROUP;
+    for (int c = threadIdx.x; c < KG * 18; c += blockDim.x) {
+        const int g = c / 18, part = c % 18;
+        uint4 v;
+        if (part < 16) v = *reinterpret_cast<const uint4*>(wsrc + static_cast<size_t>(g) * 2048 + part * 16);
+        else v = *reinterpret_cast<const uint4*>((part == 16 ? scales : biases) + static_cast<size_t>(g) * npad + col0);
+        *reinterpret_cast<uint4*>(dst + static_cast<size_t>(g) * RN_GROUP + part * 16) = v;
+    }
+}
+
+namespace tf_head_sieve {
+
+// sieve_rescore<16> from the n8-major copy: the same items (the list, every tile on an overflow, or with keys the rows'
+// first tiles), the same per-item loads, MMA chain (mma0 then three mma a group), acc = fma(xs, b, fma(d, s, acc)) in
+// group order, bf16 rounding and atomicMax(key) into best[row]. A warp an item; the CTA's batches of RN_WARPS items run
+// through one pipeline of CH-group steps, each step an item's CH groups in one contiguous piece (the head's own layout
+// gives 256-byte pieces 2 KiB apart, which the memory serves at ~190 GB/s; contiguous 1152-byte pieces at ~230).
+// KG % CH == 0. Grid any, RN_WARPS * 32 threads, rn_smem(CH, STAGES) shared.
+template <int CH, int STAGES>
+__device__ __forceinline__ void sieve_rescore_rn(const unsigned char* __restrict__ wr, const uint4* __restrict__ afr,
+        const float* __restrict__ xv, int KG, int rows, const int* __restrict__ list, const unsigned long long* __restrict__ count,
+        int cap, int n8s, const unsigned long long* __restrict__ keys, unsigned long long* __restrict__ best) {
+    constexpr int R = ROWS, NW = RN_WARPS, NT = NW * 32;
+    constexpr int O_W = CH * AFR, O_X = O_W + NW * CH * RN_GROUP;
+    constexpr int STG = O_X + CH * R * 4;
+    extern __shared__ __align__(128) unsigned char buf[];
+    qmm_frag::grid_wait();
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    // the selector's packed count: high word every hit (the overflow rule), low word the compact list's entries
+    const unsigned long long counts = keys != nullptr ? 0ull : *count;
+    const int total = static_cast<int>(counts >> 32);
+    const int n = keys != nullptr ? rows : static_cast<int>(static_cast<unsigned>(counts));
+    const bool all = keys == nullptr && total > cap;
+    const int items = all ? n8s : n;
+    const int r0 = lane >> 2;
+    qmm_frag::grid_launch();
+    const int per = gridDim.x * NW;
+    const int first = blockIdx.x * NW;
+    if (first >= items) return;
+    const int nb = (items - first + per - 1) / per;
+    const int cpi = KG / CH;
+    const int steps = nb * cpi;
+    auto item_of = [&](int j) { return first + j * per + warp; };
+    auto tile_of = [&](int it) {
+        return keys != nullptr ? static_cast<int>(0xFFFFFFFFu - static_cast<uint32_t>(keys[it])) : all ? it : list[it];
+    };
+    // keys pass: a first tile an earlier row already listed is projected once (the projection serves every row), as the
+    // record's tf_head_sieve_rescore does; unset keys stay on the original path
+    auto live_of = [&](int it) {
+        if (it >= items) return false;
+        if (keys == nullptr || keys[it] == 0ull) return true;
+        const uint32_t enc = static_cast<uint32_t>(keys[it]);
+        for (int prev = 0; prev < it; ++prev)
+            if (keys[prev] != 0ull && static_cast<uint32_t>(keys[prev]) == enc) return false;
+        return true;
+    };
+    auto load = [&](int s, int f) {
+        const int j = f / cpi, g0 = (f - j * cpi) * CH;
+        unsigned char* p = buf + s * STG;
+        for (int c = tid; c < CH * 128; c += NT) qmm_frag::cp16(p + c * 16, afr + static_cast<size_t>(g0) * 128 + c);
+        const int it = item_of(j);
+        if (live_of(it)) {
+            const unsigned char* src = wr + (static_cast<size_t>(tile_of(it)) * KG + g0) * RN_GROUP;
+            for (int c = lane; c < CH * 18; c += 32) qmm_frag::cp16(p + O_W + warp * CH * RN_GROUP + c * 16, src + c * 16);
+        }
+        for (int c = tid; c < CH * R / 4; c += NT)
+            qmm_frag::cp16(p + O_X + c * 16, xv + static_cast<size_t>(g0 + c / (R / 4)) * 2 * R + (c % (R / 4)) * 4);
+    };
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s) {
+        if (s < steps) load(s, s);
+        qmm_frag::commit();
+    }
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int f = 0; f < steps; ++f) {
+        qmm_frag::wait<STAGES - 2>();
+        __syncthreads();
+        const int nx = f + STAGES - 1;
+        if (nx < steps) load(nx % STAGES, nx);
+        qmm_frag::commit();
+        const int j = f / cpi, ch = f - j * cpi;
+        const int it = item_of(j);
+        if (live_of(it)) {
+            const unsigned char* p = buf + (f % STAGES) * STG;
+#pragma unroll
+            for (int q = 0; q < CH; ++q) {
+                const unsigned char* pw = p + O_W + (warp * CH + q) * RN_GROUP;
+                const uint2 wv = reinterpret_cast<const uint2*>(pw)[lane];
+                const __nv_bfloat16* ps = reinterpret_cast<const __nv_bfloat16*>(pw + 256);
+                const float* px = reinterpret_cast<const float*>(p + O_X + q * R * 4);
+                float d[4];
+#pragma unroll
+                for (int kt = 0; kt < 4; ++kt) {
+                    const uint4 vm = reinterpret_cast<const uint4*>(p + q * AFR)[kt * 32 + lane];
+                    const uint32_t a[4] = {vm.x, vm.y, vm.z, vm.w};
+                    const uint32_t word = kt < 2 ? wv.x : wv.y;
+                    const uint32_t b0 = qmm_frag::pair(word, (kt & 1) * 8), b1 = qmm_frag::pair(word, (kt & 1) * 8 + 4);
+                    if (kt == 0) qmm_frag::mma0(d, a, b0, b1);
+                    else qmm_frag::mma(d, a, b0, b1);
+                }
+                const int c = (lane & 3) * 2;
+                const float sv[2] = {__bfloat162float(ps[c]), __bfloat162float(ps[c + 1])};
+                const float bv[2] = {__bfloat162float(ps[8 + c]), __bfloat162float(ps[8 + c + 1])};
+                const float xr[2] = {px[r0], px[r0 + 8]};
+#pragma unroll
+                for (int e = 0; e < 4; ++e)
+                    acc[e] = __fmaf_rn(xr[e >> 1], bv[e & 1], __fmaf_rn(d[e], sv[e & 1], acc[e]));
+            }
+            if (ch == cpi - 1) {
+                const int t = tile_of(it);
+                const int col = (t >> 3) * 64 + (t & 7) * 8 + (lane & 3) * 2;
+#pragma unroll
+                for (int hh = 0; hh < 2; ++hh) {
+                    float b = neg_inf();
+                    int id = 0x7fffffff;
+#pragma unroll
+                    for (int e2 = 0; e2 < 2; ++e2) {
+                        const float v = __bfloat162float(__float2bfloat16_rn(acc[2 * hh + e2]));
+                        if (v > b) {
+                            b = v;
+                            id = col + e2;
+                        }
+                    }
+#pragma unroll
+                    for (int m = 1; m <= 2; m <<= 1)
+                        tf_qmm_group::amax_take(__shfl_xor_sync(0xffffffffu, b, m), __shfl_xor_sync(0xffffffffu, id, m), b, id);
+                    const int row = r0 + 8 * hh;
+                    if ((lane & 3) == 0 && row < rows && id != 0x7fffffff) atomicMax(best + row, key(b, id));
+                }
+#pragma unroll
+                for (int e = 0; e < 4; ++e) acc[e] = 0.0f;
+            }
+        }
+    }
+    qmm_frag::wait<0>();
+}
+
+} // namespace tf_head_sieve
+
+extern "C" __global__ void __launch_bounds__(128) tf_head_sieve_rescore_rn(const unsigned char* __restrict__ wr,
+        const uint4* __restrict__ afr, const float* __restrict__ xv, int KG, int rows, const int* __restrict__ list,
+        const unsigned long long* __restrict__ count, int cap, int n8s, const unsigned long long* __restrict__ keys,
+        unsigned long long* __restrict__ best) {
+    tf_head_sieve::sieve_rescore_rn<tf_head_sieve::RN_CH, tf_head_sieve::RN_STAGES>(wr, afr, xv, KG, rows, list, count, cap, n8s, keys, best);
+}
+
+// The rows' first tiles (keys): at most 16 items, so fewer, longer steps.
+extern "C" __global__ void __launch_bounds__(128) tf_head_sieve_rescore_rn_keys(const unsigned char* __restrict__ wr,
+        const uint4* __restrict__ afr, const float* __restrict__ xv, int KG, int rows, const int* __restrict__ list,
+        const unsigned long long* __restrict__ count, int cap, int n8s, const unsigned long long* __restrict__ keys,
+        unsigned long long* __restrict__ best) {
+    tf_head_sieve::sieve_rescore_rn<tf_head_sieve::RN_KCH, tf_head_sieve::RN_STAGES>(wr, afr, xv, KG, rows, list, count, cap, n8s, keys, best);
+}
+
 // Each row's token from its best; the round's counters: stats[0] rounds, [1] selected n8 tiles (or all on overflow), [2] their most,
 // [3] overflows, [4] rows. One warp.
 extern "C" __global__ void __launch_bounds__(32) tf_head_sieve_finish(const unsigned long long* __restrict__ best,
