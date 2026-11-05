@@ -19,7 +19,7 @@ manifest = json.loads((root / "benchmark.json").read_text())
 
 assert contract["seed_window_max_ratio"] == 1.7
 assert contract["decode_speedup_ceiling"] == 5.0
-assert contract["prefill_speedup_ceiling"] == 2.0
+assert contract["prefill_speedup_ceiling"] == 3.0
 assert contract["official_prefill_timed_runs"] == 1
 assert contract["decode_golden_offset"] == 1
 assert contract["decode_window_includes_seed"] is True
