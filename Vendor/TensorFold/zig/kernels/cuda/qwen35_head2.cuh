@@ -186,7 +186,6 @@ __device__ __forceinline__ void select(const __nv_bfloat16* __restrict__ L, int 
     for (int pass = 0; pass < 2; ++pass) {
         for (int i = t; i < 256; i += T) hist[i] = 0;
         __syncthreads();
-        // eight values a load (V a multiple of 8 and the rows 16-byte aligned: the packed span rows are)
         for (int i = t; i < V / 8; i += T) {
             const uint4 q = reinterpret_cast<const uint4*>(x)[i];
             const unsigned short v[8] = {(unsigned short)(q.x & 0xFFFFu), (unsigned short)(q.x >> 16), (unsigned short)(q.y & 0xFFFFu), (unsigned short)(q.y >> 16),
@@ -248,12 +247,6 @@ __device__ __forceinline__ void select(const __nv_bfloat16* __restrict__ L, int 
     }
 }
 
-// The rescore: row blockIdx.x's candidates (PI, n a row) below `first`, 32 a block (four n8 tiles), each value recomputed
-// from the 4-bit head with group_kernel_dict's arithmetic. A group's product d is its own four-step MMA chain from zero
-// over the row tile's A fragments (rows past M zero) and the candidate column's two words a lane (the 32 bytes its
-// tile's lanes hold), pairm's codes; the four warps take a quarter of the groups each and keep row r's d of every
-// (group, candidate). Then one lane a candidate folds the groups in order, acc = fma(xs, b, fma(d, s, acc)), and rounds
-// to bf16: each d and each fma is the full head's, in its order. PV takes the value the stored logit would widen to.
 constexpr int RS_KG = 80;
 __device__ __forceinline__ void rescore(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
                                         const uint32_t* __restrict__ w4, const __nv_bfloat162* __restrict__ sbcol,
@@ -288,7 +281,6 @@ __device__ __forceinline__ void rescore(const __nv_bfloat16* __restrict__ x, con
         const int ub = max(cols[j * 8 + g4], 0);
         wcol[j] = w4 + static_cast<size_t>(ub / 64) * KG * TILE_WORDS + (((ub % 64) / 8) * 32 + (ub % 8) * 4 + t4) * 2;
     }
-    // the lanes whose fragment entries are row r: rows g4 (entries 0, 1) and g4 + 8 (entries 2, 3)
     const bool mine = (r < 8 ? g4 == r : g4 == r - 8);
     const int e0 = r < 8 ? 0 : 2;
     const int per = (KG + 3) / 4, g_lo = warp * per, g_hi = min(KG, g_lo + per);

@@ -512,3 +512,4 @@ const vtable: bench.BenchSession.VTable = .{
     .inspectPhase = inspectPhaseFn,
     .reset = resetFn,
 };
+// redraw 118 of terrapinelf's 19c77e7b

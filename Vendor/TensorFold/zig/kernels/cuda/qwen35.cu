@@ -128,7 +128,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __r
             const int d = (t + 256 * j) * 8;
             if (d >= D) break;
             if (R != nullptr) {
-                const uint4 rw = *reinterpret_cast<const uint4*>(R + row * D + d); // the residual at use: a shorter live range
+                const uint4 rw = *reinterpret_cast<const uint4*>(R + row * D + d);
                 __nv_bfloat16* hb = reinterpret_cast<__nv_bfloat16*>(&hw[j]);
                 const __nv_bfloat16* rb = reinterpret_cast<const __nv_bfloat16*>(&rw);
 #pragma unroll
@@ -569,11 +569,6 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post_ilp(Geo geo, c
     }
 }
 
-// tf_q35_gdn_post_ilp behind a running tf_gdn_chain_conv (gdn_prefill.cu): launched as its programmatic dependent,
-// persistent row warps take items (RPW rows, value head) in row order; each waits until both value-row blocks of its
-// head have published its rows (progress words 2 hv and 2 hv + 1, a 128-byte line each), then loads y and computes
-// exactly as tf_q35_gdn_post_ilp. Every block ends with griddepcontrol.wait, so the grid ends no earlier than the chain
-// and the kernels after it see a whole chain. W_chain: the chain's rows (none past them is waited for).
 __device__ __forceinline__ int relaxed(const int* f) {
     int v;
     asm volatile("ld.global.relaxed.gpu.b32 %0, [%1];\n" : "=r"(v) : "l"(f) : "memory");
@@ -581,7 +576,7 @@ __device__ __forceinline__ int relaxed(const int* f) {
 }
 
 constexpr int POLL_NS = 2000;
-constexpr int FLAG_STRIDE = 32;  // a progress word a 128-byte line (gdn_prefill.cu's)
+constexpr int FLAG_STRIDE = 32;
 extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post_follow(Geo geo, const __nv_bfloat16* __restrict__ Y0, const __nv_bfloat16* __restrict__ Z0,
                                                                           const __nv_bfloat16* __restrict__ NW, float eps, __nv_bfloat16* __restrict__ OUT0,
                                                                           const int* __restrict__ P, float* __restrict__ XS0, const int* flags, int W_chain) {
@@ -593,13 +588,11 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post_follow(Geo geo
     constexpr int PER = DK / 32;
     const uint2 nw = *reinterpret_cast<const uint2*>(plain(NW) + lane * PER);
     asm volatile("" ::"r"(nw.x), "r"(nw.y));
-    // z, the norm weights and the counts were written before the chain began (its launch waited for them)
     const __nv_bfloat16* Z = plain(Z0);
     __nv_bfloat16* OUT = plain(OUT0);
     float* XS = plain(XS0);
     const int rows = P[2];
     const size_t W = (size_t)geo.nv * DK;
-    // persistent row warps: item (row block of RPW, value head), row blocks in order, so the earliest rows go first
     const int items = (rows + RPW - 1) / RPW * geo.nv, step = gridDim.x * blockDim.y;
     for (int item = blockIdx.x * blockDim.y + threadIdx.y; item < items; item += step) {
         const int hv = item % geo.nv;
@@ -611,8 +604,6 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post_follow(Geo geo
             zw[r] = *reinterpret_cast<const uint2*>(Z + m * W + hv * DK + lane * PER);
         }
         const int need = (int)min(min(m0 + RPW, (size_t)rows), (size_t)W_chain);
-        // relaxed polls (an acquire load per poll would invalidate the SM's L1 under the running chain each time),
-        // then one acquire fence: the rows' y stores, released before the words, are visible to the loads below
         while (min(relaxed(flags + FLAG_STRIDE * (2 * hv)), relaxed(flags + FLAG_STRIDE * (2 * hv + 1))) < need) __nanosleep(POLL_NS);
         asm volatile("fence.acq_rel.gpu;\n" ::: "memory");
         const __nv_bfloat16* Y = plain(Y0);
@@ -653,7 +644,6 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post_follow(Geo geo
             if (lane < DK / 64) XS[m * (W / 64) + hv * (DK / 64) + lane] = group_sum(done + lane * 64);
         }
     }
-    // every block ends no earlier than the chain: the grid's end implies the chain's
     await_prior();
 }
 

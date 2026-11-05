@@ -175,45 +175,45 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
         }
     }
     wait<0>();
-    __nv_bfloat16* own = reinterpret_cast<__nv_bfloat16*>(buf);
-    __syncthreads();
-#pragma unroll
-    for (int i = 0; i < I; ++i)
+    static_assert(STAGES == 2 && I == 1 && WM == 1 && WN == 4 && BN == 256);
+    static_assert(BM * (BN / 2) * sizeof(__nv_bfloat16) <= T::STAGE);
+    __nv_bfloat16* own = reinterpret_cast<__nv_bfloat16*>(stage(per % STAGES));
+    if (wn < WN / 2) {
 #pragma unroll
         for (int j = 0; j < J; ++j)
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
-                const int r = wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8;
+                const int r = (lane >> 2) + h * 8;
                 const int c = wn * (BN / WN) + j * 8 + (lane & 3) * 2;
-                *reinterpret_cast<__nv_bfloat162*>(own + r * BN + c) =
-                    __floats2bfloat162_rn(acc[i][j][2*h], acc[i][j][2*h+1]);
+                *reinterpret_cast<__nv_bfloat162*>(own + r * (BN / 2) + c) =
+                    __floats2bfloat162_rn(acc[0][j][2*h], acc[0][j][2*h+1]);
             }
+    }
     __syncthreads();
     if (wn >= WN / 2) {
 #pragma unroll
-        for (int i = 0; i < I; ++i)
+        for (int j = 0; j < J; ++j)
 #pragma unroll
-            for (int j = 0; j < J; ++j)
+            for (int h = 0; h < 2; ++h) {
+                const int r = (lane >> 2) + h * 8;
+                const int c = (wn - WN / 2) * (BN / WN) + j * 8 + (lane & 3) * 2;
+                const __nv_bfloat162 g2 = *reinterpret_cast<const __nv_bfloat162*>(own + r * (BN / 2) + c);
+                const __nv_bfloat162 u2 = __floats2bfloat162_rn(acc[0][j][2*h], acc[0][j][2*h+1]);
+                const float gf[2] = {__low2float(g2), __high2float(g2)};
+                const float uf[2] = {__low2float(u2), __high2float(u2)};
+                __nv_bfloat16 o[2];
 #pragma unroll
-                for (int h = 0; h < 2; ++h) {
-                    const int r = wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8;
-                    const int c = wn * (BN / WN) + j * 8 + (lane & 3) * 2 - BN / 2;
-                    const __nv_bfloat162 g2 = *reinterpret_cast<const __nv_bfloat162*>(own + r * BN + c);
-                    const __nv_bfloat162 u2 = *reinterpret_cast<const __nv_bfloat162*>(own + r * BN + c + BN / 2);
-                    const float gf[2] = {__low2float(g2), __high2float(g2)};
-                    const float uf[2] = {__low2float(u2), __high2float(u2)};
-                    __nv_bfloat16 o[2];
-#pragma unroll
-                    for (int e = 0; e < 2; ++e) o[e] = __float2bfloat16_rn(gf[e] / (1.0f + expf(-gf[e])) * uf[e]);
-                    const __nv_bfloat162 o2 = __halves2bfloat162(o[0], o[1]);
-                    *reinterpret_cast<__nv_bfloat162*>(own + r * BN + c) = o2;
-                    if (m0 + r < M) *reinterpret_cast<__nv_bfloat162*>(act + static_cast<size_t>(m0 + r) * P.n + n0 + c) = o2;
-                }
-    }
-    __syncthreads();
-    if (tid < rows * (BN / 128)) {
-        const int r = tid / (BN / 128), group = tid % (BN / 128);
-        as[static_cast<size_t>(m0 + r) * (P.n / 64) + n0 / 64 + group] = act_group_sum(own + r * BN + group * 64);
+                for (int e = 0; e < 2; ++e) o[e] = __float2bfloat16_rn(gf[e] / (1.0f + expf(-gf[e])) * uf[e]);
+                const __nv_bfloat162 o2 = __halves2bfloat162(o[0], o[1]);
+                *reinterpret_cast<__nv_bfloat162*>(own + r * (BN / 2) + c) = o2;
+                if (m0 + r < M) *reinterpret_cast<__nv_bfloat162*>(act + static_cast<size_t>(m0 + r) * P.n + n0 + c) = o2;
+            }
+        __syncwarp();
+        if (lane < rows) {
+            const int group = wn - WN / 2;
+            as[static_cast<size_t>(m0 + lane) * (P.n / 64) + n0 / 64 + group] =
+                act_group_sum(own + lane * (BN / 2) + group * 64);
+        }
     }
 
 }

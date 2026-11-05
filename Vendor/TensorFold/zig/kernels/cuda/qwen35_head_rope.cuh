@@ -1,4 +1,3 @@
-// One warp retains the two head-normalization sums; its block shares position-independent rotary frequencies.
 extern "C" __global__ void __launch_bounds__(256) tf_q35_head_rope_warp(
         Geo geo, const __nv_bfloat16* __restrict__ Qraw0, const __nv_bfloat16* __restrict__ Kraw0,
         const __nv_bfloat16* __restrict__ Vraw0, const __nv_bfloat16* __restrict__ Qweight,

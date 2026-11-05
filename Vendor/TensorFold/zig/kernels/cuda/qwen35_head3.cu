@@ -1,35 +1,20 @@
-// The greedy verify head through a 2-bit screen (cuda_head3.zig), for the tile-major 4-bit vocabulary head that
-// qmm_group.cu's group_kernel_dict reads. At load, a copy with each 4-bit code's two high bits, each column's
-// (4 s, b + 1.5 s) a group (the 2-bit code's interval midpoint) and each column's exact (s, b) a group. A verify window:
-//   tf_q35h3_sq:      each row's sum of squares over each 64-column group of its input;
-//   tf_q35h3_screen:  each column's screened value plus kappa times the spread of the dropped bits,
-//                     U = approx + kappa * sqrt(1.25 * sum_g s_g^2 * sum_{k in g} x_k^2), rounded up to bf16, and each
-//                     row's largest U of every 64-column tile;
-//   tf_q35h3_select:  each row's K largest U (held by the tiles whose largest U reaches the K-th largest tile maximum),
-//                     the K-th largest as the row's cut;
-//   tf_q35h3_rescore: each selected column's logit from the 4-bit head with group_kernel_dict's arithmetic (the same A
-//                     and B fragments, MMA chain, fmas and bf16 rounding);
-//   tf_q35h3_merge:   each row's token, the highest logit with ties to the lowest id, kept when the cut is below the bf16
-//                     value under that logit (every unselected column's U is at most the cut); otherwise 0xFFFFFFFF, and
-//                     the host runs the full head over the window.
 #include <cuda_bf16.h>
 #include <stdint.h>
 
 namespace tf_q35h3 {
 
-constexpr int GS = 64;                 // the head's quantization group (K columns a group)
-constexpr int TILE_WORDS = 512;        // a stored 64-column tile's 4-bit group block: 8 n8 tiles x 32 lanes x 2 words
-constexpr int CODE_WORDS = 256;        // the screen's 2-bit group block: 8 n8 tiles x 32 lanes, one word a lane
+constexpr int GS = 64;
+constexpr int TILE_WORDS = 512;
+constexpr int CODE_WORDS = 256;
 constexpr int STAGES = 8;
 constexpr int CB = CODE_WORDS * 4, SB = 64 * 4;
-// a stage: RT m16 row tiles of the input's group rows, the codes, the scales, the group sums and the sums of squares
 template <int RT>
 struct Stage {
     static constexpr int XB = RT * 16 * GS * 2, PB = RT * 16 * 4, QB = RT * 16 * 4;
     static constexpr int BYTES = XB + CB + SB + PB + QB;
 };
-constexpr int TCAP = 1024;             // the select's tiles a row at most
-constexpr int RS_KG = 80;              // the rescore's groups at most
+constexpr int TCAP = 1024;
+constexpr int RS_KG = 80;
 
 __device__ __forceinline__ uint32_t smem_addr(const void* p) { return static_cast<uint32_t>(__cvta_generic_to_shared(p)); }
 __device__ __forceinline__ void cp16(void* dst, const void* src) {
@@ -46,7 +31,6 @@ __device__ __forceinline__ void ldmatrix4(uint32_t (&r)[4], const void* p) {
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
                  : "r"(smem_addr(p)));
 }
-// qmm_frag.cuh's mma and mma0
 __device__ __forceinline__ void mma(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
     asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
         "{%0, %1, %2, %3};\n"
@@ -60,7 +44,6 @@ __device__ __forceinline__ void mma0(float (&d)[4], const uint32_t (&a)[4], uint
         : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "f"(z));
 }
-// qmm_group.cu's pairm: a word's two fields at s and s + 16 (mask) as two bf16 codes
 __device__ __forceinline__ uint32_t pairm(uint32_t w, int s, uint32_t mask) {
     const uint32_t t = ((w >> s) & mask) | 0x43004300u;
     uint32_t r;
@@ -70,7 +53,6 @@ __device__ __forceinline__ uint32_t pairm(uint32_t w, int s, uint32_t mask) {
 template <int CHUNKS>
 __device__ __forceinline__ int swz(int r, int c) { return c ^ (r % CHUNKS); }
 
-// The 2-bit codes in up to four tile ranges of tpc tiles each (each its own allocation: fast pool pieces when placed there)
 struct Chunks {
     uint32_t* p[4];
     int tpc;
@@ -80,18 +62,13 @@ __device__ __forceinline__ uint32_t* chunk_at(const Chunks& c, int tile, int KG)
     return c.p[k] + static_cast<size_t>(tile - k * c.tpc) * KG * CODE_WORDS;
 }
 
-// bf16 bits in value order: a larger key is a larger value (NaN never comes out of the screen)
 __device__ __forceinline__ unsigned key16(unsigned b) { return (b & 0x8000u) ? (~b & 0xFFFFu) : (b | 0x8000u); }
 __device__ __forceinline__ unsigned unkey16(unsigned k) { return (k & 0x8000u) ? (k & 0x7FFFu) : (~k & 0xFFFFu); }
 
-// Load: the screen's blocks of tile blockIdx.x, group blockIdx.y from the 4-bit head (tile-major words W4, group-major
-// bf16 scales S and biases B of pitch npad). A lane's 2-bit word holds, for its n8 tile's column lane / 4, the two high
-// bits of the 16 codes its 4-bit words hold: the pair the MMA's b0 / b1 takes at step kt (p = 2 kt + h) at bits 2p and
-// 16 + 2p. Scales: (4 s, b + 1.5 s) as bf16x2; sbcol: each column's exact (s, b) group by group, for the rescore.
 __device__ __forceinline__ void pack(const uint32_t* __restrict__ w4, const __nv_bfloat16* __restrict__ s,
                                      const __nv_bfloat16* __restrict__ b, int npad, int KG, const Chunks& codes,
                                      __nv_bfloat162* __restrict__ scales, __nv_bfloat162* __restrict__ sbcol) {
-    const int tile = blockIdx.x, g = blockIdx.y, t = threadIdx.x;   // t = n8 tile * 32 + lane
+    const int tile = blockIdx.x, g = blockIdx.y, t = threadIdx.x;
     const uint32_t* src = w4 + (static_cast<size_t>(tile) * KG + g) * TILE_WORDS + t * 2;
     const uint32_t w[2] = {src[0], src[1]};
     uint32_t out = 0;
@@ -109,14 +86,13 @@ __device__ __forceinline__ void pack(const uint32_t* __restrict__ w4, const __nv
         const float sv = __bfloat162float(s[static_cast<size_t>(g) * npad + col]);
         const float bv = __bfloat162float(b[static_cast<size_t>(g) * npad + col]);
         scales[(static_cast<size_t>(tile) * KG + g) * 64 + t] = __floats2bfloat162_rn(4.0f * sv, bv + 1.5f * sv);
-        __nv_bfloat162 sb;                                           // the exact pair, a column's groups together
+        __nv_bfloat162 sb;
         sb.x = s[static_cast<size_t>(g) * npad + col];
         sb.y = b[static_cast<size_t>(g) * npad + col];
         sbcol[static_cast<size_t>(col) * KG + g] = sb;
     }
 }
 
-// Row blockIdx.x's sums of squares, a warp a group: XQ[row][g] = sum of x^2 over group g's 64 columns.
 __device__ __forceinline__ void sq(const __nv_bfloat16* __restrict__ x, int KG, float* __restrict__ xq) {
     const int r = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
     const __nv_bfloat162* row = reinterpret_cast<const __nv_bfloat162*>(x + static_cast<size_t>(r) * KG * GS);
@@ -129,9 +105,6 @@ __device__ __forceinline__ void sq(const __nv_bfloat16* __restrict__ x, int KG, 
     }
 }
 
-// The screen: a 64-column tile a block of 4 warps (16 columns a warp) over RT m16 row tiles (rows past M zero), the
-// input's group rows staged with the codes, the scales, the group sums and the sums of squares STAGES deep. Each column's
-// U into out (pitch ldo, bf16 rounded up) and each row's largest U of the tile into tmax (pitch tiles).
 template <int RT>
 __device__ __forceinline__ void screen(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
                                        const float* __restrict__ xq, const Chunks& codes,
@@ -146,7 +119,7 @@ __device__ __forceinline__ void screen(const __nv_bfloat16* __restrict__ x, cons
     const int rows = min(RT * 16, M);
     const uint32_t* tile_codes = chunk_at(codes, tile, KG);
     auto stage = [&](int s) { return buf + s * STAGE; };
-    for (int c = tid; c < RT * 16 * 8; c += 128)                    // rows past M stay zero in every stage
+    for (int c = tid; c < RT * 16 * 8; c += 128)
         if (c / 8 >= rows)
 #pragma unroll
             for (int s = 0; s < STAGES; ++s) *reinterpret_cast<uint4*>(stage(s) + (c / 8) * 128 + (c % 8) * 16) = uint4{};
@@ -154,7 +127,7 @@ __device__ __forceinline__ void screen(const __nv_bfloat16* __restrict__ x, cons
     auto load = [&](int s, int g) {
         unsigned char* p = stage(s);
 #pragma unroll
-        for (int c = tid; c < RT * 16 * 8; c += 128) {              // x: rows x 64 columns, 8 chunks of 16 bytes a row (swizzled)
+        for (int c = tid; c < RT * 16 * 8; c += 128) {
             const int r = c / 8, ch = c % 8;
             if (r < rows) cp16(p + r * 128 + swz<8>(r, ch) * 16, x + static_cast<size_t>(r) * KG * GS + g * GS + ch * 8);
         }
@@ -215,7 +188,7 @@ __device__ __forceinline__ void screen(const __nv_bfloat16* __restrict__ x, cons
                 acc[rt][j][1] += d[rt][j][1] * s1.x + xv[0] * s1.y;
                 acc[rt][j][2] += d[rt][j][2] * s0.x + xv[1] * s0.y;
                 acc[rt][j][3] += d[rt][j][3] * s1.x + xv[1] * s1.y;
-                const float q0 = s0.x * s0.x, q1 = s1.x * s1.x;      // (4 s)^2
+                const float q0 = s0.x * s0.x, q1 = s1.x * s1.x;
                 var[rt][j][0] += q0 * qv[0];
                 var[rt][j][1] += q1 * qv[0];
                 var[rt][j][2] += q0 * qv[1];
@@ -232,7 +205,6 @@ __device__ __forceinline__ void screen(const __nv_bfloat16* __restrict__ x, cons
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
                 const int row = rt * 16 + (lane >> 2) + h * 8, col = tile * 64 + (warp * 2 + j) * 8 + (lane & 3) * 2;
-                // the dropped bits' spread: 1.25 (the variance of a uniform 2-bit remainder about 1.5) times sum s^2 x^2
                 const __nv_bfloat16 u0 = __float2bfloat16_ru(acc[rt][j][2 * h] + kappa * sqrtf(0.078125f * var[rt][j][2 * h]));
                 const __nv_bfloat16 u1 = __float2bfloat16_ru(acc[rt][j][2 * h + 1] + kappa * sqrtf(0.078125f * var[rt][j][2 * h + 1]));
                 m[h] = fmaxf(m[h], fmaxf(__bfloat162float(u0), __bfloat162float(u1)));
@@ -253,12 +225,10 @@ __device__ __forceinline__ void screen(const __nv_bfloat16* __restrict__ x, cons
     __syncthreads();
     if (tid < rows) {
         const float v = fmaxf(fmaxf(wmax[0][tid], wmax[1][tid]), fmaxf(wmax[2][tid], wmax[3][tid]));
-        tmax[static_cast<size_t>(tid) * tiles + tile] = __float2bfloat16_rn(v);   // a bf16 value: exact
+        tmax[static_cast<size_t>(tid) * tiles + tile] = __float2bfloat16_rn(v);
     }
 }
 
-// The K-th largest of n bf16 order keys (get(i), K <= n): two passes of a 256-bin histogram, a warp's lanes with the
-// same bin adding once (the logits crowd a few high bins).
 template <typename Get>
 __device__ __forceinline__ unsigned kth(Get get, int n, int K, unsigned* hist, unsigned* s_bin, unsigned* s_above) {
     const int t = threadIdx.x, T = blockDim.x;
@@ -293,11 +263,6 @@ __device__ __forceinline__ unsigned kth(Get get, int n, int K, unsigned* hist, u
     return prefix;
 }
 
-// Row blockIdx.x: the K-th largest of its tile maxima; the tiles above it, then the ties at it while room lasts (TCAP);
-// the K-th largest U of those tiles' columns, the cut; the columns above the cut, then the ties at it while room lasts
-// (cap a row), into PI (ids; unused slots 0xFFFFFFFF) with PV at -inf (the rescore's), and the cut's value into CUT. The
-// chosen tiles hold at least K columns at or above the tiles' K-th largest maximum, so the cut is at least that maximum,
-// and a column of any other tile has U at most its tile's maximum: every unselected column's U is at most the cut.
 __device__ __forceinline__ void select(const __nv_bfloat16* __restrict__ U, int ldo, const __nv_bfloat16* __restrict__ TM,
                                        int tiles, int K, int cap, float* __restrict__ PV, unsigned* __restrict__ PI,
                                        float* __restrict__ CUT) {
@@ -322,7 +287,6 @@ __device__ __forceinline__ void select(const __nv_bfloat16* __restrict__ U, int 
         __syncthreads();
     }
     const int nt = min(static_cast<int>(s_count), TCAP), n = nt * 64;
-    // the chosen tiles' columns, read in place: column i of the list is column i % 64 of tile tl[i / 64]
     auto col = [&](int i) { return tl[i >> 6] * 64 + (i & 63); };
     const unsigned cut = kth([&](int i) { return key16(u[col(i)]); }, n, K, hist, &s_bin, &s_above);
     if (t == 0) s_count = 0;
@@ -330,7 +294,7 @@ __device__ __forceinline__ void select(const __nv_bfloat16* __restrict__ U, int 
     float* pv = PV + static_cast<size_t>(row) * cap;
     unsigned* pi = PI + static_cast<size_t>(row) * cap;
 #pragma unroll 1
-    for (int tie = 0; tie < 2; ++tie) {                           // above the cut first (fewer than K), then the ties
+    for (int tie = 0; tie < 2; ++tie) {
         for (int i = t; i < n; i += T) {
             const unsigned k = key16(u[col(i)]);
             if (tie ? k == cut : k > cut) {
@@ -345,12 +309,6 @@ __device__ __forceinline__ void select(const __nv_bfloat16* __restrict__ U, int 
     if (t == 0) CUT[row] = __uint_as_float(unkey16(cut) << 16);
 }
 
-// The rescore: row blockIdx.x's candidates (PI, n a row), 32 a block (four n8 tiles), each value recomputed from the 4-bit
-// head with group_kernel_dict's arithmetic. A group's product d is its own four-step MMA chain from zero over the A
-// fragments of the row's m16 tile (rows past M zero) and the candidate column's two words a lane (the 32 bytes its tile's lanes hold),
-// pairm's codes; the four warps take a quarter of the groups each and keep row r's d of every (group, candidate). Then one
-// lane a candidate folds the groups in order, acc = fma(xs, b, fma(d, s, acc)), and rounds to bf16: each d and each fma is
-// the full head's, in its order. PV takes the value the stored logit would widen to.
 __device__ __forceinline__ void rescore(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
                                         const uint32_t* __restrict__ w4, const __nv_bfloat162* __restrict__ sbcol,
                                         int KG, int M, float* __restrict__ PV, const unsigned* __restrict__ PI, int n,
@@ -360,7 +318,7 @@ __device__ __forceinline__ void rescore(const __nv_bfloat16* __restrict__ x, con
     const int r = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int at = blockIdx.y * 32;
     if (at >= n || KG > RS_KG) return;
-    const int rt = r / 16, rl = r % 16;                           // the row's m16 tile and its row in it
+    const int rt = r / 16, rl = r % 16;
     x += static_cast<size_t>(rt) * 16 * KG * GS;
     M -= rt * 16;
     const size_t base = static_cast<size_t>(r) * n + at;
@@ -387,7 +345,6 @@ __device__ __forceinline__ void rescore(const __nv_bfloat16* __restrict__ x, con
         const int ub = max(cols[j * 8 + g4], 0);
         wcol[j] = w4 + static_cast<size_t>(ub / 64) * KG * TILE_WORDS + (((ub % 64) / 8) * 32 + (ub % 8) * 4 + t4) * 2;
     }
-    // the lanes whose fragment entries are row r: rows g4 (entries 0, 1) and g4 + 8 (entries 2, 3)
     const bool mine = (rl < 8 ? g4 == rl : g4 == rl - 8);
     const int e0 = rl < 8 ? 0 : 2;
     const int per = (KG + 3) / 4, g_lo = warp * per, g_hi = min(KG, g_lo + per);
@@ -434,8 +391,6 @@ __device__ __forceinline__ void rescore(const __nv_bfloat16* __restrict__ x, con
     }
 }
 
-// Row blockIdx.x's token (a warp): the highest rescored value, ties to the lowest id (tf_qmm_head_argmax_merge's rule),
-// kept when the row's cut is below the bf16 value under it; otherwise 0xFFFFFFFF.
 __device__ __forceinline__ void merge(const float* __restrict__ PV, const unsigned* __restrict__ PI, int n,
                                       const float* __restrict__ CUT, unsigned* __restrict__ toks) {
     const int r = blockIdx.x, lane = threadIdx.x;
@@ -459,14 +414,14 @@ __device__ __forceinline__ void merge(const float* __restrict__ PV, const unsign
         }
     }
     if (lane == 0) {
-        const unsigned b = __float_as_uint(best) >> 16;               // best is a bf16 value (the rescore rounds)
+        const unsigned b = __float_as_uint(best) >> 16;
         const unsigned under = best > 0.0f ? b - 1u : (best < 0.0f ? b + 1u : 0x8001u);
         const bool ok = id != 0xFFFFFFFFu && best > __int_as_float(0xff800000) && CUT[r] < __uint_as_float(under << 16);
         toks[r] = ok ? id : 0xFFFFFFFFu;
     }
 }
 
-}  // namespace tf_q35h3
+}
 
 extern "C" __global__ void __launch_bounds__(256) tf_q35h3_pack(const uint32_t* __restrict__ w4,
         const __nv_bfloat16* __restrict__ s, const __nv_bfloat16* __restrict__ b, int npad, int KG,
@@ -486,7 +441,6 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35h3_screen(const __nv_bfl
     tf_q35h3::screen<1>(x, xs, xq, codes, scales, M, KG, kappa, out, ldo, tmax, tiles);
 }
 
-// 17 to 32 rows: both m16 row tiles on each loaded code word
 extern "C" __global__ void __launch_bounds__(128) tf_q35h3_screen32(const __nv_bfloat16* __restrict__ x,
         const float* __restrict__ xs, const float* __restrict__ xq, const tf_q35h3::Chunks codes,
         const __nv_bfloat162* __restrict__ scales, int M, int KG, float kappa, __nv_bfloat16* __restrict__ out, int ldo,

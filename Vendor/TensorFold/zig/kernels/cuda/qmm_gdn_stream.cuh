@@ -13,7 +13,7 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
                                            int K, int ldx, int items, Map map, float (&acc)[GemvTile<GS, BN, STAGES>::NT][4],
                                            After after) {
     using T = GemvTile<GS, BN, STAGES>;
-    static_assert(!DICT || (GS == 64 && BN % 64 == 0 && 2 * T::S == BN / 64 * 256), "coded stages");
+    static_assert(!DICT || (FutureGroups == 0 && GS == 64 && BN % 64 == 0 && 2 * T::S == BN / 64 * 256), "coded stages");
     const int npad = DICT ? P.tiles : P.npad;
     static_assert(T::MT == 1 && T::THREADS == 128, "one m16 row tile, four column warps");
     constexpr int NT = T::NT;
@@ -133,26 +133,11 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
     if(tid==0) {
 #pragma unroll
         for(int g=1;g<=FutureGroups;++g)if(g<items){
-            const auto at=map(g);
-            // H70 (child GDNPRE): the weight tile's stride is the real npad (a coded part's `tiles`), not the code
-            const auto* w=reinterpret_cast<const unsigned char*>(P.w)+(size_t(at.x)*(npad/64)+at.y/64)*TILE_BYTES;
+            const auto at=map(g);const auto* w=reinterpret_cast<const unsigned char*>(P.w)+(size_t(at.x)*(P.npad/64)+at.y/64)*TILE_BYTES;
+            const auto* a=P.scales+size_t(at.x)*P.npad+at.y;const auto* b=P.biases+size_t(at.x)*P.npad+at.y;
             asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(w), "n"(BN*GS/2) : "memory");
-            if constexpr(DICT){
-                // the coded stage's place: each 64-column tile's 256-byte index window of the group (256 bytes
-                // of slack follows the last tile, so the window never crosses the arrays' end)
-                const int step=qmm_dict::dict_step(P.npad);
-                const size_t window=static_cast<size_t>(at.x)*step & ~static_cast<size_t>(63);
-#pragma unroll
-                for(int t2=0;t2<BN/64;++t2){
-                    const auto* idx=reinterpret_cast<const unsigned char*>(P.scales)+
-                        (static_cast<size_t>(at.y)/64+t2)*KG*step+window;
-                    asm volatile("cp.async.bulk.prefetch.L2.global [%0], 256;" :: "l"(idx) : "memory");
-                }
-            }else{
-                const auto* a=P.scales+size_t(at.x)*P.npad+at.y;const auto* b=P.biases+size_t(at.x)*P.npad+at.y;
-                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(a), "n"(BN*2) : "memory");
-                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(b), "n"(BN*2) : "memory");
-            }
+            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(a), "n"(BN*2) : "memory");
+            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(b), "n"(BN*2) : "memory");
         }
     }
 #endif
@@ -230,8 +215,6 @@ __device__ __forceinline__ void wide_items(const __nv_bfloat16* __restrict__ x, 
         const float* px = reinterpret_cast<const float*>(p + T::X + T::W + 2 * T::S);
         const int row = lane >> 2;
         const float xv[2] = {px[row], px[row + 8]};
-        // Keep the small tiles intact; wider tiles consume four output chains at a time.
-        // A shared input fragment is reloaded per strip, never reassociated within a chain.
         constexpr int STRIP = NT < 4 ? NT : 4;
         static_assert(NT % STRIP == 0, "whole output strips");
 #pragma unroll
@@ -349,14 +332,13 @@ __device__ __forceinline__ void body(const __nv_bfloat16* x,const float* xs,cons
     else tile<64,FutureGroups>(x,xs,p,t,M,K,ldx);
 }
 // body() on a launch whose coded parts carry their real npad in `tiles` (uncoded parts: tiles 0, npad as stored).
-template<int FutureGroups>
 __device__ __forceinline__ void body_dict(const __nv_bfloat16* x,const float* xs,const tf_qmm_group::Parts& parts,int M,int K,int ldx){
     int which=0;
 #pragma unroll
     for(int i=1;i<4;++i)if(int(blockIdx.x)>=parts.p[i].first)which=i;
     const auto p=parts.p[which];int t=int(blockIdx.x)-p.first;const bool coded=p.tiles>0;
-    if(which<2){if(coded)tile<256,FutureGroups,true>(x,xs,p,t,M,K,ldx);else tile<256,FutureGroups>(x,xs,p,t,M,K,ldx);}
-    else{if(coded)tile<64,FutureGroups,true>(x,xs,p,t,M,K,ldx);else tile<64,FutureGroups>(x,xs,p,t,M,K,ldx);}
+    if(which<2){if(coded)tile<256,0,true>(x,xs,p,t,M,K,ldx);else tile<256,0>(x,xs,p,t,M,K,ldx);}
+    else{if(coded)tile<64,0,true>(x,xs,p,t,M,K,ldx);else tile<64,0>(x,xs,p,t,M,K,ldx);}
 }
 }
 
@@ -365,13 +347,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_gdn_stream16(const __nv
 }
 // tf_qmm_gdn_stream16 with its dictionary-coded parts' index windows: the same loads, MMA chains, fmas and sums.
 extern "C" __global__ void __launch_bounds__(128) tf_qmm_gdn_stream16_dict(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
-    tf_qmm_gdn_stream::body_dict<0>(x,xs,parts,M,K,ldx);
-}
-// H70 (child GDNPRE): the dict twin's 4-group L2 lookahead — the same loads, MMA chains, fmas and sums; the
-// only additions are read-only cp.async.bulk.prefetch.L2 of future weight tiles and dict index windows,
-// issued before grid_wait (pure scheduling, bit-safe).
-extern "C" __global__ void __launch_bounds__(128) tf_qmm_gdn_stream16_dict_fg4(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
-    tf_qmm_gdn_stream::body_dict<4>(x,xs,parts,M,K,ldx);
+    tf_qmm_gdn_stream::body_dict(x,xs,parts,M,K,ldx);
 }
 
 namespace tf_qmm_gdn_rows32 {
