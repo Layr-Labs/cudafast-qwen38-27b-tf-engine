@@ -20,11 +20,30 @@ pub fn projectMany(e: *Engine, ls: []const Proj, x: u64, xs: u64, outs: []const 
     const A = cuda.qlinear.Affine4Kernels;
     // GB10 has no split form: a decode or verify window of one row tile groups its projections by kernel instead
     const wide = e.affine.group_wide and !prompt and rows > A.max_rows and rows <= 32;
-    const by_kernel = e.affine.split != null or (!prompt and rows <= A.max_rows) or wide;
+    const wide_deep = e.affine.group_wide_deep and !prompt and rows > 32 and rows <= e.affine.verifyRows();
+    const by_kernel = e.affine.split != null or (!prompt and rows <= A.max_rows) or wide or wide_deep;
     const segmented = by_kernel and !(prompt and rows > 16) and ls.len <= A.segs_max and for (ls) |l| {
         if (l != .a4 or l.inputs() != ls[0].inputs()) break false;
     } else true;
     if (!segmented) {
+        // GB10's wide path (rows past 32, verify windows): one cluster launch of up to four parts at their own
+        // K-slice counts (groupMixed) in place of a launch a projection — the GDN a/b 8-CTA launches join the
+        // qkv and z CTAs, the same per-CTA arithmetic (TF_GDN_PMERGE=0 keeps the separate launches).
+        const merged = !prompt and e.affine.pdl and pmergeOn() and rows > 32 and ls.len <= A.segs_max and for (ls) |l| {
+            if (l != .a4 or l.inputs() != ls[0].inputs()) break false;
+        } else true;
+        if (merged) {
+            const k = ls[0].inputs();
+            if (sums) try e.runAfter(e.fns.sums, .{ rows, (k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ x, xs, @as(c_int, @intCast(k)), params });
+            var at: usize = 0;
+            while (at < rows) : (at += e.affine.verifyRows()) {
+                const n = @min(e.affine.verifyRows(), rows - at);
+                var many: [A.segs_max]A.Out = undefined;
+                for (ls, outs, many[0..ls.len]) |l, out, *m| m.* = .{ .q = l.a4, .out = out + at * l.outputs() * 2 };
+                if (n <= 64) try e.affine.groupMixed(e.affine.verify64_fn, cuda.qlinear.verify64_smem, e.stream, x + at * k * 2, xs + at * (k / 64) * 4, many[0..ls.len], n, 1) else try e.affine.groupMixed(e.affine.verify128_fn, cuda.qlinear.verify128_smem, e.stream, x + at * k * 2, xs + at * (k / 64) * 4, many[0..ls.len], n, 1);
+            }
+            return;
+        }
         for (ls, outs, 0..) |l, out, i| try e.project(l, x, xs, out, rows, prompt, params, sums and i == 0);
         return;
     }
@@ -35,7 +54,18 @@ pub fn projectMany(e: *Engine, ls: []const Proj, x: u64, xs: u64, outs: []const 
     var many: [A.segs_max]A.Out = undefined;
     if (wide) {
         for (ls, outs, many[0..ls.len]) |l, out, *m| m.* = .{ .q = l.a4, .out = out };
+        // a 17-32-row GDN input (qkv, z, a, b with stream copies) takes the GDN stream twin's 32-row launch
+        // (one weight pass, bn = 128) instead of the split-K verify tiles; TF_GDN_STREAM32=0 keeps the tiles
+        if (e.affine.streamable(many[0..ls.len], rows)) {
+            // the GDN stream kernels read the group sums the sums pass above wrote (as at 16 rows); the
+            // output pointers are the full window's (at = 0)
+            return e.affine.decodeMany(e.stream, x, xs, many[0..ls.len], rows);
+        }
         return e.affine.verifyMany32(e.stream, x, xs, many[0..ls.len], rows);
+    }
+    if (wide_deep) {
+        for (ls, outs, many[0..ls.len]) |l, out, *m| m.* = .{ .q = l.a4, .out = out };
+        return e.affine.verifyManyWide(e.stream, x, xs, many[0..ls.len], rows);
     }
     var at: usize = 0;
     while (at < rows) : (at += A.max_rows) {
@@ -52,4 +82,10 @@ pub fn projectMany(e: *Engine, ls: []const Proj, x: u64, xs: u64, outs: []const 
 
 fn mixedAttention() bool {
     return true;
+}
+
+/// TF_GDN_PMERGE=0 restores the wide path's separate per-projection launches.
+fn pmergeOn() bool {
+    const v = @import("sys").c.getenv("TF_GDN_PMERGE") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
 }
