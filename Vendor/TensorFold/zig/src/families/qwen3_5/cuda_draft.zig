@@ -6,6 +6,7 @@ const lanes = @import("lanes");
 const engine = @import("cuda_engine.zig");
 const weights = @import("cuda_draft_weights.zig");
 pub const tree = @import("cuda_draft_tree.zig");
+pub const history_branch = @import("cuda_draft_history_branch.zig");
 const profile = @import("cuda_startup_profile.zig");
 pub const precision = @import("cuda_draft_precision.zig");
 
@@ -40,6 +41,8 @@ pub const Ctx = struct {
     parents: [engine.most_window]i32 = undefined,
     own: [engine.most_window]f64 = undefined,
     grown: usize = 0,
+    // Historical grafts are proposals, not samples from the neural selector.
+    retrieved: [engine.most_window]bool = @splat(false),
     // the stream's tokens draft_frame has read, and whether more than 1 in 32 lay outside its spans (then drafts take
     // the whole head)
     scanned: usize = 0,
@@ -95,6 +98,7 @@ pub const Draft = struct {
     hp: u64,
     ids: u64, // u32 the block's ids
     staged: cuda.HostBuffer, // pinned: the ids up, the words and projected rows down
+    staged_device: u64 = 0, // a stable mapped view, or zero for the existing D2H path
     streams: std.AutoHashMapUnmanaged(*Stream, *Ctx) = .empty,
     graphs: std.AutoHashMapUnmanaged(u64, struct { exec: ?cuda.graph.Exec, spanned: ?u64 }) = .empty,
     /// Contexts between streams, allocated and run once (`reserve`), as the driver stalls a buffer's first kernel.
@@ -137,8 +141,9 @@ pub const Draft = struct {
         try d.scratch.fill8(0, null);
         d.at = 0;
         _ = try d.layout(true);
-        d.staged = try cuda.HostBuffer.alloc(e.d, try frame.stagedBytes(c.rank));
+        d.staged = try @import("cuda_mapped_results.zig").alloc(e.d, try frame.stagedBytes(c.rank), e.mapped_results, &d.staged_device);
         errdefer d.staged.free();
+        _ = try d.layout(true); // bind mapped terminal outputs before any warmup or graph capture
         d.head2 = try frame.head2Init(d);
         errdefer if (d.head2) |*h| h.free();
         // the first context, and a hold timed on it (the quickest of several: the first ones pay the driver's stalls)
@@ -230,6 +235,11 @@ pub const Draft = struct {
             const at = (try std.math.add(usize, total, 255)) & ~@as(usize, 255);
             total = try std.math.add(usize, at, s[1]);
             if (assign) @field(d, s[0]) = d.scratch.ptr + at;
+        }
+        if (assign and d.staged_device != 0) {
+            // Keep scratch accounting/layout unchanged; resize must restore these stable output addresses.
+            d.words = d.staged_device + words_at;
+            d.hp = d.staged_device + hp_at;
         }
         return total;
     }
@@ -443,6 +453,7 @@ pub const Draft = struct {
     pub fn selectHold(d: *Draft, ctx: *Ctx, it: dr.Hold) !void {
         const rows = d.c.block - 1;
         ctx.grown = 0;
+        ctx.retrieved = @splat(false);
         // a sampled hold's candidates ranked as its target draw ranks them (its seed, each draft's position)
         d.drawn = .{ .sampling = it.sampling, .position = it.position };
         defer d.drawn = .{};
@@ -452,6 +463,7 @@ pub const Draft = struct {
             // the whole budget whenever drafts are asked: the block's forward costs the same at any depth
             const n = if (it.depth == 0) 0 else limit;
             ctx.grown = tree.grow(d.candidates(rows), it.pending, rows, n, &ctx.held, &ctx.parents, &ctx.own);
+            var history_selected = false;
             if (n >= rows and it.tokens.len >= 4) {
                 var ch: [engine.most_window]u32 = undefined;
                 tree.chain(d.candidates(rows), it.pending, ch[0..rows]);
@@ -482,6 +494,12 @@ pub const Draft = struct {
                         ctx.own[r] = 0.0;
                     }
                     ctx.grown = copy_rows;
+                    history_selected = true;
+                }
+            }
+            if (!history_selected and it.sampling == null) {
+                if (history_branch.graft(it.tokens, it.pending, ctx.held[0..ctx.grown], ctx.parents[0..ctx.grown], ctx.own[0..ctx.grown])) |retained| {
+                    @memset(ctx.retrieved[retained..ctx.grown], true);
                 }
             }
             ctx.held_n = ctx.grown;
@@ -538,7 +556,13 @@ pub const Draft = struct {
                 var prefix: [engine.most_window]u32 = undefined;
                 for (prefix[0..@min(it.follow.len, prefix.len)], 0..) |*x, i| x.* = @intCast(i);
                 const kept = it.rows orelse prefix[0..@min(it.follow.len, prefix.len)];
-                d.landing.observeTree(it.stream.sampling != null, ctx.parents[0..ctx.grown], ctx.own[0..ctx.grown], it.offered, kept);
+                const offered = @min(it.offered, ctx.grown);
+                for (ctx.parents[0..offered], ctx.own[0..offered], ctx.retrieved[0..offered], 0..) |parent, own, retrieved, i| {
+                    if (retrieved) continue;
+                    const parent_row: u32 = if (parent < 0) 0 else @intCast(parent + 1);
+                    if (std.mem.indexOfScalar(u32, kept, parent_row) == null) continue;
+                    d.landing.observe(it.stream.sampling != null, own, std.mem.indexOfScalar(u32, kept, @intCast(i + 1)) != null);
+                }
             }
             ctx.grown = 0;
             // the target's features: its ring, `offset` the first row's position (cuda_native.zig's featuresFn)
