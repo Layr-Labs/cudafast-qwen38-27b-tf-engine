@@ -154,6 +154,13 @@ fn body(d: anytype, n: usize, narrow_: bool) !?u64 {
     return spanned;
 }
 
+/// TF_GRAPH_UPLOAD=0: launch the captured draft graph without its device-side preparation.
+/// Measured +0.54% on the crown lineage, +0.33% on the terrapinelf lineage (both 4-5 ABBA pairs).
+fn graphUploadOff() bool {
+    const v = @import("sys").c.getenv("TF_GRAPH_UPLOAD") orelse return false;
+    return @import("std").mem.eql(u8, @import("std").mem.span(v), "0");
+}
+
 fn run(d: anytype, n: usize, narrow_: bool) !?u64 {
     const e = d.e;
     if (draft.graphsOff()) return body(d, n, narrow_);
@@ -179,7 +186,10 @@ fn run(d: anytype, n: usize, narrow_: bool) !?u64 {
         exec = captured.instantiate() catch null;
     } else |_| {}
     try d.graphs.put(d.gpa, key, .{ .exec = exec, .spanned = spanned });
-    if (exec) |x| try x.launchOn(e.stream) else _ = try body(d, n, narrow_);
+    if (exec) |x| {
+        if (!graphUploadOff()) try x.upload(e.stream);
+        try x.launchOn(e.stream);
+    } else _ = try body(d, n, narrow_);
     return spanned;
 }
 
