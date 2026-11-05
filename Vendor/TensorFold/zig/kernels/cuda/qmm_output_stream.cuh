@@ -19,6 +19,7 @@ template<int FutureGroups,int Slices=4,int Rolling=0,bool DICT=false>
 __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const float* __restrict__ xs,
         const tf_qmm_group::Parts& parts,int M,int K,int ldx) {
     static_assert(!DICT||Rolling==0,"coded rolling prefetch is not implemented");
+    static_assert(Slices==4,"slice-local barrier IDs require four native K slices");
     extern __shared__ __align__(128) unsigned char buf[];
     const auto p=parts.p[0];
     const int slice=threadIdx.x/128,tid=threadIdx.x%128,lane=tid&31,wn=tid>>5;
@@ -75,7 +76,19 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const f
             asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(b) : "memory");
         }
 #endif
-        wait<0>();__syncthreads();
+        wait<0>();
+        // The immutable dictionary table is initialized by all CTA threads. After the
+        // first wait/barrier, each slice owns its two stages until the final reduction.
+        // A slice-local rendezvous publishes completed copies and protects stage reuse
+        // without forcing four independent K ranges to advance in lockstep.
+        if(it==0)__syncthreads();
+        else {
+            // Immediate IDs avoid reserving all sixteen named barriers for a dynamic ID.
+            if(slice==0)asm volatile("bar.sync 1, 128;" ::: "memory");
+            else if(slice==1)asm volatile("bar.sync 2, 128;" ::: "memory");
+            else if(slice==2)asm volatile("bar.sync 3, 128;" ::: "memory");
+            else asm volatile("bar.sync 4, 128;" ::: "memory");
+        }
         if(it+1<per){load_w(it+1);load_x(it+1);}commit();
         const auto* at=stage(it);const auto* wp=reinterpret_cast<const uint32_t*>(at+2048);
         // the lane's scale or bias, fetched now and stored after the MMAs (a global pair table's latency)
@@ -146,6 +159,11 @@ extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_stream16(const _
 extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_stream16_dict(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
     if(K==6144)tf_qmm_output_stream::body<4,4,0,true>(x,xs,parts,M,K,ldx);
     else tf_qmm_output_stream::body<0,4,0,true>(x,xs,parts,M,K,ldx);
+}
+// Keep the four-group L2 lookahead for K=4096 and K=6144; use the original unprefetched twin for K=17408.
+extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_stream16_dict_fg4(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
+    if (K == 17408) tf_qmm_output_stream::body<0,4,0,true>(x,xs,parts,M,K,ldx);
+    else tf_qmm_output_stream::body<4,4,0,true>(x,xs,parts,M,K,ldx);
 }
 extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_prefetch16(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
     tf_qmm_output_stream::body<4>(x,xs,parts,M,K,ldx);
