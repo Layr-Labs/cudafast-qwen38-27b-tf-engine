@@ -185,6 +185,8 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
             sg[i][e] = 0.0f;
         }
     const int r0 = lane >> 2;
+    // Check mode stores all 16 rows in approx, including padding; preserve them there.
+    const bool upper = rows > 8 || approx != nullptr;
     const bool stab = tab_smem > 0;
     for (int g = 0; g < KG; ++g) {
         qmm_frag::wait<NS - 2>();
@@ -242,12 +244,14 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
             const float m0 = fmaf(1.5f, s0, c0), m1 = fmaf(1.5f, s1, c1);
             acc[nt][0] = fmaf(4.0f * s0, d[0], fmaf(m0, xs0, acc[nt][0]));
             acc[nt][1] = fmaf(4.0f * s1, d[1], fmaf(m1, xs0, acc[nt][1]));
-            acc[nt][2] = fmaf(4.0f * s0, d[2], fmaf(m0, xs1, acc[nt][2]));
-            acc[nt][3] = fmaf(4.0f * s1, d[3], fmaf(m1, xs1, acc[nt][3]));
             sg[nt][0] = fmaf(s0 * s0, q0, sg[nt][0]);
             sg[nt][1] = fmaf(s1 * s1, q0, sg[nt][1]);
-            sg[nt][2] = fmaf(s0 * s0, q1, sg[nt][2]);
-            sg[nt][3] = fmaf(s1 * s1, q1, sg[nt][3]);
+            if (upper) {
+                acc[nt][2] = fmaf(4.0f * s0, d[2], fmaf(m0, xs1, acc[nt][2]));
+                acc[nt][3] = fmaf(4.0f * s1, d[3], fmaf(m1, xs1, acc[nt][3]));
+                sg[nt][2] = fmaf(s0 * s0, q1, sg[nt][2]);
+                sg[nt][3] = fmaf(s1 * s1, q1, sg[nt][3]);
+            }
         }
     }
     qmm_frag::wait<0>();
@@ -260,6 +264,7 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
         float hi[4];
 #pragma unroll
         for (int e = 0; e < 4; ++e) {
+            if (e >= 2 && !upper) { hi[e] = neg_inf(); continue; }
             const float sd = sqrtf(1.25f * sg[nt][e]), ks = kappa * sd, v = acc[nt][e];
             hi[e] = v + ks + fmaf(fabsf(v) + ks, SLACK_REL, SLACK_ABS);
             if (approx != nullptr) {
@@ -269,16 +274,20 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
                 approx[id * 32 + 16 + row] = sd;
             }
         }
-        float h0 = fmaxf(hi[0], hi[1]), h1 = fmaxf(hi[2], hi[3]);
+        float h0 = fmaxf(hi[0], hi[1]), h1 = neg_inf();
         h0 = fmaxf(h0, __shfl_xor_sync(0xffffffffu, h0, 1));
         h0 = fmaxf(h0, __shfl_xor_sync(0xffffffffu, h0, 2));
-        h1 = fmaxf(h1, __shfl_xor_sync(0xffffffffu, h1, 1));
-        h1 = fmaxf(h1, __shfl_xor_sync(0xffffffffu, h1, 2));
-        float m0 = fmaxf(acc[nt][0], acc[nt][1]), m1 = fmaxf(acc[nt][2], acc[nt][3]);
+        float m0 = fmaxf(acc[nt][0], acc[nt][1]), m1 = neg_inf();
         m0 = fmaxf(m0, __shfl_xor_sync(0xffffffffu, m0, 1));
         m0 = fmaxf(m0, __shfl_xor_sync(0xffffffffu, m0, 2));
-        m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, 1));
-        m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, 2));
+        if (upper) {
+            h1 = fmaxf(hi[2], hi[3]);
+            h1 = fmaxf(h1, __shfl_xor_sync(0xffffffffu, h1, 1));
+            h1 = fmaxf(h1, __shfl_xor_sync(0xffffffffu, h1, 2));
+            m1 = fmaxf(acc[nt][2], acc[nt][3]);
+            m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, 1));
+            m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, 2));
+        }
         if ((lane & 3) == 0) {
             const size_t n8 = (t0 + warp) * 8 + nt;
             if (r0 < rows) {
@@ -406,26 +415,28 @@ extern "C" __global__ void __launch_bounds__(256) tf_head_sieve_select(const flo
             const float4* h = reinterpret_cast<const float4*>(himax + static_cast<size_t>(t) * 16);
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
+                if (i * 4 >= rows) break; // every row in this vector is inactive
                 const float4 v = h[i];
                 const float vv[4] = {v.x, v.y, v.z, v.w};
 #pragma unroll
                 for (int j = 0; j < 4; ++j) hit |= (i * 4 + j < rows) && vv[j] >= M[i * 4 + j];
             }
         }
-        bool already_scored = false;
-        if (hit) {
-#pragma unroll
-            for (int r = 0; r < 16; ++r) already_scored |= r < rows && first_tile[r] == t;
-        }
         const unsigned hits = __ballot_sync(0xffffffffu, hit);
-        const unsigned emit = __ballot_sync(0xffffffffu, hit && !already_scored);
         if (hits != 0u) {
+            // Each first tile contributes its bit in this warp's 32-tile window.
+            // hits is warp-uniform, so all 32 lanes participate in the reduction.
+            const int selected = lane < 16 && lane < rows ? first_tile[lane] : -1;
+            const unsigned delta = selected >= 0 ? static_cast<unsigned>(selected) - static_cast<unsigned>(t - lane) : 32u;
+            const unsigned selected_bit = delta < 32u ? 1u << delta : 0u;
+            const unsigned scored = __reduce_or_sync(0xffffffffu, selected_bit);
+            const unsigned emit = hits & ~scored;
             unsigned long long at = 0ull;
             // High word counts all hits for the original overflow rule; low word reserves compact entries.
             if (lane == 0) at = atomicAdd(count, (static_cast<unsigned long long>(__popc(hits)) << 32) |
                                                   static_cast<unsigned long long>(__popc(emit)));
             const unsigned base = __shfl_sync(0xffffffffu, static_cast<unsigned>(at), 0);
-            if (hit && !already_scored) {
+            if ((emit & (1u << lane)) != 0u) {
                 const unsigned pos = base + __popc(emit & ((1u << lane) - 1u));
                 if (pos < static_cast<unsigned>(cap)) list[pos] = t;
             }
