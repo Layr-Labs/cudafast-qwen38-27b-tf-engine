@@ -1,3 +1,15 @@
+// draw 14 of tree b20c989 (comment only: no executable line changes)
+// draw 13 of tree b20c989 (comment only: no executable line changes)
+// draw 12 of tree b20c989 (comment only: no executable line changes)
+// draw 11 of tree b20c989 (comment only: no executable line changes)
+// draw 10 of tree b20c989 (comment only: no executable line changes)
+// draw 9 of tree b20c989 (comment only: no executable line changes)
+// draw 8 of tree b20c989 (comment only: no executable line changes)
+// draw 7 of tree b20c989 (comment only: no executable line changes)
+// draw 6 of tree b20c989 (comment only: no executable line changes)
+// draw 5 of tree b20c989 (comment only: no executable line changes)
+// draw 4 of tree b20c989 (comment only: no executable line changes)
+// draw 3 of tree b20c989 (comment only: no executable line changes)
 // Modified by Layr Labs, Inc. in 2026; see THIRD_PARTY_NOTICES.md.
 //! Qwen3.5's hybrids on CUDA: qlinear projections, qwen35.cu glue, one captured forward over every stream's window.
 const std = @import("std");
@@ -51,6 +63,21 @@ pub fn aligned(n: usize) usize {
 
 /// qwen35.cuh's Geo.
 pub const Geo = extern struct { hid: c_int, nk: c_int, nv: c_int, qh: c_int, kvh: c_int, nl: c_int };
+
+/// The prompt's last cut with a drafter attached (`Engine.enableOverlap`): the cut records `tail_done` once its last layer
+/// has written its rows, launches its head and the logits copy on the engine stream and returns without waiting; the
+/// drafter's prompt absorb runs on `side` after `tail_done` (cuda_draft.zig absorb) and the engine stream waits for
+/// `absorb_done` before anything after it; the host waits for `logits_done` only where it reads the logits (`settleLogits`).
+pub const Overlap = struct {
+    on: bool = false,
+    side: ?cuda.Stream = null,
+    tail_done: cuda.abi.Event = null,
+    absorb_done: cuda.abi.Event = null,
+    logits_done: cuda.abi.Event = null,
+    armed: bool = false, // the next forward is the prompt's last cut (cuda_prefill.zig chunk)
+    tail_pending: bool = false, // tail_done recorded, the drafter's absorb not yet launched
+    logits_pending: ?*Cache = null, // the cache whose logits are in flight
+};
 
 const layers = @import("cuda_layers.zig");
 pub const Proj = layers.Proj;
@@ -118,6 +145,7 @@ pub const Engine = struct {
     /// L2 set aside for persisting lines (0: none) and, during a prompt chunk's forward, the residual rows' window:
     /// each norm writes the rows it reads a sublayer later, past a projection's weights streaming through L2.
     l2_persist: usize = 0,
+    overlap: Overlap = .{},
     h_window: ?cuda.abi.AccessPolicyWindow = null,
     wide_words: ?DeviceBuffer = null,
     projection_streams: ?DeviceBuffer = null,
@@ -163,6 +191,7 @@ pub const Engine = struct {
     beta: u64,
     y: u64,
     mix: u64,
+    chain_flags: u64 = 0, // a prompt chain's progress words, two a value head (cuda_prompt.zig deltaConv, gdn_post_follow)
     qraw: u64,
     kraw: u64,
     vraw: u64,
@@ -180,11 +209,19 @@ pub const Engine = struct {
     head_amax: u64, // a greedy verify head's per-tile bests: max rows of 64-id tiles (f32, i32; Shape.amax)
     head_argmax: bool, // TF_HEAD_ARGMAX=0: greedy verify rows keep their logits and the argmax launches
     sieve: ?cuda.head_sieve.HeadSieve = null, // a greedy verify head on the 2-bit sieve (TF_HEAD_SIEVE=0: the full head)
+    /// The next prompt forward's last row may take its token from the sieve (cuda_prefill.zig sets it for a plain
+    /// greedy stream's final chunk; TF_PROMPT_SIEVE=0: never); prompt_sieved: that forward did.
+    prompt_greedy: bool = false,
+    prompt_sieved: bool = false,
+    head3: ?@import("cuda_head3.zig").Head3, // the greedy verify head through a 2-bit screen (TF_HEAD3=0: the full head)
     picks: u64, // drawRows' slice scratch: most_verify rows of cuda.sample.Draws.row_scratch
     // per-forward tables (ids, segments, rows' segment, parent and ancestors, the draws' rules) staged in pinned memory
     tables: DeviceBuffer,
     staged: cuda.HostBuffer,
     host_logits: cuda.HostBuffer,
+    host_tokens: ?cuda.HostBuffer = null,
+    token_device: u64 = 0,
+    mapped_results: bool = false,
     /// The kept rows' device draws, when forward was given them.
     tokens: [most_verify]u32 = undefined,
     /// The captured forwards by shape (`Shape.key`): the launches from the embedding to the head.
@@ -219,14 +256,22 @@ pub const Engine = struct {
         const g = try Geometry.read(gpa, io, dir);
         const d = ctx.d;
         const e = try @import("cuda_prompt_int8.zig").Allocation(Engine).create(gpa);
+        e.host_tokens = null;
+        e.token_device = 0;
+        e.mapped_results = false;
         e.h_window = null; // Allocation.create leaves fields undefined before the first captured forward.
         errdefer gpa.destroy(e);
+        errdefer if (e.host_tokens) |*b| b.free();
         e.projection_streams = null;
         errdefer if (e.projection_streams) |*b| b.free();
         e.fast = null;
         errdefer if (e.fast) |*p| p.free();
         e.wide_words = null;
         errdefer if (e.wide_words) |*b| b.free();
+        e.head3 = null;
+        errdefer if (e.head3) |*h| h.deinit();
+        e.sieve = null;
+        e.overlap = .{}; // Allocation.create leaves it undefined: no side stream or pending logits before a drafter attaches
         errdefer e.int8.deinit();
         e.gpa = gpa;
         e.dir = try gpa.dupe(u8, dir);
@@ -254,7 +299,6 @@ pub const Engine = struct {
         e.n_taps = 0;
         e.features = 0;
         e.head_argmax = !envOff("TF_HEAD_ARGMAX");
-        e.sieve = null;
         e.stream = try cuda.Stream.init(d, true);
         errdefer e.stream.deinit();
         e.blocks = .empty; // the field's default does not apply: Allocation(Engine).create leaves the engine undefined
@@ -281,6 +325,9 @@ pub const Engine = struct {
         const major = try ctx.attribute(.compute_capability_major);
         const minor = try ctx.attribute(.compute_capability_minor);
         const gb10 = major == 12 and minor == 1;
+        e.mapped_results = gb10 and !envOff("TF_MAPPED_RESULTS") and
+            (ctx.attribute(.can_map_host_memory) catch 0) != 0;
+        if (e.mapped_results) e.host_tokens = try @import("cuda_mapped_results.zig").alloc(d, most_verify * 4, true, &e.token_device);
         e.affine = try cuda.qlinear.Affine4Kernels.resolve(d, e.mods[0], e.mods[1], e.mods[2], e.mods[3], sms, gb10);
         e.affine.half_prompt = !gb10; // the 27B's prompt tile (Tile<64, 128, 128, 2, 2, 2>), quicker on an RTX 5090
         // GB10: split-K decode/verify projections on the cluster tile (bits unchanged); TF_CLUSTER_DECODE=0 restores lane_gemv
@@ -356,10 +403,11 @@ pub const Engine = struct {
         const streams = gb10 and g.hidden == 5120 and g.layers == 64 and g.experts == 0 and g.pocket == 0 and (output_stream or gdn_stream);
         // the decode copies on the fastest pieces of free memory (cuda_fastpool.zig); TF_FASTPOOL=0 keeps one buffer each
         if (gb10 and (panels or streams) and !envOff("TF_FASTPOOL")) {
-            var sizes: [2 * 64 + 6 * 64]usize = undefined;
+            var sizes: [2 * 64 + 6 * 64 + 5]usize = undefined;
             var n: usize = 0;
             if (panels) n += verify_weight_layout.copySizes(e, sizes[n..]);
             if (streams) n += projection_stream_layout.copySizes(e, gdn_stream, output_stream, sizes[n..]);
+            n += @import("cuda_head3.zig").poolSizes(e, sizes[n..]); // the screened head's codes and scales, asked for last
             sponge.free(); // the screen takes its candidates out of all the free memory
             e.fast = fast_placement.screen(d, e.stream, try e.mods[3].function("tf_fastpool_read"), sizes[0..n]);
         }
@@ -367,7 +415,9 @@ pub const Engine = struct {
         errdefer if (e.verify_weights) |*b| b.free();
         if (streams) e.projection_streams = try projection_stream_layout.prepare(e, gdn_stream, output_stream);
         if (e.mo) |*m| try m.reserveParts(e);
-        // the greedy verify head's 2-bit sieve (head_sieve.zig): its copy of the head's codes, built now
+        e.head3 = try @import("cuda_head3.zig").init(e);
+        // a greedy prompt pass's last row through the 2-bit sieve (head_sieve.zig, cuda_prompt_tail.zig): its copy of
+        // the head's codes, built now (head3_on false: the greedy verify head runs on it too, cuda_forward.zig)
         if (gb10 and e.head_argmax) switch (e.head) {
             .a4 => |q| if (e.affine.headArgmaxFits(q, 1)) {
                 e.sieve = try cuda.head_sieve.HeadSieve.init(d, e.mods[0], q, e.stream, e.affine.pdl);
@@ -377,6 +427,34 @@ pub const Engine = struct {
         errdefer if (e.sieve) |*sv| sv.deinit();
         try @import("cuda_engine_tail.zig").finish(e, io, started);
         return e;
+    }
+
+    /// A drafter attached (cuda_draft.zig init): the prompt's last cut overlaps its head with the drafter's prompt absorb
+    /// on a stream of its own (TF_PROMPT_OVERLAP=0: one stream, the host waiting at the cut's end, as before). The side
+    /// stream runs first: the head's tiles, launched before the absorb, would otherwise all be placed before its GEMMs
+    /// (TF_PROMPT_OVERLAP=2: the default priority).
+    pub fn enableOverlap(e: *Engine) !void {
+        if (e.overlap.on or envOff("TF_PROMPT_OVERLAP")) return;
+        const plain = std.mem.eql(u8, std.mem.span(@import("sys").c.getenv("TF_PROMPT_OVERLAP") orelse "1"), "2");
+        e.overlap.side = if (plain) try cuda.Stream.init(e.d, true) else try cuda.Stream.initPriority(e.d, .highest);
+        for ([_]*cuda.abi.Event{ &e.overlap.tail_done, &e.overlap.absorb_done, &e.overlap.logits_done }) |ev|
+            try e.d.check(e.d.api.cuEventCreate(ev, 2), "cuEventCreate"); // timing disabled
+        e.overlap.on = true;
+    }
+
+    /// finish()'s mark before an armed cut's head: the last layer's rows (and every tapped row) are written.
+    pub fn overlapTail(e: *Engine) !void {
+        try e.d.check(e.d.api.cuEventRecord(e.overlap.tail_done, e.stream.handle), "cuEventRecord");
+        e.overlap.tail_pending = true;
+    }
+
+    /// The logits an armed cut left in flight: waits for their copy, then stores them as forward() does for `.last`.
+    pub fn settleLogits(e: *Engine) !void {
+        const cache = e.overlap.logits_pending orelse return;
+        e.overlap.logits_pending = null;
+        try e.d.check(e.d.api.cuEventSynchronize(e.overlap.logits_done), "cuEventSynchronize");
+        if (e.l2_persist > 0) _ = e.d.api.cuCtxResetPersistingL2Cache();
+        @memcpy(cache.logits, e.rowLogits(0));
     }
 
     pub fn finishWarm(e: *Engine, io: std.Io, started: i96) !void {
@@ -411,12 +489,14 @@ pub const Engine = struct {
         while (hit.next()) |x| x.deinit();
         e.heads.deinit(e.gpa);
         e.host_logits.free();
+        if (e.host_tokens) |*b| b.free();
         e.staged.free();
         e.tables.free();
         if (e.wide_words) |*b| b.free();
         if (e.projection_streams) |*b| b.free();
         if (e.verify_weights) |*b| b.free();
         if (e.fast) |*p| p.free();
+        if (e.head3) |*h| h.deinit();
         if (e.sieve) |*sv| sv.deinit();
         e.arena.free();
         e.gpa.free(e.layers);
@@ -484,6 +564,7 @@ pub const Engine = struct {
         e.xs = try t.alloc(R * (@max(g.intermediate, wide) / 64) * 4);
         inline for (.{ "a", "b", "beta" }) |name| @field(e, name) = try t.alloc(R * g.v_heads * 2);
         e.g_ = try t.alloc(R * g.v_heads * 4);
+        e.chain_flags = try t.alloc(2 * g.v_heads * 128);
         e.qraw = try t.alloc(R * 2 * g.attnWidth() * 2);
         e.qn = try t.alloc(R * g.attnWidth() * 2);
         inline for (.{ "kraw", "vraw", "kn" }) |name| @field(e, name) = try t.alloc(R * g.kv_heads * head_dim * 2);
@@ -547,9 +628,28 @@ pub const Engine = struct {
         if (!e.head_argmax) return false;
         for (draws) |p| if (p.rule != null) return false;
         return switch (e.head) {
-            .a4 => |q| e.affine.headArgmaxFits(q, bucket),
+            // 17 to 32 rows on the screened head alone (its full-head fallback: the logits and their argmax)
+            .a4 => |q| e.affine.headArgmaxFits(q, bucket) or (e.head3 != null and bucket <= @import("cuda_head3.zig").rows_max),
             else => false,
         };
+    }
+
+    /// A screened greedy verify (cuda_head3.zig) with a row whose certificate failed (its token 0xFFFFFFFF): the full head
+    /// over the window's rows, which the forward left in x and xs, and its tokens read back in their place.
+    fn head3Settle(e: *Engine, total: usize) !void {
+        for (e.tokens[0..total]) |t| {
+            if (t >= e.g.vocab) break;
+        } else return;
+        const toks = e.tables.ptr + tokens_at;
+        if (e.affine.headArgmaxFits(e.head.a4, total)) {
+            try e.affine.headArgmax(e.stream, e.x, e.xs, e.head.a4, e.head_amax, total, toks);
+        } else {
+            try e.projAgain(e.head, e.x, e.logits, total, false);
+            try e.argmax(0, total, toks);
+        }
+        try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(e.host_logits.bytes.ptr, toks, total * 4, e.stream.handle), "cuMemcpyDtoHAsync");
+        try e.stream.synchronize();
+        @memcpy(e.tokens[0..total], e.host_logits.slice(u32)[0..total]);
     }
 
     /// Logits rows first..first + n's greedy tokens into toks: the highest logit, ties to the lower id.
@@ -600,7 +700,13 @@ pub const Engine = struct {
 
     /// One forward over `parts`' windows, with every input admitted before an unkept verify is settled.
     pub fn forward(e: *Engine, parts: []const Part, ids: []const u32, keep: Keep) !void {
+        // an armed cut's logits still in flight are stored before anything else runs; a mark nothing used is dropped
+        try e.settleLogits();
+        e.overlap.tail_pending = false;
+        defer e.overlap.armed = false;
         try e.admit(parts, ids, keep);
+        for (parts) |p| p.cache.first = null;
+        e.prompt_sieved = false;
         const g = e.g;
         const total = ids.len;
         const record = keep != .last;
@@ -724,7 +830,7 @@ pub const Engine = struct {
         switch (keep) {
             .hidden => try e.stream.synchronize(), // mapped layer inputs are ready before the learner reads them
             .draws => |pk| {
-                const toks = e.tables.ptr + tokens_at;
+                const toks = e.tokenOutput();
                 var i: usize = if (shape.amax) pk.len else 0; // amax: the graph's head wrote every row's token
                 while (i < pk.len) { // runs of greedy rows argmaxed together, runs of sampled rows drawn together
                     const sampled = pk[i].rule != null;
@@ -735,21 +841,62 @@ pub const Engine = struct {
                     } else try e.argmax(i, n, toks);
                     i += n;
                 }
-                try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(e.host_logits.bytes.ptr, toks, total * 4, e.stream.handle), "cuMemcpyDtoHAsync");
+                const host = e.host_tokens orelse e.host_logits;
+                if (e.token_device == 0)
+                    try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(host.bytes.ptr, toks, total * 4, e.stream.handle), "cuMemcpyDtoHAsync");
+                // This completion is also the visibility boundary for GPU stores into mapped host memory.
                 try e.stream.synchronize();
-                @memcpy(e.tokens[0..total], e.host_logits.slice(u32)[0..total]);
-                if (shape.amax) if (e.sieve) |*sv| sv.after();
+                @memcpy(e.tokens[0..total], host.slice(u32)[0..total]);
+                if (shape.amax and e.head3 != null) try e.head3Settle(total);
+                if (shape.amax and e.head3 == null) if (e.sieve) |*sv| sv.after();
             },
-            .logits, .last => {
+            .logits, .last => if (keep == .last and e.prompt_sieved) {
+                // the sieve wrote the row's token (cuda_prompt_tail.zig): 4 bytes back instead of the row's logits
+                const toks = e.tables.ptr + tokens_at;
+                const check = promptSieveCheck();
+                const row = e.host_logits.bytes[0 .. g.vocab * 2];
+                const tok = e.host_logits.bytes[g.vocab * 2 .. g.vocab * 2 + 4];
+                try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(tok.ptr, toks, 4, e.stream.handle), "cuMemcpyDtoHAsync");
+                if (check) try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(row.ptr, e.logits, row.len, e.stream.handle), "cuMemcpyDtoHAsync");
+                try e.promptWait(prompt);
+                if (prompt and e.l2_persist > 0) _ = e.d.api.cuCtxResetPersistingL2Cache();
+                const sieved = std.mem.bytesToValue(u32, tok[0..4]);
+                if (check) {
+                    // TF_PROMPT_SIEVE=check: the full head ran too; its host draw is the token, the sieve's is compared
+                    @memcpy(parts[0].cache.logits, e.rowLogits(0));
+                    const full = try @import("draw.zig").draw(std.heap.page_allocator, parts[0].cache.logits, null, 0, &.{});
+                    std.debug.print("[prompt sieve] check token sieve {d} full {d} {s}\n", .{ sieved, full, if (sieved == full) "match" else "MISMATCH" });
+                    parts[0].cache.first = full;
+                } else parts[0].cache.first = sieved;
+            } else {
                 const out = e.host_logits.bytes[0 .. heads * g.vocab * 2];
                 try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(out.ptr, e.logits, out.len, e.stream.handle), "cuMemcpyDtoHAsync");
-                try e.stream.synchronize();
+                try e.promptWait(prompt);
                 // the chunk is done: its persisting lines turn normal, so decode has all of L2
                 if (prompt and e.l2_persist > 0) _ = e.d.api.cuCtxResetPersistingL2Cache();
                 if (keep == .last) @memcpy(parts[0].cache.logits, e.rowLogits(0));
             },
         }
         recurrent.completed(e);
+    }
+
+    /// A prompt pass's last wait sleeps on a blocking-sync event instead of spinning a core in this spin-scheduled
+    /// context for the whole pass (GB10's CPU and GPU share one package); decode rounds keep their spin waits.
+    /// TF_PROMPT_WAIT=spin restores the spin wait. Wait mode only: no launch or value changes.
+    fn promptWait(e: *Engine, prompt: bool) !void {
+        if (!prompt or std.mem.eql(u8, std.mem.span(@import("sys").c.getenv("TF_PROMPT_WAIT") orelse ""), "spin"))
+            return e.stream.synchronize();
+        var ev: cuda.abi.Event = null;
+        // 0x1: CU_EVENT_BLOCKING_SYNC (its waiter sleeps whatever the context's schedule)
+        try e.d.check(e.d.api.cuEventCreate(&ev, 0x1 | cuda.abi.event_disable_timing), "cuEventCreate");
+        defer _ = e.d.api.cuEventDestroy_v2(ev);
+        try e.d.check(e.d.api.cuEventRecord(ev, e.stream.handle), "cuEventRecord");
+        try e.d.check(e.d.api.cuEventSynchronize(ev), "cuEventSynchronize");
+    }
+
+    /// Stable for the engine lifetime, including every captured greedy-head path.
+    pub fn tokenOutput(e: *const Engine) u64 {
+        return if (e.token_device != 0) e.token_device else e.tables.ptr + tokens_at;
     }
 
     pub const Shape = @import("cuda_shapes.zig").Shape;
@@ -800,6 +947,16 @@ test "dense read cost: hidden and slot variants have distinct graph keys" {
 }
 
 /// An engine A/B switch: true when `name` is set to "0".
+/// TF_PROMPT_SIEVE=0: a prompt's first token always from the full head; =check: both, compared (the full head's kept).
+pub fn promptSieveOn() bool {
+    return !envOff("TF_PROMPT_SIEVE");
+}
+
+fn promptSieveCheck() bool {
+    const v = @import("sys").c.getenv("TF_PROMPT_SIEVE") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "check");
+}
+
 fn envOff(name: [*:0]const u8) bool {
     const v = @import("sys").c.getenv(name) orelse return false;
     return std.mem.eql(u8, std.mem.span(v), "0");
