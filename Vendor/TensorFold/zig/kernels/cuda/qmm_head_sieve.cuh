@@ -127,7 +127,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_head_sieve_prep(const __nv_
 // scale and bias arrays. Grid tiles / 4, 128 threads; shared SMEM + tab_smem (the pair table, or 0: through L2).
 namespace tf_head_sieve {
 
-template <int NS>
+template <int NS, bool LOW8 = false>
 __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
         const uint4* __restrict__ afr, const float* __restrict__ xv, const unsigned char* __restrict__ sb,
         const uint32_t* __restrict__ tab, int code, int tab_smem, const __nv_bfloat16* __restrict__ sc,
@@ -176,11 +176,13 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
         qmm_frag::commit();
     }
     qmm_frag::grid_launch();
-    float acc[8][4], sg[8][4];
+    // The upper eight rows cannot reach a live bound in a small window.
+    constexpr int LIVE = LOW8 ? 2 : 4;
+    float acc[8][LIVE], sg[8][LIVE];
 #pragma unroll
     for (int i = 0; i < 8; ++i)
 #pragma unroll
-        for (int e = 0; e < 4; ++e) {
+        for (int e = 0; e < LIVE; ++e) {
             acc[i][e] = 0.0f;
             sg[i][e] = 0.0f;
         }
@@ -242,12 +244,16 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
             const float m0 = fmaf(1.5f, s0, c0), m1 = fmaf(1.5f, s1, c1);
             acc[nt][0] = fmaf(4.0f * s0, d[0], fmaf(m0, xs0, acc[nt][0]));
             acc[nt][1] = fmaf(4.0f * s1, d[1], fmaf(m1, xs0, acc[nt][1]));
-            acc[nt][2] = fmaf(4.0f * s0, d[2], fmaf(m0, xs1, acc[nt][2]));
-            acc[nt][3] = fmaf(4.0f * s1, d[3], fmaf(m1, xs1, acc[nt][3]));
+            if constexpr (!LOW8) {
+                acc[nt][2] = fmaf(4.0f * s0, d[2], fmaf(m0, xs1, acc[nt][2]));
+                acc[nt][3] = fmaf(4.0f * s1, d[3], fmaf(m1, xs1, acc[nt][3]));
+            }
             sg[nt][0] = fmaf(s0 * s0, q0, sg[nt][0]);
             sg[nt][1] = fmaf(s1 * s1, q0, sg[nt][1]);
-            sg[nt][2] = fmaf(s0 * s0, q1, sg[nt][2]);
-            sg[nt][3] = fmaf(s1 * s1, q1, sg[nt][3]);
+            if constexpr (!LOW8) {
+                sg[nt][2] = fmaf(s0 * s0, q1, sg[nt][2]);
+                sg[nt][3] = fmaf(s1 * s1, q1, sg[nt][3]);
+            }
         }
     }
     qmm_frag::wait<0>();
@@ -257,9 +263,9 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
     int first_id0 = 0x7fffffff, first_id1 = 0x7fffffff;
 #pragma unroll
     for (int nt = 0; nt < 8; ++nt) {
-        float hi[4];
+        float hi[LIVE];
 #pragma unroll
-        for (int e = 0; e < 4; ++e) {
+        for (int e = 0; e < LIVE; ++e) {
             const float sd = sqrtf(1.25f * sg[nt][e]), ks = kappa * sd, v = acc[nt][e];
             hi[e] = v + ks + fmaf(fabsf(v) + ks, SLACK_REL, SLACK_ABS);
             if (approx != nullptr) {
@@ -269,16 +275,12 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
                 approx[id * 32 + 16 + row] = sd;
             }
         }
-        float h0 = fmaxf(hi[0], hi[1]), h1 = fmaxf(hi[2], hi[3]);
+        float h0 = fmaxf(hi[0], hi[1]);
         h0 = fmaxf(h0, __shfl_xor_sync(0xffffffffu, h0, 1));
         h0 = fmaxf(h0, __shfl_xor_sync(0xffffffffu, h0, 2));
-        h1 = fmaxf(h1, __shfl_xor_sync(0xffffffffu, h1, 1));
-        h1 = fmaxf(h1, __shfl_xor_sync(0xffffffffu, h1, 2));
-        float m0 = fmaxf(acc[nt][0], acc[nt][1]), m1 = fmaxf(acc[nt][2], acc[nt][3]);
+        float m0 = fmaxf(acc[nt][0], acc[nt][1]);
         m0 = fmaxf(m0, __shfl_xor_sync(0xffffffffu, m0, 1));
         m0 = fmaxf(m0, __shfl_xor_sync(0xffffffffu, m0, 2));
-        m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, 1));
-        m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, 2));
         if ((lane & 3) == 0) {
             const size_t n8 = (t0 + warp) * 8 + nt;
             if (r0 < rows) {
@@ -286,7 +288,16 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
                 if (!fused_top || m0 == 0.0f) himid[n8 * 16 + r0] = m0;
                 if (fused_top && m0 > first0) { first0 = m0; first_id0 = static_cast<int>(n8); }
             }
-            if (r0 + 8 < rows) {
+        }
+        if constexpr (!LOW8) {
+            float h1 = fmaxf(hi[2], hi[3]);
+            h1 = fmaxf(h1, __shfl_xor_sync(0xffffffffu, h1, 1));
+            h1 = fmaxf(h1, __shfl_xor_sync(0xffffffffu, h1, 2));
+            float m1 = fmaxf(acc[nt][2], acc[nt][3]);
+            m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, 1));
+            m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, 2));
+            if ((lane & 3) == 0 && r0 + 8 < rows) {
+                const size_t n8 = (t0 + warp) * 8 + nt;
                 himax[n8 * 16 + r0 + 8] = h1;
                 if (!fused_top || m1 == 0.0f) himid[n8 * 16 + r0 + 8] = m1;
                 if (fused_top && m1 > first1) { first1 = m1; first_id1 = static_cast<int>(n8); }
@@ -298,7 +309,8 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
         auto* block_pre = reinterpret_cast<unsigned long long*>(tabs + tab_smem);
         if ((lane & 3) == 0) {
             block_pre[warp * 16 + r0] = r0 < rows && first_id0 != 0x7fffffff ? key(first0, first_id0) : 0ull;
-            block_pre[warp * 16 + r0 + 8] = r0 + 8 < rows && first_id1 != 0x7fffffff ? key(first1, first_id1) : 0ull;
+            if constexpr (!LOW8)
+                block_pre[warp * 16 + r0 + 8] = r0 + 8 < rows && first_id1 != 0x7fffffff ? key(first1, first_id1) : 0ull;
         }
         __syncthreads(); // fused_top is uniform across the CTA.
         if (tid < rows) {
@@ -317,7 +329,16 @@ extern "C" __global__ void __launch_bounds__(128, 3) tf_head_sieve_scan(const ui
         const uint32_t* __restrict__ tab, int code, int tab_smem, const __nv_bfloat16* __restrict__ sc,
         const __nv_bfloat16* __restrict__ bi, int npad, int KG, int rows, float kappa, float* __restrict__ himax,
         float* __restrict__ himid, float* __restrict__ approx, unsigned long long* __restrict__ pre, int fused_top) {
-    tf_head_sieve::scan<tf_head_sieve::STAGES>(w2, afr, xv, sb, tab, code, tab_smem, sc, bi, npad, KG, rows, kappa, himax, himid, approx, pre, fused_top);
+    tf_head_sieve::scan<tf_head_sieve::STAGES, false>(w2, afr, xv, sb, tab, code, tab_smem, sc, bi, npad, KG, rows, kappa, himax, himid, approx, pre, fused_top);
+}
+
+// Separate entry point so the small window gets its own register allocation.
+extern "C" __global__ void __launch_bounds__(128, 3) tf_head_sieve_scan8(const uint32_t* __restrict__ w2,
+        const uint4* __restrict__ afr, const float* __restrict__ xv, const unsigned char* __restrict__ sb,
+        const uint32_t* __restrict__ tab, int code, int tab_smem, const __nv_bfloat16* __restrict__ sc,
+        const __nv_bfloat16* __restrict__ bi, int npad, int KG, int rows, float kappa, float* __restrict__ himax,
+        float* __restrict__ himid, float* __restrict__ approx, unsigned long long* __restrict__ pre, int fused_top) {
+    tf_head_sieve::scan<tf_head_sieve::STAGES, true>(w2, afr, xv, sb, tab, code, tab_smem, sc, bi, npad, KG, rows, kappa, himax, himid, approx, pre, fused_top);
 }
 
 // Each row's first tile: the n8 tile of its highest value in h (himid: the best a; key: then the lower tile) into
