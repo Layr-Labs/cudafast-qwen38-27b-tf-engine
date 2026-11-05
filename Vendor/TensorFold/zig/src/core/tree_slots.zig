@@ -81,7 +81,29 @@ pub fn carried(gpa: std.mem.Allocator, parents: []const i32, steps: []Step, firs
         remaining -= 1;
         if (parents[remaining] >= 0) sizes[@intCast(parents[remaining])] += sizes[remaining];
     }
-    var planner = Carrier{ .parents = parents, .sizes = sizes, .steps = steps, .first = first, .limit = limit };
+    // Exact carried-state register demand, not subtree node count: a long chain
+    // needs no saved slot, while a smaller branching subtree may need several.
+    // Put a maximum-demand child last so it can reuse the parent's saved slot.
+    const demand = try gpa.alloc(usize, parents.len);
+    defer gpa.free(demand);
+    @memset(demand, 0);
+    remaining = parents.len;
+    while (remaining > 0) {
+        remaining -= 1;
+        var children: usize = 0;
+        var most: usize = 0;
+        var second: usize = 0;
+        for (parents, 0..) |parent, child| if (parent == remaining) {
+            children += 1;
+            const d = demand[child];
+            if (d >= most) {
+                second = most;
+                most = d;
+            } else second = @max(second, d);
+        };
+        demand[remaining] = if (children < 2) most else @max(most, second + 1);
+    }
+    var planner = Carrier{ .parents = parents, .sizes = sizes, .demand = demand, .steps = steps, .first = first, .limit = limit };
     for (parents, 0..) |parent, row| if (parent == -1) try planner.visit(row, -1);
     std.debug.assert(planner.at == steps.len and planner.live == 0);
     return @max(1, planner.peak);
@@ -90,6 +112,7 @@ pub fn carried(gpa: std.mem.Allocator, parents: []const i32, steps: []Step, firs
 const Carrier = struct {
     parents: []const i32,
     sizes: []const usize,
+    demand: []const usize,
     steps: []Step,
     first: u32,
     limit: usize,
@@ -113,7 +136,8 @@ const Carrier = struct {
         var last: ?usize = null;
         for (b.parents, 0..) |parent, child| if (parent == row) {
             children += 1;
-            if (last == null or b.sizes[child] >= b.sizes[last.?]) last = child;
+            if (last == null or b.demand[child] > b.demand[last.?] or
+                (b.demand[child] == b.demand[last.?] and b.sizes[child] >= b.sizes[last.?])) last = child;
         };
         const write: i32 = if (children >= 2) try b.take() else -1;
         b.steps[b.at] = .{ .row = b.first + @as(u32, @intCast(row)), .read_slot = read, .write_slot = write };
@@ -280,7 +304,7 @@ test "carried plans replay every row from its parent's state and need one slot f
             }
             const peak = try carried(std.testing.allocator, parents[0..width], steps[0..width], 7, 16);
             const before = try build(std.testing.allocator, parents[0..width], plain[0..width], 7, 16);
-            try std.testing.expect(peak == @max(1, before - 1));
+            try std.testing.expect(peak <= @max(1, before - 1));
             try validateCarried(parents[0..width], steps[0..width], 7, 16);
             var registers: [max_slots]u64 = @splat(0);
             var held: u64 = 0;
@@ -294,4 +318,40 @@ test "carried plans replay every row from its parent's state and need one slot f
             try std.testing.expectEqualSlices(u64, expected[0..width], actual[0..width]);
         }
     }
+}
+
+
+test "carried demand: smaller branching subtree runs last, long chain is cheap" {
+    // Root's larger child is a chain; its smaller child is a binary fork. Size
+    // ordering saves root while visiting the fork (peak2). Demand ordering does
+    // the chain first and releases root before the fork (peak1).
+    const parents = [_]i32{ -1, 0, 1, 2, 3, 4, 0, 6, 6 };
+    var steps: [parents.len]Step = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try carried(std.testing.allocator, &parents, &steps, 0, 1));
+    try validateCarried(&parents, &steps, 0, 1);
+    const expected = [_]u32{ 0, 1, 2, 3, 4, 5, 6, 7, 8 };
+    for (steps, expected) |step, row| try std.testing.expectEqual(row, step.row);
+}
+
+test "carried demand: one-slot witness replays original row states and forest roots" {
+    const parents = [_]i32{ -1, 0, 0, 1, 1, 2, 5, 6, 7, -1, 9, 9 };
+    var steps: [parents.len]Step = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try carried(std.testing.allocator, &parents, &steps, 5, 1));
+    try validateCarried(&parents, &steps, 5, 1);
+    var expected: [parents.len]u64 = undefined;
+    var actual: [parents.len]u64 = undefined;
+    var registers: [max_slots]u64 = @splat(0);
+    var held: u64 = 0;
+    for (parents, 0..) |parent, row| {
+        const value = if (parent < 0) @as(u64, 23) else expected[@intCast(parent)];
+        expected[row] = value *% 65537 +% row +% 1;
+    }
+    for (steps) |step| {
+        const row = step.row - 5;
+        const value = if (step.read_slot == in_registers) held else if (step.read_slot < 0) @as(u64, 23) else registers[@intCast(step.read_slot)];
+        actual[row] = value *% 65537 +% row +% 1;
+        held = actual[row];
+        if (step.write_slot >= 0) registers[@intCast(step.write_slot)] = actual[row];
+    }
+    try std.testing.expectEqualSlices(u64, &expected, &actual);
 }
