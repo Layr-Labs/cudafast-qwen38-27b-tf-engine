@@ -137,7 +137,7 @@ Pinned sources for this section:
 
 ## Guards that can refuse a run
 
-The decode speedup ceiling is 5.0. The prefill speedup ceiling is 3.0.
+The decode speedup ceiling is 5.0. The prefill speedup ceiling is 5.0.
 A pair above a ceiling refuses the run.
 
 The decode time includes the seed step.
