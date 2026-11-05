@@ -6,7 +6,7 @@
 //! the best of those exact values: the full head's token whenever the best id's dropped bits' term exceeds the first
 //! tile's best-approximate id's by less than kappa spreads.
 //! TF_HEAD_SIEVE=0: the full head; =check: the full head writes the tokens and the sieve runs beside it, compared.
-//! TF_HEAD_SIEVE_K: kappa (10); TF_HEAD_SIEVE_CAP: the most n8 tiles rescored before every tile is (4096).
+//! TF_HEAD_SIEVE_K: kappa (10); TF_HEAD_SIEVE_CAP: the most n8 tiles rescored before every tile is (every tile, n / 8).
 const std = @import("std");
 const linear = @import("qlinear.zig");
 const Driver = @import("driver.zig").Driver;
@@ -89,8 +89,8 @@ pub const HeadSieve = struct {
         }
         var kappa: f32 = 10.0;
         if (@import("sys").c.getenv("TF_HEAD_SIEVE_K")) |v| kappa = std.fmt.parseFloat(f32, std.mem.span(v)) catch 10.0;
-        var cap: usize = 4096;
-        if (@import("sys").c.getenv("TF_HEAD_SIEVE_CAP")) |v| cap = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 4096;
+        var cap: usize = q.n / 8; // every n8 tile: a window lists only what it rescores, so no overflow reads the whole head
+        if (@import("sys").c.getenv("TF_HEAD_SIEVE_CAP")) |v| cap = std.fmt.parseInt(usize, std.mem.span(v), 10) catch q.n / 8;
         var h: HeadSieve = undefined;
         h.pack_fn = try group_mod.function("tf_head_sieve_pack");
         h.prep_fn = try group_mod.function("tf_head_sieve_prep");
