@@ -86,7 +86,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     try @import("cuda_prompt.zig").deltaConv(e, di, total, m, if (follow) e.chain_flags else 0);
                     if (follow) try e.runAfter(e.fns.gdn_post_follow, .{ follow_blocks, 1, 1 }, .{ 32, 4, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums, e.chain_flags, @as(c_int, @intCast(total)) });
                     if (commit) try e.runAfter(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
-                } else if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else try e.deltaScan(record, shape.slots, nseg, layer);
+                } else if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else try e.deltaScan(record, shape.slots, nseg, layer, if (prompt) null else m.out);
                 // a prompt chunk: eight rows a warp, their loads in flight together (TF_PROMPT_ILP=0: a row a warp)
                 if (follow) {} else if (prompt and total > 16 and promptIlpOn())
                     try e.runAfter(e.fns.gdn_post_ilp, .{ 1, g.v_heads, (total + 31) / 32 }, .{ 32, 4, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums })
@@ -125,6 +125,9 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     try @import("cuda_prompt.zig").run(e, @intCast(ai), total);
                 } else {
                     const args = .{ geo, e.qn, t_segs, t_rows, t_anc, @as(c_int, ai), t_params, @as(f32, 1.0 / 16.0), e.pm, e.pl, e.po };
+                    // attn_partial's warm-up of the out-projection's weights (prompt rows warm nothing): cache state only
+                    const pf = E.Engine.warmOf(if (prompt) null else m.o, E.Engine.warm_attn);
+                    const args_pf = .{ geo, e.qn, t_segs, t_rows, t_anc, @as(c_int, ai), t_params, @as(f32, 1.0 / 16.0), e.pm, e.pl, e.po, pf.w, pf.tile, pf.tiles, pf.take };
                     const groups = (total + 64 / group - 1) / (64 / group);
                     const rows_args = .{ geo, e.qn, t_segs, t_rows, t_anc, @as(c_int, ai), t_params, @as(f32, 1.0 / 16.0), @as(c_int, @intCast(total)), e.pm, e.pl, e.po };
                     if (e.kv8) {
@@ -136,7 +139,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                         if (record and total >= 2 and 2 * group <= 16 and pairOn())
                             try sharedSized(e, e.fns.attn_pair, sig.attn_pair, .{ (total + 1) / 2, partial_chunks, g.kv_heads }, 128, attn_tile, args)
                         else
-                            try sharedSized(e, e.fns.attn_partial, sig.attn_partial, .{ total, partial_chunks, g.kv_heads }, 128, attn_tile, args);
+                            try sharedSized(e, e.fns.attn_partial, sig.attn_partial, .{ total, partial_chunks, g.kv_heads }, 128, attn_tile, args_pf);
                         // streams of caches no longer than GROUP_LEN have no row for attn_rows (its blocks would only return)
                         if (!shape.short) try shared(e, e.fns.attn_rows, sig.attn_rows, .{ groups, max_chunks, g.kv_heads }, 256, rows_args);
                     }
@@ -188,8 +191,10 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
         if (shape.taps) for (e.taps[0..e.n_taps], 0..) |t, ti| if (t == i) {
             try e.runAfter(e.fns.tap, .{ total, (g.hidden + 2047) / 2048, 1 }, .{ 256, 1, 1 }, .{ e.h, e.r, t_segs, t_rows, @as(c_int, @intCast(ti)), @as(c_int, @intCast(g.hidden)), t_params });
         };
-        // a captured forward's first layer is a graph of its own (cuda_engine.zig's cutCapture)
-        if (i == 0) try e.cutCapture();
+        // a prompt chunk's captured forward keeps its first layer a graph of its own (cuda_engine.zig's cutCapture):
+        // the drafter's absorb starts once the last layer is done. A verify window's replay has no tail to overlap,
+        // so its capture stays one graph and its round pays one launch, not two.
+        if (i == 0 and prompt) try e.cutCapture();
     }
     try finish(e, total, heads, shape.hidden, if (@hasField(@TypeOf(shape), "amax")) shape.amax else false);
 }

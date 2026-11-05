@@ -7,18 +7,19 @@ __device__ __forceinline__ uint32_t compact_load_a(const __nv_bfloat16* p) {
     return word;
 }
 
-template <int STAGES = 2, int BN = 256, bool KMAJOR = true>
+template <int STAGES = 2, int BN = 256, bool KMAJOR = true, int BM = 16, bool NJ = false>
 __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
                                               const Parts& parts, __nv_bfloat16* __restrict__ act,
                                               float* __restrict__ as, int M, int K, int ldx, int rows_t) {
-    constexpr int GS = 64, BM = 16, WM = 1, WN = 4;
+    constexpr int GS = 64, WM = 1, WN = 4;
     using Base = LaneTile<GS, BM, BN, WM, WN, STAGES>;
     struct T : Base {
         enum { X = 0, W = BN * GS / 2, S = 256, STAGE = W + 2 * S + BM * 4,
                SMEM = STAGES * STAGE };
     };
     constexpr int PASSES = BN / WN / 32;
-    static_assert(T::SMEM == 17536, "compact pair pipeline footprint");
+    static_assert(BM != 16 || T::SMEM == STAGES * 8768, "compact pair pipeline footprint");
+    static_assert(BM != 32 || T::SMEM == STAGES * 8832, "compact pair 32-row pipeline footprint");
     constexpr int I = T::MT, J = T::NT;
     extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -96,9 +97,28 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     }
     grid_launch();
     for (int it = 0; it < per; ++it) {
-        wait<0>();
+        // Input belongs to the completed PDL producer, not to the async packed-weight stage.
+        // Issue the exact current-group A fragments while that stage is still in flight.
+        // NJ (newjordan EARLYA49, submission 4c77bdbd; TF_NJ): the A fragments issued before the stage wait
+        uint32_t av[GS / 16][I][4];
+        if constexpr (BM == 16 && NJ) {
+#pragma unroll
+            for (int kt = 0; kt < GS / 16; ++kt)
+#pragma unroll
+                for (int i = 0; i < I; ++i) {
+                    const int r = wm * (BM / WM) + i * 16 + (lane >> 2);
+                    const int c = it * GS + kt * 16 + 2 * (lane & 3);
+                    const __nv_bfloat16* a0 = x_ready + static_cast<size_t>(m0 + r) * ldx + c;
+                    const __nv_bfloat16* a1 = a0 + 8 * ldx;
+                    av[kt][i][0] = compact_load_a(a0);
+                    av[kt][i][1] = compact_load_a(a1);
+                    av[kt][i][2] = compact_load_a(a0 + 8);
+                    av[kt][i][3] = compact_load_a(a1 + 8);
+                }
+        }
+        wait<STAGES - 2>();
         __syncthreads();
-        const int next = it + 1;
+        const int next = it + STAGES - 1;
         if (next < per) { load_x(next % STAGES, next); load_w(next % STAGES, next); }
         commit();
         const unsigned char* p = stage(it % STAGES);
@@ -113,12 +133,61 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
             }
         }
         const float* px = reinterpret_cast<const float*>(p + T::X + T::W + 2 * T::S);
+        if constexpr (BM == 32) {
+            // two m16 row tiles, one at a time: its inputs, then each column tile's MMA chain over kt and its fmas,
+            // the 16-row body's per-row arithmetic (rows past M read row M - 1 and are never stored)
+#pragma unroll
+            for (int i = 0; i < I; ++i) {
+                const int row = i * 16 + (lane >> 2);
+                const float xv0 = px[row], xv1 = px[row + 8];
+                const int c0 = it * GS + 2 * (lane & 3);
+                const __nv_bfloat16* a0 = x_ready + static_cast<size_t>(m0 + min(row, rows - 1)) * ldx + c0;
+                const __nv_bfloat16* a1 = x_ready + static_cast<size_t>(m0 + min(row + 8, rows - 1)) * ldx + c0;
+                uint32_t av[GS / 16][4];
+#pragma unroll
+                for (int kt = 0; kt < GS / 16; ++kt) {
+                    av[kt][0] = compact_load_a(a0 + kt * 16);
+                    av[kt][1] = compact_load_a(a1 + kt * 16);
+                    av[kt][2] = compact_load_a(a0 + kt * 16 + 8);
+                    av[kt][3] = compact_load_a(a1 + kt * 16 + 8);
+                }
+#pragma unroll
+                for (int pass = 0; pass < PASSES; ++pass) {
+                    const unsigned short s_bits = static_cast<unsigned short>(pe[pass]);
+                    const unsigned short b_bits = static_cast<unsigned short>(pe[pass] >> 16);
+                    const float sf = __bfloat162float(__ushort_as_bfloat16(s_bits));
+                    const float bf = __bfloat162float(__ushort_as_bfloat16(b_bits));
+#pragma unroll
+                    for (int jj = 0; jj < 4; ++jj) {
+                        const int j = pass * 4 + jj;
+                        uint32_t wj[GS / 32];
+#pragma unroll
+                        for (int v = 0; v < GS / 32; ++v) wj[v] = pw[((wn * T::NT + j) * 32 + lane) * (GS / 32) + v];
+                        float d[4];
+#pragma unroll
+                        for (int kt = 0; kt < GS / 16; ++kt) {
+                            const uint32_t b0 = pairm(wj[kt / 2], (kt & 1) * 8, mask);
+                            const uint32_t b1 = pairm(wj[kt / 2], (kt & 1) * 8 + 4, mask);
+                            if (kt == 0) mma0(d, av[kt], b0, b1);
+                            else mma(d, av[kt], b0, b1);
+                        }
+                        const int col = jj * 8 + (lane & 3) * 2;
+                        const float sv[2] = {__shfl_sync(0xffffffffu, sf, col), __shfl_sync(0xffffffffu, sf, col + 1)};
+                        const float bv[2] = {__shfl_sync(0xffffffffu, bf, col), __shfl_sync(0xffffffffu, bf, col + 1)};
+                        const float xv[2] = {xv0, xv1};
+#pragma unroll
+                        for (int e = 0; e < 4; ++e)
+                            acc[i][j][e] = __fmaf_rn(xv[e >> 1], bv[e & 1], __fmaf_rn(d[e], sv[e & 1], acc[i][j][e]));
+                    }
+                }
+            }
+        } else {
         uint32_t words[T::NT][GS / 32];
 #pragma unroll
         for (int j = 0; j < T::NT; ++j)
 #pragma unroll
             for (int v = 0; v < GS / 32; ++v) words[j][v] = pw[((wn * T::NT + j) * 32 + lane) * (GS / 32) + v];
-        uint32_t av[GS / 16][I][4];
+        if constexpr (!(BM == 16 && NJ)) {
 #pragma unroll
         for (int kt = 0; kt < GS / 16; ++kt)
 #pragma unroll
@@ -132,6 +201,7 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
                 av[kt][i][2] = compact_load_a(a0 + 8);
                 av[kt][i][3] = compact_load_a(a1 + 8);
             }
+        }
         float xv[I][2];
 #pragma unroll
         for (int i = 0; i < I; ++i) {
@@ -139,42 +209,95 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
             xv[i][0] = px[row];
             xv[i][1] = px[row + 8];
         }
-        float d[I][J][4];
+            float d[I][J][4];
 #pragma unroll
-        for (int kt = 0; kt < GS / 16; ++kt) {
+            for (int kt = 0; kt < GS / 16; ++kt) {
 #pragma unroll
-            for (int j = 0; j < T::NT; ++j) {
-                const uint32_t b0 = pairm(words[j][kt / 2], (kt & 1) * 8, mask);
-                const uint32_t b1 = pairm(words[j][kt / 2], (kt & 1) * 8 + 4, mask);
+                for (int j = 0; j < T::NT; ++j) {
+                    const uint32_t b0 = pairm(words[j][kt / 2], (kt & 1) * 8, mask);
+                    const uint32_t b1 = pairm(words[j][kt / 2], (kt & 1) * 8 + 4, mask);
 #pragma unroll
-                for (int i = 0; i < I; ++i) {
-                    if (kt == 0) mma0(d[i][j], av[kt][i], b0, b1);
-                    else mma(d[i][j], av[kt][i], b0, b1);
+                    for (int i = 0; i < I; ++i) {
+                        if (kt == 0) mma0(d[i][j], av[kt][i], b0, b1);
+                        else mma(d[i][j], av[kt][i], b0, b1);
+                    }
                 }
             }
-        }
 #pragma unroll
-        for (int pass = 0; pass < PASSES; ++pass) {
-            const unsigned short s_bits = static_cast<unsigned short>(pe[pass]);
-            const unsigned short b_bits = static_cast<unsigned short>(pe[pass] >> 16);
-            const float sf = __bfloat162float(__ushort_as_bfloat16(s_bits));
-            const float bf = __bfloat162float(__ushort_as_bfloat16(b_bits));
+            for (int pass = 0; pass < PASSES; ++pass) {
+                const unsigned short s_bits = static_cast<unsigned short>(pe[pass]);
+                const unsigned short b_bits = static_cast<unsigned short>(pe[pass] >> 16);
+                const float sf = __bfloat162float(__ushort_as_bfloat16(s_bits));
+                const float bf = __bfloat162float(__ushort_as_bfloat16(b_bits));
 #pragma unroll
-            for (int jj = 0; jj < 4; ++jj) {
-                const int j = pass * 4 + jj;
-                const int col = jj * 8 + (lane & 3) * 2;
-                const float sv[2] = {__shfl_sync(0xffffffffu, sf, col), __shfl_sync(0xffffffffu, sf, col + 1)};
-                const float bv[2] = {__shfl_sync(0xffffffffu, bf, col), __shfl_sync(0xffffffffu, bf, col + 1)};
+                for (int jj = 0; jj < 4; ++jj) {
+                    const int j = pass * 4 + jj;
+                    const int col = jj * 8 + (lane & 3) * 2;
+                    const float sv[2] = {__shfl_sync(0xffffffffu, sf, col), __shfl_sync(0xffffffffu, sf, col + 1)};
+                    const float bv[2] = {__shfl_sync(0xffffffffu, bf, col), __shfl_sync(0xffffffffu, bf, col + 1)};
 #pragma unroll
-                for (int i = 0; i < I; ++i) {
+                    for (int i = 0; i < I; ++i) {
 #pragma unroll
-                    for (int e = 0; e < 4; ++e)
-                        acc[i][j][e] = __fmaf_rn(xv[i][e >> 1], bv[e & 1], __fmaf_rn(d[i][j][e], sv[e & 1], acc[i][j][e]));
+                        for (int e = 0; e < 4; ++e)
+                            acc[i][j][e] = __fmaf_rn(xv[i][e >> 1], bv[e & 1], __fmaf_rn(d[i][j][e], sv[e & 1], acc[i][j][e]));
+                    }
                 }
             }
         }
     }
     wait<0>();
+    if constexpr (BM == 16 && NJ) {
+    // NJ (newjordan EPILOGUE50, submission 8795d433; TF_NJ): the epilogue on the retired ring stage.
+    // The last iteration's CTA rendezvous retired the previous stage's reads.
+    // Its sibling, per % STAGES, has no outstanding writes or current readers.
+    // Reuse that dead ring stage, not buf (which may still be the live stage).
+    // STAGES=3 (jungjipdo 6dd618dc, TF_COMPACT3): the sibling stage(per % 3) was iteration per-3's
+    // live stage, read out before per-2's rendezvous; its refill (committed at per-2) is drained by
+    // the closing wait<0>, and the epilogue overwrites every element it reads under its own barrier.
+    static_assert((STAGES == 2 || STAGES == 3) && I == 1 && WM == 1 && WN == 4 && BN == 256);
+    static_assert(BM * (BN / 2) * sizeof(__nv_bfloat16) <= T::STAGE);
+    __nv_bfloat16* own = reinterpret_cast<__nv_bfloat16*>(stage(per % STAGES));
+    if (wn < WN / 2) {
+#pragma unroll
+        for (int j = 0; j < J; ++j)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int r = (lane >> 2) + h * 8;
+                const int c = wn * (BN / WN) + j * 8 + (lane & 3) * 2;
+                *reinterpret_cast<__nv_bfloat162*>(own + r * (BN / 2) + c) =
+                    __floats2bfloat162_rn(acc[0][j][2*h], acc[0][j][2*h+1]);
+            }
+    }
+    // Gate fragments cross warp boundaries once. Up fragments stay registers.
+    __syncthreads();
+    if (wn >= WN / 2) {
+#pragma unroll
+        for (int j = 0; j < J; ++j)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int r = (lane >> 2) + h * 8;
+                const int c = (wn - WN / 2) * (BN / WN) + j * 8 + (lane & 3) * 2;
+                const __nv_bfloat162 g2 = *reinterpret_cast<const __nv_bfloat162*>(own + r * (BN / 2) + c);
+                const __nv_bfloat162 u2 = __floats2bfloat162_rn(acc[0][j][2*h], acc[0][j][2*h+1]);
+                const float gf[2] = {__low2float(g2), __high2float(g2)};
+                const float uf[2] = {__low2float(u2), __high2float(u2)};
+                __nv_bfloat16 o[2];
+#pragma unroll
+                for (int e = 0; e < 2; ++e) o[e] = __float2bfloat16_rn(gf[e] / (1.0f + expf(-gf[e])) * uf[e]);
+                const __nv_bfloat162 o2 = __halves2bfloat162(o[0], o[1]);
+                *reinterpret_cast<__nv_bfloat162*>(own + r * (BN / 2) + c) = o2;
+                if (m0 + r < M) *reinterpret_cast<__nv_bfloat162*>(act + static_cast<size_t>(m0 + r) * P.n + n0 + c) = o2;
+            }
+        // A single up warp owns every element of its 64-column group. Preserve
+        // the baseline's scalar sum order, with no CTA-wide output handoff.
+        __syncwarp();
+        if (lane < rows) {
+            const int group = wn - WN / 2;
+            as[static_cast<size_t>(m0 + lane) * (P.n / 64) + n0 / 64 + group] =
+                act_group_sum(own + lane * (BN / 2) + group * 64);
+        }
+    }
+    } else {
     __nv_bfloat16* own = reinterpret_cast<__nv_bfloat16*>(buf);
     __syncthreads();
 #pragma unroll
@@ -215,6 +338,7 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
         const int r = tid / (BN / 128), group = tid % (BN / 128);
         as[static_cast<size_t>(m0 + r) * (P.n / 64) + n0 / 64 + group] = act_group_sum(own + r * BN + group * 64);
     }
+    }
 
 }
 
@@ -223,4 +347,37 @@ extern "C" __global__ void __launch_bounds__(128, 3) tf_qmm_mlp_single16_compact
  const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,
  __nv_bfloat16* act,float* sums,int M,int K,int ldx,int rows_t) {
  tf_qmm_mlp_single::mlp_single_compact_body<>(x,xs,parts,act,sums,M,K,ldx,rows_t);
+}
+
+// the BM16 tile with newjordan's two changes (EARLYA49 4c77bdbd, EPILOGUE50 8795d433): the same bits (TF_NJ)
+extern "C" __global__ void __launch_bounds__(128, 3) tf_qmm_mlp_single16_compact_pair_nj(
+ const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,
+ __nv_bfloat16* act,float* sums,int M,int K,int ldx,int rows_t) {
+ tf_qmm_mlp_single::mlp_single_compact_body<2, 256, true, 16, true>(x,xs,parts,act,sums,M,K,ldx,rows_t);
+}
+
+// The same tile at 32 rows: two m16 row tiles a CTA share the staged weight panel (one weight pass for the window,
+// where the 16-row tiles stream every weight once a tile); rows_t counts 32-row tiles. Each row keeps the body's
+// chain unchanged: the same MMAs over K, the same fmas and bf16 rounding, so the same bits a 16-row window computes.
+#ifndef TF_COMPACT32_MINB
+#define TF_COMPACT32_MINB 3
+#endif
+extern "C" __global__ void __launch_bounds__(128, TF_COMPACT32_MINB) tf_qmm_mlp_single16_compact_pair32(
+ const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,
+ __nv_bfloat16* act,float* sums,int M,int K,int ldx,int rows_t) {
+ tf_qmm_mlp_single::mlp_single_compact_body<2, 256, true, 32>(x,xs,parts,act,sums,M,K,ldx,rows_t);
+}
+
+// jungjipdo's 3-stage weight/index/sum pipeline on the same BM16 tile (submission 512bdc67, source
+// 6dd618dc's qmm_mlp_compact_pair.cuh): one deeper cp.async ring on the direct-input-fragment body —
+// the same staged words, the same fragment addresses, the same mma/fma chains, so the same bits (TF_COMPACT3).
+extern "C" __global__ void __launch_bounds__(128, 3) tf_qmm_mlp_single16_compact_pair3(
+ const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,
+ __nv_bfloat16* act,float* sums,int M,int K,int ldx,int rows_t) {
+ tf_qmm_mlp_single::mlp_single_compact_body<3, 256, true, 16>(x,xs,parts,act,sums,M,K,ldx,rows_t);
+}
+extern "C" __global__ void __launch_bounds__(128, 3) tf_qmm_mlp_single16_compact_pair_nj3(
+ const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,
+ __nv_bfloat16* act,float* sums,int M,int K,int ldx,int rows_t) {
+ tf_qmm_mlp_single::mlp_single_compact_body<3, 256, true, 16, true>(x,xs,parts,act,sums,M,K,ldx,rows_t);
 }
