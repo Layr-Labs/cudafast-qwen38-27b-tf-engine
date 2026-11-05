@@ -367,8 +367,11 @@ rc=$?
   && ok "retry: a stale control-divergence seal from before the run never triggers a retry" \
   || fail "retry: stale seal: rc=${rc} runs=$(wc -l < "${WORK}/runs")"
 
-# The sandboxed teardown, with sudo and ipcs stubbed (the sandbox user is the
-# current user; the stub ipcs lists nothing, so no real IPC object is touched).
+# The sandboxed teardown, with sudo, ipcs and keyctl stubbed (the sandbox user
+# is the current user; the stub ipcs lists nothing and the stub keyctl reports
+# empty keyrings, so no real IPC object or key is touched, and the test does
+# not need keyutils on the host). tools/test-sandbox-wipe.sh tests the keyring
+# wipe itself.
 SB="${WORK}/sb"
 JOBDIR="${SB}/root/42-1"
 mkdir -p "${SB}/bin" "${SB}/tmp" "${SB}/home" "${SB}/runner-temp"
@@ -443,6 +446,15 @@ cat > "${SB}/bin/pgrep" <<EOF
 exec $(command -v pgrep) "\$@"
 EOF
 printf '#!/usr/bin/env bash\nexit 0\n' > "${SB}/bin/ipcs"
+cat > "${SB}/bin/keyctl" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  session) [[ "$2" == - ]] || exit 1; shift 2; exec "$@" ;;
+  get_persistent) echo "keyctl_get_persistent: Operation not supported" >&2; exit 1 ;;
+  link|clear|rlist) exit 0 ;;
+  *) exit 1 ;;
+esac
+EOF
 REAL_STAT="$(command -v stat)"
 REAL_STAT_ESCAPED="$(printf '%q' "${REAL_STAT}")"
 cat > "${SB}/bin/stat" <<EOF
