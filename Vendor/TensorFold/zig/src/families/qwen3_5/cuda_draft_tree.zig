@@ -8,6 +8,12 @@ const engine = @import("cuda_engine.zig");
 const branch = 12;
 const edge_weight = 0.6;
 const scale = 1.5;
+/// The stream's own text as evidence. A candidate the history already followed after the path's last tokens (up to
+/// ngram_max of them) adds ngram_beta nats a matched token; one the history has only had adds ngram_gamma.
+const ngram_max = 6;
+const ngram_beta = 0.7;
+const ngram_gamma = 0.3;
+var ngram_bonus: [lp_top]f64 = @splat(0);
 /// A sampled stream's candidates carry the draw's own Gumbel noise at this weight (the 27B engine's draft_tree).
 const noise_weight = 0.7;
 const default_nodes = 15;
@@ -187,7 +193,7 @@ fn chancesAfterFast(c: Candidates, r: usize, pred: u32, out: *[lp_top]f64) void 
     for (0..vec_n) |v| edge[v * lanes_f64 ..][0..lanes_f64].* = acc[v];
     var most: f64 = -std.math.inf(f64);
     for (0..c.topk) |j| {
-        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edge_weight * edge[j]) / scale;
+        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edge_weight * edge[j] + ngram_bonus[j]) / scale;
         most = @max(most, out[j]);
     }
     var total: f64 = 0;
@@ -211,7 +217,7 @@ fn chancesAfter(c: Candidates, r: usize, pred: u32, out: *[lp_top]f64) void {
         for (edge[0..c.topk], succ[0..c.topk]) |*e, row| e.* += ph * bf16(row[k]);
     }
     for (0..c.topk) |j| {
-        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edge_weight * edge[j]) / scale;
+        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edge_weight * edge[j] + ngram_bonus[j]) / scale;
         most = @max(most, out[j]);
     }
     var total: f64 = 0;
@@ -220,8 +226,40 @@ fn chancesAfter(c: Candidates, r: usize, pred: u32, out: *[lp_top]f64) void {
     for (out[0..c.topk]) |*v| v.* -= log_total;
 }
 
+/// Each candidate of row `row`'s evidence from the stream so far, given the path ending at `node`.
+fn ngramBonus(c: Candidates, row: usize, hist: []const u32, tokens: []const u32, parents: []const i32, node: i32) void {
+    ngram_bonus = @splat(0);
+    if (hist.len < 2) return;
+    var tail: [ngram_max]u32 = undefined; // tail[0] is the latest token
+    var n: usize = 0;
+    var cur = node;
+    while (cur >= 0 and n < ngram_max) : (cur = parents[@intCast(cur)]) {
+        tail[n] = tokens[@intCast(cur)];
+        n += 1;
+    }
+    var h = hist.len;
+    while (n < ngram_max and h > 0) {
+        h -= 1;
+        tail[n] = hist[h];
+        n += 1;
+    }
+    const w = ids(c, row);
+    var best: [lp_top]u8 = @splat(0);
+    var seen: [lp_top]bool = @splat(false);
+    for (hist, 0..) |tok, i| {
+        for (0..c.topk) |j| {
+            if (w[2 + j] != tok) continue;
+            seen[j] = true;
+            var m: usize = 0;
+            while (m < n and i > m and hist[i - 1 - m] == tail[m]) m += 1;
+            if (m > best[j]) best[j] = @intCast(m);
+        }
+    }
+    for (0..c.topk) |j| ngram_bonus[j] = if (best[j] > 0) ngram_beta * @as(f64, @floatFromInt(best[j])) else if (seen[j]) ngram_gamma else 0;
+}
+
 /// Up to `most` nodes best first: the open node of least path cost next (ties by parent, token, row); the count grown.
-pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32, parents: []i32, own: []f64) usize {
+pub fn grow(c: Candidates, pending: u32, hist: []const u32, rows: usize, most: usize, tokens: []u32, parents: []i32, own: []f64) usize {
     const Open = struct { cost: f64, parent: i32, token: u32, row: usize, own: f64 };
     var open: [branch * (engine.most_window + 1)]Open = undefined;
     var n_open: usize = 0;
@@ -236,6 +274,7 @@ pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32
         // the node just taken (or the pending token) opens its best children on the next row
         if (row < rows) {
             var lc: [lp_top]f64 = undefined;
+            ngramBonus(c, row, hist, tokens, parents, parent);
             if (fast) chancesAfterFast(c, row, pred, &lc) else chancesAfter(c, row, pred, &lc);
             if (fast and treeCheck()) {
                 var ref: [lp_top]f64 = undefined;
@@ -276,6 +315,7 @@ pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32
         path = node.cost;
         count += 1;
     }
+    ngram_bonus = @splat(0);
     return count;
 }
 
@@ -313,7 +353,7 @@ test "best first: a node's children follow it, the cheapest open node first, cha
     var tokens: [6]u32 = undefined;
     var parents: [6]i32 = undefined;
     var own: [6]f64 = undefined;
-    const n = grow(c, 5, 2, 6, &tokens, &parents, &own);
+    const n = grow(c, 5, &.{}, 2, 6, &tokens, &parents, &own);
     try std.testing.expectEqual(@as(usize, 6), n);
     try std.testing.expectEqual(@as(u32, 0), tokens[0]); // row 0's best first
     try std.testing.expectEqual(@as(i32, -1), parents[0]);

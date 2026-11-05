@@ -14,11 +14,12 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     constexpr int GS = 64, BM = 16, WM = 1, WN = 4;
     using Base = LaneTile<GS, BM, BN, WM, WN, STAGES>;
     struct T : Base {
-        enum { X = 0, W = BN * GS / 2, S = 256, STAGE = W + 2 * S + BM * 4,
+        // XT: the group's x tile (BM rows of 64 bf16), staged with the weights
+        enum { X = 0, W = BN * GS / 2, S = 256, XT = W + 2 * S + BM * 4, STAGE = XT + BM * GS * 2,
                SMEM = STAGES * STAGE };
     };
     constexpr int PASSES = BN / WN / 32;
-    static_assert(T::SMEM == 17536, "compact pair pipeline footprint");
+    static_assert(T::SMEM == 21632, "compact pair pipeline footprint");
     constexpr int I = T::MT, J = T::NT;
     extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -60,8 +61,14 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     const uint32_t* const mgtab = reinterpret_cast<const uint32_t*>(parts.p[mpart].biases);
     const bool xsok = tid < rows;
     const float* xssrc = xs + static_cast<size_t>(m0 + min(tid, rows - 1)) * KG;
+    // x's 16 rows of the group: 16-byte chunk ch of row r at slot ch ^ (r & 7) (rows past M repeat the last one: their
+    // products are never stored); the fragments below read the same bf16 words the x rows hold
+    const int xr = tid >> 3, xch = tid & 7;
+    const __nv_bfloat16* xtsrc = x + static_cast<size_t>(m0 + min(xr, rows - 1)) * ldx + xch * 8;
+    const int xtdst = T::XT + xr * 128 + ((xch ^ (xr & 7)) * 16);
     auto load_x = [&](int s, int g) {
         if (xsok) cp4(stage(s) + T::W + 2 * T::S + tid * 4, xssrc + g);
+        cp16(stage(s) + xtdst, xtsrc + g * GS);
     };
     auto load_w = [&](int s, int g) {
         unsigned char* p = stage(s);
@@ -98,6 +105,24 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     for (int it = 0; it < per; ++it) {
         wait<0>();
         __syncthreads();
+        uint32_t av[GS / 16][I][4];
+        {
+            const unsigned char* xt = stage(it % STAGES) + T::XT;
+            const int b = (2 * (lane & 3)) * 2;
+#pragma unroll
+            for (int kt = 0; kt < GS / 16; ++kt)
+#pragma unroll
+                for (int i = 0; i < I; ++i) {
+                    const int r = wm * (BM / WM) + i * 16 + (lane >> 2);
+                    auto at = [&](int row, int ch) {
+                        return *reinterpret_cast<const uint32_t*>(xt + row * 128 + ((ch ^ (row & 7)) * 16) + b);
+                    };
+                    av[kt][i][0] = at(r, 2 * kt);
+                    av[kt][i][1] = at(r + 8, 2 * kt);
+                    av[kt][i][2] = at(r, 2 * kt + 1);
+                    av[kt][i][3] = at(r + 8, 2 * kt + 1);
+                }
+        }
         const int next = it + 1;
         if (next < per) { load_x(next % STAGES, next); load_w(next % STAGES, next); }
         commit();
@@ -118,20 +143,6 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
         for (int j = 0; j < T::NT; ++j)
 #pragma unroll
             for (int v = 0; v < GS / 32; ++v) words[j][v] = pw[((wn * T::NT + j) * 32 + lane) * (GS / 32) + v];
-        uint32_t av[GS / 16][I][4];
-#pragma unroll
-        for (int kt = 0; kt < GS / 16; ++kt)
-#pragma unroll
-            for (int i = 0; i < I; ++i) {
-                const int r = wm * (BM / WM) + i * 16 + (lane >> 2);
-                const int c = it * GS + kt * 16 + 2 * (lane & 3);
-                const __nv_bfloat16* a0 = x_ready + static_cast<size_t>(m0 + r) * ldx + c;
-                const __nv_bfloat16* a1 = a0 + 8 * ldx;
-                av[kt][i][0] = compact_load_a(a0);
-                av[kt][i][1] = compact_load_a(a1);
-                av[kt][i][2] = compact_load_a(a0 + 8);
-                av[kt][i][3] = compact_load_a(a1 + 8);
-            }
         float xv[I][2];
 #pragma unroll
         for (int i = 0; i < I; ++i) {
