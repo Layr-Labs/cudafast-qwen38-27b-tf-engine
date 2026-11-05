@@ -27,7 +27,7 @@ pub const Mode = enum { on, check };
 pub const HeadSieve = struct {
     pub const rows_max = 16;
     pub const sieve_smem: u32 = 4 * (2048 + 4 * 1024 + 4 * 256 + 128); // tf_head_sieve::SMEM
-    pub const rescore_smem: u32 = 8 * (2048 + 4 * 288 + 64) + 4 * rows_max * @sizeOf(u64); // stages + CTA keys
+    pub const rescore_smem: u32 = 4 * (2048 + 4 * 288 + 64) + 4 * rows_max * @sizeOf(u64); // stages + CTA keys
     /// The pair table in shared memory when three scan CTAs an SM still fit (GB10: 100 KiB an SM, 1 KiB a CTA).
     const tab_room: u32 = 102400 / 3 - 1024 - sieve_smem;
     const cta_top_smem: u32 = 4 * rows_max * @sizeOf(u64);
