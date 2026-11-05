@@ -185,6 +185,11 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
             sg[i][e] = 0.0f;
         }
     const int r0 = lane >> 2;
+    // Check mode stores all 16 rows in approx, including padding; preserve them there.
+    const bool upper = rows > 8 || approx != nullptr;
+    // Row lanes share r0 in groups of four; check mode still computes padded rows.
+    const bool lower_row = r0 < rows || approx != nullptr;
+    const bool upper_row = r0 + 8 < rows || approx != nullptr;
     const bool stab = tab_smem > 0;
     for (int g = 0; g < KG; ++g) {
         qmm_frag::wait<NS - 2>();
@@ -240,14 +245,18 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
             const float s0 = __uint_as_float(ea << 16), c0 = __uint_as_float(ea & 0xFFFF0000u);
             const float s1 = __uint_as_float(eb << 16), c1 = __uint_as_float(eb & 0xFFFF0000u);
             const float m0 = fmaf(1.5f, s0, c0), m1 = fmaf(1.5f, s1, c1);
-            acc[nt][0] = fmaf(4.0f * s0, d[0], fmaf(m0, xs0, acc[nt][0]));
-            acc[nt][1] = fmaf(4.0f * s1, d[1], fmaf(m1, xs0, acc[nt][1]));
-            acc[nt][2] = fmaf(4.0f * s0, d[2], fmaf(m0, xs1, acc[nt][2]));
-            acc[nt][3] = fmaf(4.0f * s1, d[3], fmaf(m1, xs1, acc[nt][3]));
-            sg[nt][0] = fmaf(s0 * s0, q0, sg[nt][0]);
-            sg[nt][1] = fmaf(s1 * s1, q0, sg[nt][1]);
-            sg[nt][2] = fmaf(s0 * s0, q1, sg[nt][2]);
-            sg[nt][3] = fmaf(s1 * s1, q1, sg[nt][3]);
+            if (lower_row) {
+                acc[nt][0] = fmaf(4.0f * s0, d[0], fmaf(m0, xs0, acc[nt][0]));
+                acc[nt][1] = fmaf(4.0f * s1, d[1], fmaf(m1, xs0, acc[nt][1]));
+                sg[nt][0] = fmaf(s0 * s0, q0, sg[nt][0]);
+                sg[nt][1] = fmaf(s1 * s1, q0, sg[nt][1]);
+            }
+            if (upper_row) {
+                acc[nt][2] = fmaf(4.0f * s0, d[2], fmaf(m0, xs1, acc[nt][2]));
+                acc[nt][3] = fmaf(4.0f * s1, d[3], fmaf(m1, xs1, acc[nt][3]));
+                sg[nt][2] = fmaf(s0 * s0, q1, sg[nt][2]);
+                sg[nt][3] = fmaf(s1 * s1, q1, sg[nt][3]);
+            }
         }
     }
     qmm_frag::wait<0>();
@@ -260,6 +269,7 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
         float hi[4];
 #pragma unroll
         for (int e = 0; e < 4; ++e) {
+            if ((e < 2 && !lower_row) || (e >= 2 && !upper_row)) { hi[e] = neg_inf(); continue; }
             const float sd = sqrtf(1.25f * sg[nt][e]), ks = kappa * sd, v = acc[nt][e];
             hi[e] = v + ks + fmaf(fabsf(v) + ks, SLACK_REL, SLACK_ABS);
             if (approx != nullptr) {
@@ -269,16 +279,20 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
                 approx[id * 32 + 16 + row] = sd;
             }
         }
-        float h0 = fmaxf(hi[0], hi[1]), h1 = fmaxf(hi[2], hi[3]);
+        float h0 = fmaxf(hi[0], hi[1]), h1 = neg_inf();
         h0 = fmaxf(h0, __shfl_xor_sync(0xffffffffu, h0, 1));
         h0 = fmaxf(h0, __shfl_xor_sync(0xffffffffu, h0, 2));
-        h1 = fmaxf(h1, __shfl_xor_sync(0xffffffffu, h1, 1));
-        h1 = fmaxf(h1, __shfl_xor_sync(0xffffffffu, h1, 2));
-        float m0 = fmaxf(acc[nt][0], acc[nt][1]), m1 = fmaxf(acc[nt][2], acc[nt][3]);
+        float m0 = fmaxf(acc[nt][0], acc[nt][1]), m1 = neg_inf();
         m0 = fmaxf(m0, __shfl_xor_sync(0xffffffffu, m0, 1));
         m0 = fmaxf(m0, __shfl_xor_sync(0xffffffffu, m0, 2));
-        m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, 1));
-        m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, 2));
+        if (upper) {
+            h1 = fmaxf(hi[2], hi[3]);
+            h1 = fmaxf(h1, __shfl_xor_sync(0xffffffffu, h1, 1));
+            h1 = fmaxf(h1, __shfl_xor_sync(0xffffffffu, h1, 2));
+            m1 = fmaxf(acc[nt][2], acc[nt][3]);
+            m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, 1));
+            m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, 2));
+        }
         if ((lane & 3) == 0) {
             const size_t n8 = (t0 + warp) * 8 + nt;
             if (r0 < rows) {
@@ -406,26 +420,28 @@ extern "C" __global__ void __launch_bounds__(256) tf_head_sieve_select(const flo
             const float4* h = reinterpret_cast<const float4*>(himax + static_cast<size_t>(t) * 16);
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
+                if (i * 4 >= rows) break; // every row in this vector is inactive
                 const float4 v = h[i];
                 const float vv[4] = {v.x, v.y, v.z, v.w};
 #pragma unroll
                 for (int j = 0; j < 4; ++j) hit |= (i * 4 + j < rows) && vv[j] >= M[i * 4 + j];
             }
         }
-        bool already_scored = false;
-        if (hit) {
-#pragma unroll
-            for (int r = 0; r < 16; ++r) already_scored |= r < rows && first_tile[r] == t;
-        }
         const unsigned hits = __ballot_sync(0xffffffffu, hit);
-        const unsigned emit = __ballot_sync(0xffffffffu, hit && !already_scored);
         if (hits != 0u) {
+            // Each first tile contributes its bit in this warp's 32-tile window.
+            // hits is warp-uniform, so all 32 lanes participate in the reduction.
+            const int selected = lane < 16 && lane < rows ? first_tile[lane] : -1;
+            const unsigned delta = selected >= 0 ? static_cast<unsigned>(selected) - static_cast<unsigned>(t - lane) : 32u;
+            const unsigned selected_bit = delta < 32u ? 1u << delta : 0u;
+            const unsigned scored = __reduce_or_sync(0xffffffffu, selected_bit);
+            const unsigned emit = hits & ~scored;
             unsigned long long at = 0ull;
             // High word counts all hits for the original overflow rule; low word reserves compact entries.
             if (lane == 0) at = atomicAdd(count, (static_cast<unsigned long long>(__popc(hits)) << 32) |
                                                   static_cast<unsigned long long>(__popc(emit)));
             const unsigned base = __shfl_sync(0xffffffffu, static_cast<unsigned>(at), 0);
-            if (hit && !already_scored) {
+            if ((emit & (1u << lane)) != 0u) {
                 const unsigned pos = base + __popc(emit & ((1u << lane) - 1u));
                 if (pos < static_cast<unsigned>(cap)) list[pos] = t;
             }
@@ -472,9 +488,10 @@ extern "C" __global__ void __launch_bounds__(128) tf_head_sieve_rescore(const ui
         }
         // Compact-list entries are nonnegative; all warps reach each CTA barrier.
         const bool live = in_range && (keys != nullptr || all || item >= 0) && !duplicate_first;
-        // All threads take this uniform keys-mode branch. If every warp is redundant,
-        // skip the entire staged pipeline after grid_wait/grid_launch, before any copies.
-        if (keys != nullptr && !__syncthreads_or(live)) continue;
+        // In the first keys CTA, warp 0 owns item 0 and can never be a duplicate,
+        // so it is live whenever the loop runs. Other CTAs retain the uniform vote
+        // and may skip the entire staged pipeline when every warp is redundant.
+        if (keys != nullptr && base != 0 && !__syncthreads_or(live)) continue;
         const int t = live ? item : 0;
         const size_t tile = static_cast<size_t>(t >> 3);
         const int nt = t & 7;
@@ -523,7 +540,8 @@ extern "C" __global__ void __launch_bounds__(128) tf_head_sieve_rescore(const ui
                 const float xr[2] = {px[r0], px[r0 + 8]};
 #pragma unroll
                 for (int e = 0; e < 4; ++e)
-                    acc[e] = __fmaf_rn(xr[e >> 1], bv[e & 1], __fmaf_rn(d[e], sv[e & 1], acc[e]));
+                    if (e < 2 || rows > 8) // uniform: upper eight rows are unused otherwise
+                        acc[e] = __fmaf_rn(xr[e >> 1], bv[e & 1], __fmaf_rn(d[e], sv[e & 1], acc[e]));
             }
         }
         qmm_frag::wait<0>();
@@ -533,6 +551,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_head_sieve_rescore(const ui
         const int col = static_cast<int>(col0) + (lane & 3) * 2;
 #pragma unroll
         for (int hh = 0; hh < 2; ++hh) {
+            if (hh != 0 && rows <= 8) continue; // no upper shared slot can be read
             float b = neg_inf();
             int id = 0x7fffffff;
             if (live) {
