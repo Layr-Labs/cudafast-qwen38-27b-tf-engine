@@ -179,6 +179,9 @@ jobs:
       - name: Adapter wrapper (sudo, prlimit, keyring guard and its proof file)
         run: tools/test-run-engine-sandboxed.sh
 
+      - name: Keyring guard proof step (per-start lines, missing run time)
+        run: tools/test-keyring-guard-proof.sh
+
       - name: Sandbox wipe (files, IPC, kernel keyrings)
         run: tools/test-sandbox-wipe.sh
 
