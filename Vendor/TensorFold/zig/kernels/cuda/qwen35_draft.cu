@@ -224,3 +224,9 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35d_attn(const __nv_bfloat1
 #include "qwen35_draft_frame.cuh"
 
 #include "qwen35_head2.cuh"
+
+#include "qwen35_dround.cuh"
+
+#include "qwen35_dtree.cuh"
+
+#include "qwen35_absorb.cuh"
