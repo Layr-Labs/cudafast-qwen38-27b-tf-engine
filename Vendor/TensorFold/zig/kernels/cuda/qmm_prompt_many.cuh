@@ -165,6 +165,10 @@ __device__ __forceinline__ bool short_tile(int rows) {
 template <int GS, int BM, int BN, int WM, int WN, int STAGES>
 __device__ __forceinline__ void prompt_many_body(
         const __nv_bfloat16* __restrict__ x, const ManyParts& parts, int M, int K, int ldx, int group) {
+    // Fire the dependents at entry, as the decode grouped kernels do (qmm_group.cu's grid_launch) and as the
+    // tf_q35 glue after a prompt GEMM assumes of its predecessor: a runAfter-launched follower overlaps its launch
+    // and its static-weight prefetch (taken before await_prior) with this GEMM. No arithmetic or load moves.
+    grid_launch();
     int q = 0;
 #pragma unroll
     for (int i = 1; i < MANY; ++i)
@@ -185,6 +189,7 @@ __device__ __forceinline__ void prompt_many_body(
 template <int GS, int BM, int BN, int WM, int WN, int STAGES>
 __device__ __forceinline__ void prompt_split_body(
         const __nv_bfloat16* __restrict__ x, const ManyPart& P, int M, int K, int ldx, int group, int full_cols) {
+    grid_launch();  // dependents fire at entry: prompt_many_body's comment
     const int rows_t = (M + BM - 1) / BM, full = rows_t * (full_cols / BN);
     if ((int)blockIdx.x < full) {
         const int2 at = tile_of((int)blockIdx.x, M, full_cols, BM, BN, group);
@@ -356,6 +361,7 @@ template <int GS, int BM, int WM, int WN, int STAGES>
 __device__ __forceinline__ void prompt_mlp_body(
         const __nv_bfloat16* __restrict__ x, const ManyParts& parts, __nv_bfloat16* __restrict__ act, int M, int K,
         int ldx, int group) {
+    grid_launch();  // dependents fire at entry: prompt_many_body's comment
     const int2 at = tile_of((int)blockIdx.x, M, parts.p[0].n, BM, 64, group);
     if (BM / WM > 16 && M - at.x <= 16 * WM)
         prompt_mlp_tile<GS, 16 * WM, WM, WN, STAGES>(x, parts, act, M, K, ldx, at.x, at.y);
