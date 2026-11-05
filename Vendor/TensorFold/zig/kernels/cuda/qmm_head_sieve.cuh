@@ -104,10 +104,12 @@ extern "C" __global__ void __launch_bounds__(128) tf_head_sieve_prep(const __nv_
             s2 = fmaf(lo, lo, s2);
             s2 = fmaf(hi, hi, s2);
         }
+        // The eight lanes of an active row participate with the same subgroup mask.
+        const unsigned rowmask = 0xffu << (lane & ~7);
+        s2 += __shfl_xor_sync(rowmask, s2, 1);
+        s2 += __shfl_xor_sync(rowmask, s2, 2);
+        s2 += __shfl_xor_sync(rowmask, s2, 4);
     }
-    s2 += __shfl_xor_sync(0xffffffffu, s2, 1);
-    s2 += __shfl_xor_sync(0xffffffffu, s2, 2);
-    s2 += __shfl_xor_sync(0xffffffffu, s2, 4);
     if (part == 0) {
         xv[g * 32 + row] = row < rows ? xs[static_cast<size_t>(row) * KG + g] : 0.0f;
         xv[g * 32 + 16 + row] = s2;
