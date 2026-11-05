@@ -754,6 +754,11 @@ pub const Engine = struct {
         shape.hidden = keep == .hidden;
         shape.paged = @import("cuda_attention.zig").hasPages(segs);
         shape.amax = keep == .draws and e.learning == null and !e.pockets.any() and e.headArgmax(shape.total, keep.draws);
+        const sieve_keys: u64 = if (shape.amax and e.head3 == null) blk: {
+            if (e.sieve) |*sv| if (sv.mode == .on) break :blk sv.best;
+            break :blk 0;
+        } else 0;
+        if (sieve_keys != 0 and total > e.host_logits.bytes.len / @sizeOf(u64)) return error.InvalidQwenSegments;
         // a cache of at most GROUP_LEN positions holds fewer keys than that before any row it verifies
         shape.short = for (parts) |p| {
             if (p.cache.cap > @import("cuda_forward.zig").group_len) break false;
@@ -818,9 +823,16 @@ pub const Engine = struct {
                     } else try e.argmax(i, n, toks);
                     i += n;
                 }
-                try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(e.host_logits.bytes.ptr, toks, total * 4, e.stream.handle), "cuMemcpyDtoHAsync");
+                // The ordinary sieve returns winning keys directly; all other paths still return tokens.
+                const readback = if (sieve_keys != 0) sieve_keys else toks;
+                const width: usize = if (sieve_keys != 0) @sizeOf(u64) else @sizeOf(u32);
+                const bytes = total * width;
+                try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(e.host_logits.bytes.ptr, readback, bytes, e.stream.handle), "cuMemcpyDtoHAsync");
                 try e.stream.synchronize();
-                @memcpy(e.tokens[0..total], e.host_logits.slice(u32)[0..total]);
+                if (sieve_keys != 0) {
+                    for (e.host_logits.slice(u64)[0..total], e.tokens[0..total]) |key, *token|
+                        token.* = std.math.maxInt(u32) - @as(u32, @truncate(key));
+                } else @memcpy(e.tokens[0..total], e.host_logits.slice(u32)[0..total]);
                 if (shape.amax and e.head3 != null) try e.head3Settle(total);
                 if (shape.amax and e.head3 == null) if (e.sieve) |*sv| sv.after();
             },

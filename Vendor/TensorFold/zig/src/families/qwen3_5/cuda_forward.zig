@@ -281,7 +281,7 @@ pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool, amax: bool) 
             // the 2-bit sieve and the listed column groups exactly (head_sieve.zig); check mode runs the full head too
             if (@hasField(@TypeOf(e.*), "sieve")) if (e.sieve) |*sv| {
                 if (sv.mode == .check) try e.affine.headArgmax(e.stream, x, e.xs, e.head.a4, e.head_amax, heads, toks);
-                return sv.run(e.stream, x, e.xs, e.head.a4, heads, toks);
+                return sv.run(e.stream, x, e.xs, e.head.a4, heads, toks, sv.mode == .on);
             };
             return e.affine.headArgmax(e.stream, x, e.xs, e.head.a4, e.head_amax, heads, toks);
         };

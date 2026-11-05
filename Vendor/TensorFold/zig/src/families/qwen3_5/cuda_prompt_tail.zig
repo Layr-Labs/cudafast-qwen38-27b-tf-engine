@@ -72,7 +72,7 @@ pub fn run(e: *E.Engine, layer: usize, total: usize) !void {
     if (e.prompt_greedy) if (e.sieve) |*sv| if (sv.mode == .on) {
         if (std.mem.eql(u8, std.mem.span(@import("sys").c.getenv("TF_PROMPT_SIEVE") orelse ""), "check"))
             try e.projAgain(e.head, x, e.logits, 1, false);
-        try sv.run(e.stream, x, e.xs, e.head.a4, 1, e.tables.ptr + @import("cuda_round.zig").tokens_at);
+        try sv.run(e.stream, x, e.xs, e.head.a4, 1, e.tables.ptr + @import("cuda_round.zig").tokens_at, false);
         e.prompt_sieved = true;
         return;
     };

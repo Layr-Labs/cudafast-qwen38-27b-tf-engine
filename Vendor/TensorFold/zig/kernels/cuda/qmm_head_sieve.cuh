@@ -440,7 +440,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_head_sieve_rescore(const ui
         const __nv_bfloat16* __restrict__ scales, const __nv_bfloat16* __restrict__ biases, int npad,
         const uint4* __restrict__ afr, const float* __restrict__ xv, int KG, int rows, const int* __restrict__ list,
         const unsigned long long* __restrict__ count, int cap, int n8s, const unsigned long long* __restrict__ keys,
-        unsigned long long* __restrict__ best) {
+        unsigned long long* __restrict__ best, unsigned long long* __restrict__ stats) {
     using namespace tf_head_sieve;
     extern __shared__ __align__(128) unsigned char buf[];
     qmm_frag::grid_wait();
@@ -451,6 +451,15 @@ extern "C" __global__ void __launch_bounds__(128) tf_head_sieve_rescore(const ui
     const bool all = keys == nullptr && total > cap;
     const int items = all ? n8s : n;
     const int r0 = lane >> 2;
+    // The second rescore can record the same completed selector counts as finish.
+    if (stats != nullptr && blockIdx.x == 0 && tid == 0) {
+        const unsigned long long selected = all ? static_cast<unsigned long long>(n8s) : static_cast<unsigned long long>(total);
+        stats[0] += 1;
+        stats[1] += selected;
+        if (selected > stats[2]) stats[2] = selected;
+        if (all) stats[3] += 1;
+        stats[4] += static_cast<unsigned long long>(rows);
+    }
     qmm_frag::grid_launch();
     for (int base = blockIdx.x * 4; base < items; base += gridDim.x * 4) {
         const int it = base + warp;
