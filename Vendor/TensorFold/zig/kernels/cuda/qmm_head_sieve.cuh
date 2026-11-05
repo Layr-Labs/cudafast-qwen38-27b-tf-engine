@@ -527,7 +527,8 @@ extern "C" __global__ void __launch_bounds__(128) tf_head_sieve_rescore(const ui
             }
         }
         qmm_frag::wait<0>();
-        __syncthreads();
+        // Pipeline stages end at RS_SMEM; block_best is a disjoint region. The
+        // barrier after its writes still orders all four warps before reduction.
         // Reduce the four warp keys in shared memory before publishing one key per row.
         auto* block_best = reinterpret_cast<unsigned long long*>(buf + RS_SMEM);
         const int col = static_cast<int>(col0) + (lane & 3) * 2;
