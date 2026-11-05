@@ -101,7 +101,14 @@ pub const Kernels = struct {
         const cols = n / tile_n;
         const tiles = (rows + tile_m - 1) / tile_m * cols;
         if (n % tile_n != 0 or cols < 10 or tiles % kk.slots == 0) return null;
-        if (tiles < kk.slots) return 0;
+        if (tiles < kk.slots) {
+            // Split just enough 128-column panels to fill the first resident wave. Splitting one panel adds
+            // one block for each row tile; if the remaining slots cannot fit that group, keep whole panels.
+            const row_tiles = (rows + tile_m - 1) / tile_m;
+            const split = @min(cols, (kk.slots - tiles) / row_tiles);
+            if (split == 0) return null;
+            return (cols - split) * tile_n;
+        }
         return (cols - cols / 5) * tile_n;
     }
 
