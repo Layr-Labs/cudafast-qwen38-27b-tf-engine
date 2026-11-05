@@ -147,11 +147,187 @@ extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_stream16_dict(co
     if(K==6144)tf_qmm_output_stream::body<4,4,0,true>(x,xs,parts,M,K,ldx);
     else tf_qmm_output_stream::body<0,4,0,true>(x,xs,parts,M,K,ldx);
 }
-// Keep the four-group L2 lookahead for K=4096 and K=6144; use the original unprefetched twin for K=17408.
+// H68 (child GAP): the dict twin's 4-group L2 lookahead on every K, not only K==6144 — the same loads,
+// MMA chains, fmas and slice-ordered sum (body<4> is the exercised K==6144 path); the only additions are
+// read-only cp.async.bulk.prefetch.L2 of future weight tiles and dict windows, issued before grid_wait.
 extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_stream16_dict_fg4(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
-    if (K == 17408) tf_qmm_output_stream::body<0,4,0,true>(x,xs,parts,M,K,ldx);
-    else tf_qmm_output_stream::body<4,4,0,true>(x,xs,parts,M,K,ldx);
+    tf_qmm_output_stream::body<4,4,0,true>(x,xs,parts,M,K,ldx);
 }
 extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_prefetch16(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
     tf_qmm_output_stream::body<4>(x,xs,parts,M,K,ldx);
+}
+
+// ---------------------------------------------------------------------------
+// The 32-row twin (affine4_kernels.zig out32): the same four K slices a CTA with their ordered shared-memory sum.
+// A slice's double-buffered stage holds the 32 input rows (staged and swizzled exactly as the 16-row kernel stages its
+// 16, one band of 16 rows after the other) and the tile's 2048 weight bytes; the group sums, the scale/bias index
+// window and the pair table are read through L2, so a stage is 6144 bytes and two CTAs fit an SM. Each m16 row tile
+// runs the 16-row kernel's ldmatrix fragments, MMA chain and fmas, and the slices keep its ordered sum: the same bits
+// tf_qmm_output_stream16 computes for each row (rows past M are zero-filled and never stored).
+namespace tf_qmm_output_rows32 {
+
+using namespace qmm_frag;
+
+constexpr int ROWS=32, XB=ROWS*128, W_OFF=XB;       // 4096 bytes of staged x, then the weights
+constexpr int STAGE=XB+2048;                        // 6144
+constexpr int SLICE_BYTES=STAGE*2, BYTES=SLICE_BYTES*4; // 12288, 49152 (qlinear.zig out32_smem)
+static_assert(BYTES>=3*16*128*4,"three slices' partial sums over the stages");
+
+template<int FutureGroups,bool DICT=false>
+__device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ x,const float* __restrict__ xs,
+        const tf_qmm_group::Parts& parts,int M,int K,int ldx) {
+    extern __shared__ __align__(128) unsigned char buf[];
+    const auto p=parts.p[0];
+    const int slice=threadIdx.x/128,tid=threadIdx.x%128,lane=tid&31,wn=tid>>5;
+    const int KG=K/64,per=KG/4,g0=slice*per,tile=blockIdx.x,n0=tile*64,rows=min(M,ROWS);
+    const int tiles=DICT?int(gridDim.x):p.npad/64;
+    auto* local=buf+slice*SLICE_BYTES;
+    auto stage=[&](int it){return local+(it&1)*STAGE;};
+    auto weight=[&](int g){return reinterpret_cast<const unsigned char*>(p.w)+(size_t(g)*tiles+tile)*2048;};
+    // the index windows and the table through L2: the lane's index at bit0 of its group's window, its table entry
+    // (a pair code: the (scale, bias) pair; else its scale or bias), the values the 16-row kernel reads from its stage
+    qmm_dict::DictLanes D{};
+    const unsigned char* dbase=nullptr;
+    if constexpr(DICT){
+        D=qmm_dict::dict_lanes<64,4>(p,n0,KG,tid);
+        dbase=reinterpret_cast<const unsigned char*>(p.scales)+static_cast<size_t>(tile)*KG*D.step;
+    }
+    auto load_w=[&](int it){
+        auto* dst=stage(it);const int g=g0+it;
+        cp16(dst+W_OFF+tid*16,weight(g)+tid*16);
+    };
+    auto load_x=[&](int it){
+        auto* dst=stage(it);const int g=g0+it;
+#pragma unroll
+        for(int band=0;band<2;++band){
+            const int row=band*16+tid/8,ch=tid%8;
+            cp16z(dst+row*128+swz<8>(row,ch)*16,x+size_t(min(row,rows-1))*ldx+g*64+ch*8,row<rows);
+        }
+    };
+    load_w(0);commit();
+#if __CUDA_ARCH__ >= 900
+    if(tid==0) {
+#pragma unroll
+        for(int g=1;g<=FutureGroups;++g)if(g<per){
+            const auto* w=weight(g0+g);
+            asm volatile("cp.async.bulk.prefetch.L2.global [%0], 2048;" :: "l"(w) : "memory");
+            if constexpr(DICT){
+                const auto* idx=dbase+qmm_dict::dict_window(D,g0+g);
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], 256;" :: "l"(idx) : "memory");
+            }else{
+                const auto* s=p.scales+size_t(g0+g)*p.npad+n0;const auto* b=p.biases+size_t(g0+g)*p.npad+n0;
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(s) : "memory");
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], 128;" :: "l"(b) : "memory");
+            }
+        }
+    }
+#endif
+    grid_wait();qmm_dict::x_keep_l2(x,rows,K,ldx);load_x(0);commit();grid_launch();
+    uint32_t mask;asm volatile("mov.b32 %0, 0x000F000F;\n":"=r"(mask));
+    float acc[2][2][4]{};
+    const int b_off=DICT?(D.pair?0:16):0;
+    const int r4=lane>>2;
+    for(int it=0;it<per;++it){
+        const int g=g0+it;
+        // this group's scale/bias and sums through L2, issued before the stage wait
+        uint32_t dv=0;
+        [[maybe_unused]] __nv_bfloat162 s2[2],b2[2];
+        if constexpr(DICT){
+            if(!(D.pair&&D.shift!=0)){
+                const uint32_t* pk=reinterpret_cast<const uint32_t*>(dbase+qmm_dict::dict_window(D,g));
+                const int off=(g*D.step&63)*8+D.bit0;
+                const uint32_t idx=__funnelshift_r(__ldg(pk+(off>>5)),__ldg(pk+(off>>5)+1),off&31)&D.mask;
+                dv=D.pair?__ldg(reinterpret_cast<const uint32_t*>(p.biases)+idx)
+                         :uint32_t(__ldg(reinterpret_cast<const unsigned short*>(p.biases)+D.base+idx));
+            }
+        }else{
+#pragma unroll
+            for(int j=0;j<2;++j){
+                const int col=n0+wn*16+j*8+(lane&3)*2;
+                s2[j]=__ldg(reinterpret_cast<const __nv_bfloat162*>(p.scales+size_t(g)*p.npad+col));
+                b2[j]=__ldg(reinterpret_cast<const __nv_bfloat162*>(p.biases+size_t(g)*p.npad+col));
+            }
+        }
+        float xv[2][2];
+#pragma unroll
+        for(int mt=0;mt<2;++mt)
+#pragma unroll
+            for(int h=0;h<2;++h){const int row=mt*16+r4+h*8;xv[mt][h]=row<rows?__ldg(xs+size_t(row)*KG+g):0.0f;}
+        wait<0>();__syncthreads();
+        if(it+1<per){load_w(it+1);load_x(it+1);}commit();
+        const auto* at=stage(it);const auto* wp=reinterpret_cast<const uint32_t*>(at+W_OFF);
+        uint32_t words[2][2];
+#pragma unroll
+        for(int j=0;j<2;++j)
+#pragma unroll
+            for(int v=0;v<2;++v)words[j][v]=wp[((wn*2+j)*32+lane)*2+v];
+        [[maybe_unused]] float sf=0.0f,bf=0.0f;
+        if constexpr(DICT)qmm_dict::dict_raw_vals(D,dv,sf,bf);
+#pragma unroll
+        for(int mt=0;mt<2;++mt){
+            float d[2][4];
+#pragma unroll
+            for(int kt=0;kt<4;++kt){
+                uint32_t a[4];const int r=mt*16+(lane&7)+((lane>>3)&1)*8,ch=kt*2+(lane>>4);
+                ldmatrix4(a,at+r*128+swz<8>(r,ch)*16);
+#pragma unroll
+                for(int j=0;j<2;++j){const auto b0=tf_qmm_group::pairm(words[j][kt/2],(kt&1)*8,mask),b1=tf_qmm_group::pairm(words[j][kt/2],(kt&1)*8+4,mask);
+                    if(kt==0)mma0(d[j],a,b0,b1);else mma(d[j],a,b0,b1);
+                }
+            }
+#pragma unroll
+            for(int j=0;j<2;++j){
+                float sv[2],bv[2];
+                if constexpr(DICT){
+                    const int c0=j*8+(lane&3)*2;
+                    sv[0]=__shfl_sync(0xffffffffu,sf,c0);sv[1]=__shfl_sync(0xffffffffu,sf,c0+1);
+                    bv[0]=__shfl_sync(0xffffffffu,bf,b_off+c0);bv[1]=__shfl_sync(0xffffffffu,bf,b_off+c0+1);
+                }else{
+                    sv[0]=__low2float(s2[j]);sv[1]=__high2float(s2[j]);bv[0]=__low2float(b2[j]);bv[1]=__high2float(b2[j]);
+                }
+#pragma unroll
+                for(int e=0;e<4;++e)acc[mt][j][e]=__fmaf_rn(xv[mt][e>>1],bv[e&1],__fmaf_rn(d[j][e],sv[e&1],acc[mt][j][e]));
+            }
+        }
+    }
+    wait<0>();__syncthreads();auto* partial=reinterpret_cast<float*>(buf);
+    if(slice!=0){
+#pragma unroll
+        for(int mt=0;mt<2;++mt)
+#pragma unroll
+        for(int j=0;j<2;++j)
+#pragma unroll
+            for(int e=0;e<4;++e)partial[(((slice-1)*4+mt*2+j)*4+e)*128+tid]=acc[mt][j][e];
+    }
+    __syncthreads();
+    if(slice==0){
+        for(int peer=1;peer<4;++peer)
+#pragma unroll
+            for(int mt=0;mt<2;++mt)
+#pragma unroll
+            for(int j=0;j<2;++j)
+#pragma unroll
+                for(int e=0;e<4;++e)acc[mt][j][e]=acc[mt][j][e]+partial[(((peer-1)*4+mt*2+j)*4+e)*128+tid];
+#pragma unroll
+        for(int mt=0;mt<2;++mt)
+#pragma unroll
+        for(int j=0;j<2;++j)
+#pragma unroll
+            for(int h=0;h<2;++h){const int r=mt*16+(lane>>2)+h*8,c=n0+wn*16+j*8+(lane&3)*2;
+                if(r<M&&c+1<p.n)*reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<__nv_bfloat16*>(p.out)+size_t(r)*p.n+c)=__floats2bfloat162_rn(acc[mt][j][2*h],acc[mt][j][2*h+1]);
+            }
+    }
+}
+} // namespace tf_qmm_output_rows32
+
+extern "C" __global__ void __launch_bounds__(512,2) tf_qmm_output_stream32(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
+    tf_qmm_output_rows32::body<0>(x,xs,parts,M,K,ldx);
+}
+extern "C" __global__ void __launch_bounds__(512,2) tf_qmm_output_prefetch32(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K, int ldx){
+    tf_qmm_output_rows32::body<4>(x,xs,parts,M,K,ldx);
+}
+// tf_qmm_output_stream32 on a dictionary-coded part: the same loads, MMA chains, fmas and slice-ordered sum.
+extern "C" __global__ void __launch_bounds__(512,2) tf_qmm_output_stream32_dict(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
+    if(K==6144)tf_qmm_output_rows32::body<4,true>(x,xs,parts,M,K,ldx);
+    else tf_qmm_output_rows32::body<0,true>(x,xs,parts,M,K,ldx);
 }
