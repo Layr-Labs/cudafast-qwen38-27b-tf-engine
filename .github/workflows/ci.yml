@@ -1,4 +1,4 @@
-# Engine CI -- build and test only, hosted, with no credential.
+# Engine CI -- build and test only, with no credential.
 #
 #   - no credential of any kind, and a step below trips if a workflow in this
 #     tree starts referencing one, inheriting the caller's, or asking for a
@@ -9,21 +9,30 @@
 #     channel prebuilt (tools/fetch-benchd.sh);
 #   - no model weights, no R2, no ranked box.
 #
-# ONE JOB:
-#   `lint`            hosted x86 Ubuntu: hygiene, manifest lint, and selected
-#                     GPU-free control-plane tests.
+# TWO JOBS:
+#   `route`           GitHub-hosted, no permissions: chooses the runner for
+#                     `lint` (.github/workflows/darkbloom-route.yml).
+#   `lint`            Linux: hygiene, manifest lint, and selected GPU-free
+#                     control-plane tests. It runs on GitHub-hosted x86
+#                     `ubuntu-latest`, or on an ARM64 Darkbloom Sandbox when
+#                     routing is on and the Darkbloom plane grants one.
 #
 # The ranked pipeline is .github/workflows/benchmark.yml (workflow_dispatch
 # only, self-hosted, no credential), which benchmark.json's runner.workflow
 # names. It is never in this file.
 
-# MANUAL ONLY. This repository uses no paid GitHub feature, and
-# these jobs need GitHub-hosted runners, so they run only when dispatched by
-# hand. Run the same checks locally before a push (AGENTS.md, "Checks").
+# WHEN IT RUNS. On every pull request, on every push to main, and when
+# dispatched by hand. The repository is public, so GitHub-hosted runners are
+# free. Routing is off unless the repository variable DARKBLOOM_ROUTING is
+# exactly `on` (docs/ci-coverage.md, "Runner routing"). The same checks run
+# locally (AGENTS.md, "Checks").
 
 name: ci
 
 on:
+  pull_request:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -34,9 +43,19 @@ permissions:
   contents: read
 
 jobs:
+  # Chooses a Darkbloom Sandbox or the GitHub-hosted fallback for the job
+  # below. The route job never fails the run.
+  route:
+    uses: ./.github/workflows/darkbloom-route.yml
+    permissions: {}
+    with:
+      lanes: |
+        lint linux_arm64 ubuntu-latest
+
   lint:
     name: lint (repo hygiene, hosted)
-    runs-on: ubuntu-latest
+    needs: route
+    runs-on: ${{ fromJSON(needs.route.outputs.routes)['lint'] }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -55,6 +74,42 @@ jobs:
         # inside the directory it scans.
         run: tools/ci-workflow-egress-scan.sh
 
+      - name: ShellCheck (pinned)
+        # The GitHub-hosted image has ShellCheck 0.9.0 and the Darkbloom image
+        # has none. This step installs the same 0.9.0 on both, as a pinned
+        # release BINARY that runs only if its sha256 matches. It goes first,
+        # so actionlint below checks run blocks with it too. The release has no
+        # checksums file; the two digests are of the release assets.
+        env:
+          SHELLCHECK_VERSION: 0.9.0
+          SHELLCHECK_SHA256_X86_64: 700324c6dd0ebea0117591c6cc9d7350d9c7c5c287acbad7630fa17b1d4d9e2f
+          SHELLCHECK_SHA256_AARCH64: 179c579ef3481317d130adebede74a34dbbc2df961a70916dd4039ebf0735fae
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) arch=x86_64; sha256="${SHELLCHECK_SHA256_X86_64}" ;;
+            aarch64) arch=aarch64; sha256="${SHELLCHECK_SHA256_AARCH64}" ;;
+            *) echo "::error::no pinned ShellCheck for $(uname -m)" >&2; exit 1 ;;
+          esac
+          workdir="${RUNNER_TEMP}/shellcheck"
+          mkdir -p "${workdir}"
+          tarball="${workdir}/shellcheck.tar.xz"
+          url="https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.${arch}.tar.xz"
+
+          curl --fail --silent --show-error --location --retry 3 -o "${tarball}" "${url}"
+
+          if ! printf '%s  %s\n' "${sha256}" "${tarball}" | sha256sum --check --status; then
+            echo "::error::ShellCheck ${SHELLCHECK_VERSION} tarball does not match its pinned sha256; refusing to execute it" >&2
+            echo "  expected ${sha256}" >&2
+            echo "  actual   $(sha256sum "${tarball}" | cut -d ' ' -f 1)" >&2
+            exit 1
+          fi
+
+          tar -xJf "${tarball}" -C "${workdir}" --strip-components=1 "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+          chmod +x "${workdir}/shellcheck"
+          "${workdir}/shellcheck" --version
+          echo "${workdir}" >> "${GITHUB_PATH}"
+
       - name: actionlint
         # A pinned release BINARY, hash-verified before it is allowed to run.
         # The org's Actions policy admits GitHub-owned actions by 40-hex SHA
@@ -67,20 +122,25 @@ jobs:
         # hash it actually has matches. A swapped, tampered, or truncated
         # asset fails the step instead of executing.
         #
-        # Kept at the known-good 1.7.12 pin. Bump the version and checksum
-        # together; the checksum is the matching line from that release's
+        # Kept at the known-good 1.7.12 pin. Bump the version and checksums
+        # together; each checksum is the matching line from that release's
         # actionlint_<version>_checksums.txt.
         env:
           ACTIONLINT_VERSION: 1.7.12
-          # linux amd64 because this job is `runs-on: ubuntu-latest`. Pick the
-          # asset that matches the runner if that ever changes.
-          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          # linux amd64 on GitHub-hosted runners, linux arm64 on Darkbloom.
+          ACTIONLINT_SHA256_AMD64: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          ACTIONLINT_SHA256_ARM64: 325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6
         run: |
           set -euo pipefail
 
+          case "$(uname -m)" in
+            x86_64) arch=amd64; ACTIONLINT_SHA256="${ACTIONLINT_SHA256_AMD64}" ;;
+            aarch64) arch=arm64; ACTIONLINT_SHA256="${ACTIONLINT_SHA256_ARM64}" ;;
+            *) echo "::error::no pinned actionlint for $(uname -m)" >&2; exit 1 ;;
+          esac
           workdir="$(mktemp -d)"
           tarball="${workdir}/actionlint.tar.gz"
-          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_${arch}.tar.gz"
 
           curl --fail --silent --show-error --location --retry 3 -o "${tarball}" "${url}"
 
@@ -125,10 +185,10 @@ jobs:
             esac
           done < <(git ls-files -z '*.sh' ':!:Vendor/TensorFold/**')
 
-          # The sweep. Its tool ships in the hosted image, so this adds no
-          # download and no egress. The whole tree passes at warning severity
-          # today; the gate keeps it that way. A script that needs an exception
-          # carries an inline suppression with the reason next to it.
+          # The sweep, with the pinned 0.9.0 from the step above. The whole
+          # tree passes at warning severity today; the gate keeps it that way.
+          # A script that needs an exception carries an inline suppression with
+          # the reason next to it.
           #
           # No comment in this block may start with the tool's own name: the
           # workflow linter shellchecks these run blocks, and a comment that
