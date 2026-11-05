@@ -134,6 +134,9 @@ pub const Engine = struct {
     /// each norm writes the rows it reads a sublayer later, past a projection's weights streaming through L2.
     l2_persist: usize = 0,
     overlap: Overlap = .{},
+    /// promptWait's blocking-sync event, created on the first prompt wait and kept for the engine's life
+    /// (null: none yet, or TF_PROMPT_WAIT=spin)
+    prompt_event: cuda.abi.Event = null,
     h_window: ?cuda.abi.AccessPolicyWindow = null,
     wide_words: ?DeviceBuffer = null,
     projection_streams: ?DeviceBuffer = null,
@@ -253,6 +256,7 @@ pub const Engine = struct {
         errdefer if (e.head3) |*h| h.deinit();
         e.sieve = null;
         e.overlap = .{}; // Allocation.create leaves it undefined: no side stream or pending logits before a drafter attaches
+        e.prompt_event = null; // likewise: promptWait creates it on first use
         errdefer e.int8.deinit();
         e.gpa = gpa;
         e.dir = try gpa.dupe(u8, dir);
@@ -314,6 +318,11 @@ pub const Engine = struct {
         e.l2_persist = 0;
         if (gb10 and !envOff("TF_L2_PERSIST") and d.api.cuCtxSetLimit(cuda.abi.limit_persisting_l2, l2_persist_bytes) == cuda.abi.success) e.l2_persist = l2_persist_bytes;
         e.affine.group_wide = gb10 and !envOff("TF_WIDE_GROUP");
+        // GB10: 33 to 128-row windows' projections grouped the verifyMany32 way on the plain row kernels (bits
+        // unchanged: each part's blocks are its own launch's); TF_WIDE_DEEP=0 restores one launch a projection
+        e.affine.group_wide_deep = gb10 and !envOff("TF_WIDE_DEEP");
+        // rows > 32 row kernels on the deep weight ring (qmm_group.cu group_wide_body; bits unchanged); TF_WIDE_KERNEL=0
+        e.affine.wide_deep_kernel = !envOff("TF_WIDE_KERNEL");
         // GB10: out/o (short K slices) on lane_gemv's column CTAs instead (bits unchanged); TF_SHORT_LANE=0 restores the cluster tile
         e.affine.short_lane = gb10 and !envOff("TF_SHORT_LANE");
         errdefer e.affine.deinit();
@@ -348,6 +357,10 @@ pub const Engine = struct {
         e.plan = try cuda.grouped.Router.resolve(e.mods[10]);
         e.moe = try cuda.moe.Fns.resolve(e.mods[13]);
         inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(e.fns, name) = try e.mods[4].function("tf_q35_" ++ name);
+        // the U3/U4 escapes: TF_NORM_U0=1 binds the baseline norm (the residual's loads held across the past_rows
+        // return), TF_NORMROPE_U0=1 the baseline norm+rope tail (a per-thread rotate, no pair fold); unset keeps both
+        if (@import("sys").c.getenv("TF_NORM_U0") != null) e.fns.norm = try e.mods[4].function("tf_q35_norm_u0");
+        if (@import("sys").c.getenv("TF_NORMROPE_U0") != null) e.fns.norm_rope = try e.mods[4].function("tf_q35_norm_rope_u0");
         try e.fns.attn_partial.allowDynamicShared(@import("cuda_forward.zig").attn_tiles); // bf16 tiles' two buffers
         try e.fns.attn_rows.allowDynamicShared(@import("cuda_forward.zig").attn_tiles);
         inline for (@typeInfo(Keeps).@"struct".field_names) |name| @field(e.keeps, name) = try e.mods[6].function("tf_q35k_" ++ name);
@@ -474,6 +487,7 @@ pub const Engine = struct {
         if (e.verify_weights) |*b| b.free();
         if (e.fast) |*p| p.free();
         if (e.head3) |*h| h.deinit();
+        if (e.prompt_event != null) _ = e.d.api.cuEventDestroy_v2(e.prompt_event);
         if (e.sieve) |*sv| sv.deinit();
         e.arena.free();
         e.gpa.free(e.layers);
@@ -552,7 +566,8 @@ pub const Engine = struct {
         e.logits = try t.alloc(most_verify * g.vocab * 2);
         if (g.moe()) e.routed = try routed.Scratch.carve(t, g, R);
         e.amax = try t.alloc(most_verify * argmaxSlices(g.vocab) * 8);
-        e.head_amax = try t.alloc(cuda.qlinear.Affine4Kernels.max_rows * ((g.vocab + 63) / 64) * 8);
+        // the amax head's per-tile bests: 32 rows (the sieve's extended windows; TF_SIEVE32=0 still runs at most 16)
+        e.head_amax = try t.alloc(32 * ((g.vocab + 63) / 64) * 8);
         e.picks = try t.alloc(most_verify * cuda.sample.Draws.row_scratch);
         return total;
     }
@@ -690,6 +705,7 @@ pub const Engine = struct {
         const heads: usize = if (record) total else 1;
         // the prompt GEMM only for prompt chunks: a window's rows keep the bits of one-row steps
         const prompt = !record;
+        if (record) @import("cuda_dtprof.zig").mark(e.d, e.stream, .verify_entry);
         // the tables
         const st = e.staged.bytes;
         @memcpy(std.mem.bytesAsSlice(u32, st[ids_at..][0 .. total * 4]), ids);
@@ -800,9 +816,12 @@ pub const Engine = struct {
                     e.cut_head = null;
                 }
             }
+            if (record) @import("cuda_dtprof.zig").mark(e.d, e.stream, .verify_launch);
             if (e.heads.get(shape.key())) |h| try h.launchOn(e.stream);
             try gop.value_ptr.launchOn(e.stream);
+            if (record) @import("cuda_dtprof.zig").mark(e.d, e.stream, .verify_end);
         }
+        const dround_start: u64 = @intCast(parts[0].cache.len);
         for (parts) |p| p.cache.advanced(p.rows, record);
         switch (keep) {
             .hidden => try e.stream.synchronize(), // mapped layer inputs are ready before the learner reads them
@@ -818,8 +837,10 @@ pub const Engine = struct {
                     } else try e.argmax(i, n, toks);
                     i += n;
                 }
+                if (record and parts.len == 1) @import("cuda_dround.zig").afterVerify(e, parts[0].cache, dround_start, parts[0].rows, parts[0].parents, ids, toks);
                 try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(e.host_logits.bytes.ptr, toks, total * 4, e.stream.handle), "cuMemcpyDtoHAsync");
                 try e.stream.synchronize();
+                @import("cuda_dtprof.zig").mark(e.d, e.stream, .post_sync);
                 @memcpy(e.tokens[0..total], e.host_logits.slice(u32)[0..total]);
                 if (shape.amax and e.head3 != null) try e.head3Settle(total);
                 if (shape.amax and e.head3 == null) if (e.sieve) |*sv| sv.after();
@@ -858,20 +879,21 @@ pub const Engine = struct {
     /// context for the whole pass (GB10's CPU and GPU share one package); decode rounds keep their spin waits.
     /// TF_PROMPT_WAIT=spin restores the spin wait. Wait mode only: no launch or value changes.
     fn promptWait(e: *Engine, prompt: bool) !void {
-        if (!prompt or std.mem.eql(u8, std.mem.span(@import("sys").c.getenv("TF_PROMPT_WAIT") orelse ""), "spin"))
-            return e.stream.synchronize();
-        var ev: cuda.abi.Event = null;
-        // 0x1: CU_EVENT_BLOCKING_SYNC (its waiter sleeps whatever the context's schedule)
-        try e.d.check(e.d.api.cuEventCreate(&ev, 0x1 | cuda.abi.event_disable_timing), "cuEventCreate");
-        defer _ = e.d.api.cuEventDestroy_v2(ev);
-        try e.d.check(e.d.api.cuEventRecord(ev, e.stream.handle), "cuEventRecord");
-        try e.d.check(e.d.api.cuEventSynchronize(ev), "cuEventSynchronize");
+        if (!prompt or promptWaitSpin()) return e.stream.synchronize();
+        // one event for the engine's life instead of a create and a destroy on every prompt pass: a record after the
+        // previous wait returned re-arms it, so the wait still covers exactly the work queued before this call
+        if (e.prompt_event == null) {
+            // 0x1: CU_EVENT_BLOCKING_SYNC (its waiter sleeps whatever the context's schedule)
+            try e.d.check(e.d.api.cuEventCreate(&e.prompt_event, 0x1 | cuda.abi.event_disable_timing), "cuEventCreate");
+        }
+        try e.d.check(e.d.api.cuEventRecord(e.prompt_event, e.stream.handle), "cuEventRecord");
+        try e.d.check(e.d.api.cuEventSynchronize(e.prompt_event), "cuEventSynchronize");
     }
 
     pub const Shape = @import("cuda_shapes.zig").Shape;
 
     /// The same scan selected by body, exposed for host launch-contract fixtures.
-    pub fn deltaScan(e: *Engine, record: bool, slot_count: u8, segments: usize, layer: c_int) !void {
+    pub fn deltaScan(e: *Engine, record: bool, slot_count: u8, segments: usize, layer: c_int, next: ?Proj) !void {
         const scan = if (!record) e.fns.gdn_chain else switch (slot_count) {
             1 => e.fns.gdn_slots_1,
             2 => e.fns.gdn_slots_2,
@@ -888,7 +910,31 @@ pub const Engine = struct {
         const input = e.tables.ptr + @as(usize, if (record) Round.steps_at else rowpar_at);
         // qwen35_slots.cuh: up to four slots scan two value rows a warp, so a block covers eight
         const rows_a_warp: usize = if (record and (slot_count == 3 or slot_count == 35 or slot_count == 37 or slot_count == 38)) 4 else if (record and slot_count <= 4) 2 else 1;
-        try e.runAfter(scan, .{ 1, geometry.dk / (4 * rows_a_warp), e.g.v_heads * segments }, .{ 32, 4, 1 }, .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, input, layer, e.y, e.tables.ptr + params_at });
+        const grid = .{ 1, geometry.dk / (4 * rows_a_warp), e.g.v_heads * segments };
+        const base = .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, input, layer, e.y, e.tables.ptr + params_at };
+        // the slots kernels that declare the warm-up's four trailing parameters (qwen35_slots.cuh, qwen35_slots16.cuh):
+        // the lean scans (37, 38) do not, so a window on them keeps plain launches
+        if (!record or slot_count == 37 or slot_count == 38) return e.runAfter(scan, grid, .{ 32, 4, 1 }, base);
+        const pf = warmOf(next, warm_gdn);
+        return e.runAfter(scan, grid, .{ 32, 4, 1 }, base ++ .{ pf.w, pf.tile, pf.tiles, pf.take });
+    }
+
+    /// Shares (of 64) of each 64-column tile of the next lane projection warmed into L2 during the latency-bound kernel before it.
+    pub const warm_gdn: usize = 40;
+    pub const warm_attn: usize = 40;
+
+    pub const Warm = struct { w: u64 = 0, tile: c_int = 0, tiles: c_int = 0, take: c_int = 0 };
+
+    /// The L2 warm-up of `next`'s weight words (tile-major, k / 64 tiles of 2 KiB a 64-column tile): cache state only.
+    pub fn warmOf(next: ?Proj, share: usize) Warm {
+        if (envOff("TF_WARM")) return .{};
+        const p = next orelse return .{};
+        if (p != .a4) return .{};
+        const q = p.a4;
+        if (q.k % 64 != 0 or q.n % 64 != 0) return .{};
+        const tile = q.k / 64 * 2048;
+        const take = tile * share / 64 / 16 * 16;
+        return .{ .w = q.w, .tile = @intCast(tile), .tiles = @intCast(q.npad / 64), .take = @intCast(take) };
     }
 
     /// The launches of a forward of `shape`, from the embedding to the kept rows' logits (captured once a shape).
@@ -919,6 +965,15 @@ test "dense read cost: hidden and slot variants have distinct graph keys" {
 /// TF_PROMPT_SIEVE=0: a prompt's first token always from the full head; =check: both, compared (the full head's kept).
 pub fn promptSieveOn() bool {
     return !envOff("TF_PROMPT_SIEVE");
+}
+
+/// TF_PROMPT_WAIT=spin, read once: the environment does not change while the engine runs.
+var prompt_wait_spin: ?bool = null;
+fn promptWaitSpin() bool {
+    if (prompt_wait_spin) |v| return v;
+    const v = std.mem.eql(u8, std.mem.span(@import("sys").c.getenv("TF_PROMPT_WAIT") orelse ""), "spin");
+    prompt_wait_spin = v;
+    return v;
 }
 
 fn promptSieveCheck() bool {
