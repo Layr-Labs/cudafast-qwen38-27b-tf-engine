@@ -289,6 +289,8 @@ fn linear(gpa: std.mem.Allocator, e: *Engine, stage: *DeviceBuffer, w: *Weights,
         const kmajor = e.dict_kmajor and n == 17408 and k == 5120;
         try e.affine.encode(e.stream, &out, ds, kmajor, cuda.qlinear.pairTabRoom(n, k, kmajor));
     };
+    if (@import("sys").c.getenv("TF_DTPROF") != null and k == 25600)
+        std.debug.print("[dtprof] drafter fc {d}x{d}: code {x} pair {} table {d} B\n", .{ n, k, out.code, cuda.qlinear.pairCode(out.code), out.tabBytesUpTo(1 << 20) });
     try e.stream.synchronize();
     return out;
 }
