@@ -9,13 +9,15 @@
 #     channel prebuilt (tools/fetch-benchd.sh);
 #   - no model weights, no R2, no ranked box.
 #
-# TWO JOBS:
+# THREE JOBS:
 #   `route`           GitHub-hosted, no permissions: chooses the runner for
 #                     `lint` (.github/workflows/darkbloom-route.yml).
 #   `lint`            Linux: hygiene, manifest lint, and selected GPU-free
 #                     control-plane tests. It runs on GitHub-hosted x86
 #                     `ubuntu-latest`, or on an ARM64 Darkbloom Sandbox when
 #                     routing is on and the Darkbloom plane grants one.
+#   `privileged`      GitHub-hosted `ubuntu-latest` only: the sandbox wipe
+#                     test, which needs real sudo and a second group.
 #
 # The ranked pipeline is .github/workflows/benchmark.yml (workflow_dispatch
 # only, self-hosted, no credential), which benchmark.json's runner.workflow
@@ -239,9 +241,6 @@ jobs:
       - name: Adapter wrapper (sudo, prlimit, keyring guard and its proof file)
         run: tools/test-run-engine-sandboxed.sh
 
-      - name: Sandbox wipe (files, IPC, kernel keyrings)
-        run: tools/test-sandbox-wipe.sh
-
       - name: Serve memory plan
         run: tools/test-serve-up-plan-memory.sh
 
@@ -286,3 +285,20 @@ jobs:
 
       - name: Box runner supervisor
         run: tools/box-runner/test/test-box-runner.sh
+
+  privileged:
+    name: Privileged sandbox tests, hosted
+    # Never routed: these tests need passwordless sudo to a second user and a
+    # supplementary group, which a Darkbloom runner does not give a job.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          submodules: false
+          persist-credentials: false
+
+      - name: Sandbox wipe (files, IPC, kernel keyrings)
+        run: tools/test-sandbox-wipe.sh

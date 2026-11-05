@@ -31,6 +31,10 @@ with no token permissions and no checkout. The `lint` job runs on
 |---|---|---|
 | `lint` | `linux_arm64` | `ubuntu-latest` |
 
+The `privileged` job runs `tools/test-sandbox-wipe.sh` on `ubuntu-latest`
+only. It is never routed: the test needs passwordless sudo to a second user
+and a supplementary group, and a Darkbloom runner gives a job neither.
+
 Routing is off unless the repository variable `DARKBLOOM_ROUTING` is exactly
 `on`. While it is off, and for pull requests from forks, the job keeps its
 fallback and the route job sends no request. When it is on, the route job
