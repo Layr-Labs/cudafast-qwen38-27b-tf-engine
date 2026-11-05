@@ -60,8 +60,11 @@ __device__ __forceinline__ uint32_t ordered(float v) {
 // One (tile, group) block of the head's tile-major words (a lane's two words an n8 tile, eight codes each) into its
 // 2-bit block of 256 words, [n8 tile / 4][lane][n8 tile % 4]: a lane's sixteen codes >> 2 of the tile, placed so that
 // pair2(w, 4 kt) and pair2(w, 4 kt + 2) are its B fragment registers of k step kt. Grid tiles x groups, 256 threads.
-extern "C" __global__ void __launch_bounds__(256) tf_head_sieve_pack(const uint32_t* __restrict__ w, uint32_t* __restrict__ w2) {
+extern "C" __global__ void __launch_bounds__(256) tf_head_sieve_pack(const uint32_t* __restrict__ w, uint32_t* __restrict__ w2, int KG) {
     const size_t blk = blockIdx.x;
+    // Transpose the internal 2-bit copy from [tile, group] to [group, tile].
+    const size_t tile_count = static_cast<size_t>(gridDim.x) / KG;
+    const size_t out_blk = (blk % KG) * tile_count + blk / KG;
     const int nt = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const uint32_t* src = w + blk * 512 + nt * 64 + lane * 2;
     uint32_t out = 0;
@@ -72,14 +75,14 @@ extern "C" __global__ void __launch_bounds__(256) tf_head_sieve_pack(const uint3
         const uint32_t c0 = (v >> sh) & 15u, c1 = (v >> (sh + 16)) & 15u, c8 = (v >> (sh + 4)) & 15u, c9 = (v >> (sh + 20)) & 15u;
         out |= (c0 >> 2) << (kt * 4) | (c8 >> 2) << (kt * 4 + 2) | (c1 >> 2) << (16 + kt * 4) | (c9 >> 2) << (16 + kt * 4 + 2);
     }
-    w2[blk * 256 + (nt >> 2) * 128 + lane * 4 + (nt & 3)] = out;
+    w2[out_blk * 256 + (nt >> 2) * 128 + lane * 4 + (nt & 3)] = out;
 }
 
 // The rows' A fragments by (group, k step, lane), zero past `rows`; each group's input sums (xs, zero past rows) and
 // sums of squares; the rows' bests, their first tiles and the candidate count cleared. Grid K / 64, 128 threads.
 extern "C" __global__ void __launch_bounds__(128) tf_head_sieve_prep(const __nv_bfloat16* __restrict__ x,
         const float* __restrict__ xs, int rows, int K, uint4* __restrict__ afr, float* __restrict__ xv,
-        unsigned long long* __restrict__ best, unsigned long long* __restrict__ pre, int* __restrict__ count) {
+        unsigned long long* __restrict__ best, unsigned long long* __restrict__ pre, unsigned long long* __restrict__ count) {
     qmm_frag::grid_wait();
     const int g = blockIdx.x, KG = gridDim.x, tid = threadIdx.x, lane = tid & 31, kt = tid >> 5;
     const int r = lane >> 2, h = K / 2, k2 = (g * 64 + kt * 16 + (lane & 3) * 2) / 2;
@@ -113,13 +116,13 @@ extern "C" __global__ void __launch_bounds__(128) tf_head_sieve_prep(const __nv_
         best[tid] = 0ull;
         pre[tid] = 0ull;
     }
-    if (g == 0 && tid == 0) *count = 0;
+    if (g == 0 && tid == 0) *count = 0ull;
     qmm_frag::grid_launch();
 }
 
 // The sieve: a CTA's four 64-id tiles, a warp each, through every group of the 2-bit copy (bf16 MMA on the rows' A
 // fragments, the pair dictionary's scales and biases). Each (row, n8 tile)'s best a + k s + slack into himax
-// [n8][16], its best a into himid [n8][16]; approx (when set) gets every (id, row)'s a and s
+// [n8][16], its best a into himid [n8][16] when needed; approx (when set) gets every (id, row)'s a and s
 // ([id][32]: a for 16 rows, then s). Pair-coded heads (code) read the dictionary, others (code 0) the (kg, npad)
 // scale and bias arrays. Grid tiles / 4, 128 threads; shared SMEM + tab_smem (the pair table, or 0: through L2).
 namespace tf_head_sieve {
@@ -129,7 +132,7 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
         const uint4* __restrict__ afr, const float* __restrict__ xv, const unsigned char* __restrict__ sb,
         const uint32_t* __restrict__ tab, int code, int tab_smem, const __nv_bfloat16* __restrict__ sc,
         const __nv_bfloat16* __restrict__ bi, int npad, int KG, int rows, float kappa, float* __restrict__ himax,
-        float* __restrict__ himid, float* __restrict__ approx) {
+        float* __restrict__ himid, float* __restrict__ approx, unsigned long long* __restrict__ pre, int fused_top) {
     extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int bits = code & 31, step = 8 * bits;
@@ -137,13 +140,14 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
     unsigned char* tabs = buf + NS * STAGE;
     for (int c = tid; c < tab_smem / 16; c += 128) qmm_frag::cp16(tabs + c * 16, reinterpret_cast<const unsigned char*>(tab) + c * 16);
     const size_t t0 = static_cast<size_t>(blockIdx.x) * TILES;
+    const size_t tile_count = static_cast<size_t>(gridDim.x) * TILES;
     auto stage = [&](int s) { return buf + s * STAGE; };
     auto load_w = [&](int s, int g) {
         unsigned char* p = stage(s);
 #pragma unroll
         for (int j = 0; j < 2; ++j) {
             const int c = tid + j * 128, t = c >> 6, off = c & 63;
-            qmm_frag::cp16(p + AFR + t * 1024 + off * 16, reinterpret_cast<const unsigned char*>(w2) + ((t0 + t) * KG + g) * 1024 + off * 16);
+            qmm_frag::cp16(p + AFR + t * 1024 + off * 16, reinterpret_cast<const unsigned char*>(w2) + (static_cast<size_t>(g) * tile_count + t0 + t) * 1024 + off * 16);
         }
         if (tid < 64) {
             const int t = tid >> 4, part = tid & 15;
@@ -248,6 +252,9 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
     }
     qmm_frag::wait<0>();
     __syncthreads();
+    // One best key per row and 64-id tile; preserve top's himid ordering.
+    float first0 = neg_inf(), first1 = neg_inf();
+    int first_id0 = 0x7fffffff, first_id1 = 0x7fffffff;
 #pragma unroll
     for (int nt = 0; nt < 8; ++nt) {
         float hi[4];
@@ -276,12 +283,29 @@ __device__ __forceinline__ void scan(const uint32_t* __restrict__ w2,
             const size_t n8 = (t0 + warp) * 8 + nt;
             if (r0 < rows) {
                 himax[n8 * 16 + r0] = h0;
-                himid[n8 * 16 + r0] = m0;
+                if (!fused_top || m0 == 0.0f) himid[n8 * 16 + r0] = m0;
+                if (fused_top && m0 > first0) { first0 = m0; first_id0 = static_cast<int>(n8); }
             }
             if (r0 + 8 < rows) {
                 himax[n8 * 16 + r0 + 8] = h1;
-                himid[n8 * 16 + r0 + 8] = m1;
+                if (!fused_top || m1 == 0.0f) himid[n8 * 16 + r0 + 8] = m1;
+                if (fused_top && m1 > first1) { first1 = m1; first_id1 = static_cast<int>(n8); }
             }
+        }
+    }
+    if (fused_top) {
+        // Each warp publishes its row keys; one thread per row reduces all four tiles.
+        auto* block_pre = reinterpret_cast<unsigned long long*>(tabs + tab_smem);
+        if ((lane & 3) == 0) {
+            block_pre[warp * 16 + r0] = r0 < rows && first_id0 != 0x7fffffff ? key(first0, first_id0) : 0ull;
+            block_pre[warp * 16 + r0 + 8] = r0 + 8 < rows && first_id1 != 0x7fffffff ? key(first1, first_id1) : 0ull;
+        }
+        __syncthreads(); // fused_top is uniform across the CTA.
+        if (tid < rows) {
+            unsigned long long best_key = block_pre[tid];
+#pragma unroll
+            for (int w = 1; w < 4; ++w) best_key = best_key > block_pre[w * 16 + tid] ? best_key : block_pre[w * 16 + tid];
+            if (best_key != 0ull) atomicMax(pre + tid, best_key);
         }
     }
 }
@@ -292,8 +316,8 @@ extern "C" __global__ void __launch_bounds__(128, 3) tf_head_sieve_scan(const ui
         const uint4* __restrict__ afr, const float* __restrict__ xv, const unsigned char* __restrict__ sb,
         const uint32_t* __restrict__ tab, int code, int tab_smem, const __nv_bfloat16* __restrict__ sc,
         const __nv_bfloat16* __restrict__ bi, int npad, int KG, int rows, float kappa, float* __restrict__ himax,
-        float* __restrict__ himid, float* __restrict__ approx) {
-    tf_head_sieve::scan<tf_head_sieve::STAGES>(w2, afr, xv, sb, tab, code, tab_smem, sc, bi, npad, KG, rows, kappa, himax, himid, approx);
+        float* __restrict__ himid, float* __restrict__ approx, unsigned long long* __restrict__ pre, int fused_top) {
+    tf_head_sieve::scan<tf_head_sieve::STAGES>(w2, afr, xv, sb, tab, code, tab_smem, sc, bi, npad, KG, rows, kappa, himax, himid, approx, pre, fused_top);
 }
 
 // Each row's first tile: the n8 tile of its highest value in h (himid: the best a; key: then the lower tile) into
@@ -343,23 +367,32 @@ extern "C" __global__ void __launch_bounds__(256) tf_head_sieve_top(const float*
 }
 
 // Each row's threshold: the lower of the exact best value its first tile gave (best[row], a lower bound of the row's
-// top logit) and that tile's best a (himid at pre[row]'s tile); then every n8 tile some row's himax reaches into list
+// top logit) and that tile's best a (decoded from pre, with signed-zero restored from himid); qualifying tiles enter the list
 // (count past cap: an overflow, and the rescoring takes every tile). mrow (when set) gets the thresholds. A row whose
 // best is unset takes every tile.
 extern "C" __global__ void __launch_bounds__(256) tf_head_sieve_select(const float* __restrict__ himax,
         const float* __restrict__ himid, const unsigned long long* __restrict__ pre,
-        const unsigned long long* __restrict__ best, int rows, int n8s, int* __restrict__ list, int* __restrict__ count,
+        const unsigned long long* __restrict__ best, int rows, int n8s, int* __restrict__ list, unsigned long long* __restrict__ count,
         int cap, float* __restrict__ mrow) {
     qmm_frag::grid_wait();
     __shared__ float M[16];
+    __shared__ int first_tile[16];
     const int tid = threadIdx.x, lane = tid & 31;
     if (tid < 16) {
         const unsigned long long k = best[tid], f = pre[tid];
+        // The preceding keys-mode rescore evaluates every selected first tile for every live row.
+        first_tile[tid] = f == 0ull ? -1 : static_cast<int>(0xFFFFFFFFu - static_cast<uint32_t>(f));
         const uint32_t u = static_cast<uint32_t>(k >> 32);
         float v = k == 0ull || f == 0ull ? tf_head_sieve::neg_inf() : __uint_as_float((u & 0x80000000u) ? (u & 0x7FFFFFFFu) : ~u);
         if (k != 0ull && f != 0ull) {
-            const size_t t = 0xFFFFFFFFu - static_cast<uint32_t>(f);
-            v = fminf(v, himid[t * 16 + tid]);
+            const uint32_t ordered = static_cast<uint32_t>(f >> 32);
+            float mid = __uint_as_float((ordered & 0x80000000u) ? (ordered & 0x7FFFFFFFu) : ~ordered);
+            // key() normalizes -0 to +0; retain the selected zero's exact sign for fminf and check-mode diagnostics.
+            if (mid == 0.0f) {
+                const size_t t = 0xFFFFFFFFu - static_cast<uint32_t>(f);
+                mid = himid[t * 16 + tid];
+            }
+            v = fminf(v, mid);
         }
         M[tid] = v;
         if (blockIdx.x == 0 && mrow != nullptr) mrow[tid] = v;
@@ -379,14 +412,22 @@ extern "C" __global__ void __launch_bounds__(256) tf_head_sieve_select(const flo
                 for (int j = 0; j < 4; ++j) hit |= (i * 4 + j < rows) && vv[j] >= M[i * 4 + j];
             }
         }
-        const unsigned mask = __ballot_sync(0xffffffffu, hit);
-        if (mask != 0u) {
-            int at = 0;
-            if (lane == 0) at = atomicAdd(count, __popc(mask));
-            at = __shfl_sync(0xffffffffu, at, 0);
-            if (hit) {
-                const int pos = at + __popc(mask & ((1u << lane) - 1u));
-                if (pos < cap) list[pos] = t;
+        bool already_scored = false;
+        if (hit) {
+#pragma unroll
+            for (int r = 0; r < 16; ++r) already_scored |= r < rows && first_tile[r] == t;
+        }
+        const unsigned hits = __ballot_sync(0xffffffffu, hit);
+        const unsigned emit = __ballot_sync(0xffffffffu, hit && !already_scored);
+        if (hits != 0u) {
+            unsigned long long at = 0ull;
+            // High word counts all hits for the original overflow rule; low word reserves compact entries.
+            if (lane == 0) at = atomicAdd(count, (static_cast<unsigned long long>(__popc(hits)) << 32) |
+                                                  static_cast<unsigned long long>(__popc(emit)));
+            const unsigned base = __shfl_sync(0xffffffffu, static_cast<unsigned>(at), 0);
+            if (hit && !already_scored) {
+                const unsigned pos = base + __popc(emit & ((1u << lane) - 1u));
+                if (pos < static_cast<unsigned>(cap)) list[pos] = t;
             }
         }
     }
@@ -398,21 +439,26 @@ extern "C" __global__ void __launch_bounds__(256) tf_head_sieve_select(const flo
 extern "C" __global__ void __launch_bounds__(128) tf_head_sieve_rescore(const uint32_t* __restrict__ w,
         const __nv_bfloat16* __restrict__ scales, const __nv_bfloat16* __restrict__ biases, int npad,
         const uint4* __restrict__ afr, const float* __restrict__ xv, int KG, int rows, const int* __restrict__ list,
-        const int* __restrict__ count, int cap, int n8s, const unsigned long long* __restrict__ keys,
+        const unsigned long long* __restrict__ count, int cap, int n8s, const unsigned long long* __restrict__ keys,
         unsigned long long* __restrict__ best) {
     using namespace tf_head_sieve;
     extern __shared__ __align__(128) unsigned char buf[];
     qmm_frag::grid_wait();
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const int n = keys != nullptr ? rows : *count;
-    const bool all = keys == nullptr && n > cap;
+    const unsigned long long counts = keys != nullptr ? 0ull : *count;
+    const int total = static_cast<int>(counts >> 32);
+    const int n = keys != nullptr ? rows : static_cast<int>(static_cast<unsigned>(counts));
+    const bool all = keys == nullptr && total > cap;
     const int items = all ? n8s : n;
     const int r0 = lane >> 2;
     qmm_frag::grid_launch();
     for (int base = blockIdx.x * 4; base < items; base += gridDim.x * 4) {
         const int it = base + warp;
-        const bool live = it < items;
-        const int t = !live ? 0 : keys != nullptr ? static_cast<int>(0xFFFFFFFFu - static_cast<uint32_t>(keys[it])) : all ? it : list[it];
+        const bool in_range = it < items;
+        const int item = !in_range ? 0 : keys != nullptr ? static_cast<int>(0xFFFFFFFFu - static_cast<uint32_t>(keys[it])) : all ? it : list[it];
+        // Compact-list entries are nonnegative; out-of-range warps still participate in barriers.
+        const bool live = in_range && (keys != nullptr || all || item >= 0);
+        const int t = live ? item : 0;
         const size_t tile = static_cast<size_t>(t >> 3);
         const int nt = t & 7;
         const unsigned char* wsrc = reinterpret_cast<const unsigned char*>(w) + tile * KG * 2048 + nt * 256;
@@ -465,12 +511,14 @@ extern "C" __global__ void __launch_bounds__(128) tf_head_sieve_rescore(const ui
         }
         qmm_frag::wait<0>();
         __syncthreads();
-        if (live) {
-            const int col = static_cast<int>(col0) + (lane & 3) * 2;
+        // Reduce the four warp keys in shared memory before publishing one key per row.
+        auto* block_best = reinterpret_cast<unsigned long long*>(buf + RS_SMEM);
+        const int col = static_cast<int>(col0) + (lane & 3) * 2;
 #pragma unroll
-            for (int hh = 0; hh < 2; ++hh) {
-                float b = neg_inf();
-                int id = 0x7fffffff;
+        for (int hh = 0; hh < 2; ++hh) {
+            float b = neg_inf();
+            int id = 0x7fffffff;
+            if (live) {
 #pragma unroll
                 for (int e2 = 0; e2 < 2; ++e2) {
                     const float v = __bfloat162float(__float2bfloat16_rn(acc[2 * hh + e2]));
@@ -482,23 +530,33 @@ extern "C" __global__ void __launch_bounds__(128) tf_head_sieve_rescore(const ui
 #pragma unroll
                 for (int m = 1; m <= 2; m <<= 1)
                     tf_qmm_group::amax_take(__shfl_xor_sync(0xffffffffu, b, m), __shfl_xor_sync(0xffffffffu, id, m), b, id);
-                const int row = r0 + 8 * hh;
-                if ((lane & 3) == 0 && row < rows && id != 0x7fffffff) atomicMax(best + row, key(b, id));
             }
+            const int row = r0 + 8 * hh;
+            if ((lane & 3) == 0)
+                block_best[warp * ROWS + row] = live && row < rows && id != 0x7fffffff ? key(b, id) : 0ull;
         }
+        __syncthreads();
+        if (tid < rows) {
+            unsigned long long k = block_best[tid];
+#pragma unroll
+            for (int w = 1; w < 4; ++w) k = k > block_best[w * ROWS + tid] ? k : block_best[w * ROWS + tid];
+            if (k != 0ull) atomicMax(best + tid, k);
+        }
+        __syncthreads(); // all warps finish reading block_best before the next grid-stride iteration
+
     }
 }
 
-// Each row's token from its best; the round's counters: stats[0] rounds, [1] rescored n8 tiles, [2] their most,
+// Each row's token from its best; the round's counters: stats[0] rounds, [1] selected n8 tiles (or all on overflow), [2] their most,
 // [3] overflows, [4] rows. One warp.
 extern "C" __global__ void __launch_bounds__(32) tf_head_sieve_finish(const unsigned long long* __restrict__ best,
-        int rows, unsigned* __restrict__ toks, const int* __restrict__ count, int cap, int n8s,
+        int rows, unsigned* __restrict__ toks, const unsigned long long* __restrict__ count, int cap, int n8s,
         unsigned long long* __restrict__ stats) {
     qmm_frag::grid_wait();
     const int tid = threadIdx.x;
     if (tid < rows) toks[tid] = 0xFFFFFFFFu - static_cast<unsigned>(best[tid] & 0xFFFFFFFFull);
     if (tid == 0) {
-        const int n = *count;
+        const int n = static_cast<int>(*count >> 32);
         const unsigned long long items = n > cap ? static_cast<unsigned long long>(n8s) : static_cast<unsigned long long>(n);
         stats[0] += 1;
         stats[1] += items;
