@@ -20,8 +20,8 @@ pub const symbol_single_dict = "tf_qmm_mlp_single16_dict";
 pub const smem: u32 = qlinear.group_smem + 16 * 64 * 2;
 pub const kmajor_smem: u32 = 13440 + 16 * 128 * 2;
 pub const single_smem: u32 = 41088;
-/// Pair-only half panel: two weight/index/sum/input-tile stages (the input fragments read from the staged tile).
-pub const compact_pair_smem: u32 = 21632;
+/// Pair-only half panel: three weight/index/sum stages, direct input fragments.
+pub const compact_pair_smem: u32 = 26304;
 /// tf_qmm_mlp_single32: two stages of 32 input rows, four 2 KB weight tiles, 256 scales and biases, 32 sums.
 pub const single32_smem: u32 = 2 * (32 * 128 + 256 * 32 + 2 * 256 * 2 + 32 * 4);
 /// tf_qmm_mlp_single16_dict past single_smem: four warps' decoded values, then gate's and up's tables.
@@ -55,7 +55,7 @@ pub const Kernels = struct {
             k.single_dict_fn = fs;
             const fc = try group_mod.function("tf_qmm_mlp_single16_compact_pair");
             try fc.allowDynamicShared(compact_pair_smem);
-            // three CTAs an SM need the 100 KiB carveout on GB10 (3 x 21632 bytes and their reserve exceed 64 KiB)
+            // Hint a larger carveout so three 26,304-byte CTAs can fit when other resources allow.
             try fc.setAttribute(.preferred_shared_memory_carveout, 100);
             k.compact_pair_fn = fc;
         }
