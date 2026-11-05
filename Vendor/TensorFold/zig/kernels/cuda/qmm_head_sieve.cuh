@@ -412,20 +412,21 @@ extern "C" __global__ void __launch_bounds__(256) tf_head_sieve_select(const flo
                 for (int j = 0; j < 4; ++j) hit |= (i * 4 + j < rows) && vv[j] >= M[i * 4 + j];
             }
         }
-        bool already_scored = false;
-        if (hit) {
-#pragma unroll
-            for (int r = 0; r < 16; ++r) already_scored |= r < rows && first_tile[r] == t;
-        }
         const unsigned hits = __ballot_sync(0xffffffffu, hit);
-        const unsigned emit = __ballot_sync(0xffffffffu, hit && !already_scored);
         if (hits != 0u) {
+            // Each first tile contributes its bit in this warp's 32-tile window.
+            // hits is warp-uniform, so all 32 lanes participate in the reduction.
+            const int selected = lane < 16 && lane < rows ? first_tile[lane] : -1;
+            const unsigned delta = selected >= 0 ? static_cast<unsigned>(selected) - static_cast<unsigned>(t - lane) : 32u;
+            const unsigned selected_bit = delta < 32u ? 1u << delta : 0u;
+            const unsigned scored = __reduce_or_sync(0xffffffffu, selected_bit);
+            const unsigned emit = hits & ~scored;
             unsigned long long at = 0ull;
             // High word counts all hits for the original overflow rule; low word reserves compact entries.
             if (lane == 0) at = atomicAdd(count, (static_cast<unsigned long long>(__popc(hits)) << 32) |
                                                   static_cast<unsigned long long>(__popc(emit)));
             const unsigned base = __shfl_sync(0xffffffffu, static_cast<unsigned>(at), 0);
-            if (hit && !already_scored) {
+            if ((emit & (1u << lane)) != 0u) {
                 const unsigned pos = base + __popc(emit & ((1u << lane) - 1u));
                 if (pos < static_cast<unsigned>(cap)) list[pos] = t;
             }
