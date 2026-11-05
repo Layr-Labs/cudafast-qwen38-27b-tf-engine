@@ -73,18 +73,24 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     const pack = try e.mods[3].function("tf_pack_kmajor");
     const grouped = try e.mods[0].function("tf_qmm_gdn_stream16");
     try grouped.allowDynamicShared(cuda.qlinear.out16_smem); // decodeMany's 16-row launch floor (35328 >= 22656)
-    // its twin for dictionary-coded parts: a 256-column CTA's decoded scales and biases and its part's table
+    // its twin for dictionary-coded parts: a 256-column CTA's decoded scales and biases and its part's table.
+    // H70 (child GDNPRE): TF_GDNPRE=0 falls back to the plain dict twin; the default fg4 twin adds only
+    // read-only L2 prefetch of future groups' weight tiles and dict index windows — identical arithmetic.
+    const gdnpre = if (@import("sys").c.getenv("TF_GDNPRE")) |v| !@import("std").mem.eql(u8, @import("std").mem.span(v), "0") else true;
     const grouped_dict: ?cuda.Function = if (e.affine.dict == null) null else blk: {
-        const f = try e.mods[0].function("tf_qmm_gdn_stream16_dict");
+        const f = try e.mods[0].function(if (gdnpre) "tf_qmm_gdn_stream16_dict_fg4" else "tf_qmm_gdn_stream16_dict");
         try f.allowDynamicShared(@max(cuda.qlinear.out16_smem, 22656 + 4 * 256 + @as(u32, @max(cuda.qlinear.dict_tab_max, cuda.qlinear.gdn_pair_tab_max))));
         break :blk f;
     };
     const down = try e.mods[0].function("tf_qmm_output_stream16");
     const out = try e.mods[0].function("tf_qmm_output_prefetch16");
     try down.allowDynamicShared(35328);
-    // its twin for a dictionary-coded down/out/o projection: the table past the stages
+    // its twin for a dictionary-coded down/out/o projection: the table past the stages.
+    // H68 (child GAP): TF_OUTPRE=0 falls back to the plain dict twin; the default fg4 twin adds only
+    // read-only L2 prefetch of future groups (the exercised K==6144 path) — identical arithmetic.
+    const outpre = if (@import("sys").c.getenv("TF_OUTPRE")) |v| !@import("std").mem.eql(u8, @import("std").mem.span(v), "0") else true;
     const down_dict: ?cuda.Function = if (e.affine.dict == null) null else blk: {
-        const f = try e.mods[0].function("tf_qmm_output_stream16_dict");
+        const f = try e.mods[0].function(if (outpre) "tf_qmm_output_stream16_dict_fg4" else "tf_qmm_output_stream16_dict");
         try f.allowDynamicShared(35328 + @as(u32, @max(cuda.qlinear.dict_tab_max, cuda.qlinear.out_pair_tab_max)));
         break :blk f;
     };
