@@ -147,6 +147,12 @@ extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_stream16_dict(co
     if(K==6144)tf_qmm_output_stream::body<4,4,0,true>(x,xs,parts,M,K,ldx);
     else tf_qmm_output_stream::body<0,4,0,true>(x,xs,parts,M,K,ldx);
 }
+// H68 (child GAP): the dict twin's 4-group L2 lookahead on every K, not only K==6144 — the same loads,
+// MMA chains, fmas and slice-ordered sum (body<4> is the exercised K==6144 path); the only additions are
+// read-only cp.async.bulk.prefetch.L2 of future weight tiles and dict windows, issued before grid_wait.
+extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_stream16_dict_fg4(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
+    tf_qmm_output_stream::body<4,4,0,true>(x,xs,parts,M,K,ldx);
+}
 extern "C" __global__ void __launch_bounds__(512) tf_qmm_output_prefetch16(const __nv_bfloat16* x,const float* xs,const __grid_constant__ tf_qmm_group::Parts parts,int M,int K,int ldx){
     tf_qmm_output_stream::body<4>(x,xs,parts,M,K,ldx);
 }
