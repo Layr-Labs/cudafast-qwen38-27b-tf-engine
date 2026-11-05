@@ -462,11 +462,20 @@ extern "C" __global__ void __launch_bounds__(128) tf_head_sieve_rescore(const ui
         bool duplicate_first = false;
         if (keys != nullptr && in_range && keys[it] != 0ull && item >= 0 && item < n8s) {
             const uint32_t encoded_tile = static_cast<uint32_t>(keys[it]);
-            for (int prev = 0; prev < it; ++prev) {
-                const unsigned long long earlier = keys[prev];
-                if (earlier != 0ull && static_cast<uint32_t>(earlier) == encoded_tile) {
-                    duplicate_first = true;
-                    break;
+            // The supported first-key list has at most 16 entries. Lanes load
+            // different earlier keys in parallel and vote on the same tile id.
+            // Keep the serial loop as a conservative fallback for larger callers.
+            if (it > 0 && it <= 32) {
+                const unsigned long long earlier = lane < it ? keys[lane] : 0ull;
+                const bool matches = lane < it && earlier != 0ull && static_cast<uint32_t>(earlier) == encoded_tile;
+                duplicate_first = __ballot_sync(0xffffffffu, matches) != 0u;
+            } else if (it > 32) {
+                for (int prev = 0; prev < it; ++prev) {
+                    const unsigned long long earlier = keys[prev];
+                    if (earlier != 0ull && static_cast<uint32_t>(earlier) == encoded_tile) {
+                        duplicate_first = true;
+                        break;
+                    }
                 }
             }
         }
