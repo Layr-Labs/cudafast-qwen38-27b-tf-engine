@@ -269,6 +269,9 @@ pub const symbols = struct {
     pub const pack_scales = "tf_transpose_pad16";
     // dictionary-coded twins (qmm_dict.cuh) and the load-time encoder (affine4_pack.cu)
     pub const group_dict = "_ZN12tf_qmm_group17group_kernel_dictILi64ELi16ELi64ELi1ELi4ELi8ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
+    // the wide row kernels' deep weight ring (qmm_group.cu group_wide_body): extern "C" names, plain tiles
+    pub const group_wide64 = "tf_qmm_group_wide64";
+    pub const group_wide128 = "tf_qmm_group_wide128";
     // the greedy verify head: the dictionary tile's per-tile row bests (AMAX), then their merge into tokens
     pub const head_amax = "_ZN12tf_qmm_group17group_kernel_dictILi64ELi16ELi64ELi1ELi4ELi8ELb0ELb0ELb1EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
     pub const head_merge = "tf_qmm_head_argmax_merge";
@@ -315,6 +318,8 @@ pub const group_smem: u32 = 35328; // LaneTile<64, 16, 64, 1, 4, 8>::SMEM
 pub const verify_smem: u32 = 32640; // LaneTile<64, 32, 64, 1, 4, 5>::SMEM
 pub const verify64_smem: u32 = 43008; // LaneTile<64, 64, 64, 1, 4, 4>::SMEM
 pub const verify128_smem: u32 = 57600; // LaneTile<64, 128, 64, 1, 4, 3>::SMEM
+pub const wide64_deep_smem: u32 = 86016; // group_wide_body<64, 64, 64, 1, 4, 8, 8>: eight x stages (67584) + eight weight stages (18432)
+pub const wide128_deep_smem: u32 = 76800; // group_wide_body<64, 128, 64, 1, 4, 4, 4>: four x stages (67584) + four weight stages (9216)
 pub const split_smem: u32 = 17664; // LaneTile<64, 16, 64, 1, 4, 4>::SMEM: four stages, so more split CTAs fit an SM
 pub const prefill_smem: u32 = 62976; // Tile<64, 128, 128, 2, 4, 3>::SMEM
 pub const prefill_n64_smem: u32 = 56064; // Tile<64, 128, 64, 2, 4, 3>::SMEM
@@ -331,6 +336,10 @@ pub const dict_pair_max: u32 = 8191;
 /// The lane twins' (lane_gemv.cu) and gdn_stream16 twin's (qmm_gdn_stream.cuh) shared pair-table room at two CTAs an SM.
 pub const lane_pair_tab_max: u32 = 14592;
 pub const out16_smem: u32 = 35328;
+/// The 32-row output stream twin's stages (qmm_output_stream.cuh, tf_qmm_output_stream32): four slices x two stages x
+/// (32 staged input rows x 128 bytes + 2048 weight bytes); its sums, index windows and pair table come through L2, so
+/// two CTAs fit an SM.
+pub const out32_smem: u32 = 49152;
 pub const out_pair_tab_max: u32 = 14336;
 pub const gdn_pair_tab_max: u32 = 26496;
 /// group_kernel_dict's (qmm_group.cu GROUP_PAIR_SMEM, GROUP_PAIR_SMEM_ONE): two CTAs an SM in a cluster launch; any
