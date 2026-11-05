@@ -54,6 +54,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_head_rope_warp(
     row_positions(sg, rowanc[row], row, M, pos);
     const int slot = sg.len + (int)row - sg.row0;
     const StoreBf16 store{layer, geo.kvh};
+    __nv_bfloat16 lows[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const int d = 4 * lane + i;
@@ -68,14 +69,19 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_head_rope_warp(
             const float a = d < 32 ? own : partner, b = d < 32 ? partner : own;
             low = __float2bfloat16_rn(d < 32 ? a * cs - b * sn : b * cs + a * sn);
         }
-        const __nv_bfloat16 high = normalized[1][i];
-        if (query) {
-            Qn[(row * geo.qh + head) * HD + d] = low;
-            Qn[(row * geo.qh + head) * HD + 128 + d] = high;
-        } else {
-            const int kh = head - geo.qh;
-            store(sg, kh, slot, d, low, Vraw[(row * geo.kvh + kh) * HD + d]);
-            store(sg, kh, slot, 128 + d, high, Vraw[(row * geo.kvh + kh) * HD + 128 + d]);
+        lows[i] = low;
+    }
+    // a query head's lane writes its four rotated and four high entries as two 8-byte stores (the same values)
+    if (query) {
+        *reinterpret_cast<uint2*>(Qn + (row * geo.qh + head) * HD + 4 * lane) = *reinterpret_cast<const uint2*>(lows);
+        *reinterpret_cast<uint2*>(Qn + (row * geo.qh + head) * HD + 128 + 4 * lane) = *reinterpret_cast<const uint2*>(normalized[1]);
+    } else {
+        const int kh = head - geo.qh;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int d = 4 * lane + i;
+            store(sg, kh, slot, d, lows[i], Vraw[(row * geo.kvh + kh) * HD + d]);
+            store(sg, kh, slot, 128 + d, normalized[1][i], Vraw[(row * geo.kvh + kh) * HD + 128 + d]);
         }
     }
 }
