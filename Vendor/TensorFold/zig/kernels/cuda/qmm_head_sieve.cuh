@@ -472,9 +472,10 @@ extern "C" __global__ void __launch_bounds__(128) tf_head_sieve_rescore(const ui
         }
         // Compact-list entries are nonnegative; all warps reach each CTA barrier.
         const bool live = in_range && (keys != nullptr || all || item >= 0) && !duplicate_first;
-        // All threads take this uniform keys-mode branch. If every warp is redundant,
-        // skip the entire staged pipeline after grid_wait/grid_launch, before any copies.
-        if (keys != nullptr && !__syncthreads_or(live)) continue;
+        // In the first keys CTA, warp 0 owns item 0 and can never be a duplicate,
+        // so it is live whenever the loop runs. Other CTAs retain the uniform vote
+        // and may skip the entire staged pipeline when every warp is redundant.
+        if (keys != nullptr && base != 0 && !__syncthreads_or(live)) continue;
         const int t = live ? item : 0;
         const size_t tile = static_cast<size_t>(t >> 3);
         const int nt = t & 7;
