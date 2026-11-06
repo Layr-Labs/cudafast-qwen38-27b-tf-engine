@@ -35,16 +35,13 @@ fn size(p: layers.Proj) usize {
     return q.npad * q.k / 2;
 }
 
-/// Whether candidate `index` of `layer` goes on the fast pool: every stream, an attention layer's q, k and v too
-/// (TF_ATTN_COPIES_POOLED=0: those three stay on ordinary memory, as before). Every pooled copy is streamed every
-/// verify round, so a round's read time is the sum over copies of bytes over the speed of the piece behind them, whatever
-/// the order they fill the pieces in. Off the pool these three copies are allocated right after the screen has freed its
-/// slowest candidates, so they likely sit on the slowest memory; on it they take the next fastest screened pieces.
-/// Placement only: the copies hold the same words wherever they sit.
+/// Whether candidate `index` of `layer` goes on the fast pool: every stream but an attention layer's q, k and v, whose
+/// copies stay on ordinary memory so the pool's fastest pieces keep holding what they held before them
+/// (TF_ATTN_COPIES_POOLED=1: those too).
 fn pooled(layer: *const layers.Layer, index: usize) bool {
     if (layer.mixer != .attention or index < 2) return true;
-    const v = @import("sys").c.getenv("TF_ATTN_COPIES_POOLED") orelse return true;
-    return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
+    const v = @import("sys").c.getenv("TF_ATTN_COPIES_POOLED") orelse return false;
+    return @import("std").mem.eql(u8, @import("std").mem.span(v), "1");
 }
 
 /// The streams' sizes in the order `prepare` places them on the fast pool (for its screen); returns how many.
@@ -76,24 +73,18 @@ pub fn prepare(e: anytype, input: bool, output: bool) !?cuda.DeviceBuffer {
     const pack = try e.mods[3].function("tf_pack_kmajor");
     const grouped = try e.mods[0].function("tf_qmm_gdn_stream16");
     try grouped.allowDynamicShared(cuda.qlinear.out16_smem); // decodeMany's 16-row launch floor (35328 >= 22656)
-    // its twin for dictionary-coded parts: a 256-column CTA's decoded scales and biases and its part's table.
-    // H70 (child GDNPRE): TF_GDNPRE=0 falls back to the plain dict twin; the default fg4 twin adds only
-    // read-only L2 prefetch of future groups' weight tiles and dict index windows — identical arithmetic.
-    const gdnpre = if (@import("sys").c.getenv("TF_GDNPRE")) |v| !@import("std").mem.eql(u8, @import("std").mem.span(v), "0") else true;
+    // its twin for dictionary-coded parts: a 256-column CTA's decoded scales and biases and its part's table
     const grouped_dict: ?cuda.Function = if (e.affine.dict == null) null else blk: {
-        const f = try e.mods[0].function(if (gdnpre) "tf_qmm_gdn_stream16_dict_fg4" else "tf_qmm_gdn_stream16_dict");
+        const f = try e.mods[0].function("tf_qmm_gdn_stream16_dict");
         try f.allowDynamicShared(@max(cuda.qlinear.out16_smem, 22656 + 4 * 256 + @as(u32, @max(cuda.qlinear.dict_tab_max, cuda.qlinear.gdn_pair_tab_max))));
         break :blk f;
     };
     const down = try e.mods[0].function("tf_qmm_output_stream16");
     const out = try e.mods[0].function("tf_qmm_output_prefetch16");
     try down.allowDynamicShared(35328);
-    // its twin for a dictionary-coded down/out/o projection: the table past the stages.
-    // H68 (child GAP): TF_OUTPRE=0 falls back to the plain dict twin; the default fg4 twin adds only
-    // read-only L2 prefetch of future groups (the exercised K==6144 path) — identical arithmetic.
-    const outpre = if (@import("sys").c.getenv("TF_OUTPRE")) |v| !@import("std").mem.eql(u8, @import("std").mem.span(v), "0") else true;
+    // its twin for a dictionary-coded down/out/o projection: the table past the stages
     const down_dict: ?cuda.Function = if (e.affine.dict == null) null else blk: {
-        const f = try e.mods[0].function(if (outpre) "tf_qmm_output_stream16_dict_fg4" else "tf_qmm_output_stream16_dict");
+        const f = try e.mods[0].function("tf_qmm_output_stream16_dict");
         try f.allowDynamicShared(35328 + @as(u32, @max(cuda.qlinear.dict_tab_max, cuda.qlinear.out_pair_tab_max)));
         break :blk f;
     };
