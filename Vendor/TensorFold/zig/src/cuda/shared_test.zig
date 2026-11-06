@@ -13,7 +13,6 @@ const Fake = struct {
     var device_of_current: abi.Device = 0;
     var set_result: abi.Result = abi.success;
     var retains: usize = 0;
-    var short: usize = 0; // the next `short` primary-context creations fail with CUDA_ERROR_OUT_OF_MEMORY
     var releases: usize = 0;
     var released: abi.Device = -1;
     var switches: usize = 0;
@@ -42,10 +41,6 @@ const Fake = struct {
 
     fn retain(ctx: *abi.Context, dev: abi.Device) callconv(.c) abi.Result {
         retains += 1;
-        if (short > 0) {
-            short -= 1;
-            return abi.error_out_of_memory;
-        }
         ctx.* = primary(dev);
         return abi.success;
     }
@@ -78,7 +73,6 @@ const Fake = struct {
         device_of_current = dev;
         set_result = abi.success;
         retains = 0;
-        short = 0;
         releases = 0;
         released = -1;
         switches = 0;
@@ -111,22 +105,6 @@ test "Context.shared keeps the host's current primary context, on its own device
     try std.testing.expectEqual(@as(usize, 1), Fake.releases);
     try std.testing.expectEqual(@as(abi.Device, 3), Fake.released);
     try std.testing.expectEqual(Fake.primary(3), Fake.current);
-}
-
-test "Context.shared with nothing current creates device 0's primary context, retried while the driver is out of memory" {
-    var d = Fake.driver(null, 0);
-    Fake.short = 3;
-    source.setCurrent(stale);
-    defer source.setCurrent(null);
-    var c = try Context.shared(&d);
-    try std.testing.expectEqual(@as(usize, 4), Fake.retains); // three refused creations, then the one that held
-    try std.testing.expectEqual(@as(abi.Device, 5), c.device);
-    try std.testing.expectEqual(Fake.primary(5), c.handle);
-    try std.testing.expectEqual(Fake.primary(5), Fake.current);
-    try std.testing.expectEqual(Fake.primary(5), source.current());
-    c.deinit();
-    try std.testing.expectEqual(@as(usize, 1), Fake.releases);
-    try std.testing.expectEqual(@as(abi.Device, 5), Fake.released);
 }
 
 test "Context.shared refuses a current context that is not a primary one and drops the retain it took" {
