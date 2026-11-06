@@ -76,23 +76,9 @@ pub fn screen(d: *const cuda.Driver, stream: cuda.Stream, probe: cuda.Function, 
     const want = piecesFor(sizes);
     if (want == 0 or want > most) return null;
     var buf: [16384]u8 = undefined;
-    const meminfo = read("/proc/meminfo", &buf) orelse return null;
-    const free_bytes = memFree(meminfo) orelse return null;
-    const free_count: usize = if (free_bytes > keep_free and !rescueForced()) @min((free_bytes - keep_free) / piece, most) else 0;
-    // The rescue (TF_FASTPOOL_RESCUE=0 turns it off): when MemFree is too short for the copies (the pool would be off), the
-    // candidates come out of MemAvailable instead (free memory plus the page cache the kernel can reclaim; committing them
-    // pushes that cache out), but only R x want of them (R = TF_FASTPOOL_RESCUE_R hundredths, default 240: a fresh box
-    // screens about 2.4 x want), with rescue_keep left beside them, and past MemFree's count MemAvailable is re-read every 16
-    // commits and the commits stop once it is down to rescue_keep. When MemFree holds the copies nothing changes. Placement
-    // only: the copies hold the same words wherever they sit.
-    const rescue = free_count < want and rescueOn();
-    var count = free_count;
-    if (rescue) {
-        const avail_bytes = memAvailable(meminfo) orelse 0;
-        const avail_count: usize = if (avail_bytes > rescue_keep) (avail_bytes - rescue_keep) / piece else 0;
-        count = @min(avail_count, rescueCount(want, rescueHundredths()), most);
-        std.log.scoped(.cuda).info("fastpool: rescue: MemFree holds {d} of {d} pieces; {d} candidates out of MemAvailable", .{ free_count, want, count });
-    }
+    const free_bytes = memFree(read("/proc/meminfo", &buf) orelse return null) orelse return null;
+    if (free_bytes <= keep_free) return null;
+    const count = @min((free_bytes - keep_free) / piece, most);
     if (count < want) return null;
 
     var cand: [most]u64 = @splat(0);
@@ -103,12 +89,6 @@ pub fn screen(d: *const cuda.Driver, stream: cuda.Stream, probe: cuda.Function, 
         }
     }
     while (n < count) {
-        if (rescue and n >= free_count and (n - free_count) % 16 == 0) {
-            // past MemFree's count: the commits so far done, then what the kernel says it can still give
-            stream.synchronize() catch return null;
-            const now = memAvailable(read("/proc/meminfo", &buf) orelse break) orelse break;
-            if (now <= rescue_keep) break;
-        }
         var p: cuda.abi.DevicePtr = 0;
         if (d.api.cuMemAlloc_v2(&p, piece) != cuda.abi.success) break;
         cand[n] = p;
@@ -193,42 +173,6 @@ fn read(path: [:0]const u8, buf: []u8) ?[]const u8 {
     return buf[0..n];
 }
 
-/// Memory the rescue leaves beside its candidates.
-const rescue_keep: usize = 24 << 30;
-
-fn rescueOn() bool {
-    const v = @import("sys").c.getenv("TF_FASTPOOL_RESCUE") orelse return true;
-    return !std.mem.eql(u8, std.mem.span(v), "0");
-}
-
-/// TF_FASTPOOL_RESCUE_FORCE=1 (tests): the rescue path whatever MemFree says, so a fresh box measures it.
-fn rescueForced() bool {
-    const v = @import("sys").c.getenv("TF_FASTPOOL_RESCUE_FORCE") orelse return false;
-    return std.mem.eql(u8, std.mem.span(v), "1");
-}
-
-/// R in hundredths: TF_FASTPOOL_RESCUE_R (100 to 1000), default 240.
-fn rescueHundredths() usize {
-    const v = @import("sys").c.getenv("TF_FASTPOOL_RESCUE_R") orelse return 240;
-    const r = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return 240;
-    return std.math.clamp(r, 100, 1000);
-}
-
-/// The rescue's candidates: ceil(R x want).
-fn rescueCount(want: usize, hundredths: usize) usize {
-    return (want * hundredths + 99) / 100;
-}
-
-fn memAvailable(text: []const u8) ?usize {
-    var lines = std.mem.tokenizeScalar(u8, text, '\n');
-    while (lines.next()) |line| if (std.mem.startsWith(u8, line, "MemAvailable:")) {
-        var it = std.mem.tokenizeAny(u8, line[13..], " \t");
-        const kb = std.fmt.parseInt(usize, it.next() orelse return null, 10) catch return null;
-        return kb *| 1024;
-    };
-    return null;
-}
-
 fn memFree(text: []const u8) ?usize {
     var lines = std.mem.tokenizeScalar(u8, text, '\n');
     while (lines.next()) |line| if (std.mem.startsWith(u8, line, "MemFree:")) {
@@ -258,9 +202,4 @@ test "fastpool: pieces counted the way alloc fills them" {
     try t.expectEqual(@as(?u64, (1 << 32) + 70 * m), p.alloc(25 * m));
     try t.expectEqual(@as(?u64, null), p.alloc(piece));
     try t.expectEqual(@as(?usize, 123 * 1024), memFree("MemTotal: 9 kB\nMemFree:   123 kB\nMemAvailable: 999 kB\n"));
-    try t.expectEqual(@as(?usize, 999 * 1024), memAvailable("MemTotal: 9 kB\nMemFree:   123 kB\nMemAvailable: 999 kB\n"));
-    try t.expectEqual(@as(usize, 310), rescueCount(129, 240)); // 2.4 x 129 = 309.6 -> 310
-    try t.expectEqual(@as(usize, 129), rescueCount(129, 100)); // R 1.0: want itself
-    try t.expectEqual(@as(usize, 137), rescueCount(129, 106)); // 1.06 x 129 = 136.74 -> 137
-    try t.expectEqual(@as(usize, 20), rescueCount(8, 240));
 }
