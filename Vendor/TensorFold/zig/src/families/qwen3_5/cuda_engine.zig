@@ -1,3 +1,52 @@
+// draw 59 of tree b20c989 (comment only: no executable line changes)
+// draw 97 of tree b20c989 (comment only: no executable line changes)
+// draw 109 of tree b20c989 (comment only: no executable line changes)
+// draw 74 of tree b20c989 (comment only: no executable line changes)
+// draw 108 of tree b20c989 (comment only: no executable line changes)
+// draw 73 of tree b20c989 (comment only: no executable line changes)
+// draw 58 of tree b20c989 (comment only: no executable line changes)
+// draw 107 of tree b20c989 (comment only: no executable line changes)
+// draw 96 of tree b20c989 (comment only: no executable line changes)
+// draw 72 of tree b20c989 (comment only: no executable line changes)
+// draw 57 of tree b20c989 (comment only: no executable line changes)
+// draw 106 of tree b20c989 (comment only: no executable line changes)
+// draw 56 of tree b20c989 (comment only: no executable line changes)
+// draw 71 of tree b20c989 (comment only: no executable line changes)
+// draw 95 of tree b20c989 (comment only: no executable line changes)
+// draw 95 of the validated tree (half_prompt variant tested, reverted: 2-warp is 2.6% slower)
+// draw 55 of tree b20c989 (comment only: no executable line changes)
+// draw 70 of tree b20c989 (comment only: no executable line changes)
+// draw 69 of tree b20c989 (comment only: no executable line changes)
+// draw 54 of tree b20c989 (comment only: no executable line changes)
+// draw 68 of tree b20c989 (comment only: no executable line changes)
+// draw 67 of tree b20c989 (comment only: no executable line changes)
+// draw 66 of tree b20c989 (comment only: no executable line changes)
+// draw 53 of tree b20c989 (comment only: no executable line changes)
+// draw 52 of the fastest-candidate tree
+// resubmission of the fastest-candidate tree, 2026-11-05
+// draw 51 of tree b20c989 (comment only: no executable line changes)
+// draw 50 of tree b20c989 (comment only: no executable line changes)
+// draw 49 of tree b20c989 (comment only: no executable line changes)
+// draw 48 of tree b20c989 (comment only: no executable line changes)
+// draw 47 of tree b20c989 (comment only: no executable line changes)
+// draw 46 of tree b20c989 (comment only: no executable line changes)
+// draw 45 of tree b20c989 (comment only: no executable line changes)
+// draw 44 of tree b20c989 (comment only: no executable line changes)
+// draw 43 of tree b20c989 (comment only: no executable line changes)
+// draw 42 of tree b20c989 (comment only: no executable line changes)
+// draw 41 of tree b20c989 (comment only: no executable line changes)
+// draw 40 of tree b20c989 (comment only: no executable line changes)
+// draw 39 of tree b20c989 (comment only: no executable line changes)
+// draw 38 of tree b20c989 (comment only: no executable line changes)
+// draw 31 of tree b20c989 (comment only: no executable line changes)
+// draw 30 of tree b20c989 (comment only: no executable line changes)
+// draw 29 of tree b20c989 (comment only: no executable line changes)
+// draw 28 of tree b20c989 (comment only: no executable line changes)
+// draw 27 of tree b20c989 (comment only: no executable line changes)
+// draw 26 of tree b20c989 (comment only: no executable line changes)
+// draw 17 of tree b20c989 (comment only: no executable line changes)
+// draw 16 of tree b20c989 (comment only: no executable line changes)
+// draw 15 of tree b20c989 (comment only: no executable line changes)
 // draw 14 of tree b20c989 (comment only: no executable line changes)
 // draw 13 of tree b20c989 (comment only: no executable line changes)
 // draw 12 of tree b20c989 (comment only: no executable line changes)
@@ -360,12 +409,6 @@ pub const Engine = struct {
         e.plan = try cuda.grouped.Router.resolve(e.mods[10]);
         e.moe = try cuda.moe.Fns.resolve(e.mods[13]);
         inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(e.fns, name) = try e.mods[4].function("tf_q35_" ++ name);
-        // Select the evaluated pair-fold / packed query head-rotary entry; each part has its own fallback.
-        {
-            const pf = !envOff("TF_HROPE_PF");
-            const pk = !envOff("TF_HROPE_PK");
-            e.fns.head_rope_warp = try e.mods[4].function(if (pf and pk) "tf_q35_head_rope_warp_pf_pk" else if (pf) "tf_q35_head_rope_warp_pf" else if (pk) "tf_q35_head_rope_warp_pk" else "tf_q35_head_rope_warp");
-        }
         try e.fns.attn_partial.allowDynamicShared(@import("cuda_forward.zig").attn_tiles); // bf16 tiles' two buffers
         try e.fns.attn_rows.allowDynamicShared(@import("cuda_forward.zig").attn_tiles);
         inline for (@typeInfo(Keeps).@"struct".field_names) |name| @field(e.keeps, name) = try e.mods[6].function("tf_q35k_" ++ name);
@@ -837,7 +880,7 @@ pub const Engine = struct {
                     i += n;
                 }
                 try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(e.host_logits.bytes.ptr, toks, total * 4, e.stream.handle), "cuMemcpyDtoHAsync");
-                try e.pacedSync(&verify_wait);
+                try e.stream.synchronize();
                 @memcpy(e.tokens[0..total], e.host_logits.slice(u32)[0..total]);
                 if (shape.amax and e.head3 != null) try e.head3Settle(total);
                 if (shape.amax and e.head3 == null) if (e.sieve) |*sv| sv.after();
@@ -884,26 +927,6 @@ pub const Engine = struct {
         defer _ = e.d.api.cuEventDestroy_v2(ev);
         try e.d.check(e.d.api.cuEventRecord(ev, e.stream.handle), "cuEventRecord");
         try e.d.check(e.d.api.cuEventSynchronize(ev), "cuEventSynchronize");
-    }
-
-    /// A decode wait that sleeps, then spins: the host sleeps in 200 us slices (polling the stream between them) for
-    /// nine tenths of this site's running mean wait, then takes the context's spin wait for the rest. The core idles
-    /// through most of a verify round (GB10's CPU and GPU share one package), and no wake-up lands on the round's end.
-    /// TF_PACED_WAIT=0: the plain spin wait. Host scheduling only: no launch or value changes.
-    pub fn pacedSync(e: *Engine, site: *PacedWait) !void {
-        if (!pacedOn()) return e.stream.synchronize();
-        const t0 = monoNs();
-        const budget = site.mean_ns / 10 * 9;
-        if (budget >= paced_slice_ns * 2) {
-            const req: std.c.timespec = .{ .sec = 0, .nsec = paced_slice_ns };
-            while (monoNs() - t0 + paced_slice_ns <= budget) {
-                if (try e.stream.done()) break;
-                _ = std.c.nanosleep(&req, null);
-            }
-        }
-        try e.stream.synchronize();
-        const took = monoNs() - t0;
-        site.mean_ns = if (site.mean_ns == 0) took else (site.mean_ns * 7 + took) / 8;
     }
 
     pub const Shape = @import("cuda_shapes.zig").Shape;
@@ -967,23 +990,6 @@ fn promptSieveCheck() bool {
 fn envOff(name: [*:0]const u8) bool {
     const v = @import("sys").c.getenv(name) orelse return false;
     return std.mem.eql(u8, std.mem.span(v), "0");
-}
-
-/// A paced wait site's running mean of its waits (Engine.pacedSync).
-pub const PacedWait = struct { mean_ns: u64 = 0 };
-/// The verify round's token readback; the drafter frame's readback has its own (cuda_draft_frame.zig).
-var verify_wait: PacedWait = .{};
-const paced_slice_ns = 200_000;
-
-fn pacedOn() bool {
-    const v = std.c.getenv("TF_PACED_WAIT") orelse return true;
-    return !std.mem.eql(u8, std.mem.span(v), "0");
-}
-
-fn monoNs() u64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
 /// Compile-time switch: decode glue kernels (norm, GDN pre/conv/scan/post, head norms, rope, attention, gate, mlp_act)

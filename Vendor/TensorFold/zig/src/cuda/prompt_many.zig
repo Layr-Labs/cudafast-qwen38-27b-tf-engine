@@ -43,12 +43,6 @@ pub const Kernels = struct {
     slots: usize,
     /// Native MLP, two-row normal/split projection, and three-row grouped projection.
     persistent_fns: [4]?Function = @splat(null),
-    /// A 496-row prompt's planned tiles (qmm_prompt_plan.cuh): projections and the MLP; null off GB10's 48 SMs.
-    plan_fn: ?Function = null,
-    plan_mlp_fn: ?Function = null,
-    /// TF_PROMPT_PLAN's bits (default all): 1 the 5120-column projections, 2 attention's q, k and v, 4 the MLP, 8 the
-    /// recurrent layers' qkv, z, a and b.
-    plan_mask: u32 = 15,
 
     /// From a loaded qmm_prefill module, on a device of `sms` SMs.
     pub fn resolve(prefill_mod: module.Module, sms: usize) !Kernels {
@@ -72,45 +66,8 @@ pub const Kernels = struct {
                 try kernel.allowDynamicShared(smem);
                 dest.* = kernel;
             }
-            const pf = try prefill_mod.function("tf_qmm_prompt_plan");
-            try pf.allowDynamicShared(smem);
-            const pm = try prefill_mod.function("tf_qmm_prompt_plan_mlp");
-            try pm.allowDynamicShared(smem);
-            result.plan_fn = pf;
-            result.plan_mlp_fn = pm;
-            if (std.c.getenv("TF_PROMPT_PLAN")) |v| result.plan_mask = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 15;
         }
         return result;
-    }
-
-    /// qmm_prompt_plan_tables.cuh's plans: (first item, items), each for exactly a 496-row prompt on 96 slots.
-    const plan_rows = 496;
-    const plans = [_][2]c_int{ .{ 0, 192 }, .{ 192, 576 }, .{ 768, 1248 }, .{ 2016, 576 } };
-
-    /// The plan for these projections of a `rows`-row prompt (null: the persistent schedules): plan 0 one 5120-column
-    /// output (out, o, down), plan 1 attention's q (with its gate), k and v of a 5120-wide input, plan 3 a recurrent
-    /// layer's qkv, z, a and b of a 5120-wide input.
-    fn planFor(kk: *const Kernels, outs: []const Out, rows: usize) ?usize {
-        if (kk.plan_fn == null or kk.slots != 96 or rows != plan_rows) return null;
-        if (outputRole(outs) and kk.plan_mask & 1 != 0) return 0;
-        if (outs.len == 3 and outs[0].q.k == 5120 and outs[0].q.n == 12288 and outs[1].q.n == 1024 and outs[2].q.n == 1024 and
-            outs[1].q.k == 5120 and outs[2].q.k == 5120 and kk.plan_mask & 2 != 0) return 1;
-        if (outs.len == 4 and kk.plan_mask & 8 != 0 and outs[0].q.n == 10240 and outs[1].q.n == 6144 and outs[2].q.n == 48 and
-            outs[3].q.n == 48 and for (outs) |o| {
-            if (o.q.k != 5120) break false;
-        } else true) return 3;
-        return null;
-    }
-
-    fn planned(kk: *const Kernels, f: Function, s: Stream, x: u64, parts: Parts, act: ?u64, rows: usize, k: usize, plan: usize) !void {
-        var g: launch_.Args = .{};
-        g.add(x);
-        g.add(parts);
-        if (act) |a| g.add(a);
-        for ([_]usize{ rows, k, k }) |v| g.add(@as(c_int, @intCast(v)));
-        g.add(plans[plan][0]);
-        g.add(plans[plan][1]);
-        try launch_.launch(f, .{ .grid = .{ .x = @intCast(kk.slots) }, .block = .{ .x = threads }, .shared = smem }, s, &g);
     }
 
     fn persistent(kk: *const Kernels, f: Function, s: Stream, x: u64, parts: Parts, act: u64, rows: usize, k: usize, group: usize, full_cols: c_int, blocks: usize) !void {
@@ -171,8 +128,6 @@ pub const Kernels = struct {
         g.add(act);
         for ([_]usize{ rows, k, k, group }) |v| g.add(@as(c_int, @intCast(v)));
         const blocks = rows_t * (gate.n / 64);
-        if (kk.slots == 96 and rows == plan_rows and gate.n == 17408 and gate.k == 5120 and kk.plan_mask & 4 != 0) if (kk.plan_mlp_fn) |f|
-            return kk.planned(f, s, x, parts, act, rows, k, 2);
         if (kk.slots == 96 and blocks > kk.slots and gate.n == 17408 and gate.k == 5120) if (kk.persistent_fns[0]) |f|
             return kk.persistent(f, s, x, parts, act, rows, k, group, -1, blocks);
         try launch_.launch(kk.mlp_fn, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = threads }, .shared = smem }, s, &g);
@@ -186,15 +141,6 @@ pub const Kernels = struct {
         // prefill_kernel's row band: the row tiles of a column panel that share it from L2
         const band = (32 << 20) / (tile_m * k * 2);
         const group = @max(1, @min(rows_t, band));
-        if (kk.planFor(outs, rows)) |plan| {
-            var parts: Parts = std.mem.zeroes(Parts);
-            for (outs, 0..) |o, i| {
-                if (o.q.k != k) return error.InputMismatch;
-                parts.p[i] = .{ .w = o.q.w, .scales = o.q.s, .biases = o.q.b, .out = o.out, .n = @intCast(o.q.n), .npad = @intCast(o.q.npad), .first = 0 };
-            }
-            parts.count = @intCast(outs.len);
-            return kk.planned(kk.plan_fn.?, s, x, parts, null, rows, k, plan);
-        }
         if (outs.len == 1) if (kk.splitCols(outs[0].q.n, rows)) |full_cols| {
             const o = outs[0];
             const part: Part = .{ .w = o.q.w, .scales = o.q.s, .biases = o.q.b, .out = o.out, .n = @intCast(o.q.n), .npad = @intCast(o.q.npad), .first = 0 };
