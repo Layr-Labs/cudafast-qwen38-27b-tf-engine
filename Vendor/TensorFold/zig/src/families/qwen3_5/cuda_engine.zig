@@ -207,6 +207,9 @@ pub const Engine = struct {
     tables: DeviceBuffer,
     staged: cuda.HostBuffer,
     host_logits: cuda.HostBuffer,
+    host_tokens: ?cuda.HostBuffer = null,
+    token_device: u64 = 0,
+    mapped_results: bool = false,
     /// The kept rows' device draws, when forward was given them.
     tokens: [most_verify]u32 = undefined,
     /// The captured forwards by shape (`Shape.key`): the launches from the embedding to the head.
@@ -241,8 +244,12 @@ pub const Engine = struct {
         const g = try Geometry.read(gpa, io, dir);
         const d = ctx.d;
         const e = try @import("cuda_prompt_int8.zig").Allocation(Engine).create(gpa);
+        e.host_tokens = null;
+        e.token_device = 0;
+        e.mapped_results = false;
         e.h_window = null; // Allocation.create leaves fields undefined before the first captured forward.
         errdefer gpa.destroy(e);
+        errdefer if (e.host_tokens) |*b| b.free();
         e.projection_streams = null;
         errdefer if (e.projection_streams) |*b| b.free();
         e.fast = null;
@@ -306,6 +313,9 @@ pub const Engine = struct {
         const major = try ctx.attribute(.compute_capability_major);
         const minor = try ctx.attribute(.compute_capability_minor);
         const gb10 = major == 12 and minor == 1;
+        e.mapped_results = gb10 and !envOff("TF_MAPPED_RESULTS") and
+            (ctx.attribute(.can_map_host_memory) catch 0) != 0;
+        if (e.mapped_results) e.host_tokens = try @import("cuda_mapped_results.zig").alloc(d, most_verify * 4, true, &e.token_device);
         e.affine = try cuda.qlinear.Affine4Kernels.resolve(d, e.mods[0], e.mods[1], e.mods[2], e.mods[3], sms, gb10);
         e.affine.half_prompt = !gb10; // the 27B's prompt tile (Tile<64, 128, 128, 2, 2, 2>), quicker on an RTX 5090
         // GB10: split-K decode/verify projections on the cluster tile (bits unchanged); TF_CLUSTER_DECODE=0 restores lane_gemv
@@ -467,6 +477,7 @@ pub const Engine = struct {
         while (hit.next()) |x| x.deinit();
         e.heads.deinit(e.gpa);
         e.host_logits.free();
+        if (e.host_tokens) |*b| b.free();
         e.staged.free();
         e.tables.free();
         if (e.wide_words) |*b| b.free();
@@ -807,7 +818,7 @@ pub const Engine = struct {
         switch (keep) {
             .hidden => try e.stream.synchronize(), // mapped layer inputs are ready before the learner reads them
             .draws => |pk| {
-                const toks = e.tables.ptr + tokens_at;
+                const toks = e.tokenOutput();
                 var i: usize = if (shape.amax) pk.len else 0; // amax: the graph's head wrote every row's token
                 while (i < pk.len) { // runs of greedy rows argmaxed together, runs of sampled rows drawn together
                     const sampled = pk[i].rule != null;
@@ -818,9 +829,12 @@ pub const Engine = struct {
                     } else try e.argmax(i, n, toks);
                     i += n;
                 }
-                try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(e.host_logits.bytes.ptr, toks, total * 4, e.stream.handle), "cuMemcpyDtoHAsync");
-                try e.stream.synchronize();
-                @memcpy(e.tokens[0..total], e.host_logits.slice(u32)[0..total]);
+                const host = e.host_tokens orelse e.host_logits;
+                if (e.token_device == 0)
+                    try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(host.bytes.ptr, toks, total * 4, e.stream.handle), "cuMemcpyDtoHAsync");
+                // This completion is also the visibility boundary for GPU stores into mapped host memory.
+                try e.pacedSync(&verify_wait);
+                @memcpy(e.tokens[0..total], host.slice(u32)[0..total]);
                 if (shape.amax and e.head3 != null) try e.head3Settle(total);
                 if (shape.amax and e.head3 == null) if (e.sieve) |*sv| sv.after();
             },
@@ -866,6 +880,31 @@ pub const Engine = struct {
         defer _ = e.d.api.cuEventDestroy_v2(ev);
         try e.d.check(e.d.api.cuEventRecord(ev, e.stream.handle), "cuEventRecord");
         try e.d.check(e.d.api.cuEventSynchronize(ev), "cuEventSynchronize");
+    }
+
+    /// A decode wait that sleeps, then spins: the host sleeps in 200 us slices (polling the stream between them) for
+    /// nine tenths of this site's running mean wait, then takes the context's spin wait for the rest. The core idles
+    /// through most of a verify round (GB10's CPU and GPU share one package), and no wake-up lands on the round's end.
+    /// TF_PACED_WAIT=0: the plain spin wait. Host scheduling only: no launch or value changes.
+    pub fn pacedSync(e: *Engine, site: *PacedWait) !void {
+        if (!pacedOn()) return e.stream.synchronize();
+        const t0 = monoNs();
+        const budget = site.mean_ns / 10 * 9;
+        if (budget >= paced_slice_ns * 2) {
+            const req: std.c.timespec = .{ .sec = 0, .nsec = paced_slice_ns };
+            while (monoNs() - t0 + paced_slice_ns <= budget) {
+                if (try e.stream.done()) break;
+                _ = std.c.nanosleep(&req, null);
+            }
+        }
+        try e.stream.synchronize();
+        const took = monoNs() - t0;
+        site.mean_ns = if (site.mean_ns == 0) took else (site.mean_ns * 7 + took) / 8;
+    }
+
+    /// Stable for the engine lifetime, including every captured greedy-head path.
+    pub fn tokenOutput(e: *const Engine) u64 {
+        return if (e.token_device != 0) e.token_device else e.tables.ptr + tokens_at;
     }
 
     pub const Shape = @import("cuda_shapes.zig").Shape;
@@ -929,6 +968,23 @@ fn promptSieveCheck() bool {
 fn envOff(name: [*:0]const u8) bool {
     const v = @import("sys").c.getenv(name) orelse return false;
     return std.mem.eql(u8, std.mem.span(v), "0");
+}
+
+/// A paced wait site's running mean of its waits (Engine.pacedSync).
+pub const PacedWait = struct { mean_ns: u64 = 0 };
+/// The verify round's token readback; the drafter frame's readback has its own (cuda_draft_frame.zig).
+var verify_wait: PacedWait = .{};
+const paced_slice_ns = 200_000;
+
+fn pacedOn() bool {
+    const v = std.c.getenv("TF_PACED_WAIT") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
+
+fn monoNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
 /// Compile-time switch: decode glue kernels (norm, GDN pre/conv/scan/post, head norms, rope, attention, gate, mlp_act)
