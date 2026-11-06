@@ -25,9 +25,11 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q0,
     float4* slots = kept[threadIdx.y];
     float root[R][PT], state[R][PT];
 #pragma unroll
-    for (int r = 0; r < R; ++r)
-#pragma unroll
-        for (int i = 0; i < PT; ++i) root[r][i] = st[r * DK + i];
+    for (int r = 0; r < R; ++r) {
+        // the lane's four state entries are one aligned float4: the same bytes, one load
+        const float4 r4 = *reinterpret_cast<const float4*>(st + r * DK);
+        root[r][0] = r4.x; root[r][1] = r4.y; root[r][2] = r4.z; root[r][3] = r4.w;
+    }
     float pg[4];
     float4 pd[4];
     uint2 pk[4];
@@ -84,13 +86,11 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q0,
     if (recorded(P) && sg.rows != 1 && (sg.pn > 0 || sg.pn2 > 0) && !sg.skip)
 #pragma unroll
         for (int r = 0; r < R; ++r)
-#pragma unroll
-            for (int i = 0; i < PT; ++i) st[r * DK + i] = root[r][i];
+            *reinterpret_cast<float4*>(st + r * DK) = make_float4(root[r][0], root[r][1], root[r][2], root[r][3]);
     if (sg.rows == 1)
 #pragma unroll
         for (int r = 0; r < R; ++r)
-#pragma unroll
-            for (int i = 0; i < PT; ++i) reinterpret_cast<float*>(sg.before)[(size_t)layer * geo.rec() + at + r * DK + i] = root[r][i];
+            *reinterpret_cast<float4*>(reinterpret_cast<float*>(sg.before) + (size_t)layer * geo.rec() + at + r * DK) = make_float4(root[r][0], root[r][1], root[r][2], root[r][3]);
     const bool record = recorded(P);
     // each lane's row-0 inputs: a row's are `row` strides further
     const unsigned kstride = (unsigned)NK * DK, vstride = (unsigned)NV * DK;
@@ -235,8 +235,7 @@ __device__ __forceinline__ void q35_slots_lean(Geo geo, const __nv_bfloat16* q0,
     if (record && sg.rows != 1) return;  // the folded root went back before the steps
 #pragma unroll
     for (int r = 0; r < R; ++r)
-#pragma unroll
-        for (int i = 0; i < PT; ++i) st[r * DK + i] = state[r][i];
+        *reinterpret_cast<float4*>(st + r * DK) = make_float4(state[r][0], state[r][1], state[r][2], state[r][3]);
 }
 
 // tf_q35_gdn_lean_N loads its state before the wait (EARLY); tf_q35_gdn_lean_N_late waits first (TF_SCAN_EARLY=0)
