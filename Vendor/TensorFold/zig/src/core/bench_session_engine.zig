@@ -352,10 +352,10 @@ const Run = struct {
     }
 
     fn wait(run: *Run) !void {
-        // 20 us sleeps instead of yield-spinning a core for the whole request (GB10's CPU and GPU share one package);
+        // 200 us sleeps instead of yield-spinning a core for the whole request (GB10's CPU and GPU share one package);
         // TF_BENCH_WAIT=yield: the yield loop
         if (!std.mem.eql(u8, std.mem.span(std.c.getenv("TF_BENCH_WAIT") orelse ""), "yield")) {
-            const req: std.c.timespec = .{ .sec = 0, .nsec = 20_000 };
+            const req: std.c.timespec = .{ .sec = 0, .nsec = 200_000 };
             while (!run.done.load(.acquire)) _ = std.c.nanosleep(&req, null);
         } else while (!run.done.load(.acquire)) std.Thread.yield() catch {};
         if (run.failed) return error.EngineFailed;
@@ -512,3 +512,4 @@ const vtable: bench.BenchSession.VTable = .{
     .inspectPhase = inspectPhaseFn,
     .reset = resetFn,
 };
+// redraw 1014 of 19c77e7b with retry, rescue, three prompt-pass pieces and piece 31
