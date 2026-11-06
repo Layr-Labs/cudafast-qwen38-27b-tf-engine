@@ -171,13 +171,8 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __r
             *reinterpret_cast<uint4*>(xrow + d) = xw;
         }
         if (XS == nullptr) return;
-        // A group is eight adjacent vector-store threads, entirely within one
-        // warp. The producing warp consumes its own rounded group in the exact
-        // scalar order; no cross-warp output handoff is required.
-        __syncwarp();
-        if ((t & 31) < 4)
-            for (int g = (t >> 5) * 4 + (t & 31); g < D / 64; g += 32)
-                XS[row * (D / 64) + g] = group_sum(xrow + g * 64);
+        __syncthreads();
+        for (int g = t; g < D / 64; g += blockDim.x) XS[row * (D / 64) + g] = group_sum(xrow + g * 64);
         return;
     }
     if (past_rows(P, blockIdx.x)) return;
