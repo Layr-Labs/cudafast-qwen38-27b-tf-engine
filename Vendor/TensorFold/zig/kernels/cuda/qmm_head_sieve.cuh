@@ -631,22 +631,12 @@ __device__ __forceinline__ void sieve_rescore_rn(const unsigned char* __restrict
     auto tile_of = [&](int it) {
         return keys != nullptr ? static_cast<int>(0xFFFFFFFFu - static_cast<uint32_t>(keys[it])) : all ? it : list[it];
     };
-    // keys pass: a first tile an earlier row already listed is projected once (the projection serves every row), as the
-    // record's tf_head_sieve_rescore does; unset keys stay on the original path
-    auto live_of = [&](int it) {
-        if (it >= items) return false;
-        if (keys == nullptr || keys[it] == 0ull) return true;
-        const uint32_t enc = static_cast<uint32_t>(keys[it]);
-        for (int prev = 0; prev < it; ++prev)
-            if (keys[prev] != 0ull && static_cast<uint32_t>(keys[prev]) == enc) return false;
-        return true;
-    };
     auto load = [&](int s, int f) {
         const int j = f / cpi, g0 = (f - j * cpi) * CH;
         unsigned char* p = buf + s * STG;
         for (int c = tid; c < CH * 128; c += NT) qmm_frag::cp16(p + c * 16, afr + static_cast<size_t>(g0) * 128 + c);
         const int it = item_of(j);
-        if (live_of(it)) {
+        if (it < items) {
             const unsigned char* src = wr + (static_cast<size_t>(tile_of(it)) * KG + g0) * RN_GROUP;
             for (int c = lane; c < CH * 18; c += 32) qmm_frag::cp16(p + O_W + warp * CH * RN_GROUP + c * 16, src + c * 16);
         }
@@ -667,7 +657,7 @@ __device__ __forceinline__ void sieve_rescore_rn(const unsigned char* __restrict
         qmm_frag::commit();
         const int j = f / cpi, ch = f - j * cpi;
         const int it = item_of(j);
-        if (live_of(it)) {
+        if (it < items) {
             const unsigned char* p = buf + (f % STAGES) * STG;
 #pragma unroll
             for (int q = 0; q < CH; ++q) {
