@@ -28,9 +28,6 @@ pub fn stagedLen(rank: usize) usize {
 pub fn segments(st: []u8) []Segment {
     return @alignCast(std.mem.bytesAsSlice(Segment, st[segments_at..words_at]));
 }
-/// The frame's readback's running mean wait (cuda_engine.zig pacedSync).
-var frame_wait: @import("cuda_engine.zig").PacedWait = .{};
-
 pub fn stage(c: draft.Config, items: []const dr.Hold, contexts: []const *draft.Ctx, st: []u8) !void {
     if (items.len == 0 or items.len > max_streams or contexts.len != items.len or (c.block != 8 and c.block != 16) or st.len < try stagedBytes(c.rank) or @intFromPtr(st.ptr) % 8 != 0) return error.BadDraftFrame;
     for (items, contexts, 0..) |it, ctx, index| {
@@ -214,7 +211,7 @@ pub fn forward(d: anytype, items: []const dr.Hold, contexts: []const *draft.Ctx)
     const spanned = try run(d, items.len, narrow(contexts));
     try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + words_at, d.words, rows * lp_words * 4, e.stream.handle), "cuMemcpyDtoHAsync");
     try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + hp_at, d.hp, rows * c.rank * 2, e.stream.handle), "cuMemcpyDtoHAsync");
-    try e.pacedSync(&frame_wait); // sleeps, then spins (cuda_engine.zig pacedSync)
+    try e.stream.synchronize();
     if (spanned != null) for (0..rows) |r| {
         const w = std.mem.bytesAsSlice(u32, st[words_at + r * lp_words * 4 ..][0 .. lp_words * 4]);
         for (w[2..][0..c.topk]) |*id| if (id.* >= spans[0][1]) {
