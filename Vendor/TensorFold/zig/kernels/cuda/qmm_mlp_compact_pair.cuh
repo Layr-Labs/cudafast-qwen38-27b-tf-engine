@@ -21,6 +21,16 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     static_assert(T::SMEM == 17536, "compact pair pipeline footprint");
     constexpr int I = T::MT, J = T::NT;
     extern __shared__ __align__(128) unsigned char buf[];
+#if __CUDA_ARCH__ >= 1200
+    // One completion transaction covers the two contiguous 4 KiB gate/up panels per stage.
+    // Metadata and input sums stay in the original cp.async group; no activation is fetched early.
+    __shared__ __align__(8) uint64_t weight_barriers[STAGES];
+    if (threadIdx.x == 0)
+#pragma unroll
+        for (int s = 0; s < STAGES; ++s)
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" :: "r"(smem(&weight_barriers[s])) : "memory");
+    __syncthreads();
+#endif
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm = warp / WN, wn = warp % WN;
     const int KG = K / GS, cid = blockIdx.x, rank = 0;
@@ -65,9 +75,25 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     };
     auto load_w = [&](int s, int g) {
         unsigned char* p = stage(s);
+#if __CUDA_ARCH__ >= 1200
+        if (tid == 0) {
+            const uint32_t barrier = smem(&weight_barriers[s]);
+            asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;\n"
+                         :: "r"(barrier), "n"(int(T::W)) : "memory");
+            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+#pragma unroll
+            for (int part = 0; part < 2; ++part) {
+                const auto* src = reinterpret_cast<const unsigned char*>(parts.p[part].w) +
+                                  (static_cast<size_t>(g) * (P.npad / 64) + n0 / 64) * TILE_BYTES;
+                asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
+                             :: "r"(smem(p + part * (T::W / 2))), "l"(src), "n"(int(T::W / 2)), "r"(barrier) : "memory");
+            }
+        }
+#else
 #pragma unroll
         for (int j = 0; j < WC; ++j)
             if (wok[j]) cp16(p + wdst[j], wsrc[j] + static_cast<size_t>(g) * (KMAJOR ? P.npad / 64 : 1) * TILE_BYTES);
+#endif
         if (dok) cp16(p + ddst, dsrc + static_cast<size_t>(g) * dpitch);
     };
     uint32_t mask;
@@ -96,7 +122,34 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     }
     grid_launch();
     for (int it = 0; it < per; ++it) {
+        // Input belongs to the completed PDL producer, not to the async packed-weight stage.
+        // Issue the exact current-group A fragments while that stage is still in flight.
+        uint32_t av[GS / 16][I][4];
+#pragma unroll
+        for (int kt = 0; kt < GS / 16; ++kt)
+#pragma unroll
+            for (int i = 0; i < I; ++i) {
+                const int r = wm * (BM / WM) + i * 16 + (lane >> 2);
+                const int c = it * GS + kt * 16 + 2 * (lane & 3);
+                const __nv_bfloat16* a0 = x_ready + static_cast<size_t>(m0 + r) * ldx + c;
+                const __nv_bfloat16* a1 = a0 + 8 * ldx;
+                av[kt][i][0] = compact_load_a(a0);
+                av[kt][i][1] = compact_load_a(a1);
+                av[kt][i][2] = compact_load_a(a0 + 8);
+                av[kt][i][3] = compact_load_a(a1 + 8);
+            }
         wait<0>();
+#if __CUDA_ARCH__ >= 1200
+        if (tid == 0) {
+            const uint32_t barrier = smem(&weight_barriers[it % STAGES]);
+            const uint32_t phase = (it / STAGES) & 1;
+            asm volatile("{ .reg .pred ready;\n"
+                         "wait_weight:\n"
+                         "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 ready, [%0], %1;\n"
+                         "@!ready bra wait_weight;\n"
+                         "}\n" :: "r"(barrier), "r"(phase) : "memory");
+        }
+#endif
         __syncthreads();
         const int next = it + 1;
         if (next < per) { load_x(next % STAGES, next); load_w(next % STAGES, next); }
@@ -118,20 +171,6 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
         for (int j = 0; j < T::NT; ++j)
 #pragma unroll
             for (int v = 0; v < GS / 32; ++v) words[j][v] = pw[((wn * T::NT + j) * 32 + lane) * (GS / 32) + v];
-        uint32_t av[GS / 16][I][4];
-#pragma unroll
-        for (int kt = 0; kt < GS / 16; ++kt)
-#pragma unroll
-            for (int i = 0; i < I; ++i) {
-                const int r = wm * (BM / WM) + i * 16 + (lane >> 2);
-                const int c = it * GS + kt * 16 + 2 * (lane & 3);
-                const __nv_bfloat16* a0 = x_ready + static_cast<size_t>(m0 + r) * ldx + c;
-                const __nv_bfloat16* a1 = a0 + 8 * ldx;
-                av[kt][i][0] = compact_load_a(a0);
-                av[kt][i][1] = compact_load_a(a1);
-                av[kt][i][2] = compact_load_a(a0 + 8);
-                av[kt][i][3] = compact_load_a(a1 + 8);
-            }
         float xv[I][2];
 #pragma unroll
         for (int i = 0; i < I; ++i) {
@@ -175,45 +214,59 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
         }
     }
     wait<0>();
-    __nv_bfloat16* own = reinterpret_cast<__nv_bfloat16*>(buf);
+#if __CUDA_ARCH__ >= 1200
+    // All weight transactions have been acquired and no stage remains in flight.
     __syncthreads();
+    if (tid == 0)
 #pragma unroll
-    for (int i = 0; i < I; ++i)
+        for (int s = 0; s < STAGES; ++s)
+            asm volatile("mbarrier.inval.shared::cta.b64 [%0];\n" :: "r"(smem(&weight_barriers[s])) : "memory");
+#endif
+    // The last iteration's CTA rendezvous retired the previous stage's reads.
+    // Its sibling, per % STAGES, has no outstanding writes or current readers.
+    // Reuse that dead ring stage, not buf (which may still be the live stage).
+    static_assert(STAGES == 2 && I == 1 && WM == 1 && WN == 4 && BN == 256);
+    static_assert(BM * (BN / 2) * sizeof(__nv_bfloat16) <= T::STAGE);
+    __nv_bfloat16* own = reinterpret_cast<__nv_bfloat16*>(stage(per % STAGES));
+    if (wn < WN / 2) {
 #pragma unroll
         for (int j = 0; j < J; ++j)
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
-                const int r = wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8;
+                const int r = (lane >> 2) + h * 8;
                 const int c = wn * (BN / WN) + j * 8 + (lane & 3) * 2;
-                *reinterpret_cast<__nv_bfloat162*>(own + r * BN + c) =
-                    __floats2bfloat162_rn(acc[i][j][2*h], acc[i][j][2*h+1]);
+                *reinterpret_cast<__nv_bfloat162*>(own + r * (BN / 2) + c) =
+                    __floats2bfloat162_rn(acc[0][j][2*h], acc[0][j][2*h+1]);
             }
+    }
+    // Gate fragments cross warp boundaries once. Up fragments stay registers.
     __syncthreads();
     if (wn >= WN / 2) {
 #pragma unroll
-        for (int i = 0; i < I; ++i)
+        for (int j = 0; j < J; ++j)
 #pragma unroll
-            for (int j = 0; j < J; ++j)
+            for (int h = 0; h < 2; ++h) {
+                const int r = (lane >> 2) + h * 8;
+                const int c = (wn - WN / 2) * (BN / WN) + j * 8 + (lane & 3) * 2;
+                const __nv_bfloat162 g2 = *reinterpret_cast<const __nv_bfloat162*>(own + r * (BN / 2) + c);
+                const __nv_bfloat162 u2 = __floats2bfloat162_rn(acc[0][j][2*h], acc[0][j][2*h+1]);
+                const float gf[2] = {__low2float(g2), __high2float(g2)};
+                const float uf[2] = {__low2float(u2), __high2float(u2)};
+                __nv_bfloat16 o[2];
 #pragma unroll
-                for (int h = 0; h < 2; ++h) {
-                    const int r = wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8;
-                    const int c = wn * (BN / WN) + j * 8 + (lane & 3) * 2 - BN / 2;
-                    const __nv_bfloat162 g2 = *reinterpret_cast<const __nv_bfloat162*>(own + r * BN + c);
-                    const __nv_bfloat162 u2 = *reinterpret_cast<const __nv_bfloat162*>(own + r * BN + c + BN / 2);
-                    const float gf[2] = {__low2float(g2), __high2float(g2)};
-                    const float uf[2] = {__low2float(u2), __high2float(u2)};
-                    __nv_bfloat16 o[2];
-#pragma unroll
-                    for (int e = 0; e < 2; ++e) o[e] = __float2bfloat16_rn(gf[e] / (1.0f + expf(-gf[e])) * uf[e]);
-                    const __nv_bfloat162 o2 = __halves2bfloat162(o[0], o[1]);
-                    *reinterpret_cast<__nv_bfloat162*>(own + r * BN + c) = o2;
-                    if (m0 + r < M) *reinterpret_cast<__nv_bfloat162*>(act + static_cast<size_t>(m0 + r) * P.n + n0 + c) = o2;
-                }
-    }
-    __syncthreads();
-    if (tid < rows * (BN / 128)) {
-        const int r = tid / (BN / 128), group = tid % (BN / 128);
-        as[static_cast<size_t>(m0 + r) * (P.n / 64) + n0 / 64 + group] = act_group_sum(own + r * BN + group * 64);
+                for (int e = 0; e < 2; ++e) o[e] = __float2bfloat16_rn(gf[e] / (1.0f + expf(-gf[e])) * uf[e]);
+                const __nv_bfloat162 o2 = __halves2bfloat162(o[0], o[1]);
+                *reinterpret_cast<__nv_bfloat162*>(own + r * (BN / 2) + c) = o2;
+                if (m0 + r < M) *reinterpret_cast<__nv_bfloat162*>(act + static_cast<size_t>(m0 + r) * P.n + n0 + c) = o2;
+            }
+        // A single up warp owns every element of its 64-column group. Preserve
+        // the baseline's scalar sum order, with no CTA-wide output handoff.
+        __syncwarp();
+        if (lane < rows) {
+            const int group = wn - WN / 2;
+            as[static_cast<size_t>(m0 + lane) * (P.n / 64) + n0 / 64 + group] =
+                act_group_sum(own + lane * (BN / 2) + group * 64);
+        }
     }
 
 }
