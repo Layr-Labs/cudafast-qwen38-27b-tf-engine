@@ -1026,5 +1026,3 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_pair_dict(const __n
 #include "qmm_mlp_single32.cuh"
 
 #include "qmm_head_sieve.cuh"
-
-#include "qmm_prompt_head_scan.cuh"
