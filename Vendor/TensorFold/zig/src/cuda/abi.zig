@@ -15,6 +15,7 @@ pub const GraphExec = ?*opaque {};
 pub const Kernel = ?*opaque {};
 
 pub const success: Result = 0;
+pub const error_out_of_memory: Result = 2;
 pub const error_not_found: Result = 500;
 pub const error_not_ready: Result = 600;
 
@@ -34,6 +35,7 @@ pub const DeviceAttribute = enum(c_int) {
     clock_rate = 13,
     multiprocessor_count = 16,
     integrated = 18,
+    can_map_host_memory = 19,
     l2_cache_size = 38,
     compute_capability_major = 75,
     compute_capability_minor = 76,
