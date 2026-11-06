@@ -35,13 +35,16 @@ fn size(p: layers.Proj) usize {
     return q.npad * q.k / 2;
 }
 
-/// Whether candidate `index` of `layer` goes on the fast pool: every stream but an attention layer's q, k and v, whose
-/// copies stay on ordinary memory so the pool's fastest pieces keep holding what they held before them
-/// (TF_ATTN_COPIES_POOLED=1: those too).
+/// Whether candidate `index` of `layer` goes on the fast pool: every stream, an attention layer's q, k and v too
+/// (TF_ATTN_COPIES_POOLED=0: those three stay on ordinary memory, as before). Every pooled copy is streamed every
+/// verify round, so a round's read time is the sum over copies of bytes over the speed of the piece behind them, whatever
+/// the order they fill the pieces in. Off the pool these three copies are allocated right after the screen has freed its
+/// slowest candidates, so they likely sit on the slowest memory; on it they take the next fastest screened pieces.
+/// Placement only: the copies hold the same words wherever they sit.
 fn pooled(layer: *const layers.Layer, index: usize) bool {
     if (layer.mixer != .attention or index < 2) return true;
-    const v = @import("sys").c.getenv("TF_ATTN_COPIES_POOLED") orelse return false;
-    return @import("std").mem.eql(u8, @import("std").mem.span(v), "1");
+    const v = @import("sys").c.getenv("TF_ATTN_COPIES_POOLED") orelse return true;
+    return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
 }
 
 /// The streams' sizes in the order `prepare` places them on the fast pool (for its screen); returns how many.
