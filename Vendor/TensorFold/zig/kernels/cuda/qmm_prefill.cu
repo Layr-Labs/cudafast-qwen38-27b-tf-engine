@@ -180,14 +180,71 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_split(const __nv
     tf_qmm_prefill::prompt_split_body<64, 128, 128, 1, 4, 2>(x, part, M, K, ldx, group, full_cols);
 }
 
+// PFL3 m64 bodies (TF_PFL3_M64=1): the crown non-persistent bodies at BM=64 tiles - the same per-element
+// fp chain (GS group then k16 into one fp32 accumulator from zero), half the tile rows, so a rows<=64
+// prompt stops issuing MMAs and ldmatrix loads on rows it never stores. Each output keeps the crown bits.
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_many64(const __nv_bfloat16* __restrict__ x,
+        const __grid_constant__ tf_qmm_prefill::ManyParts parts, int M, int K, int ldx, int group) {
+    tf_qmm_prefill::prompt_many_body<64, 64, 128, 1, 4, 2>(x, parts, M, K, ldx, group);
+}
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_mlp64(const __nv_bfloat16* __restrict__ x,
+        const __grid_constant__ tf_qmm_prefill::ManyParts parts, __nv_bfloat16* __restrict__ act, int M, int K, int ldx,
+        int group) {
+    tf_qmm_prefill::prompt_mlp_body<64, 64, 1, 4, 2>(x, parts, act, M, K, ldx, group);
+}
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_split64(const __nv_bfloat16* __restrict__ x,
+        const __grid_constant__ tf_qmm_prefill::ManyPart part, int M, int K, int ldx, int group, int full_cols) {
+    tf_qmm_prefill::prompt_split_body<64, 64, 128, 1, 4, 2>(x, part, M, K, ldx, group, full_cols);
+}
+
 // Selective persistent prompt schedules retain each output's original tile body.
 #include "qmm_prompt_rows2.cuh"
 #include "qmm_prompt_rows3.cuh"
 #include "qmm_prompt_persist.cuh"
 #include "qmm_prompt_persist_rows2.cuh"
 #include "qmm_prompt_persist_rows3.cuh"
-#include "qmm_prompt_plan.cuh"
 template __global__ void tf_qmm_persistent::kernel<128,1,true,false>(const __nv_bfloat16* __restrict__, const __grid_constant__ tf_qmm_prefill::ManyParts, __nv_bfloat16* __restrict__, int,int,int,int,int,int,int);
 template __global__ void tf_qmm_persistent_rows2::kernel<128,1,false,false>(const __nv_bfloat16* __restrict__, const __grid_constant__ tf_qmm_prefill::ManyParts, __nv_bfloat16* __restrict__, int,int,int,int,int,int,int);
 template __global__ void tf_qmm_persistent_rows2::kernel<128,1,false,true>(const __nv_bfloat16* __restrict__, const __grid_constant__ tf_qmm_prefill::ManyParts, __nv_bfloat16* __restrict__, int,int,int,int,int,int,int);
 template __global__ void tf_qmm_persistent_rows3::kernel<128,1,false,false>(const __nv_bfloat16* __restrict__, const __grid_constant__ tf_qmm_prefill::ManyParts, __nv_bfloat16* __restrict__, int,int,int,int,int,int,int);
+
+// PTILE 3-stage prompt bodies (qmm_prompt_pipe3.cuh / qmm_prompt_persist3.cuh): the crown bodies' bits with a
+// deeper cp.async pipeline. The 2-stage extern "C" entries above stay the default; prompt_many.zig selects the
+// 3-stage entries per launch when TF_PTILE_STAGES=3.
+#include "qmm_prompt_pipe3.cuh"
+#include "qmm_prompt_persist3.cuh"
+
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_many3(const __nv_bfloat16* __restrict__ x,
+        const __grid_constant__ tf_qmm_prefill::ManyParts parts, int M, int K, int ldx, int group) {
+    tf_qmm_prefill::prompt_many_body<64, 128, 128, 1, 4, 3>(x, parts, M, K, ldx, group);
+}
+
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_split3(const __nv_bfloat16* __restrict__ x,
+        const __grid_constant__ tf_qmm_prefill::ManyPart part, int M, int K, int ldx, int group, int full_cols) {
+    tf_qmm_prefill::prompt_split_body<64, 128, 128, 1, 4, 3>(x, part, M, K, ldx, group, full_cols);
+}
+
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_mlp3(const __nv_bfloat16* __restrict__ x,
+        const __grid_constant__ tf_qmm_prefill::ManyParts parts, __nv_bfloat16* __restrict__ act, int M, int K, int ldx,
+        int group) {
+    tf_qmm_prefill::prompt_mlp_body<64, 128, 1, 4, 3>(x, parts, act, M, K, ldx, group);
+}
+
+// PTILE warp retune of the non-persistent many body: 4x2 warps (256 threads) instead of 1x4 (128). Same tiles,
+// same m16n8k16 chains and bf16 bits; only the warps' shares widen (each warp takes 16 columns instead of 32),
+// the per-group ldmatrix A-traffic halves (WM splits rows) and 16 warps share an SM. Measured (137-ptile-mb3):
+// gdn qkvzab 246us vs crown 284us, attention qkv 135us vs 176us at T=32; every output bit-equal.
+extern "C" __global__ void __launch_bounds__(256) tf_qmm_prompt_manyw42(const __nv_bfloat16* __restrict__ x,
+        const __grid_constant__ tf_qmm_prefill::ManyParts parts, int M, int K, int ldx, int group) {
+    tf_qmm_prefill::prompt_many_body<64, 128, 128, 4, 2, 2>(x, parts, M, K, ldx, group);
+}
+
+// CAP3-03 rows2 wave-balanced map (qmm_prompt_persist_rows2v3.cuh): the crown rows2 SPLIT schedule with a
+// tile->CTA order that pairs the short row band against a plain full (max ~1.875 full-tile equivalents a CTA
+// at the scored M=496/N=5120 shape against the crown's 2.0). Same tf_qmm_pipe tile bodies and bits; outside
+// the engagement guard the crown mapping (rotate included) runs verbatim.
+#include "qmm_prompt_persist_rows2v3.cuh"
+// PEER-11 (terrapinelf/00bbc635): a 496-row prompt's planned tiles; the plan tables' per-panel coverage
+// (heights summing to 496, no overlap) was verified by script on this tree before inclusion.
+#include "qmm_prompt_plan.cuh"
+template __global__ void tf_qmm_persist_rows2v3::kernel<128,1,false,true>(const __nv_bfloat16* __restrict__, const __grid_constant__ tf_qmm_prefill::ManyParts, __nv_bfloat16* __restrict__, int,int,int,int,int,int,int);
