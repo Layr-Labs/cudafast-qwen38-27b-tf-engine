@@ -334,8 +334,9 @@ pub const HeadSieve = struct {
 
     /// The listed n8 tiles exactly (keys: each row's first tile instead), each row's best into best.
     fn rescore(h: *const HeadSieve, s: Stream, q: Affine4, rows: usize, keys: u64) !void {
-        // both passes from the n8-major copy (its keys pass skips first tiles shared by several rows, as the record's)
-        if (h.rn_buf != null) {
+        // the selected list from the n8-major copy; the first tiles (keys) through the record's kernel, which skips
+        // first tiles shared by several rows (one exact projection serves every row) and reduces keys per CTA
+        if (h.rn_buf != null and keys == 0) {
             const rb = h.rn_buf.?;
             var a: launch_.Args = .{};
             a.add(rb.ptr);
@@ -381,11 +382,6 @@ pub const HeadSieve = struct {
 
     /// After a verify that ran the sieve, its stream drained: the counters at rounds 1, 2, 4, .. (check: every 8th).
     pub fn after(h: *HeadSieve) void {
-        // The counters and the stderr lines below are a check-mode instrument. The scored decode runs
-        // mode .on, where nothing reads the stats page -- but the page crossed with a synchronous
-        // cuMemcpyDtoH, which drains the stream inside the round and breaks the host's run-ahead. Keep
-        // only the call there (fkiene's piece, from cd0908a; +0.06%, CI -0.19..+0.06).
-        if (h.mode != .check) return;
         h.rounds += 1;
         if (h.rounds != h.next_log) return;
         h.next_log = if (h.mode == .check) h.rounds + 8 else h.rounds * 2;
