@@ -11,17 +11,14 @@
 // a group's last k16 step, after its last read of the stage: the next stage's words, scales, first A rows and first B
 // pair load under that step's MMAs, and the next group opens with its operands in registers and its copies issued
 // among its first MMAs. Copies are predicated instructions rather than branches so they schedule among the MMAs.
-//
-// A k16 step issues its MMAs a row at a time, each A row refilled after its last column and the next step's B pairs formed
-// under the first rows; every accumulator still takes its MMAs over K in the same order. The barrier opens the last k16
-// step: its operands are all in registers by then.
 #pragma once
 
 namespace tf_qmm_pipe {
 using namespace tf_qmm_prefill;
 
-// pair()'s bits with its mask and add in one and-or lop3: the mask and the bias word come in registers (mov.b32 in
-// volatile asm keeps ptxas from folding them back into two lop3s around two immediates), then the same bf16x2 sub.
+// PEER-12 (jungjipdo 2ef80108/00bbc635): pair()'s bits with the mask and the bias word folded in one and-or
+// lop3 (truth table 0xEA), then the same bf16x2 sub. Bit-identical by integer identity; TF_PAIRLOP3=1 selects
+// the twin kernels at resolve time (prompt_many.zig), the default entries keep pair() untouched.
 __device__ __forceinline__ uint32_t pair_lop3(uint32_t w, int s, uint32_t mask, uint32_t magic) {
 #if __CUDA_ARCH__ >= 900
     uint32_t t, r;
@@ -40,7 +37,7 @@ __device__ __forceinline__ void cp16p(void* dst, const void* src, bool p) {
 }
 
 // prompt_mlp_tile's outputs (gate and up through silu(gate) * up) with the barrier inside the group, two stages.
-template <int GS, int BM, int WM, int WN, int STAGES>
+template <int GS, int BM, int WM, int WN, int STAGES, bool LOP3 = false>
 __device__ __forceinline__ void mlp_tile(const __nv_bfloat16* __restrict__ x, const ManyParts& parts, __nv_bfloat16* __restrict__ act, int M, int K,
         int ldx, int m0, int n0) {
     constexpr int BN = 128;
@@ -116,12 +113,18 @@ __device__ __forceinline__ void mlp_tile(const __nv_bfloat16* __restrict__ x, co
         const int ch = kt * 2 + (lane >> 4);
         ldmatrix4(a[i], p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16);
     };
-    uint32_t mask, magic;
-    asm volatile("mov.b32 %0, 0x000F000F;\n" : "=r"(mask));
-    asm volatile("mov.b32 %0, 0x43004300;\n" : "=r"(magic));
+    uint32_t mlmask = 0, mlmagic = 0;
+    if constexpr (LOP3) {
+        asm volatile("mov.b32 %0, 0x000F000F;\n" : "=r"(mlmask));
+        asm volatile("mov.b32 %0, 0x43004300;\n" : "=r"(mlmagic));
+    }
     auto weight_pair = [&](int j, int kt) {
-        return make_uint2(fma2(pair_lop3(words[j][kt / 2], (kt & 1) * 8, mask, magic), sv[j], bv[j]),
-                          fma2(pair_lop3(words[j][kt / 2], (kt & 1) * 8 + 4, mask, magic), sv[j], bv[j]));
+        if constexpr (LOP3)
+            return make_uint2(fma2(pair_lop3(words[j][kt / 2], (kt & 1) * 8, mlmask, mlmagic), sv[j], bv[j]),
+                              fma2(pair_lop3(words[j][kt / 2], (kt & 1) * 8 + 4, mlmask, mlmagic), sv[j], bv[j]));
+        else
+            return make_uint2(fma2(pair(words[j][kt / 2], (kt & 1) * 8), sv[j], bv[j]),
+                              fma2(pair(words[j][kt / 2], (kt & 1) * 8 + 4), sv[j], bv[j]));
     };
     // stage 0 in, visible, and its first operands in registers
     load(0, g0, true);
@@ -148,9 +151,9 @@ __device__ __forceinline__ void mlp_tile(const __nv_bfloat16* __restrict__ x, co
             const int cur = kt & 1;
             const bool last = kt + 1 == GS / 16;
             if (last) {
-                // every read of this stage is issued (this step's A rows and B pairs are in registers): the next stage
-                // may be read once landed, and this one refilled after the barrier. A tile's last group reads the other
-                // stage too; nothing uses what it reads.
+                // every read of this stage is issued (this step's A rows and B pairs are in registers): the next
+                // stage may be read once landed, and this one refilled after the barrier. A tile's last group reads
+                // the other stage too; nothing uses what it reads.
                 wait<0>();
                 __syncthreads();
                 read_w(pn);
@@ -193,7 +196,7 @@ __device__ __forceinline__ void mlp_tile(const __nv_bfloat16* __restrict__ x, co
 
 // prompt_tile's outputs (one projection, BN columns) with the barrier inside the group: mlp_tile's order (each A row
 // held for its k16 step and refilled after its last column, B pairs double buffered), two stages.
-template <int GS, int BM, int BN, int WM, int WN, int STAGES>
+template <int GS, int BM, int BN, int WM, int WN, int STAGES, bool LOP3 = false>
 __device__ __forceinline__ void tile(
         const __nv_bfloat16* __restrict__ x, const uint32_t* __restrict__ w, const __nv_bfloat16* __restrict__ scales,
         const __nv_bfloat16* __restrict__ biases, void* __restrict__ out, int N, int npad, int M, int K, int ldx, int m0,
@@ -263,12 +266,18 @@ __device__ __forceinline__ void tile(
         const int ch = kt * 2 + (lane >> 4);
         ldmatrix4(a[i], p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16);
     };
-    uint32_t mask, magic;
-    asm volatile("mov.b32 %0, 0x000F000F;\n" : "=r"(mask));
-    asm volatile("mov.b32 %0, 0x43004300;\n" : "=r"(magic));
+    uint32_t mask = 0, magic = 0;
+    if constexpr (LOP3) {
+        asm volatile("mov.b32 %0, 0x000F000F;\n" : "=r"(mask));
+        asm volatile("mov.b32 %0, 0x43004300;\n" : "=r"(magic));
+    }
     auto weight_pair = [&](int j, int kt) {
-        return make_uint2(fma2(pair_lop3(words[j][kt / 2], (kt & 1) * 8, mask, magic), sv[j], bv[j]),
-                          fma2(pair_lop3(words[j][kt / 2], (kt & 1) * 8 + 4, mask, magic), sv[j], bv[j]));
+        if constexpr (LOP3)
+            return make_uint2(fma2(pair_lop3(words[j][kt / 2], (kt & 1) * 8, mask, magic), sv[j], bv[j]),
+                              fma2(pair_lop3(words[j][kt / 2], (kt & 1) * 8 + 4, mask, magic), sv[j], bv[j]));
+        else
+            return make_uint2(fma2(pair(words[j][kt / 2], (kt & 1) * 8), sv[j], bv[j]),
+                              fma2(pair(words[j][kt / 2], (kt & 1) * 8 + 4), sv[j], bv[j]));
     };
     load(0, g0, true);
     commit();
