@@ -42,9 +42,10 @@ __device__ __forceinline__ void q35_slots(Geo geo, const __nv_bfloat16* q, const
     float4* slots = kept[threadIdx.y];
     float root[R][PT], state[R][PT];
 #pragma unroll
-    for (int r = 0; r < R; ++r)
-#pragma unroll
-        for (int i = 0; i < PT; ++i) root[r][i] = st[r * DK + i];
+    for (int r = 0; r < R; ++r) {
+        const float4 r4 = *reinterpret_cast<const float4*>(st + r * DK);
+        root[r][0] = r4.x; root[r][1] = r4.y; root[r][2] = r4.z; root[r][3] = r4.w;
+    }
     // the carried prefix (pn2) first, then the newer one (pn), each with apply's arithmetic, row by row
 #pragma unroll 1
     for (int set = 0; set < 2; ++set) {
@@ -179,21 +180,19 @@ __device__ __forceinline__ void q35_slots(Geo geo, const __nv_bfloat16* q, const
     if (record && sg.rows != 1) {
         if ((sg.pn > 0 || sg.pn2 > 0) && !sg.skip)
 #pragma unroll
-            for (int r = 0; r < R; ++r)
-#pragma unroll
-                for (int i = 0; i < PT; ++i) st[r * DK + i] = root[r][i];
+        for (int r = 0; r < R; ++r)
+            *reinterpret_cast<float4*>(st + r * DK) = make_float4(root[r][0], root[r][1], root[r][2], root[r][3]);
         return;
     }
 #pragma unroll
     for (int r = 0; r < R; ++r)
-#pragma unroll
-        for (int i = 0; i < PT; ++i) st[r * DK + i] = state[r][i];
+        *reinterpret_cast<float4*>(st + r * DK) = make_float4(state[r][0], state[r][1], state[r][2], state[r][3]);
 }
 #define TF_Q35_SLOTS(N, R, REUSE) \
 extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_slots_##N(Geo geo, const __nv_bfloat16* q, \
  const __nv_bfloat16* k, const __nv_bfloat16* v, const float* g, const __nv_bfloat16* beta, const Seg* segs, \
- const SlotStep* steps, int layer, __nv_bfloat16* y, const int* P) { \
-  release_next(); await_prior(); \
+ const SlotStep* steps, int layer, __nv_bfloat16* y, const int* P, const void* pfw, int pft, int pfn, int pfb) { \
+  release_next(); await_prior(); warm_tiles(plain(pfw), pft, pfn, pfb); \
   q35_slots<N, R, REUSE>(geo, after_wait(q), after_wait(k), after_wait(v), after_wait(g), after_wait(beta), segs, steps, layer, after_wait(y), P); }
 TF_Q35_SLOTS(1, 2, false)
 TF_Q35_SLOTS(2, 2, false)
