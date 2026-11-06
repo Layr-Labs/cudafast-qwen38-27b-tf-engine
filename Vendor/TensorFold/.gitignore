@@ -1,0 +1,4 @@
+# Build outputs stay outside the tracked submission paths (Sol audit 2026-11-06):
+# the staged worker and its identity sidecars are artifacts, not sources.
+/zig-out/
+.build/
