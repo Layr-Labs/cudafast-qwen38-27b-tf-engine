@@ -440,7 +440,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_head_sieve_rescore(const ui
         const __nv_bfloat16* __restrict__ scales, const __nv_bfloat16* __restrict__ biases, int npad,
         const uint4* __restrict__ afr, const float* __restrict__ xv, int KG, int rows, const int* __restrict__ list,
         const unsigned long long* __restrict__ count, int cap, int n8s, const unsigned long long* __restrict__ keys,
-        unsigned long long* __restrict__ best) {
+        unsigned long long* __restrict__ best, unsigned long long* __restrict__ stats) {
     using namespace tf_head_sieve;
     extern __shared__ __align__(128) unsigned char buf[];
     qmm_frag::grid_wait();
@@ -451,6 +451,14 @@ extern "C" __global__ void __launch_bounds__(128) tf_head_sieve_rescore(const ui
     const bool all = keys == nullptr && total > cap;
     const int items = all ? n8s : n;
     const int r0 = lane >> 2;
+    if (stats != nullptr && blockIdx.x == 0 && tid == 0) {
+        const unsigned long long selected = all ? static_cast<unsigned long long>(n8s) : static_cast<unsigned long long>(total);
+        stats[0] += 1;
+        stats[1] += selected;
+        if (selected > stats[2]) stats[2] = selected;
+        if (all) stats[3] += 1;
+        stats[4] += static_cast<unsigned long long>(rows);
+    }
     qmm_frag::grid_launch();
     for (int base = blockIdx.x * 4; base < items; base += gridDim.x * 4) {
         const int it = base + warp;
@@ -606,7 +614,8 @@ namespace tf_head_sieve {
 template <int CH, int STAGES>
 __device__ __forceinline__ void sieve_rescore_rn(const unsigned char* __restrict__ wr, const uint4* __restrict__ afr,
         const float* __restrict__ xv, int KG, int rows, const int* __restrict__ list, const unsigned long long* __restrict__ count,
-        int cap, int n8s, const unsigned long long* __restrict__ keys, unsigned long long* __restrict__ best) {
+        int cap, int n8s, const unsigned long long* __restrict__ keys, unsigned long long* __restrict__ best,
+        unsigned long long* __restrict__ stats) {
     constexpr int R = ROWS, NW = RN_WARPS, NT = NW * 32;
     constexpr int O_W = CH * AFR, O_X = O_W + NW * CH * RN_GROUP;
     constexpr int STG = O_X + CH * R * 4;
@@ -620,6 +629,14 @@ __device__ __forceinline__ void sieve_rescore_rn(const unsigned char* __restrict
     const bool all = keys == nullptr && total > cap;
     const int items = all ? n8s : n;
     const int r0 = lane >> 2;
+    if (stats != nullptr && blockIdx.x == 0 && tid == 0) {
+        const unsigned long long selected = all ? static_cast<unsigned long long>(n8s) : static_cast<unsigned long long>(total);
+        stats[0] += 1;
+        stats[1] += selected;
+        if (selected > stats[2]) stats[2] = selected;
+        if (all) stats[3] += 1;
+        stats[4] += static_cast<unsigned long long>(rows);
+    }
     qmm_frag::grid_launch();
     const int per = gridDim.x * NW;
     const int first = blockIdx.x * NW;
@@ -727,16 +744,16 @@ __device__ __forceinline__ void sieve_rescore_rn(const unsigned char* __restrict
 extern "C" __global__ void __launch_bounds__(128) tf_head_sieve_rescore_rn(const unsigned char* __restrict__ wr,
         const uint4* __restrict__ afr, const float* __restrict__ xv, int KG, int rows, const int* __restrict__ list,
         const unsigned long long* __restrict__ count, int cap, int n8s, const unsigned long long* __restrict__ keys,
-        unsigned long long* __restrict__ best) {
-    tf_head_sieve::sieve_rescore_rn<tf_head_sieve::RN_CH, tf_head_sieve::RN_STAGES>(wr, afr, xv, KG, rows, list, count, cap, n8s, keys, best);
+        unsigned long long* __restrict__ best, unsigned long long* __restrict__ stats) {
+    tf_head_sieve::sieve_rescore_rn<tf_head_sieve::RN_CH, tf_head_sieve::RN_STAGES>(wr, afr, xv, KG, rows, list, count, cap, n8s, keys, best, stats);
 }
 
 // The rows' first tiles (keys): at most 16 items, so fewer, longer steps.
 extern "C" __global__ void __launch_bounds__(128) tf_head_sieve_rescore_rn_keys(const unsigned char* __restrict__ wr,
         const uint4* __restrict__ afr, const float* __restrict__ xv, int KG, int rows, const int* __restrict__ list,
         const unsigned long long* __restrict__ count, int cap, int n8s, const unsigned long long* __restrict__ keys,
-        unsigned long long* __restrict__ best) {
-    tf_head_sieve::sieve_rescore_rn<tf_head_sieve::RN_KCH, tf_head_sieve::RN_STAGES>(wr, afr, xv, KG, rows, list, count, cap, n8s, keys, best);
+        unsigned long long* __restrict__ best, unsigned long long* __restrict__ stats) {
+    tf_head_sieve::sieve_rescore_rn<tf_head_sieve::RN_KCH, tf_head_sieve::RN_STAGES>(wr, afr, xv, KG, rows, list, count, cap, n8s, keys, best, stats);
 }
 
 // Each row's token from its best; the round's counters: stats[0] rounds, [1] selected n8 tiles (or all on overflow), [2] their most,

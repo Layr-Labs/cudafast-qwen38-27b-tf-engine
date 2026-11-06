@@ -227,17 +227,18 @@ pub const HeadSieve = struct {
 
     /// A greedy verify's head over `rows` rows of x (bf16, k wide) with group sums xs: each row's token into toks
     /// (check mode: into the sieve's own, compared with toks, which the full head has written).
-    pub fn run(h: *const HeadSieve, s: Stream, x: u64, xs: u64, q: Affine4, rows: usize, toks: u64) !void {
-        return h.runWith(false, s, x, xs, q, rows, toks);
+    pub fn run(h: *const HeadSieve, s: Stream, x: u64, xs: u64, q: Affine4, rows: usize, toks: u64, host_keys: bool) !void {
+        return h.runWith(false, s, x, xs, q, rows, toks, host_keys);
     }
 
     /// Only the prompt-tail call site uses this entry. Verify/decode retain the base scan and allocation.
     pub fn runPromptTail(h: *const HeadSieve, s: Stream, x: u64, xs: u64, q: Affine4, toks: u64) !void {
-        return h.runWith(true, s, x, xs, q, 1, toks);
+        return h.runWith(true, s, x, xs, q, 1, toks, false);
     }
 
-    fn runWith(h: *const HeadSieve, comptime prompt_tail: bool, s: Stream, x: u64, xs: u64, q: Affine4, rows: usize, toks: u64) !void {
+    fn runWith(h: *const HeadSieve, comptime prompt_tail: bool, s: Stream, x: u64, xs: u64, q: Affine4, rows: usize, toks: u64, host_keys: bool) !void {
         if (rows == 0 or rows > rows_max) return error.WindowTooWide;
+        if (host_keys and (prompt_tail or h.mode != .on)) return error.InvalidHeadSieveHostKeys;
         const scan_tab = if (prompt_tail) h.prompt_tab_smem else h.tab_smem;
         const scan_fn = if (prompt_tail) h.prompt_sieve_fn else h.sieve_fn;
         const scan_smem = if (prompt_tail) prompt_sieve_smem else sieve_smem;
@@ -291,7 +292,7 @@ pub const HeadSieve = struct {
             a.add(h.pre);
             try launch_.launch(h.top_fn, .{ .grid = .{ .x = select_ctas }, .block = .{ .x = 256 }, .pdl = h.pdl }, s, &a);
         }
-        try h.rescore(s, q, rows, h.pre);
+        try h.rescore(s, q, rows, h.pre, 0);
         {
             var a: launch_.Args = .{};
             a.add(h.himax);
@@ -306,8 +307,8 @@ pub const HeadSieve = struct {
             a.add(h.mrow);
             try launch_.launch(h.select_fn, .{ .grid = .{ .x = select_scan_ctas }, .block = .{ .x = 256 }, .pdl = h.pdl }, s, &a);
         }
-        try h.rescore(s, q, rows, 0);
-        {
+        try h.rescore(s, q, rows, 0, if (host_keys) h.stats else 0);
+        if (!host_keys) {
             var a: launch_.Args = .{};
             a.add(h.best);
             a.add(int(rows));
@@ -333,7 +334,7 @@ pub const HeadSieve = struct {
     }
 
     /// The listed n8 tiles exactly (keys: each row's first tile instead), each row's best into best.
-    fn rescore(h: *const HeadSieve, s: Stream, q: Affine4, rows: usize, keys: u64) !void {
+    fn rescore(h: *const HeadSieve, s: Stream, q: Affine4, rows: usize, keys: u64, stats: u64) !void {
         // both passes from the n8-major copy (its keys pass skips first tiles shared by several rows, as the record's)
         if (h.rn_buf != null) {
             const rb = h.rn_buf.?;
@@ -349,6 +350,7 @@ pub const HeadSieve = struct {
             a.add(int(h.n8s));
             a.add(keys);
             a.add(h.best);
+            a.add(stats);
             const ctas: usize = if (keys != 0) (rows + 3) / 4 else rn_ctas;
             const f = if (keys != 0) h.rn_keys_fn.? else h.rn_fn.?;
             const smem: u32 = if (keys != 0) rn_keys_smem else rn_smem;
@@ -370,6 +372,7 @@ pub const HeadSieve = struct {
         a.add(int(h.n8s));
         a.add(keys);
         a.add(h.best);
+        a.add(stats);
         const ctas: usize = if (keys != 0) (rows + 3) / 4 else rescore_ctas;
         try launch_.launch(h.rescore_fn, .{ .grid = .{ .x = @intCast(ctas) }, .block = .{ .x = 128 }, .shared = rescore_smem, .pdl = h.pdl }, s, &a);
     }
