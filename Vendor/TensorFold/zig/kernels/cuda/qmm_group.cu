@@ -350,6 +350,265 @@ template __global__ void tf_qmm_group::group_kernel<64, 64, 64, 1, 4, 4, false, 
 template __global__ void tf_qmm_group::group_kernel<64, 128, 64, 1, 4, 3, false, false, false, false>(
     const __nv_bfloat16* __restrict__, const float* __restrict__, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
 
+namespace tf_qmm_group {
+
+// A wide-row group_kernel (the SWAP=0 plain path) whose weight stream runs deeper than its activation staging: the
+// activations keep a shallow XSTAGES ring (their slices are L2-resident across a launch's column tiles) and the
+// weights a deep WSTAGES one (they are the DRAM stream the launch lives on). group_kernel<64, 64, 64, 1, 4, 4>'s
+// stage carries 8 KiB of activations with 2 KiB of weights, so a 4-stage ring keeps at most ~3 weight stages a CTA
+// in flight; this ring keeps WSTAGES-1. Same tiles, loads, MMA chain, per-group fmas, slice sums, bf16 roundings and
+// stores as group_kernel's plain path: every output element's floating-point order is unchanged (the commit groups
+// empty at the ring's tail so the wait depth stays the loop's constant).
+template <int GS, int BM, int BN, int WM, int WN, int WSTAGES, int XSTAGES>
+__device__ __forceinline__ void group_wide_body(
+        const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs, const Parts parts,
+        int M, int K, int ldx, int rows_t, int C) {
+    using T = LaneTile<GS, BM, BN, WM, WN, XSTAGES>;
+    constexpr int I = T::MT, J = T::NT;
+    constexpr int WS = T::W + 2 * T::S;            // a weight stage: the panel, scales and biases
+    constexpr int XS2 = T::X + T::XS;              // an activation stage: the inputs and their group sums
+    static_assert(WSTAGES >= 2 && XSTAGES >= 2, "the rings need a fill stage and a consume stage");
+    extern __shared__ __align__(128) unsigned char buf[];
+    unsigned char* const xr = buf;                 // activations first, weights past them
+    unsigned char* const wr = buf + XSTAGES * XS2;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int wm = warp / WN, wn = warp % WN;
+    const int KG = K / GS, cid = blockIdx.x / C, rank = blockIdx.x % C;
+    int q = 0;
+#pragma unroll
+    for (int i = 1; i < PARTS; ++i)
+        if (i < parts.count && cid >= parts.p[i].first) q = i;
+    const Part P = parts.p[q];                   // in registers: the loads below index it every group
+    const int sk = P.sk, lc = cid - P.first;
+    const int tile = lc / rows_t * (C / sk) + rank / sk, slice = rank % sk;
+    const int m0 = lc % rows_t * BM, n0 = tile * BN, per = KG / sk, g0 = slice * per;
+    const bool live = tile < P.tiles;            // a cluster's spare blocks past the last tile only join its syncs
+
+    const int rows = min(BM, M - m0);            // rows past M stay zero in every stage (set once below)
+    constexpr int TILE_BYTES = 64 * GS / 2;      // one stored 64-column tile's group block
+    constexpr int XC = (BM * T::CHUNKS + T::THREADS - 1) / T::THREADS, WC = (T::W / 16 + T::THREADS - 1) / T::THREADS;
+    constexpr int SC = (2 * T::S / 16 + T::THREADS - 1) / T::THREADS;
+    static_assert(BM <= T::THREADS, "one input sum a thread");
+    const __nv_bfloat16* xsrc[XC];
+    const unsigned char* wsrc[WC];
+    const __nv_bfloat16* ssrc[SC];
+    int xdst[XC], wdst[WC], sdst[SC];
+    bool xok[XC], wok[WC], sok[SC];
+#pragma unroll
+    for (int j = 0; j < XC; ++j) {
+        const int c = tid + j * T::THREADS, r = c / T::CHUNKS, ch = c % T::CHUNKS;
+        xok[j] = c < BM * T::CHUNKS && r < rows;
+        xsrc[j] = x + static_cast<size_t>(m0 + min(r, rows - 1)) * ldx + ch * 8;
+        xdst[j] = r * T::ROW + swz<T::CHUNKS>(r, ch) * 16;
+    }
+#pragma unroll
+    for (int j = 0; j < WC; ++j) {
+        const int c = tid + j * T::THREADS, t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
+        wok[j] = c < T::W / 16;
+        wsrc[j] = reinterpret_cast<const unsigned char*>(P.w) + static_cast<size_t>(n0 / 64 + t) * KG * TILE_BYTES +
+                  off * 16;
+        wdst[j] = c * 16;                        // within a weight stage
+    }
+#pragma unroll
+    for (int j = 0; j < SC; ++j) {
+        const int c = tid + j * T::THREADS, which = c / (T::S / 16), off = c % (T::S / 16);
+        sok[j] = c < 2 * (T::S / 16);
+        ssrc[j] = (which ? P.biases : P.scales) + n0 + off * 8;
+        sdst[j] = T::W + which * T::S + off * 16;
+    }
+    const bool xsok = tid < rows;
+    const float* xssrc = xs + static_cast<size_t>(m0 + min(tid, rows - 1)) * KG;
+    auto xstage = [&](int s) { return xr + s * XS2; };
+    auto wstage = [&](int s) { return wr + s * WS; };
+    auto load_x = [&](int s, int g) {
+        unsigned char* p = xstage(s);
+#pragma unroll
+        for (int j = 0; j < XC; ++j)
+            if (xok[j]) cp16(p + xdst[j], xsrc[j] + g * GS);
+        if (xsok) cp4(p + T::X + tid * 4, xssrc + g);
+    };
+    auto load_w = [&](int s, int g) {
+        unsigned char* p = wstage(s);
+#pragma unroll
+        for (int j = 0; j < WC; ++j)
+            if (wok[j]) cp16(p + wdst[j], wsrc[j] + static_cast<size_t>(g) * TILE_BYTES);
+#pragma unroll
+        for (int j = 0; j < SC; ++j)
+            if (sok[j]) cp16(p + sdst[j], ssrc[j] + static_cast<size_t>(g) * P.npad);
+    };
+    uint32_t mask;                               // 0x000F000F, opaque to the compiler (kept in a register)
+    asm volatile("mov.b32 %0, 0x000F000F;\n" : "=r"(mask));
+
+    float acc[I][J][4];
+#pragma unroll
+    for (int i = 0; i < I; ++i)
+#pragma unroll
+        for (int j = 0; j < J; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
+    if (live) {
+#pragma unroll
+        for (int c = tid; c < BM * T::CHUNKS; c += T::THREADS)
+            if (c / T::CHUNKS >= rows)
+#pragma unroll
+                for (int s = 0; s < XSTAGES; ++s)
+                    *reinterpret_cast<uint4*>(xstage(s) + c / T::CHUNKS * T::ROW + c % T::CHUNKS * 16) = uint4{};
+#pragma unroll
+        for (int s = 0; s < WSTAGES - 1; ++s) {
+            if (s < per) load_w(s, g0 + s);
+            commit();
+        }
+        grid_wait();
+#pragma unroll
+        for (int s = 0; s < XSTAGES - 1; ++s) {
+            if (s < per) load_x(s, g0 + s);
+            commit();
+        }
+        grid_launch();
+        // Both rings issue D - 1 iterations ahead of the compute, one weight commit then one activation commit per
+        // iteration (the empty tail commits keep the cadence). A consumed stage's commit then sits 2D - 3 commits
+        // back from the newest (its ring's peer sits deeper), so the steady wait exempts exactly 2D - 4; the first
+        // D iterations drain fully (the prologue's commits break the cadence). A stage's writer targets the slot
+        // its predecessor read, and the barrier below orders that behind the predecessor's reads.
+        constexpr int D = WSTAGES < XSTAGES ? WSTAGES : XSTAGES;
+        for (int it = 0; it < per; ++it) {
+            if (it < D) wait<0>(); else wait<2 * D - 4>();
+            __syncthreads();
+            const int nw = it + WSTAGES - 1, nx = it + XSTAGES - 1;
+            if (nw < per) load_w(nw % WSTAGES, g0 + nw);
+            commit();
+            if (nx < per) load_x(nx % XSTAGES, g0 + nx);
+            commit();
+            const unsigned char* p = xstage(it % XSTAGES);
+            const unsigned char* wp = wstage(it % WSTAGES);
+            const uint32_t* pw = reinterpret_cast<const uint32_t*>(wp);
+            const __nv_bfloat16* ps = reinterpret_cast<const __nv_bfloat16*>(wp + T::W);
+            const float* px = reinterpret_cast<const float*>(p + T::X);
+            uint32_t words[T::NT][GS / 32];
+#pragma unroll
+            for (int j = 0; j < T::NT; ++j)
+#pragma unroll
+                for (int v = 0; v < GS / 32; ++v)
+                    words[j][v] = pw[((wn * T::NT + j) * 32 + lane) * (GS / 32) + v];
+            float d[I][J][4];
+#pragma unroll
+            for (int kt = 0; kt < GS / 16; ++kt) {
+                uint32_t a[I > 0 ? I : 1][4];
+#pragma unroll
+                for (int i = 0; i < I; ++i) {
+                    const int r = wm * (BM / WM) + i * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
+                    const int ch = kt * 2 + (lane >> 4);
+                    ldmatrix4(a[i], p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16);
+                }
+#pragma unroll
+                for (int j = 0; j < T::NT; ++j) {
+                    const uint32_t b0 = pairm(words[j][kt / 2], (kt & 1) * 8, mask);
+                    const uint32_t b1 = pairm(words[j][kt / 2], (kt & 1) * 8 + 4, mask);
+#pragma unroll
+                    for (int i = 0; i < I; ++i) {
+                        if (kt == 0) mma0(d[i][j], a[i], b0, b1);
+                        else mma(d[i][j], a[i], b0, b1);
+                    }
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < T::NT; ++j) {
+                const int col = wn * (BN / WN) + j * 8 + (lane & 3) * 2;
+                const __nv_bfloat162 s2 = *reinterpret_cast<const __nv_bfloat162*>(ps + col);
+                const __nv_bfloat162 b2 = *reinterpret_cast<const __nv_bfloat162*>(ps + BN + col);
+                const float sv[2] = {__low2float(s2), __high2float(s2)};
+                const float bv[2] = {__low2float(b2), __high2float(b2)};
+#pragma unroll
+                for (int i = 0; i < I; ++i) {
+                    const int row = wm * (BM / WM) + i * 16 + (lane >> 2);
+                    const float xv[2] = {px[row], px[row + 8]};
+#pragma unroll
+                    for (int e = 0; e < 4; ++e)          // acc = fma(xs, b, fma(p, s, acc)): qmm.cu's order
+                        acc[i][j][e] = __fmaf_rn(xv[e >> 1], bv[e & 1],
+                                                 __fmaf_rn(d[i][j][e], sv[e & 1], acc[i][j][e]));
+                }
+            }
+        }
+        wait<0>();
+        __syncthreads();
+    } else {
+        grid_launch();
+    }
+    const int N = P.n;
+    auto put = [&](int row, int col, float v) {
+        if (row >= M || col >= N) return;
+        reinterpret_cast<__nv_bfloat16*>(P.out)[static_cast<size_t>(row) * N + col] = __float2bfloat16_rn(v);
+    };
+    auto emit = [&](int i, int j, int h, float v0, float v1) {      // entries 2h, 2h + 1 of fragment (i, j)
+        const int col = n0 + wn * (BN / WN) + j * 8 + (lane & 3) * 2;
+        const int row = m0 + wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8;
+        if (row >= M) return;
+        if (col + 1 < N && (N & 1) == 0) {
+            auto* dst = reinterpret_cast<__nv_bfloat16*>(P.out) + static_cast<size_t>(row) * N + col;
+            *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(v0, v1);
+        } else {
+            put(row, col, v0);
+            put(row, col + 1, v1);
+        }
+    };
+    if (sk > 1) {                                // uniform in a cluster: it holds one part
+#if __CUDA_ARCH__ >= 900
+        auto cluster = cooperative_groups::this_cluster();
+        float* mine = reinterpret_cast<float*>(buf);
+        if (slice != 0) {
+#pragma unroll
+            for (int i = 0; i < I; ++i)
+#pragma unroll
+                for (int j = 0; j < J; ++j)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) mine[((i * J + j) * 4 + e) * T::THREADS + tid] = acc[i][j][e];
+        }
+        cluster.sync();
+        if (slice == 0 && live) {                // slice 0 adds its tile's peers in slice order, as qmm.cu does
+            for (int peer = 1; peer < sk; ++peer) {
+                const float* theirs = cluster.map_shared_rank(mine, rank + peer);
+#pragma unroll
+                for (int i = 0; i < I; ++i)
+#pragma unroll
+                    for (int j = 0; j < J; ++j)
+                        for (int e = 0; e < 4; ++e)
+                            acc[i][j][e] = acc[i][j][e] + theirs[((i * J + j) * 4 + e) * T::THREADS + tid];
+            }
+        }
+        cluster.sync();                          // peers keep their memory until slice 0 has read it
+        if (slice != 0) return;
+#else
+        __trap();
+        return;
+#endif
+    }
+    if (!live) return;
+#pragma unroll
+    for (int i = 0; i < I; ++i)
+#pragma unroll
+        for (int j = 0; j < J; ++j)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) emit(i, j, h, acc[i][j][2 * h], acc[i][j][2 * h + 1]);
+}
+
+} // namespace tf_qmm_group
+
+// extern "C" entries keep their names stable for the zig side (qlinear.zig symbols): 33 to 64 and 65 to 128-row
+// windows' row kernels with the deep weight ring. rows_t = 1 always (wide()/verifyManyWide take one row tile), so
+// every m16 tile of the panel is live (BM / 16 m16 tiles a warp).
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_group_wide64(
+        const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
+        const __grid_constant__ tf_qmm_group::Parts parts, int M, int K, int ldx, int rows_t, int C) {
+    tf_qmm_group::group_wide_body<64, 64, 64, 1, 4, 8, 8>(x, xs, parts, M, K, ldx, rows_t, C);
+}
+
+extern "C" __global__ void __launch_bounds__(128) tf_qmm_group_wide128(
+        const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
+        const __grid_constant__ tf_qmm_group::Parts parts, int M, int K, int ldx, int rows_t, int C) {
+    tf_qmm_group::group_wide_body<64, 128, 64, 1, 4, 4, 4>(x, xs, parts, M, K, ldx, rows_t, C);
+}
+
+
 #include "qmm_dict.cuh"
 
 namespace tf_qmm_group {
@@ -986,6 +1245,20 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_pair(const __nv_bfl
 // MMA chains, fmas and sums, each scale and bias decoded from its dictionary index (dict_lanes).
 template __global__ void tf_qmm_group::group_kernel_dict<64, 16, 64, 1, 4, 8, false>(
     const __nv_bfloat16* __restrict__, const float* __restrict__, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
+// The same tile with a shallower stage ring (TF_FC_STAGES, the drafter's fc): only its pipeline depth differs, so
+// more CTAs an SM fit and the 320 CTAs of a 5120-column, four-slice launch need fewer waves; same arithmetic.
+template __global__ void tf_qmm_group::group_kernel_dict<64, 16, 64, 1, 4, 2, false>(
+    const __nv_bfloat16* __restrict__, const float* __restrict__, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
+template __global__ void tf_qmm_group::group_kernel_dict<64, 16, 64, 1, 4, 3, false>(
+    const __nv_bfloat16* __restrict__, const float* __restrict__, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
+template __global__ void tf_qmm_group::group_kernel_dict<64, 16, 64, 1, 4, 4, false>(
+    const __nv_bfloat16* __restrict__, const float* __restrict__, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
+template __global__ void tf_qmm_group::group_kernel<64, 16, 64, 1, 4, 2, false, false, false, false>(
+    const __nv_bfloat16* __restrict__, const float* __restrict__, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
+template __global__ void tf_qmm_group::group_kernel<64, 16, 64, 1, 4, 3, false, false, false, false>(
+    const __nv_bfloat16* __restrict__, const float* __restrict__, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
+template __global__ void tf_qmm_group::group_kernel<64, 16, 64, 1, 4, 4, false, false, false, false>(
+    const __nv_bfloat16* __restrict__, const float* __restrict__, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
 // The greedy verify head: the same tile, each row's best of its 64 columns in place of the logits.
 template __global__ void tf_qmm_group::group_kernel_dict<64, 16, 64, 1, 4, 8, false, false, true>(
     const __nv_bfloat16* __restrict__, const float* __restrict__, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
@@ -1027,4 +1300,4 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_mlp_pair_dict(const __n
 
 #include "qmm_head_sieve.cuh"
 
-#include "qmm_prompt_head_scan.cuh"
+#include "qmm_absorb.cuh"
