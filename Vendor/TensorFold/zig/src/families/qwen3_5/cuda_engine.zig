@@ -192,6 +192,7 @@ pub const Engine = struct {
     y: u64,
     mix: u64,
     chain_flags: u64 = 0, // a prompt chain's progress words, two a value head (cuda_prompt.zig deltaConv, gdn_post_follow)
+    mix_rows: u64 = 0, // gdn_post_follow's heads done per 8-row block, followed by the out projection (cuda_forward.zig)
     qraw: u64,
     kraw: u64,
     vraw: u64,
@@ -560,6 +561,7 @@ pub const Engine = struct {
         inline for (.{ "a", "b", "beta" }) |name| @field(e, name) = try t.alloc(R * g.v_heads * 2);
         e.g_ = try t.alloc(R * g.v_heads * 4);
         e.chain_flags = try t.alloc(2 * g.v_heads * 128);
+        e.mix_rows = try t.alloc((R + 7) / 8 * 4);
         e.qraw = try t.alloc(R * 2 * g.attnWidth() * 2);
         e.qn = try t.alloc(R * g.attnWidth() * 2);
         inline for (.{ "kraw", "vraw", "kn" }) |name| @field(e, name) = try t.alloc(R * g.kv_heads * head_dim * 2);

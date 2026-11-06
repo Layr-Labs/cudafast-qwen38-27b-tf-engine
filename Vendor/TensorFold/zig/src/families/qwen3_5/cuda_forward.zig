@@ -82,9 +82,12 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 // the chain's dependent gdn_post (gdn_post_ilp's rows and bits) takes each row as both of its head's
                 // chain blocks publish it, during the chain (TF_POST_FOLLOW=0: gdn_post after the chain)
                 const follow = conv_in_chain and total > 16 and promptIlpOn() and postFollowOn();
+                // the out projection follows the post follower row band by row band (TF_OUT_FOLLOW=0: after the chain)
+                const out_follow = follow and outFollowOn() and m.out == .a4 and !e.int8.on and e.mix_rows != 0;
                 if (conv_in_chain) {
+                    if (out_follow) try e.d.check(e.d.api.cuMemsetD8Async(e.mix_rows, 0, (total + 7) / 8 * 4, e.stream.handle), "cuMemsetD8Async");
                     try @import("cuda_prompt.zig").deltaConv(e, di, total, m, if (follow) e.chain_flags else 0);
-                    if (follow) try e.runAfter(e.fns.gdn_post_follow, .{ follow_blocks, 1, 1 }, .{ 32, 4, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums, e.chain_flags, @as(c_int, @intCast(total)) });
+                    if (follow) try e.runAfter(e.fns.gdn_post_follow, .{ follow_blocks, 1, 1 }, .{ 32, 4, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums, e.chain_flags, @as(c_int, @intCast(total)), if (out_follow) e.mix_rows else @as(u64, 0) });
                     if (commit) try e.runAfter(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
                 } else if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else try e.deltaScan(record, shape.slots, nseg, layer);
                 // a prompt chunk: eight rows a warp, their loads in flight together (TF_PROMPT_ILP=0: a row a warp)
@@ -92,7 +95,9 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     try e.runAfter(e.fns.gdn_post_ilp, .{ 1, g.v_heads, (total + 31) / 32 }, .{ 32, 4, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums })
                 else
                     try e.runAfter(e.fns.gdn_post, .{ 1, g.v_heads, post_blocks }, .{ 32, post_rows, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums });
-                try e.projAgain(m.out, e.mix, e.r, total, prompt);
+                var followed = false;
+                if (out_follow) followed = try e.prompt_many.promptFollow(e.stream, e.mix, &.{.{ .q = m.out.a4, .out = e.r }}, total, e.mix_rows, g.v_heads, E.glue_pdl and e.affine.pdl);
+                if (!followed) try e.projAgain(m.out, e.mix, e.r, total, prompt);
                 di += 1;
             },
             .attention => |m| {
@@ -202,6 +207,13 @@ fn chainConvOn() bool {
 
 /// gdn_post_follow's persistent blocks of four row warps beside the chain (GB10: one an SM).
 const follow_blocks = 48;
+
+/// TF_OUT_FOLLOW=0: a 496-row prompt chunk's GDN out projection waits for its whole chain instead of following
+/// gdn_post_follow's row bands (cuda/prompt_many.zig promptFollow).
+fn outFollowOn() bool {
+    const v = @import("sys").c.getenv("TF_OUT_FOLLOW") orelse return true;
+    return !@import("std").mem.eql(u8, @import("std").mem.span(v), "0");
+}
 
 /// TF_POST_FOLLOW=0: a prompt chunk's gdn_post runs after its chain instead of following it.
 fn postFollowOn() bool {

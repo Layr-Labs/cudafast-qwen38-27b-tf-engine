@@ -46,6 +46,8 @@ pub const Kernels = struct {
     /// A 496-row prompt's planned tiles (qmm_prompt_plan.cuh): projections and the MLP; null off GB10's 48 SMs.
     plan_fn: ?Function = null,
     plan_mlp_fn: ?Function = null,
+    /// plan_fn's twin that follows a running GDN chain row band by row band (qmm_prompt_plan.cuh); null with plan_fn.
+    plan_follow_fn: ?Function = null,
     /// TF_PROMPT_PLAN's bits (default all): 1 the 5120-column projections, 2 attention's q, k and v, 4 the MLP, 8 the
     /// recurrent layers' qkv, z, a and b.
     plan_mask: u32 = 15,
@@ -78,6 +80,9 @@ pub const Kernels = struct {
             try pm.allowDynamicShared(smem);
             result.plan_fn = pf;
             result.plan_mlp_fn = pm;
+            const pff = try prefill_mod.function("tf_qmm_prompt_plan_follow");
+            try pff.allowDynamicShared(smem);
+            result.plan_follow_fn = pff;
             if (std.c.getenv("TF_PROMPT_PLAN")) |v| result.plan_mask = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 15;
         }
         return result;
@@ -111,6 +116,31 @@ pub const Kernels = struct {
         g.add(plans[plan][0]);
         g.add(plans[plan][1]);
         try launch_.launch(f, .{ .grid = .{ .x = @intCast(kk.slots) }, .block = .{ .x = threads }, .shared = smem }, s, &g);
+    }
+
+    /// `prompt` of one 5120-column output whose input rows are still being written by a GDN chain's post follower:
+    /// plan 0's tiles (the same items, tile shapes and bits as `prompt`) launched as the follower's programmatic
+    /// dependent, each tile first waiting until every 8-row block it reads has `need` published head items in `rows_done`
+    /// (qmm_prompt_plan.cuh tf_qmm_prompt_plan_follow). False when plan 0 does not take these outputs; the caller then
+    /// runs `prompt` after the chain as before.
+    pub fn promptFollow(kk: *const Kernels, s: Stream, x: u64, outs: []const Out, rows: usize, rows_done: u64, need: usize, pdl: bool) !bool {
+        const f = kk.plan_follow_fn orelse return false;
+        const plan = kk.planFor(outs, rows) orelse return false;
+        if (plan != 0 or outs.len != 1 or rows_done == 0) return false;
+        const o = outs[0];
+        var parts: Parts = std.mem.zeroes(Parts);
+        parts.p[0] = .{ .w = o.q.w, .scales = o.q.s, .biases = o.q.b, .out = o.out, .n = @intCast(o.q.n), .npad = @intCast(o.q.npad), .first = 0 };
+        parts.count = 1;
+        var g: launch_.Args = .{};
+        g.add(x);
+        g.add(parts);
+        for ([_]usize{ rows, o.q.k, o.q.k }) |v| g.add(@as(c_int, @intCast(v)));
+        g.add(plans[plan][0]);
+        g.add(plans[plan][1]);
+        g.add(rows_done);
+        g.add(@as(c_int, @intCast(need)));
+        try launch_.launch(f, .{ .grid = .{ .x = @intCast(kk.slots) }, .block = .{ .x = threads }, .shared = smem, .pdl = pdl }, s, &g);
+        return true;
     }
 
     fn persistent(kk: *const Kernels, f: Function, s: Stream, x: u64, parts: Parts, act: u64, rows: usize, k: usize, group: usize, full_cols: c_int, blocks: usize) !void {

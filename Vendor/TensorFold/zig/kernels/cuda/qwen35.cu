@@ -589,7 +589,8 @@ constexpr int POLL_NS = 2000;
 constexpr int FLAG_STRIDE = 32;  // a progress word a 128-byte line (gdn_prefill.cu's)
 extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post_follow(Geo geo, const __nv_bfloat16* __restrict__ Y0, const __nv_bfloat16* __restrict__ Z0,
                                                                           const __nv_bfloat16* __restrict__ NW, float eps, __nv_bfloat16* __restrict__ OUT0,
-                                                                          const int* __restrict__ P, float* __restrict__ XS0, const int* flags, int W_chain) {
+                                                                          const int* __restrict__ P, float* __restrict__ XS0, const int* flags, int W_chain,
+                                                                          int* rows_done) {
     constexpr int RPW = 8;
     __shared__ __align__(16) __nv_bfloat16 row_done[4][DK];
     __nv_bfloat16* done = row_done[threadIdx.y];
@@ -656,6 +657,13 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_post_follow(Geo geo
             *reinterpret_cast<uint2*>(done + lane * PER) = ow;
             __syncwarp();
             if (lane < DK / 64) XS[m * (W / 64) + hv * (DK / 64) + lane] = group_sum(done + lane * 64);
+        }
+        // rows_done (may be null): this item's head counted for its 8-row block once every lane's stores are released,
+        // for the out projection that follows the chain (qmm_prompt_plan.cuh tf_qmm_prompt_plan_follow)
+        if (rows_done != nullptr) {
+            __threadfence();
+            __syncwarp();
+            if (lane == 0) atomicAdd(rows_done + m0 / RPW, 1);
         }
     }
     // every block ends no earlier than the chain: the grid's end implies the chain's
