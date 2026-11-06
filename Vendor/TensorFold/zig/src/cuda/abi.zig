@@ -15,6 +15,7 @@ pub const GraphExec = ?*opaque {};
 pub const Kernel = ?*opaque {};
 
 pub const success: Result = 0;
+pub const error_out_of_memory: Result = 2;
 pub const error_not_found: Result = 500;
 pub const error_not_ready: Result = 600;
 
