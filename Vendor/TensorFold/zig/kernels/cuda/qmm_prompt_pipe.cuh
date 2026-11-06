@@ -16,6 +16,19 @@
 namespace tf_qmm_pipe {
 using namespace tf_qmm_prefill;
 
+// pair()'s bits with its mask and add in one and-or lop3: the mask and the bias word come in registers (mov.b32 in
+// volatile asm keeps ptxas from folding them back into two lop3s around two immediates), then the same bf16x2 sub.
+__device__ __forceinline__ uint32_t pair_lop3(uint32_t w, int s, uint32_t mask, uint32_t magic) {
+#if __CUDA_ARCH__ >= 900
+    uint32_t t, r;
+    asm("lop3.b32 %0, %1, %2, %3, 0xEA;\n" : "=r"(t) : "r"(w >> s), "r"(mask), "r"(magic));
+    asm("sub.rn.bf16x2 %0, %1, %2;\n" : "=r"(r) : "r"(t), "r"(magic));
+    return r;
+#else
+    return pair(w, s);
+#endif
+}
+
 // A 16-byte cp.async issued only where p holds: a predicated instruction rather than a branch, so the copies schedule
 // among the MMAs. Rows past M are not read; their A rows only reach accumulator rows that are never stored.
 __device__ __forceinline__ void cp16p(void* dst, const void* src, bool p) {
@@ -246,9 +259,12 @@ __device__ __forceinline__ void tile(
         const int ch = kt * 2 + (lane >> 4);
         ldmatrix4(a[i], p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16);
     };
+    uint32_t mask, magic;
+    asm volatile("mov.b32 %0, 0x000F000F;\n" : "=r"(mask));
+    asm volatile("mov.b32 %0, 0x43004300;\n" : "=r"(magic));
     auto weight_pair = [&](int j, int kt) {
-        return make_uint2(fma2(pair(words[j][kt / 2], (kt & 1) * 8), sv[j], bv[j]),
-                          fma2(pair(words[j][kt / 2], (kt & 1) * 8 + 4), sv[j], bv[j]));
+        return make_uint2(fma2(pair_lop3(words[j][kt / 2], (kt & 1) * 8, mask, magic), sv[j], bv[j]),
+                          fma2(pair_lop3(words[j][kt / 2], (kt & 1) * 8 + 4, mask, magic), sv[j], bv[j]));
     };
     load(0, g0, true);
     commit();
