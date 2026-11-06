@@ -1,7 +1,6 @@
 //! One device's primary context, the one CUDA's runtime and PyTorch share, made current on the calling thread.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const abi = @import("abi.zig");
 const Driver = @import("driver.zig").Driver;
 const Error = @import("driver.zig").Error;
@@ -25,7 +24,7 @@ pub const Context = struct {
         var dev: abi.Device = 0;
         try d.check(d.api.cuDeviceGet(&dev, ordinal), "cuDeviceGet");
         var ctx: abi.Context = null;
-        try retainPrimary(d, &ctx, dev);
+        try d.check(d.api.cuDevicePrimaryCtxRetain(&ctx, dev), "cuDevicePrimaryCtxRetain");
         errdefer _ = d.api.cuDevicePrimaryCtxRelease_v2(dev);
         try d.check(d.api.cuCtxSetCurrent(ctx), "cuCtxSetCurrent");
         try @import("context_health.zig").retain(d, ctx);
@@ -105,33 +104,3 @@ pub const Context = struct {
         return m;
     }
 };
-
-/// Creating a primary context can fail with CUDA_ERROR_OUT_OF_MEMORY while most of the host's memory is free: the
-/// driver needs a few large physically contiguous blocks, and on a host whose free memory is fragmented the kernel's
-/// compaction and reclaim make them only some time later. So that one error is retried, `retain_tries` attempts in all,
-/// `retain_nap_s` seconds apart, each retry logged; any other error, or the last attempt's, fails as it did before.
-const retain_tries = 10;
-const retain_nap_s = if (builtin.is_test) 0 else 1;
-
-fn retainPrimary(d: *const Driver, ctx: *abi.Context, dev: abi.Device) Error!void {
-    var attempt: u32 = 1;
-    while (true) : (attempt += 1) {
-        const res = d.api.cuDevicePrimaryCtxRetain(ctx, dev);
-        if (res != abi.error_out_of_memory or attempt == retain_tries) return d.check(res, "cuDevicePrimaryCtxRetain");
-        std.log.warn("cuDevicePrimaryCtxRetain: out of memory on attempt {d} of {d}; retrying in {d} s", .{
-            attempt, retain_tries, retain_nap_s,
-        });
-        nap(retain_nap_s);
-    }
-}
-
-fn nap(seconds: u32) void {
-    if (seconds == 0) return;
-    switch (builtin.os.tag) {
-        .windows => {},
-        else => {
-            const t: std.c.timespec = .{ .sec = seconds, .nsec = 0 };
-            _ = std.c.nanosleep(&t, null);
-        },
-    }
-}
