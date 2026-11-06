@@ -6,7 +6,6 @@ const lanes = @import("lanes");
 const engine = @import("cuda_engine.zig");
 const weights = @import("cuda_draft_weights.zig");
 pub const tree = @import("cuda_draft_tree.zig");
-pub const history_branch = @import("cuda_draft_history_branch.zig");
 const profile = @import("cuda_startup_profile.zig");
 pub const precision = @import("cuda_draft_precision.zig");
 
@@ -25,7 +24,7 @@ const lp_top = 20;
 pub const Config = @import("cuda_draft_config.zig").Config;
 pub const frame = @import("cuda_draft_frame.zig");
 pub const memory = @import("cuda_draft_memory.zig");
-const Fns = struct { gather_taps: cuda.Function, gather_rows: cuda.Function, dyn_conv: cuda.Function, norm_rope: cuda.Function, ring_put: cuda.Function, attn: cuda.Function, dyn_conv_batch: cuda.Function, norm_rope_batch: cuda.Function, norm_rope_qk_batch: cuda.Function, mask_rows: cuda.Function, attn_partial: cuda.Function, attn_partial_rows4: cuda.Function, attn_merge: cuda.Function, head2_pack: cuda.Function, head2_screen: cuda.Function, head2_select: cuda.Function, head2_rescore: cuda.Function };
+const Fns = struct { norm_rope_ring: cuda.Function, gather_taps: cuda.Function, gather_rows: cuda.Function, dyn_conv: cuda.Function, norm_rope: cuda.Function, ring_put: cuda.Function, attn: cuda.Function, dyn_conv_batch: cuda.Function, norm_rope_batch: cuda.Function, norm_rope_qk_batch: cuda.Function, mask_rows: cuda.Function, attn_partial: cuda.Function, attn_partial_rows4: cuda.Function, attn_merge: cuda.Function, head2_pack: cuda.Function, head2_screen: cuda.Function, head2_select: cuda.Function, head2_rescore: cuda.Function, gather_rows_dev: cuda.Function, ring_put_dev: cuda.Function, dround_accept: cuda.Function };
 
 /// qwen35_draft.cu's TapRows.
 const TapRows = extern struct { n: c_int, rows: [engine.most_window]c_int };
@@ -41,8 +40,6 @@ pub const Ctx = struct {
     parents: [engine.most_window]i32 = undefined,
     own: [engine.most_window]f64 = undefined,
     grown: usize = 0,
-    // Historical grafts are proposals, not samples from the neural selector.
-    retrieved: [engine.most_window]bool = @splat(false),
     // the stream's tokens draft_frame has read, and whether more than 1 in 32 lay outside its spans (then drafts take
     // the whole head)
     scanned: usize = 0,
@@ -219,14 +216,14 @@ pub const Draft = struct {
         const B = c.block * d.frame_streams;
         const R = @max(max_rows, B);
         const sizes = .{
-            .{ "taps_in", try bytes(.{ R, c.n_taps, c.hidden, 2 }) },                 .{ "th", try bytes(.{ R, c.hidden, 2 }) },              .{ "thn", try bytes(.{ R, c.hidden, 2 }) },                         .{ "kabs", try bytes(.{ R, c.layers, c.kvWidth(), 2 }) },
-            .{ "kn", try bytes(.{ R, c.kvWidth(), 2 }) },                             .{ "vabs", try bytes(.{ R, c.layers, c.kvWidth(), 2 }) },         .{ "xs", try bytes(.{ R, c.n_taps, (c.hidden / 64), 4 }) },         .{ "h", try bytes(.{ B, c.hidden, 2 }) },
-            .{ "h2", try bytes(.{ B, c.hidden, 2 }) },                                .{ "x", try bytes(.{ B, c.hidden, 2 }) },               .{ "xin", try bytes(.{ B, c.hidden, 2 }) },                         .{ "dyn", try bytes(.{ B, c.dynamic(), 2 }) },
-            .{ "qraw", try bytes(.{ B, c.qWidth(), 2 }) },                            .{ "q", try bytes(.{ B, c.qWidth(), 2 }) },             .{ "kraw", try bytes(.{ B, c.kvWidth(), 2 }) },                     .{ "kb", try bytes(.{ B, c.kvWidth(), 2 }) },
-            .{ "vb", try bytes(.{ B, c.kvWidth(), 2 }) },                             .{ "att", try bytes(.{ B, c.qWidth(), 2 }) },           .{ "o", try bytes(.{ B, c.hidden, 2 }) },                           .{ "gate", try bytes(.{ B, c.intermediate, 2 }) },
-            .{ "up", try bytes(.{ B, c.intermediate, 2 }) },                          .{ "act", try bytes(.{ B, c.intermediate, 2 }) },       .{ "logits", try bytes(.{ B, c.vocab, 2 }) },                       .{ "words", try bytes(.{ B, lp_words, 4 }) },
-            .{ "segments", try bytes(.{ d.frame_streams, @sizeOf(frame.Segment) }) }, .{ "pm", try bytes(.{ B, c.heads, frame.chunks, 4 }) }, .{ "pl", try bytes(.{ B, c.heads, frame.chunks, 4 }) },             .{ "po", try bytes(.{ B, c.heads, frame.chunks, c.head_dim, 4 }) },
-            .{ "hp", try bytes(.{ B, c.rank, 2 }) },                                  .{ "ids", try bytes(.{ B, 4 }) },                       .{ "parts", cuda.sample.Draws.topkPartsBytes(c.vocab, c.topk, B) },
+            .{ "taps_in", try bytes(.{ R, c.n_taps, c.hidden, 2 }) },                 .{ "th", try bytes(.{ R, c.hidden, 2 }) },                .{ "thn", try bytes(.{ R, c.hidden, 2 }) },                         .{ "kabs", try bytes(.{ R, c.layers, c.kvWidth(), 2 }) },
+            .{ "kn", try bytes(.{ R, c.kvWidth(), 2 }) },                             .{ "vabs", try bytes(.{ R, c.layers, c.kvWidth(), 2 }) }, .{ "xs", try bytes(.{ R, c.n_taps, (c.hidden / 64), 4 }) },         .{ "h", try bytes(.{ B, c.hidden, 2 }) },
+            .{ "h2", try bytes(.{ B, c.hidden, 2 }) },                                .{ "x", try bytes(.{ B, c.hidden, 2 }) },                 .{ "xin", try bytes(.{ B, c.hidden, 2 }) },                         .{ "dyn", try bytes(.{ B, c.dynamic(), 2 }) },
+            .{ "qraw", try bytes(.{ B, c.qWidth(), 2 }) },                            .{ "q", try bytes(.{ B, c.qWidth(), 2 }) },               .{ "kraw", try bytes(.{ B, c.kvWidth(), 2 }) },                     .{ "kb", try bytes(.{ B, c.kvWidth(), 2 }) },
+            .{ "vb", try bytes(.{ B, c.kvWidth(), 2 }) },                             .{ "att", try bytes(.{ B, c.qWidth(), 2 }) },             .{ "o", try bytes(.{ B, c.hidden, 2 }) },                           .{ "gate", try bytes(.{ B, c.intermediate, 2 }) },
+            .{ "up", try bytes(.{ B, c.intermediate, 2 }) },                          .{ "act", try bytes(.{ B, c.intermediate, 2 }) },         .{ "logits", try bytes(.{ B, c.vocab, 2 }) },                       .{ "words", try bytes(.{ B, lp_words, 4 }) },
+            .{ "segments", try bytes(.{ d.frame_streams, @sizeOf(frame.Segment) }) }, .{ "pm", try bytes(.{ B, c.heads, frame.chunks, 4 }) },   .{ "pl", try bytes(.{ B, c.heads, frame.chunks, 4 }) },             .{ "po", try bytes(.{ B, c.heads, frame.chunks, c.head_dim, 4 }) },
+            .{ "hp", try bytes(.{ B, c.rank, 2 }) },                                  .{ "ids", try bytes(.{ B, 4 }) },                         .{ "parts", cuda.sample.Draws.topkPartsBytes(c.vocab, c.topk, B) },
         };
         var total: usize = 0;
         inline for (sizes) |s| {
@@ -368,17 +365,23 @@ pub const Draft = struct {
         const e = d.e;
         while (n > 0) {
             const rows = @min(n, max_rows);
+            @import("cuda_dtprof.zig").sub(e.d, e.stream, 0);
             if (rows_) |rs| {
                 var tr: TapRows = .{ .n = @intCast(rows), .rows = @splat(0) };
                 for (rs, 0..) |r, i| tr.rows[i] = @intCast(r);
                 try e.runAfter(d.fns.gather_rows, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ tap_ring, @as(c_int, engine.tap_rows), @as(c_longlong, @intCast(start)), tr, @as(c_int, @intCast(c.n_taps * c.hidden)), d.taps_in });
             } else try e.runAfter(d.fns.gather_taps, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ tap_ring, @as(c_int, engine.tap_rows), @as(c_longlong, @intCast(start)), @as(c_int, @intCast(c.n_taps * c.hidden)), d.taps_in });
+            @import("cuda_dtprof.zig").sub(e.d, e.stream, 1);
             try d.proj(d.w.fc, d.taps_in, d.th, rows);
+            @import("cuda_dtprof.zig").sub(e.d, e.stream, 2);
+            if (platform.c.getenv("TF_FC_CHECK") != null) try d.fcCheck(rows);
+            if (rows >= 128 and platform.c.getenv("TF_H60_CHECK") != null) try d.h60Check();
             const kv = rows * c.kvWidth() * 2; // a layer's k (v) rows in kabs (vabs)
             // a prompt piece: every layer's k and v project the same normed taps, up to four a prompt GEMM launch
             const grouped = precision.prompt(d.projection_role, rows, precision.dflash_projection_prompt_cutoff);
             try e.runAfter(e.fns.norm, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ d.th, @as(u64, 0), d.w.hidden_norm, d.thn, d.c.eps, @as(c_int, @intCast(d.c.hidden)), @as(u64, 0), if (grouped) @as(u64, 0) else d.xs });
             const grouped_live = liveGroups() and !grouped and rows <= 16;
+            @import("cuda_dtprof.zig").sub(e.d, e.stream, 3);
             if (grouped) {
                 const P = cuda.prompt_many;
                 var many: [P.parts_max]P.Out = undefined;
@@ -401,25 +404,187 @@ pub const Draft = struct {
                     many[count] = .{ .q = weight, .out = out };
                     count += 1;
                     if (count == many.len) {
-                        try e.affine.decodeMany(e.stream, d.thn, d.xs, many[0..count], rows);
+                        try d.absorbKv(many[0..count], rows);
                         count = 0;
                     }
                 };
-                if (count > 0) try e.affine.decodeMany(e.stream, d.thn, d.xs, many[0..count], rows);
+                if (count > 0) try d.absorbKv(many[0..count], rows);
             }
+            @import("cuda_dtprof.zig").sub(e.d, e.stream, 4);
             for (d.w.layers, 0..) |l, i| {
                 const kabs = d.kabs + i * kv;
                 const vabs = d.vabs + i * kv;
                 if (!grouped and !grouped_live) try d.projAgain(l.k, d.thn, kabs, rows);
-                try d.normRope(kabs, l.k_norm, d.kn, rows, c.kv_heads, start);
                 if (!grouped and !grouped_live) try d.projAgain(l.v, d.thn, vabs, rows);
-                try e.runAfter(d.fns.ring_put, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ d.kn, vabs, d.ringK(ctx, i), d.ringV(ctx, i), @as(c_int, @intCast(c.kvWidth())), @as(c_longlong, @intCast(start)), @as(c_int, @intCast(c.ringRows())) });
+                try d.absorbRing(ctx, i, kabs, vabs, rows, start, 0);
             }
+            @import("cuda_dtprof.zig").sub(e.d, e.stream, 5);
             start += rows;
             n -= rows;
             ctx.end = start;
         }
         if (ctx.end > c.window and ctx.begin < ctx.end - c.window) ctx.begin = ctx.end - c.window;
+    }
+
+    /// TF_DROUND: absorbRows' kernels over all `rows` rows of a verified window, the kept path's rows and count read
+    /// from the device round's state `st` (gather_rows_dev, ring_put_dev): each row's projections are the verify
+    /// tiles' per-row chains, so the path's rows get absorbRows' bits; the context's bounds are the host's to set.
+    pub fn absorbDev(d: *Draft, ctx: *Ctx, tap_ring: u64, start: u64, rows: usize, st: u64) !void {
+        const previous = d.projection_role;
+        defer d.projection_role = previous;
+        d.projection_role = .live;
+        const c = d.c;
+        const e = d.e;
+        if (rows == 0 or rows > engine.most_window) return error.BadDraftRows;
+        try e.runAfter(d.fns.gather_rows_dev, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ tap_ring, @as(c_int, engine.tap_rows), @as(c_longlong, @intCast(start)), st, @as(c_int, @intCast(c.n_taps * c.hidden)), d.taps_in });
+        try d.proj(d.w.fc, d.taps_in, d.th, rows);
+        if (platform.c.getenv("TF_FC_CHECK") != null) try d.fcCheck(rows);
+        const kv = rows * c.kvWidth() * 2;
+        try e.runAfter(e.fns.norm, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ d.th, @as(u64, 0), d.w.hidden_norm, d.thn, d.c.eps, @as(c_int, @intCast(d.c.hidden)), @as(u64, 0), d.xs });
+        const grouped_live = liveGroups() and rows <= 16;
+        if (grouped_live) {
+            const A = cuda.qlinear.Affine4Kernels;
+            var many: [A.segs_max]A.Out = undefined;
+            var count: usize = 0;
+            for (d.w.layers, 0..) |l, i| for ([2]cuda.qlinear.Affine4{ l.k, l.v }, [2]u64{ d.kabs + i * kv, d.vabs + i * kv }) |weight, out| {
+                many[count] = .{ .q = weight, .out = out };
+                count += 1;
+                if (count == many.len) {
+                    try d.absorbKv(many[0..count], rows);
+                    count = 0;
+                }
+            };
+            if (count > 0) try d.absorbKv(many[0..count], rows);
+        }
+        for (d.w.layers, 0..) |l, i| {
+            const kabs = d.kabs + i * kv;
+            const vabs = d.vabs + i * kv;
+            if (!grouped_live) try d.projAgain(l.k, d.thn, kabs, rows);
+            if (!grouped_live) try d.projAgain(l.v, d.thn, vabs, rows);
+            try d.absorbRing(ctx, i, kabs, vabs, rows, start, st);
+        }
+    }
+
+    /// Absorb-only alternatives; reference checks reuse kn (no extra device storage).
+    fn absorbKv(d: *Draft, outs: []const cuda.qlinear.Affine4Kernels.Out, rows: usize) !void {
+        const A = cuda.qlinear.Affine4Kernels;
+        if (A.absorbL2Stages("TF_KV_L2")) |st| {
+            var coded = true;
+            for (outs) |o| coded = coded and d.e.affine.coded(o.q);
+            if (coded) try d.e.affine.absorbL2(d.e.stream, d.thn, d.xs, outs, rows, st) else try d.e.affine.decodeMany(d.e.stream, d.thn, d.xs, outs, rows);
+        } else try d.e.affine.decodeMany(d.e.stream, d.thn, d.xs, outs, rows);
+        if (platform.c.getenv("TF_KV_CHECK") != null) for (outs) |o| {
+            try d.projAgain(o.q, d.thn, d.kn, rows);
+            try d.checkBytes("kvcheck", o.out, d.kn, rows * o.q.n * 2);
+        };
+    }
+
+    fn checkBytes(d: *Draft, tag: []const u8, got: u64, ref: u64, nbytes: usize) !void {
+        try d.e.stream.synchronize();
+        const a = try d.gpa.alloc(u8, nbytes);
+        defer d.gpa.free(a);
+        const b = try d.gpa.alloc(u8, nbytes);
+        defer d.gpa.free(b);
+        try d.e.d.check(d.e.d.api.cuMemcpyDtoH_v2(a.ptr, got, nbytes), "cuMemcpyDtoH");
+        try d.e.d.check(d.e.d.api.cuMemcpyDtoH_v2(b.ptr, ref, nbytes), "cuMemcpyDtoH");
+        const same = std.mem.eql(u8, a, b);
+        std.debug.print("[{s}] {d} bytes: {s}\n", .{ tag, nbytes, if (same) "same" else "DIFFER" });
+        if (!same) return error.AbsorbBytesDiffer;
+    }
+
+    fn originalRing(d: *Draft, ctx: *Ctx, i: usize, k: u64, v: u64, rows: usize, start: u64, st: u64) !void {
+        try d.normRope(k, d.w.layers[i].k_norm, d.kn, rows, d.c.kv_heads, start);
+        if (st == 0) {
+            try d.e.runAfter(d.fns.ring_put, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ d.kn, v, d.ringK(ctx, i), d.ringV(ctx, i), @as(c_int, @intCast(d.c.kvWidth())), @as(c_longlong, @intCast(start)), @as(c_int, @intCast(d.c.ringRows())) });
+        } else try d.e.runAfter(d.fns.ring_put_dev, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ d.kn, v, d.ringK(ctx, i), d.ringV(ctx, i), @as(c_int, @intCast(d.c.kvWidth())), @as(c_longlong, @intCast(start)), @as(c_int, @intCast(d.c.ringRows())), st });
+    }
+
+    fn absorbRing(d: *Draft, ctx: *Ctx, i: usize, k: u64, v: u64, rows: usize, start: u64, st: u64) !void {
+        const enabled = if (platform.c.getenv("TF_ABSORB_FUSE")) |v_| std.mem.eql(u8, std.mem.span(v_), "1") else false;
+        if (!enabled) return d.originalRing(ctx, i, k, v, rows, start, st);
+        try d.e.runAfter(d.fns.norm_rope_ring, .{ rows * d.c.kv_heads, 1, 1 }, .{ 32, 1, 1 }, .{ k, d.w.layers[i].k_norm, v, d.ringK(ctx, i), d.ringV(ctx, i), @as(c_int, @intCast(d.c.kv_heads)), @as(c_int, @intCast(d.c.kvWidth())), @as(c_longlong, @intCast(start)), d.c.eps, d.c.theta, @as(c_int, @intCast(d.c.ringRows())), st });
+        if (platform.c.getenv("TF_GLUE_CHECK") == null) return;
+        try d.e.stream.synchronize();
+        var n: u32 = @intCast(rows);
+        if (st != 0) try d.e.d.check(d.e.d.api.cuMemcpyDtoH_v2(&n, st, 4), "cuMemcpyDtoH");
+        const row_bytes = d.c.kvWidth() * 2;
+        const nbytes = 2 * n * row_bytes;
+        const a = try d.gpa.alloc(u8, nbytes);
+        defer d.gpa.free(a);
+        const b = try d.gpa.alloc(u8, nbytes);
+        defer d.gpa.free(b);
+        for ([_]u64{ d.ringK(ctx, i), d.ringV(ctx, i) }, 0..) |ring, which| for (0..n) |r| {
+            const off = (which * n + r) * row_bytes;
+            try d.e.d.check(d.e.d.api.cuMemcpyDtoH_v2(a[off..].ptr, ring + ((start + r) % d.c.ringRows()) * row_bytes, row_bytes), "cuMemcpyDtoH");
+        };
+        try d.originalRing(ctx, i, k, v, rows, start, st);
+        try d.e.stream.synchronize();
+        for ([_]u64{ d.ringK(ctx, i), d.ringV(ctx, i) }, 0..) |ring, which| for (0..n) |r| {
+            const off = (which * n + r) * row_bytes;
+            try d.e.d.check(d.e.d.api.cuMemcpyDtoH_v2(b[off..].ptr, ring + ((start + r) % d.c.ringRows()) * row_bytes, row_bytes), "cuMemcpyDtoH");
+        };
+        const same = std.mem.eql(u8, a, b);
+        std.debug.print("[gluecheck] layer {d} rows {d}: {s}\n", .{ i, n, if (same) "same" else "DIFFER" });
+        if (!same) return error.AbsorbBytesDiffer;
+    }
+
+    /// Exercise both H60 wide tile sizes on real gathered prompt taps, without changing a window or tree.
+    /// Reuse thn/xs; the subsequent hidden norm overwrites both before normal absorb consumes them.
+    fn h60Check(d: *Draft) !void {
+        const e = d.e;
+        if (e.affine.wide64_deep_fn == null or e.affine.wide128_deep_fn == null) return error.H60KernelMissing;
+        const saved = e.affine.wide_deep_kernel;
+        defer e.affine.wide_deep_kernel = saved;
+        try e.runAfter(e.fns.sums, .{ 128, (d.w.fc.k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ d.taps_in, d.xs, @as(c_int, @intCast(d.w.fc.k)), @as(u64, 0) });
+        for ([_]usize{ 64, 128 }) |rows| {
+            const nbytes = rows * d.c.hidden * 2;
+            const a = try d.gpa.alloc(u8, nbytes);
+            defer d.gpa.free(a);
+            const b = try d.gpa.alloc(u8, nbytes);
+            defer d.gpa.free(b);
+            e.affine.wide_deep_kernel = true;
+            try e.affine.verify(e.stream, d.taps_in, d.xs, d.w.fc, d.thn, rows);
+            try e.stream.synchronize();
+            try e.d.check(e.d.api.cuMemcpyDtoH_v2(a.ptr, d.thn, nbytes), "cuMemcpyDtoH");
+            e.affine.wide_deep_kernel = false;
+            try e.affine.verify(e.stream, d.taps_in, d.xs, d.w.fc, d.thn, rows);
+            try e.stream.synchronize();
+            try e.d.check(e.d.api.cuMemcpyDtoH_v2(b.ptr, d.thn, nbytes), "cuMemcpyDtoH");
+            const same = std.mem.eql(u8, a, b);
+            std.debug.print("[h60check] rows {d} bytes {d}: {s}\n", .{ rows, nbytes, if (same) "same" else "DIFFER" });
+            if (!same) return error.AbsorbBytesDiffer;
+        }
+    }
+
+    /// TF_FC_CHECK: the fc just run (TF_FC_STAGES) against decode()'s default tile, every bit of every row.
+    fn fcCheck(d: *Draft, rows: usize) !void {
+        const S = struct {
+            var n: usize = 0;
+            var bad: usize = 0;
+        };
+        const e = d.e;
+        const nbytes = rows * d.c.hidden * 2;
+        cuda.qlinear.Affine4Kernels.fc_default = true;
+        defer cuda.qlinear.Affine4Kernels.fc_default = false;
+        try d.proj(d.w.fc, d.taps_in, d.thn, rows);
+        try e.stream.synchronize();
+        const a = try d.gpa.alloc(u8, nbytes);
+        defer d.gpa.free(a);
+        const b = try d.gpa.alloc(u8, nbytes);
+        defer d.gpa.free(b);
+        try e.d.check(e.d.api.cuMemcpyDtoH_v2(a.ptr, d.th, nbytes), "cuMemcpyDtoH");
+        try e.d.check(e.d.api.cuMemcpyDtoH_v2(b.ptr, d.thn, nbytes), "cuMemcpyDtoH");
+        S.n += 1;
+        if (!std.mem.eql(u8, a, b)) S.bad += 1;
+        if (S.bad != 0) return error.AbsorbBytesDiffer;
+        std.debug.print("[fccheck] call {d} rows {d}: {s} | mismatching calls {d}\n", .{ S.n, rows, if (std.mem.eql(u8, a, b)) "same" else "DIFFER", S.bad });
+    }
+
+    pub fn ringKPub(d: *Draft, ctx: *Ctx, layer: usize) u64 {
+        return d.ringK(ctx, layer);
+    }
+    pub fn ringVPub(d: *Draft, ctx: *Ctx, layer: usize) u64 {
+        return d.ringV(ctx, layer);
     }
 
     /// A warmup or standalone hold goes through the same batched frame as shared lane holds.
@@ -428,7 +593,38 @@ pub const Draft = struct {
         try frame.forward(d, &.{item}, &.{ctx});
     }
 
-    fn candidates(d: *const Draft, rows: usize) tree.Candidates {
+    /// TF_TREE_TRUST / TF_TREE_DEPTH_LAM: the offline search's winner knobs. V3 default: trust 1.0 (R4's
+    /// landing-chance tree weighting on with no env set); TF_TREE_TRUST=0 restores the crown-identical tree.
+    fn treeTune(l: *const tree.Landing, sampled: bool) tree.Tune {
+        const S = struct {
+            var trust: ?f64 = null;
+            var lam: ?f64 = null;
+        };
+        // default 0 (2026-11-04 trust3: the intended weighting is 1-5% slower on g1/g3/g2/g5; the dangling-context
+        // builds behaved like 0); TF_TREE_TRUST=1 restores the weighting
+        if (S.trust == null) S.trust = if (platform.c.getenv("TF_TREE_TRUST")) |v| std.fmt.parseFloat(f64, std.mem.span(v)) catch 0 else 0;
+        if (S.lam == null) S.lam = if (platform.c.getenv("TF_TREE_DEPTH_LAM")) |v| std.fmt.parseFloat(f64, std.mem.span(v)) catch 0 else 0;
+        const tc = tree.TrustCtx{ .l = l, .sampled = sampled };
+        return .{ .trust = S.trust.?, .lam = S.lam.?, .ctx = &tc, .chance_fn = if (S.trust.? > 0) tree.landingChance else null };
+    }
+
+    /// grow() reads the Landing table through a context that outlives the call (default). TF_TRUST_FIX=0 restores
+    /// the original call, whose context points into treeTune's returned frame (whatever that stack slot then holds).
+    pub fn trustFix() bool {
+        const S = struct {
+            var on: ?bool = null;
+        };
+        if (S.on == null) S.on = if (platform.c.getenv("TF_TRUST_FIX")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+        return S.on.?;
+    }
+
+    /// treeTune's trust and depth weight (cuda_dtree.zig passes them to the device tree).
+    pub fn tuneValues(d: *const Draft) [2]f64 {
+        const t = treeTune(&d.landing, false);
+        return .{ t.trust, t.lam };
+    }
+
+    pub fn candidates(d: *const Draft, rows: usize) tree.Candidates {
         const base = d.selection_base;
         return .{ .words = d.staged.bytes[words_at + base * lp_words * 4 ..][0 .. rows * lp_words * 4], .projected = d.staged.bytes[hp_at + base * d.c.rank * 2 ..][0 .. rows * d.c.rank * 2], .topk = d.c.topk, .rank = d.c.rank, .predecessor = d.w.predecessor, .successor = d.w.successor, .sampling = d.drawn.sampling, .position = d.drawn.position };
     }
@@ -446,7 +642,6 @@ pub const Draft = struct {
     pub fn selectHold(d: *Draft, ctx: *Ctx, it: dr.Hold) !void {
         const rows = d.c.block - 1;
         ctx.grown = 0;
-        ctx.retrieved = @splat(false);
         // a sampled hold's candidates ranked as its target draw ranks them (its seed, each draft's position)
         d.drawn = .{ .sampling = it.sampling, .position = it.position };
         defer d.drawn = .{};
@@ -455,8 +650,14 @@ pub const Draft = struct {
         if (limit > 0) {
             // the whole budget whenever drafts are asked: the block's forward costs the same at any depth
             const n = if (it.depth == 0) 0 else limit;
-            ctx.grown = tree.grow(d.candidates(rows), it.pending, rows, n, &ctx.held, &ctx.parents, &ctx.own);
-            var history_selected = false;
+            if (@import("cuda_dtree.zig").take(ctx, n)) return;
+            if (trustFix()) {
+                // the trust context lives in this frame (TF_TRUST_FIX=0: the original call below), as long as grow() reads it
+                const tc = tree.TrustCtx{ .l = &d.landing, .sampled = it.sampling != null };
+                var tune = treeTune(&d.landing, it.sampling != null);
+                tune.ctx = &tc;
+                ctx.grown = tree.grow(d.candidates(rows), it.pending, rows, n, &ctx.held, &ctx.parents, &ctx.own, tune);
+            } else ctx.grown = tree.grow(d.candidates(rows), it.pending, rows, n, &ctx.held, &ctx.parents, &ctx.own, treeTune(&d.landing, it.sampling != null));
             if (n >= rows and it.tokens.len >= 4) {
                 var ch: [engine.most_window]u32 = undefined;
                 tree.chain(d.candidates(rows), it.pending, ch[0..rows]);
@@ -487,12 +688,6 @@ pub const Draft = struct {
                         ctx.own[r] = 0.0;
                     }
                     ctx.grown = copy_rows;
-                    history_selected = true;
-                }
-            }
-            if (!history_selected and it.sampling == null) {
-                if (history_branch.graft(it.tokens, it.pending, ctx.held[0..ctx.grown], ctx.parents[0..ctx.grown], ctx.own[0..ctx.grown])) |retained| {
-                    @memset(ctx.retrieved[retained..ctx.grown], true);
                 }
             }
             ctx.held_n = ctx.grown;
@@ -542,26 +737,27 @@ pub const Draft = struct {
         const d = cast(p);
         const t0 = std.Io.Clock.awake.now(d.io);
         defer timing("absorb", d.io, t0);
+        @import("cuda_dtprof.zig").mark(d.e.d, d.e.stream, .absorb_entry);
+        defer @import("cuda_dtprof.zig").mark(d.e.d, d.e.stream, .absorb_exit);
         for (items) |it| {
             const ctx = d.streams.get(it.stream) orelse return error.UnknownStream;
             if (it.features.space != .device or it.features.dtype != .bf16) return error.UnsupportedFeatures;
-            if (it.offered > 0 and ctx.grown > 0 and ctx.own[0] < 0) {
+            if (it.offered > 0 and ctx.grown > 0) {
                 var prefix: [engine.most_window]u32 = undefined;
                 for (prefix[0..@min(it.follow.len, prefix.len)], 0..) |*x, i| x.* = @intCast(i);
                 const kept = it.rows orelse prefix[0..@min(it.follow.len, prefix.len)];
-                const offered = @min(it.offered, ctx.grown);
-                for (ctx.parents[0..offered], ctx.own[0..offered], ctx.retrieved[0..offered], 0..) |parent, own, retrieved, i| {
-                    if (retrieved) continue;
-                    const parent_row: u32 = if (parent < 0) 0 else @intCast(parent + 1);
-                    if (std.mem.indexOfScalar(u32, kept, parent_row) == null) continue;
-                    d.landing.observe(it.stream.sampling != null, own, std.mem.indexOfScalar(u32, kept, @intCast(i + 1)) != null);
-                }
+                if (tree.r4log()) tree.dumpTree(ctx.parents[0..ctx.grown], ctx.own[0..ctx.grown], ctx.held[0..ctx.grown], it.offered, kept, it.stream.sampling != null);
+                if (ctx.own[0] < 0) d.landing.observeTree(it.stream.sampling != null, ctx.parents[0..ctx.grown], ctx.own[0..ctx.grown], it.offered, kept);
             }
             ctx.grown = 0;
             // the target's features: its ring, `offset` the first row's position (cuda_native.zig's featuresFn)
+            const dround = @import("cuda_dround.zig");
+            dround.drafter = d;
+            if (dround.takeAbsorb(d, ctx, it)) continue;
             if (it.rows) |rs| {
                 try d.absorb(ctx, it.features.buffer, it.features.offset, rs.len, rs, it.prompt);
             } else try d.absorb(ctx, it.features.buffer, it.features.offset, it.features.rows, null, it.prompt);
+            dround.afterAbsorb(d, ctx);
         }
     }
 
@@ -576,7 +772,11 @@ pub const Draft = struct {
             ctx.* = d.streams.get(it.stream) orelse return error.UnknownStream;
             frame.scan(ctx.*, it.tokens);
         }
+        const dround = @import("cuda_dround.zig");
+        dround.drafter = d;
+        if (try dround.takeFrame(d, items, contexts[0..items.len])) return;
         try frame.forward(d, items, contexts[0..items.len]);
+        dround.afterFrame(d, contexts[0]);
     }
 
     fn heldFn(p: *anyopaque, streams: []const *Stream, out: []const []u32) anyerror!void {
@@ -607,8 +807,27 @@ pub const Draft = struct {
             const step = if (own >= 0) 0.99 else d.landing.chance(sampled, own);
             o.* = step * (if (parent >= 0) out[@intCast(parent)] else 1);
         }
+        // the gate on a wide window: a grown node past the 16-row band (node 15 on, row 17 on) counts its chance times
+        // TF_TREE_GATE (the allocator then widens the window only when the discounted tokens pay the measured 32-row
+        // cost); copied rows (own 0) keep theirs. Only the verified prefix changes, never the drafted tokens.
+        const gate = treeGate();
+        if (gate != 1.0 and out.len > gate_from) for (out[gate_from..], ctx.own[gate_from..out.len]) |*o, own| {
+            if (own < 0) o.* *= gate;
+        };
         return true;
     }
+
+    const gate_from = 15;
+
+    /// TF_TREE_GATE: the discount on a grown node's chance past the 16-row band (1: none).
+    fn treeGate() f64 {
+        const S = struct {
+            var v: ?f64 = null;
+        };
+        if (S.v == null) S.v = if (platform.c.getenv("TF_TREE_GATE")) |v| std.fmt.parseFloat(f64, std.mem.span(v)) catch default_gate else default_gate;
+        return S.v.?;
+    }
+    const default_gate = 1.0;
 
     fn releaseFn(p: *anyopaque, s: *Stream) void {
         const d = cast(p);
