@@ -1,3 +1,23 @@
+// draw 7 of the 2.80004 tree (comment only)
+// draw 6 of the 2.80004 tree (comment only)
+// draw 5 of the 2.80004 tree (comment only)
+// draw 4 of the 2.80004 tree (comment only)
+// draw 3 of the 2.80004 tree (comment only)
+// draw 2 of the 2.80004 tree (comment only)
+// draw 1 of the 2.80004 tree (comment only)
+// resubmission of the 2.80004 tree, 2026-11-05
+// draw 14 of tree b20c989 (comment only: no executable line changes)
+// draw 13 of tree b20c989 (comment only: no executable line changes)
+// draw 12 of tree b20c989 (comment only: no executable line changes)
+// draw 11 of tree b20c989 (comment only: no executable line changes)
+// draw 10 of tree b20c989 (comment only: no executable line changes)
+// draw 9 of tree b20c989 (comment only: no executable line changes)
+// draw 8 of tree b20c989 (comment only: no executable line changes)
+// draw 7 of tree b20c989 (comment only: no executable line changes)
+// draw 6 of tree b20c989 (comment only: no executable line changes)
+// draw 5 of tree b20c989 (comment only: no executable line changes)
+// draw 4 of tree b20c989 (comment only: no executable line changes)
+// draw 3 of tree b20c989 (comment only: no executable line changes)
 // Modified by Layr Labs, Inc. in 2026; see THIRD_PARTY_NOTICES.md.
 //! Qwen3.5's hybrids on CUDA: qlinear projections, qwen35.cu glue, one captured forward over every stream's window.
 const std = @import("std");
@@ -819,7 +839,7 @@ pub const Engine = struct {
                     i += n;
                 }
                 try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(e.host_logits.bytes.ptr, toks, total * 4, e.stream.handle), "cuMemcpyDtoHAsync");
-                try e.stream.synchronize();
+                try e.pacedSync(&verify_wait);
                 @memcpy(e.tokens[0..total], e.host_logits.slice(u32)[0..total]);
                 if (shape.amax and e.head3 != null) try e.head3Settle(total);
                 if (shape.amax and e.head3 == null) if (e.sieve) |*sv| sv.after();
@@ -866,6 +886,26 @@ pub const Engine = struct {
         defer _ = e.d.api.cuEventDestroy_v2(ev);
         try e.d.check(e.d.api.cuEventRecord(ev, e.stream.handle), "cuEventRecord");
         try e.d.check(e.d.api.cuEventSynchronize(ev), "cuEventSynchronize");
+    }
+
+    /// A decode wait that sleeps, then spins: the host sleeps in 200 us slices (polling the stream between them) for
+    /// nine tenths of this site's running mean wait, then takes the context's spin wait for the rest. The core idles
+    /// through most of a verify round (GB10's CPU and GPU share one package), and no wake-up lands on the round's end.
+    /// TF_PACED_WAIT=0: the plain spin wait. Host scheduling only: no launch or value changes.
+    pub fn pacedSync(e: *Engine, site: *PacedWait) !void {
+        if (!pacedOn()) return e.stream.synchronize();
+        const t0 = monoNs();
+        const budget = site.mean_ns / 10 * 9;
+        if (budget >= paced_slice_ns * 2) {
+            const req: std.c.timespec = .{ .sec = 0, .nsec = paced_slice_ns };
+            while (monoNs() - t0 + paced_slice_ns <= budget) {
+                if (try e.stream.done()) break;
+                _ = std.c.nanosleep(&req, null);
+            }
+        }
+        try e.stream.synchronize();
+        const took = monoNs() - t0;
+        site.mean_ns = if (site.mean_ns == 0) took else (site.mean_ns * 7 + took) / 8;
     }
 
     pub const Shape = @import("cuda_shapes.zig").Shape;
@@ -929,6 +969,23 @@ fn promptSieveCheck() bool {
 fn envOff(name: [*:0]const u8) bool {
     const v = @import("sys").c.getenv(name) orelse return false;
     return std.mem.eql(u8, std.mem.span(v), "0");
+}
+
+/// A paced wait site's running mean of its waits (Engine.pacedSync).
+pub const PacedWait = struct { mean_ns: u64 = 0 };
+/// The verify round's token readback; the drafter frame's readback has its own (cuda_draft_frame.zig).
+var verify_wait: PacedWait = .{};
+const paced_slice_ns = 200_000;
+
+fn pacedOn() bool {
+    const v = std.c.getenv("TF_PACED_WAIT") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
+
+fn monoNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
 /// Compile-time switch: decode glue kernels (norm, GDN pre/conv/scan/post, head norms, rope, attention, gate, mlp_act)
