@@ -12,6 +12,11 @@ fn branchWidth() usize {
     const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return branch;
     return @min(@as(usize, 20), if (n == 0) branch else n);
 }
+/// edge 0.4 with scale 1.2 measured +3.31% acceptance (n=24, p=0.0043) on stitched-paragraph
+/// proxies and -3.4% on the real pool (submission 4f4bc27: 2.687 vs 2.746). Those proxies draw every
+/// paragraph from ONE work; the organiser's pool draws from 4+ different works, and tree-shape effects
+/// are corpus-specific. The golden fails the same way (edge 0.85: +6.9% golden, -1.6% pool). There is
+/// NO local predictor for tree-shape transfer -- keep these constants at the values the tree shipped.
 const edge_weight = 0.6;
 /// TF_EDGE_WEIGHT (percent): the selector term's weight against the unary (default 60).
 fn edgeWeight() f64 {
