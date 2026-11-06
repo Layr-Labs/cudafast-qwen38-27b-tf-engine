@@ -56,16 +56,6 @@ fn take(e: *Engine, len: usize) !Recycled {
     return .{ .buffer = try DeviceBuffer.alloc(e.d, len) };
 }
 
-/// `take` for a window's keys and values: with no pooled block of exactly `len` bytes, the pooled block of a whole
-/// `whole`-byte window instead of an allocation inside a timed phase. Rows sit at offsets of the cache's own cap, so only
-/// the first `len` bytes are read or written; the block is cleared at phase close as any other.
-fn takeWithin(e: *Engine, len: usize, whole: usize) !Recycled {
-    pool_of = e;
-    for (e.blocks.items, 0..) |b, i| if (b.buffer.len == len) return e.blocks.swapRemove(i);
-    if (whole > len) for (e.blocks.items, 0..) |b, i| if (b.buffer.len == whole) return e.blocks.swapRemove(i);
-    return .{ .buffer = try DeviceBuffer.alloc(e.d, len) };
-}
-
 /// The engine whose pool `give` fills: the one that allocated through `take` (one engine a process).
 var pool_of: ?*Engine = null;
 
@@ -198,15 +188,9 @@ pub const Cache = struct {
 
     /// `init`, with the drafter's tap ring only when `taps` (a stream that drafts; the forwards skip a missing ring).
     pub fn initFor(gpa: std.mem.Allocator, e: *Engine, cap: usize, taps: bool) !Cache {
-        return initWithin(gpa, e, cap, cap, taps);
-    }
-
-    /// `initFor`, whose keys and values may sit at the start of a pooled `whole`-position window's block.
-    pub fn initWithin(gpa: std.mem.Allocator, e: *Engine, cap: usize, whole: usize, taps: bool) !Cache {
         const test_pages = try pageTest();
         const rows = try cacheRows(cap, test_pages);
-        const row_bytes = e.g.kvBytes(1, e.kv8);
-        var kv = (try takeWithin(e, try std.math.mul(usize, row_bytes, rows), try std.math.mul(usize, row_bytes, whole))).buffer;
+        var kv = (try take(e, try std.math.mul(usize, e.g.kvBytes(1, e.kv8), rows))).buffer;
         var own = true;
         errdefer if (own) kv.free();
         var paged: ?Paged = null;
