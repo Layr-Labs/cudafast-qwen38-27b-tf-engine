@@ -90,6 +90,27 @@ __device__ __forceinline__ T* plain(T* p) {
 }
 __device__ __forceinline__ void keep4(const uint4& v) { asm volatile("" ::"r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)); }
 
+// An L2 warm-up of the next weight stream (cache state only; no value changes): the first `take` bytes of each of `tiles`
+// tiles of `tile_bytes` at w, issued as bulk L2 prefetches by the grid's first blocks while a latency-bound kernel runs.
+__device__ __forceinline__ void warm_tiles(const void* w, int tile_bytes, int tiles, int take) {
+#if __CUDA_ARCH__ >= 900
+    if (w == nullptr || take <= 0) return;
+    constexpr int CH = 16384;
+    const int nb = gridDim.x * gridDim.y * gridDim.z;
+    const int b = blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
+    const int issuers = min(nb, 40);
+    if (b >= issuers) return;
+    const int per = (take + CH - 1) / CH;
+    for (int i = threadIdx.x + blockDim.x * threadIdx.y; ; i += blockDim.x * blockDim.y) {
+        const int t = b + issuers * (i / per), c = i % per;
+        if (t >= tiles) break;
+        const int sz = min(CH, take - c * CH);
+        const char* a = reinterpret_cast<const char*>(w) + (size_t)t * tile_bytes + (size_t)c * CH;
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(a), "r"(sz) : "memory");
+    }
+#endif
+}
+
 // h = bf16(h + r) (r may be null), x = bf16(w * (h * inv)), XS (may be null) x's group sums; D 256k up to 8192.
 extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __restrict__ H0, const __nv_bfloat16* __restrict__ R0,
                                                                const __nv_bfloat16* __restrict__ W, __nv_bfloat16* __restrict__ X0, float eps, int D,
@@ -131,6 +152,135 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __r
                 const uint4 rw = *reinterpret_cast<const uint4*>(R + row * D + d); // the residual at use: a shorter live range
                 __nv_bfloat16* hb = reinterpret_cast<__nv_bfloat16*>(&hw[j]);
                 const __nv_bfloat16* rb = reinterpret_cast<const __nv_bfloat16*>(&rw);
+#pragma unroll
+                for (int k = 0; k < 8; k++) hb[k] = __float2bfloat16_rn(bf(hb[k]) + bf(rb[k]));
+                *reinterpret_cast<uint4*>(H + row * D + d) = hw[j];
+            }
+            *reinterpret_cast<uint4*>(xrow + d) = hw[j];
+        }
+        __syncthreads();
+        float sq = 0.0f;
+        const uint2* mine = reinterpret_cast<const uint2*>(xrow) + t * (E / 4);
+#pragma unroll
+        for (int i = 0; i < MAXE / 4; i++) {
+            if (4 * i >= E) break;
+            const uint2 v = mine[i];
+            const __nv_bfloat16* vb = reinterpret_cast<const __nv_bfloat16*>(&v);
+#pragma unroll
+            for (int k = 0; k < 4; k++) {
+                const float h = bf(vb[k]);
+                sq = fmaf(h, h, sq);
+            }
+        }
+        sq = warp_sum(sq);
+        if ((t & 31) == 0) red[t >> 5] = sq;
+        __syncthreads();
+        float sum = 0.0f;
+        for (int i = 0; i < 8; i++) sum += red[i];
+        const float scale = rsqrtf(sum / (float)D + eps);
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const int d = (t + 256 * j) * 8;
+            if (d >= D) break;
+            const __nv_bfloat16* hb = reinterpret_cast<const __nv_bfloat16*>(&hw[j]);
+            const __nv_bfloat16* wb = reinterpret_cast<const __nv_bfloat16*>(&wv[j]);
+            uint4 xw;
+            __nv_bfloat16* xb = reinterpret_cast<__nv_bfloat16*>(&xw);
+#pragma unroll
+            for (int k = 0; k < 8; k++) xb[k] = __float2bfloat16_rn(bf(wb[k]) * (bf(hb[k]) * scale));
+            *reinterpret_cast<uint4*>(X + row * D + d) = xw;
+            *reinterpret_cast<uint4*>(xrow + d) = xw;
+        }
+        if (XS == nullptr) return;
+        __syncthreads();
+        for (int g = t; g < D / 64; g += blockDim.x) XS[row * (D / 64) + g] = group_sum(xrow + g * 64);
+        return;
+    }
+    if (past_rows(P, blockIdx.x)) return;
+    const size_t row = blockIdx.x;
+    // E not a multiple of 4: a thread's entries one at a time
+    float hv[MAXE];
+    float ss = 0.0f;
+#pragma unroll
+    for (int i = 0; i < MAXE; i++) {
+        if (i >= E) break;
+        const size_t at = row * D + t * E + i;
+        float h = bf(H[at]);
+        if (R != nullptr) {
+            const __nv_bfloat16 hb = __float2bfloat16_rn(h + bf(R[at]));
+            H[at] = hb;
+            h = bf(hb);
+        }
+        hv[i] = h;
+        ss = fmaf(h, h, ss);
+    }
+    ss = warp_sum(ss);
+    if ((t & 31) == 0) red[t >> 5] = ss;
+    __syncthreads();
+    float total = 0.0f;
+    for (int i = 0; i < 8; i++) total += red[i];
+    const float inv = rsqrtf(total / (float)D + eps);
+#pragma unroll
+    for (int i = 0; i < MAXE; i++) {
+        if (i >= E) break;
+        const int d = t * E + i;
+        const __nv_bfloat16 x = __float2bfloat16_rn(bf(W[d]) * (hv[i] * inv));
+        X[row * D + d] = x;
+        xrow[d] = x;
+    }
+    if (XS == nullptr) return;
+    __syncthreads();
+    for (int g = t; g < D / 64; g += blockDim.x) XS[row * (D / 64) + g] = group_sum(xrow + g * 64);
+}
+
+// U3 escape (TF_NORM_U0): the c9fe646 baseline norm, the residual's uint4 loads held across the
+// past_rows early-return (a longer live range) instead of loaded at use; identical arithmetic.
+
+// h = bf16(h + r) (r may be null), x = bf16(w * (h * inv)), XS (may be null) x's group sums; D 256k up to 8192.
+extern "C" __global__ void __launch_bounds__(256) tf_q35_norm_u0(__nv_bfloat16* __restrict__ H0, const __nv_bfloat16* __restrict__ R0,
+                                                               const __nv_bfloat16* __restrict__ W, __nv_bfloat16* __restrict__ X0, float eps, int D,
+                                                               const int* __restrict__ P, float* __restrict__ XS0) {
+    constexpr int MAXE = 32;
+    __shared__ float red[8];
+    __shared__ __align__(16) __nv_bfloat16 xrow[8192];
+    release_next();
+    const int t = threadIdx.x;
+    const int E = D / 256;
+    // Immutable weights overlap the prior kernel; consumed row values remain behind its dependency wait.
+    uint4 wv[4];
+    if ((E & 3) == 0) {
+#pragma unroll
+        for (int j = 0; j < 4; j++)
+            if ((t + 256 * j) * 8 < D) wv[j] = *reinterpret_cast<const uint4*>(plain(W) + (t + 256 * j) * 8);
+#pragma unroll
+        for (int j = 0; j < 4; j++)
+            if ((t + 256 * j) * 8 < D) keep4(wv[j]);
+    }
+    await_prior();
+    __nv_bfloat16* H = after_wait(H0);
+    const __nv_bfloat16* R = after_wait(R0);
+    __nv_bfloat16* X = after_wait(X0);
+    float* XS = after_wait(XS0);
+    if ((E & 3) == 0) {
+        const size_t row = blockIdx.x;
+        uint4 hw[4], rw[4];
+#pragma unroll
+        for (int j = 0; j < 4; j++)
+            if ((t + 256 * j) * 8 < D) hw[j] = *reinterpret_cast<const uint4*>(H + row * D + (t + 256 * j) * 8);
+        if (R != nullptr) {
+#pragma unroll
+            for (int j = 0; j < 4; j++)
+                if ((t + 256 * j) * 8 < D) rw[j] = *reinterpret_cast<const uint4*>(R + row * D + (t + 256 * j) * 8);
+        }
+        if (past_rows(P, blockIdx.x)) return;
+        // h + r and w * (h * inv) move 8 entries a lane through xrow; the squares keep a thread's E entries in order
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const int d = (t + 256 * j) * 8;
+            if (d >= D) break;
+            if (R != nullptr) {
+                __nv_bfloat16* hb = reinterpret_cast<__nv_bfloat16*>(&hw[j]);
+                const __nv_bfloat16* rb = reinterpret_cast<const __nv_bfloat16*>(&rw[j]);
 #pragma unroll
                 for (int k = 0; k < 8; k++) hb[k] = __float2bfloat16_rn(bf(hb[k]) + bf(rb[k]));
                 *reinterpret_cast<uint4*>(H + row * D + d) = hw[j];
@@ -823,7 +973,7 @@ extern "C" __global__ void __launch_bounds__(32) tf_q35_attn_merge_gate(Geo geo,
 
 // tf_q35_head_norm of a (row, head) on threads 0-63, then tf_q35_rope's rotation of it: a query head's into Qn, a key
 // head's with its value into the cache slot. Grid (rows, query heads + key heads), HD threads.
-template <typename Store, bool EARLY = false>
+template <typename Store, bool EARLY = false, bool PAIRFOLD = true>
 __device__ __forceinline__ void norm_rope_rows(const Geo& geo, const __nv_bfloat16* __restrict__ QRAW, const __nv_bfloat16* __restrict__ KRAW,
                                                const __nv_bfloat16* __restrict__ WQ, const __nv_bfloat16* __restrict__ WK,
                                                __nv_bfloat16* __restrict__ Qn, const __nv_bfloat16* __restrict__ Vr, const Seg* __restrict__ segs,
@@ -865,11 +1015,18 @@ __device__ __forceinline__ void norm_rope_rows(const Geo& geo, const __nv_bfloat
     int pos[3];
     row_positions(sg, rowanc[m], m, M, pos);
     const int slot = sg.len + (int)m - sg.row0;
+    if (!PAIRFOLD) {  // TF_NORMROPE_U0: the baseline tail, a per-thread rotate of one output
+        if (query) Qn[(m * QH + head) * HD + t] = rotate(xs, t, pos);
+        else store(sg, head, slot, t, rotate(xs, t, pos), Vr[(m * KVH + head) * HD + t]);
+        return;
+    }
     auto put = [&](int d, __nv_bfloat16 y) {
         if (query) Qn[(m * QH + head) * HD + d] = y;
         else store(sg, head, slot, d, y, Vr[(m * KVH + head) * HD + d]);
     };
     if (t < 32) {
+        // one sincosf for the (t, t + 32) pair: rotate's d and d + 32 share i = t, so the same rope_coeff's
+        // angle, sn and cs; the products and the bf16 rounding are rotate's own, per output
         const float2 sc = rope_coeff(t, pos);
         const float a = bf(xs[t]), b = bf(xs[t + 32]);
         put(t, __float2bfloat16_rn(a * sc.y - b * sc.x));
@@ -896,6 +1053,24 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm_rope(Geo geo, cons
     norm_rope_rows<StoreBf16, true>(geo, after_wait(QRAW), after_wait(KRAW), WQ, WK, after_wait(Qn), after_wait(Vr), segs, rowseg, rowanc, P, M, eps, StoreBf16{layer, geo.kvh}, wv);
 }
 
+// U4 escape (TF_NORMROPE_U0): the c9fe646 baseline norm+rope tail, one rotate per thread, no pair fold.
+extern "C" __global__ void __launch_bounds__(256) tf_q35_norm_rope_u0(Geo geo, const __nv_bfloat16* __restrict__ QRAW, const __nv_bfloat16* __restrict__ KRAW,
+                                                                      const __nv_bfloat16* __restrict__ WQ, const __nv_bfloat16* __restrict__ WK,
+                                                                      __nv_bfloat16* __restrict__ Qn, const __nv_bfloat16* __restrict__ Vr,
+                                                                      const Seg* __restrict__ segs, const int* __restrict__ rowseg,
+                                                                      const Ancestor* __restrict__ rowanc, int layer, const int* __restrict__ P,
+                                                                      const int* __restrict__ M, float eps) {
+    release_next();
+    uint2 wv = make_uint2(0, 0);
+    if (threadIdx.x < 64) {
+        const __nv_bfloat16* W = blockIdx.y < (unsigned)geo.qh ? WQ : WK;
+        wv = *reinterpret_cast<const uint2*>(plain(W) + 4 * threadIdx.x);
+        asm volatile("" ::"r"(wv.x), "r"(wv.y));  // issued before the wait (keep4's rule)
+    }
+    await_prior();
+    norm_rope_rows<StoreBf16, true, false>(geo, after_wait(QRAW), after_wait(KRAW), WQ, WK, after_wait(Qn), after_wait(Vr), segs, rowseg, rowanc, P, M, eps, StoreBf16{layer, geo.kvh}, wv);
+}
+
 #include "qwen35_rows.cuh"
 #include "qwen35_slots.cuh"
 #include "qwen35_slots16.cuh"
@@ -906,9 +1081,11 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm_rope(Geo geo, cons
 extern "C" __global__ void __launch_bounds__(128) tf_q35_attn_partial(Geo geo, const __nv_bfloat16* __restrict__ Q0, const Seg* __restrict__ segs,
                                                                         const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
                                                                         const int* __restrict__ P, float scale,
-                                                                        float* __restrict__ PM0, float* __restrict__ PL0, float* __restrict__ PO0) {
+                                                                        float* __restrict__ PM0, float* __restrict__ PL0, float* __restrict__ PO0,
+                                                                        const void* pfw, int pft, int pfn, int pfb) {
     release_next();
     await_prior();
+    warm_tiles(plain(pfw), pft, pfn, pfb);
     const __nv_bfloat16* Q = after_wait(Q0);
     float* PM = after_wait(PM0);
     float* PL = after_wait(PL0);
