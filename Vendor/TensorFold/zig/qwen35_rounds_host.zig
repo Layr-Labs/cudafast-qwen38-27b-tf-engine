@@ -91,16 +91,16 @@ test "Verify width calibration: actual DeltaNet dispatch selects its register va
     e.fns.gdn_slots_16 = function(&d, 36);
     e.fns.gdn_slots16_3 = function(&d, 35);
     for ([_]u8{ 1, 2, 4, 8, 16 }) |slots| {
-        try e.deltaScan(true, slots, 1, 0);
+        try e.deltaScan(true, slots, 1, 0, null);
         try std.testing.expectEqual(@as(usize, 20 + slots), Capture.id);
         try std.testing.expectEqual(e.tables.ptr + q.round.steps_at, Capture.input);
         try std.testing.expectEqual(@as(u32, 128), Capture.threads);
     }
-    try e.deltaScan(false, 1, 1, 0);
+    try e.deltaScan(false, 1, 1, 0, null);
     try std.testing.expectEqual(@as(usize, 11), Capture.id);
     try std.testing.expectEqual(e.tables.ptr + q.round.rowpar_at, Capture.input);
-    try std.testing.expectError(error.InvalidGdnSlots, e.deltaScan(true, 3, 1, 0));
-    try e.deltaScan(true, 35, 1, 0);
+    try std.testing.expectError(error.InvalidGdnSlots, e.deltaScan(true, 3, 1, 0, null));
+    try e.deltaScan(true, 35, 1, 0, null);
     try std.testing.expectEqual(@as(usize, 35), Capture.id);
     try std.testing.expectEqual(@as(u32, 8), Capture.grid_y);
     try std.testing.expectEqual(e.tables.ptr + q.round.steps_at, Capture.input);
