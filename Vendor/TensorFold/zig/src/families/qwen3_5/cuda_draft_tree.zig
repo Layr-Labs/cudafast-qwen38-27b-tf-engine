@@ -1,35 +1,70 @@
+// draw 35
 //! A hold's drafts from its rows' candidates: a chain, the planner's lanes, or a best-first tree as the 27B engine's.
 const std = @import("std");
 const platform = @import("sys");
 const lanes = @import("lanes");
 const engine = @import("cuda_engine.zig");
 
-/// Children a node, the selector's weight, the softmax scale, and the nodes a tree takes by default.
-const branch = 12;
-/// TF_DRAFT_BRANCH: children a node opens (default 12).
-fn branchWidth() usize {
-    const v = platform.c.getenv("TF_DRAFT_BRANCH") orelse return branch;
-    const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return branch;
-    return @min(@as(usize, 20), if (n == 0) branch else n);
-}
-const edge_weight = 0.6;
-/// TF_EDGE_WEIGHT (percent): the selector term's weight against the unary (default 60).
-fn edgeWeight() f64 {
-    const v = platform.c.getenv("TF_EDGE_WEIGHT") orelse return edge_weight;
-    const pct = std.fmt.parseFloat(f64, std.mem.span(v)) catch return edge_weight;
-    return if (pct <= 0) edge_weight else pct / 100.0;
-}
-const scale = 1.5;
-/// TF_TREE_SCALE (percent): the row softmax's scale, which sets how a row's normaliser contrasts
-/// against the path cost (default 150).
-fn softScale() f64 {
-    const v = platform.c.getenv("TF_TREE_SCALE") orelse return scale;
-    const pct = std.fmt.parseFloat(f64, std.mem.span(v)) catch return scale;
-    return if (pct <= 0) scale else pct / 100.0;
-}
+/// Children a node at most, the selector's weight, the softmax scale, and the nodes a tree takes by default.
+/// Each is env-tunable once (errors fall back): TF_TREE_BRANCH clamped to 1..max_branch, TF_EDGE_WEIGHT,
+/// TF_SCALE, TF_NOISE_WEIGHT.
+const default_branch = 12;
+const max_branch = 24;
+const default_edge = 0.6;
+const default_scale = 1.5;
 /// A sampled stream's candidates carry the draw's own Gumbel noise at this weight (the 27B engine's draft_tree).
-const noise_weight = 0.7;
+const default_noise = 0.7;
 const default_nodes = 15;
+
+/// Children a node at most: TF_TREE_BRANCH, 1..max_branch (a node's row offers at most lp_top anyway).
+fn branchN() usize {
+    const S = struct {
+        var v: ?usize = null;
+    };
+    if (S.v == null) {
+        const n = if (platform.c.getenv("TF_TREE_BRANCH")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch default_branch else default_branch;
+        S.v = @min(@max(n, 1), max_branch);
+    }
+    return S.v.?;
+}
+
+/// The device tree's (cuda_dtree.zig) view of the env-tuned values, the same ones grow() reads.
+pub fn branchPub() usize {
+    return branchN();
+}
+pub fn edgeWeightPub() f64 {
+    return edgeWeight();
+}
+pub fn scalePub() f64 {
+    return scaleVal();
+}
+
+/// TF_EDGE_WEIGHT: the selector projection's weight in a candidate's score.
+fn edgeWeight() f64 {
+    const S = struct {
+        var v: ?f64 = null;
+    };
+    if (S.v == null) S.v = if (platform.c.getenv("TF_EDGE_WEIGHT")) |v| std.fmt.parseFloat(f64, std.mem.span(v)) catch default_edge else default_edge;
+    return S.v.?;
+}
+
+/// TF_SCALE: the softmax scale of a candidate's score.
+fn scaleVal() f64 {
+    const S = struct {
+        var v: ?f64 = null;
+    };
+    if (S.v == null) S.v = if (platform.c.getenv("TF_SCALE")) |v| std.fmt.parseFloat(f64, std.mem.span(v)) catch default_scale else default_scale;
+    return S.v.?;
+}
+
+/// TF_NOISE_WEIGHT: the draw's Gumbel noise weight in a sampled stream's candidates' scores.
+fn noiseWeight() f64 {
+    const S = struct {
+        var v: ?f64 = null;
+    };
+    if (S.v == null) S.v = if (platform.c.getenv("TF_NOISE_WEIGHT")) |v| std.fmt.parseFloat(f64, std.mem.span(v)) catch default_noise else default_noise;
+    return S.v.?;
+}
 const lp_top = 20;
 const lp_words = 3 + 2 * lp_top;
 
@@ -50,7 +85,132 @@ pub const Candidates = struct {
 fn drawn(c: Candidates, r: usize, token: u32, logit: f64) f64 {
     const s = c.sampling orelse return logit;
     const u = @min(lanes.gpu_rule.uniform24(s.seed, @intCast(c.position + r), token), @as(f32, @bitCast(@as(u32, 0x3F7FFFFF))));
-    return logit / @max(s.temperature, 1e-6) + noise_weight * -@log(-@log(@as(f64, u)));
+    return logit / @max(s.temperature, 1e-6) + noiseWeight() * -@log(-@log(@as(f64, u)));
+}
+
+/// TF_R4LOG=1: per-visit candidate-distribution telemetry on stderr (default off; offline tree search's data).
+pub fn r4log() bool {
+    const S = struct {
+        var on: ?bool = null;
+    };
+    if (S.on == null) S.on = platform.c.getenv("TF_R4LOG") != null;
+    return S.on.?;
+}
+
+/// One visit's row header, once per row per grow() sweep: the row's candidate ids and unary logits.
+var r4_seen: [fast_rows]bool = @splat(false);
+
+fn hexList(buf: []u8, i: *usize, first: bool, bits: u64) void {
+    const digits = "0123456789abcdef";
+    if (!first and i.* < buf.len) {
+        buf[i.*] = ',';
+        i.* += 1;
+    }
+    var tmp: [16]u8 = undefined;
+    var n: usize = 0;
+    var v = bits;
+    if (v == 0) {
+        tmp[0] = '0';
+        n = 1;
+    }
+    while (v > 0) : (v /= 16) {
+        tmp[n] = digits[@intCast(v % 16)];
+        n += 1;
+    }
+    var k: usize = 0;
+    while (k < n and i.* < buf.len) : (k += 1) {
+        buf[i.*] = tmp[n - 1 - k];
+        i.* += 1;
+    }
+}
+
+fn decList(buf: []u8, i: *usize, first: bool, v: i64) void {
+    var tmp: [20]u8 = undefined;
+    var n: usize = 0;
+    var x = v;
+    const neg = x < 0;
+    if (neg) x = -x;
+    if (x == 0) {
+        tmp[0] = '0';
+        n = 1;
+    }
+    while (x > 0) : (x = @divTrunc(x, 10)) {
+        tmp[n] = @intCast('0' + @as(u8, @intCast(@rem(x, 10))));
+        n += 1;
+    }
+    if (!first and i.* < buf.len) {
+        buf[i.*] = ',';
+        i.* += 1;
+    }
+    if (neg and i.* < buf.len) {
+        buf[i.*] = '-';
+        i.* += 1;
+    }
+    var k: usize = 0;
+    while (k < n and i.* < buf.len) : (k += 1) {
+        buf[i.*] = tmp[n - 1 - k];
+        i.* += 1;
+    }
+}
+
+/// R4R: a row's candidate ids and unary logits (the pred-independent halves of the scores).
+fn dumpRowBits(c: Candidates, r: usize) void {
+    const w = ids(c, r);
+    var buf: [1536]u8 = undefined;
+    var i: usize = 0;
+    const head = std.fmt.bufPrint(buf[i..], "R4R r={d} k={d} ids=", .{ r, c.topk }) catch return;
+    i += head.len;
+    for (w[2..][0..c.topk], 0..) |t, j| decList(&buf, &i, j == 0, t);
+    const mid = std.fmt.bufPrint(buf[i..], " u=", .{}) catch return;
+    i += mid.len;
+    for (w[2 + lp_top ..][0..c.topk], 0..) |u, j| {
+        const bits: u32 = @bitCast(u);
+        hexList(&buf, &i, j == 0, bits);
+    }
+    buf[i] = '\n';
+    i += 1;
+    std.debug.print("{s}", .{buf[0..i]});
+}
+
+/// R4V: one (row, pred) visit: the selector-edge vector before the weight, the final log-chances after.
+fn dumpVisitBits(c: Candidates, r: usize, pred: u32, edge: *const [lp_top]f64, out: *const [lp_top]f64) void {
+    if (!r4_seen[r]) {
+        r4_seen[r] = true;
+        dumpRowBits(c, r);
+    }
+    var buf: [2560]u8 = undefined;
+    var i: usize = 0;
+    const head = std.fmt.bufPrint(buf[i..], "R4V r={d} p={d} e=", .{ r, pred }) catch return;
+    i += head.len;
+    for (edge[0..c.topk], 0..) |v, j| hexList(&buf, &i, j == 0, @bitCast(v));
+    const mid = std.fmt.bufPrint(buf[i..], " l=", .{}) catch return;
+    i += mid.len;
+    for (out[0..c.topk], 0..) |v, j| hexList(&buf, &i, j == 0, @bitCast(v));
+    buf[i] = '\n';
+    i += 1;
+    std.debug.print("{s}", .{buf[0..i]});
+}
+
+/// R4T: a verified round's offered tree (parents in node order, own log-chances, tokens) and the rows it kept
+/// (row 0 is the pending token; node i sits at row i + 1). The offline tree search's outcome labels.
+pub fn dumpTree(parents: []const i32, own: []const f64, tokens: []const u32, offered: usize, kept: []const u32, sampled: bool) void {
+    var buf: [4096]u8 = undefined;
+    var i: usize = 0;
+    const head = std.fmt.bufPrint(buf[i..], "R4T n={d} off={d} sp={d} par=", .{ parents.len, offered, @intFromBool(sampled) }) catch return;
+    i += head.len;
+    for (parents, 0..) |p, j| decList(&buf, &i, j == 0, p);
+    const mid = std.fmt.bufPrint(buf[i..], " own=", .{}) catch return;
+    i += mid.len;
+    for (own, 0..) |o, j| hexList(&buf, &i, j == 0, @bitCast(o));
+    const mid2 = std.fmt.bufPrint(buf[i..], " tok=", .{}) catch return;
+    i += mid2.len;
+    for (tokens, 0..) |t, j| decList(&buf, &i, j == 0, t);
+    const mid3 = std.fmt.bufPrint(buf[i..], " kept=", .{}) catch return;
+    i += mid3.len;
+    for (kept, 0..) |k, j| decList(&buf, &i, j == 0, k);
+    buf[i] = '\n';
+    i += 1;
+    std.debug.print("{s}", .{buf[0..i]});
 }
 
 /// A grown tree's nodes at most: 0 when the drafter drafts chains and lane trees (TF_NO_TREES, TF_DRAFT_NODES=0).
@@ -206,13 +366,14 @@ fn chancesAfterFast(c: Candidates, r: usize, pred: u32, out: *[lp_top]f64) void 
     for (0..vec_n) |v| edge[v * lanes_f64 ..][0..lanes_f64].* = acc[v];
     var most: f64 = -std.math.inf(f64);
     for (0..c.topk) |j| {
-        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edgeWeight() * edge[j]) / softScale();
+        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edgeWeight() * edge[j]) / scaleVal();
         most = @max(most, out[j]);
     }
     var total: f64 = 0;
     for (out[0..c.topk]) |v| total += @exp(v - most);
     const log_total = most + @log(total);
     for (out[0..c.topk]) |*v| v.* -= log_total;
+    if (r4log()) dumpVisitBits(c, r, pred, &edge, out);
 }
 
 /// Row `r`'s candidates after `pred` as log-chances: softmax of (unary + edge x selector) / scale.
@@ -230,19 +391,40 @@ fn chancesAfter(c: Candidates, r: usize, pred: u32, out: *[lp_top]f64) void {
         for (edge[0..c.topk], succ[0..c.topk]) |*e, row| e.* += ph * bf16(row[k]);
     }
     for (0..c.topk) |j| {
-        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edgeWeight() * edge[j]) / softScale();
+        out[j] = drawn(c, r, w[2 + j], @as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + edgeWeight() * edge[j]) / scaleVal();
         most = @max(most, out[j]);
     }
     var total: f64 = 0;
     for (out[0..c.topk]) |v| total += @exp(v - most);
     const log_total = most + @log(total);
     for (out[0..c.topk]) |*v| v.* -= log_total;
+    if (r4log()) dumpVisitBits(c, r, pred, &edge, out);
 }
 
 /// Up to `most` nodes best first: the open node of least path cost next (ties by parent, token, row); the count grown.
-pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32, parents: []i32, own: []f64) usize {
+/// `tune` (default zeroed = the crown behavior bit for bit): `trust` blends each candidate's path term from
+/// its own log-chance toward the Landing tables' observed landing chance (offline search's tau), and `lam`
+/// adds lam x row to a node's cost (a shallow bias; the offline search's depth-vs-breadth knob).
+pub const Tune = struct {
+    trust: f64 = 0,
+    lam: f64 = 0,
+    ctx: ?*const anyopaque = null,
+    chance_fn: ?*const fn (?*const anyopaque, f64) f64 = null,
+};
+
+/// The Landing tables behind a trust tune: the caller pins the stream's sampled flag.
+pub const TrustCtx = struct { l: *const Landing, sampled: bool };
+
+pub fn landingChance(ctx: ?*const anyopaque, own: f64) f64 {
+    const t: *const TrustCtx = @ptrCast(@alignCast(ctx.?));
+    return t.l.chance(t.sampled, own);
+}
+
+pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32, parents: []i32, own: []f64, tune: Tune) usize {
     const Open = struct { cost: f64, parent: i32, token: u32, row: usize, own: f64 };
-    var open: [branch * (engine.most_window + 1)]Open = undefined;
+    const branch = branchN();
+    // the open list is sized for the largest branch the env may select; growth checks n_open == open.len
+    var open: [max_branch * (engine.most_window + 1)]Open = undefined;
     var n_open: usize = 0;
     var count: usize = 0;
     var pred = pending;
@@ -251,6 +433,7 @@ pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32
     var path: f64 = 0;
     const fast = treeFast() and rows <= fast_rows and c.rank == fast_rank and c.topk <= lp_top;
     if (fast) row_cache.filled = @splat(false);
+    if (r4log()) r4_seen = @splat(false);
     while (true) {
         // the node just taken (or the pending token) opens its best children on the next row
         if (row < rows) {
@@ -271,9 +454,15 @@ pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32
                 }
             }.more);
             const w = ids(c, row);
-            for (order[0..@min(branchWidth(), c.topk)]) |j| {
+            for (order[0..@min(branch, c.topk)]) |j| {
                 if (!std.math.isFinite(lc[j]) or n_open == open.len) break;
-                open[n_open] = .{ .cost = path - lc[j], .parent = parent, .token = w[2 + j], .row = row, .own = lc[j] };
+                var cost = path - lc[j];
+                if (tune.trust > 0 and tune.chance_fn != null) {
+                    const pm = (1 - tune.trust) * @exp(lc[j]) + tune.trust * @max(tune.chance_fn.?(tune.ctx, lc[j]), 1e-300);
+                    cost = path - @log(@max(pm, 1e-300));
+                }
+                if (tune.lam != 0) cost += tune.lam * @as(f64, @floatFromInt(row));
+                open[n_open] = .{ .cost = cost, .parent = parent, .token = w[2 + j], .row = row, .own = lc[j] };
                 n_open += 1;
             }
         }
@@ -332,11 +521,10 @@ test "best first: a node's children follow it, the cheapest open node first, cha
     var tokens: [6]u32 = undefined;
     var parents: [6]i32 = undefined;
     var own: [6]f64 = undefined;
-    const n = grow(c, 5, 2, 6, &tokens, &parents, &own);
+    const n = grow(c, 5, 2, 6, &tokens, &parents, &own, .{});
     try std.testing.expectEqual(@as(usize, 6), n);
     try std.testing.expectEqual(@as(u32, 0), tokens[0]); // row 0's best first
     try std.testing.expectEqual(@as(i32, -1), parents[0]);
     for (parents[0..n], 0..) |p, i| try std.testing.expect(p < @as(i32, @intCast(i)));
     for (tokens[0..n], parents[0..n]) |t, p| try std.testing.expectEqual(p >= 0, t >= 10); // row 1's ids under row 0's
 }
-// draw 28 of 4e2b427a
