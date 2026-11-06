@@ -649,7 +649,8 @@ __device__ __forceinline__ void body(const __nv_bfloat16* x,const float* xs,cons
 #pragma unroll
     for(int i=1;i<4;++i)if(int(blockIdx.x)>=parts.p[i].first)which=i;
     const auto p=parts.p[which];int t=int(blockIdx.x)-p.first;const bool coded=DICT&&p.tiles>0;
-    if(which<2){if(coded)tile<128,true>(x,xs,p,t,M,K,ldx);else tile<128>(x,xs,p,t,M,K,ldx);}
+    // qkv and z on the 16-row twin's 256-column CTAs (both m16 row tiles share each weight stage)
+    if(which<2){if(coded)tile<256,true>(x,xs,p,t,M,K,ldx);else tile<256>(x,xs,p,t,M,K,ldx);}
     else{if(coded)tile<64,true>(x,xs,p,t,M,K,ldx);else tile<64>(x,xs,p,t,M,K,ldx);}
 }
 }

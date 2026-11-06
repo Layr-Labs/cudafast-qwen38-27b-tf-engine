@@ -22,6 +22,12 @@ pub const kmajor_smem: u32 = 13440 + 16 * 128 * 2;
 pub const single_smem: u32 = 41088;
 /// Pair-only half panel: two weight/index/sum stages, direct input fragments.
 pub const compact_pair_smem: u32 = 17536;
+/// The same tile on jungjipdo's three-stage ring (submission 512bdc67, TF_COMPACT3): three weight/index/sum
+/// stages of 8768 bytes, direct input fragments. Three such CTAs exceed the 64 KiB carveout, so the
+/// resolve hints the full carveout for it.
+pub const compact_pair3_smem: u32 = 26304;
+/// compact_pair at 32 rows (tf_qmm_mlp_single16_compact_pair32): two m16 row tiles sharing the staged weight panel.
+pub const compact_pair32_smem: u32 = 17664;
 /// tf_qmm_mlp_single32: two stages of 32 input rows, four 2 KB weight tiles, 256 scales and biases, 32 sums.
 pub const single32_smem: u32 = 2 * (32 * 128 + 256 * 32 + 2 * 256 * 2 + 32 * 4);
 /// tf_qmm_mlp_single16_dict past single_smem: four warps' decoded values, then gate's and up's tables.
@@ -39,6 +45,9 @@ pub const Kernels = struct {
     single32_dict_fn: ?Function = null, // tf_qmm_mlp_single32_dict: dictionary-coded twin on the K-major panels
     dict_fn: ?Function = null, // GB10: tf_qmm_mlp_pair's twin, taken when gate and up are both coded (tile-major)
     compact_pair_fn: ?Function = null,
+    /// TF_COMPACT3: the compact pair runs jungjipdo's three-stage ring (compact_pair3_smem).
+    compact3: bool = false,
+    compact_pair32_fn: ?Function = null, // tf_qmm_mlp_single16_compact_pair32: the compact tile at 17 to 32 rows
     single_dict_fn: ?Function = null, // tf_qmm_mlp_single16's, when both are coded on the K-major panel's layout
 
     /// From the loaded qmm_group module; `pdl` as the decode tiles' launches (GB10).
@@ -53,12 +62,38 @@ pub const Kernels = struct {
             const fs = try group_mod.function(symbol_single_dict);
             try fs.allowDynamicShared(single_smem + single_dict_dec + 2 * qlinear.dict_tab_max);
             k.single_dict_fn = fs;
-            const fc = try group_mod.function("tf_qmm_mlp_single16_compact_pair");
-            try fc.allowDynamicShared(compact_pair_smem);
-            // 50% rounds upward to the 64 KiB carveout on GB10. This is a hint,
-            // allowing the driver to avoid disruptive per-node reconfiguration.
-            try fc.setAttribute(.preferred_shared_memory_carveout, 50);
+            // TF_NJ (default on; "0" = the original tile): newjordan's EARLYA49 (submission 4c77bdbd) and
+            // EPILOGUE50 (8795d433) on the BM16 tile, the same bits. CAP3-02: the default now matches the
+            // comment — the tested NJ twin is the shipping decode-MLP path; TF_NJ=0 restores the original.
+            const nj = if (@import("sys").c.getenv("TF_NJ")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+            // TF_COMPACT3 (default off; "1" = jungjipdo's ring): 3-stage weight/index/sum pipeline on the
+            // BM16 compact tile (submission 512bdc67, source 6dd618dc). The same staged words, fragment
+            // addresses and mma/fma chains, so the same bits. PEER-04 gate (173-cap305-cleanredo, 3
+            // counterbalanced pairs, exact tapes): no demonstrated benefit, decode +0.405..+0.466% worse
+            // on both topics — off until new evidence.
+            const c3 = if (@import("sys").c.getenv("TF_COMPACT3")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+            const fc = try group_mod.function(if (nj)
+                (if (c3) "tf_qmm_mlp_single16_compact_pair_nj3" else "tf_qmm_mlp_single16_compact_pair_nj")
+            else
+                (if (c3) "tf_qmm_mlp_single16_compact_pair3" else "tf_qmm_mlp_single16_compact_pair"));
+            const csmem: u32 = if (c3) compact_pair3_smem else compact_pair_smem;
+            try fc.allowDynamicShared(csmem);
+            if (c3) {
+                // three 26,304-byte CTAs exceed the 64 KiB carveout; hint the full carveout so they fit
+                // (jungjipdo 6dd618dc's mlp_pair.zig hints 100 for the same footprint)
+                try fc.setAttribute(.preferred_shared_memory_carveout, 100);
+            } else {
+                // 50% rounds upward to the 64 KiB carveout on GB10. This is a hint,
+                // allowing the driver to avoid disruptive per-node reconfiguration.
+                try fc.setAttribute(.preferred_shared_memory_carveout, 50);
+            }
+            k.compact3 = c3;
             k.compact_pair_fn = fc;
+            const fc32 = try group_mod.function("tf_qmm_mlp_single16_compact_pair32");
+            try fc32.allowDynamicShared(compact_pair32_smem);
+            // three CTAs an SM fit the 64 KiB carveout (3 x 17664 bytes)
+            try fc32.setAttribute(.preferred_shared_memory_carveout, 50);
+            k.compact_pair32_fn = fc32;
         }
         return k;
     }
@@ -80,10 +115,44 @@ pub const Kernels = struct {
             qlinear.splitK(gate.n, gate.k) == 1;
     }
 
+    /// TF_COMPACT32=0 keeps the 17 to 32-row windows on tf_qmm_mlp_single32(_dict) (the crown's tiles).
+    fn compact32On() bool {
+        const v = @import("sys").c.getenv("TF_COMPACT32") orelse return true;
+        return !std.mem.eql(u8, std.mem.span(v), "0");
+    }
+
     /// act (rows, n) = bf16(silu(x through gate) * (x through up)), x's group sums in xs; act's group sums into as.
     pub fn pair(kk: *const Kernels, s: Stream, x: u64, xs: u64, gate: Affine4, up: Affine4, act: u64, as: u64, rows: usize) !void {
         if (!fits(gate, up) or rows == 0) return error.InputMismatch;
-        if (rows > 16 and rows <= 32 and gate.n == 17408 and gate.k == 5120 and gate.verify_w != 0 and up.verify_w != 0)
+        if (rows > 16 and rows <= 32 and gate.n == 17408 and gate.k == 5120 and gate.verify_w != 0 and up.verify_w != 0) {
+            // the compact pair tile at 32 rows: the same parts the 16-row compact takes (verify_w K-major panels,
+            // dictionary index stream in scales, the codes in first), rows_t now counting 32-row tiles; the kernel
+            // keeps tf_qmm_mlp_single16's per-row chain, so the same bits as the 16-row window's rows
+            if (compact32On() and kk.compact_pair32_fn != null and coded(gate, up, true) and
+                qlinear.pairCode(gate.code) and qlinear.pairCode(up.code))
+            {
+                var wide: qlinear.Parts = std.mem.zeroes(qlinear.Parts);
+                for ([2]Affine4{ gate, up }, wide.p[0..2]) |q, *p| p.* = .{
+                    .w = q.verify_w,
+                    .scales = q.sb,
+                    .biases = q.tab,
+                    .out = 0,
+                    .n = @intCast(q.n),
+                    .npad = @intCast(q.npad),
+                    .sk = 1,
+                    .tiles = @intCast(q.n / 128),
+                    .first = @bitCast(q.code & ~qlinear.dict_kmajor),
+                };
+                wide.count = 2;
+                var ca: launch_.Args = .{};
+                ca.add(x);
+                ca.add(xs);
+                ca.add(wide);
+                ca.add(act);
+                ca.add(as);
+                for ([_]usize{ rows, gate.k, gate.k, (rows + 31) / 32 }) |v| ca.add(@as(c_int, @intCast(v)));
+                return launch_.launch(kk.compact_pair32_fn.?, .{ .grid = .{ .x = @intCast(gate.n / 128) }, .block = .{ .x = 128 }, .shared = compact_pair32_smem, .pdl = kk.pdl }, s, &ca);
+            }
             if (kk.single32_fn) |fw| {
                 const sdict32 = kk.single32_dict_fn != null and coded(gate, up, true) and singleTab(gate) + singleTab(up) <= single_tab_max;
                 var wide: qlinear.Parts = std.mem.zeroes(qlinear.Parts);
@@ -109,7 +178,8 @@ pub const Kernels = struct {
                 const f32_use = if (sdict32) kk.single32_dict_fn.? else fw;
                 const sh32: u32 = if (sdict32) single32_smem + singleTab(gate) + singleTab(up) else single32_smem;
                 return launch_.launch(f32_use, .{ .grid = .{ .x = @intCast(gate.n / 128) }, .block = .{ .x = 128 }, .shared = sh32, .pdl = kk.pdl }, s, &a);
-            };
+            }
+        }
         const rows_t = (rows + 15) / 16;
         // a window of at most 16 rows: the single16 tile bounds its own rows (`min(BM, M - m0)`), so it reads the
         // K-major panels and their dictionary index stream (a byte a 64 weights) instead of the tile-major panels'
@@ -149,7 +219,7 @@ pub const Kernels = struct {
         g.add(as);
         for ([_]usize{ rows, gate.k, gate.k, rows_t }) |v| g.add(@as(c_int, @intCast(v)));
         const f = if (compact) kk.compact_pair_fn.? else if (sdict) kk.single_dict_fn.? else if (major) kk.kmajor_fn.? else if (dict) kk.dict_fn.? else kk.pair_fn;
-        const shared: u32 = if (compact) compact_pair_smem else if (sdict) single_smem + single_dict_dec + singleTab(gate) + singleTab(up) else if (single) single_smem else if (major) kmajor_smem else if (dict) smem + qlinear.dict_dec + @max(gate.tabBytes(), up.tabBytes()) else smem;
+        const shared: u32 = if (compact) (if (kk.compact3) compact_pair3_smem else compact_pair_smem) else if (sdict) single_smem + single_dict_dec + singleTab(gate) + singleTab(up) else if (single) single_smem else if (major) kmajor_smem else if (dict) smem + qlinear.dict_dec + @max(gate.tabBytes(), up.tabBytes()) else smem;
         try launch_.launch(f, .{ .grid = .{ .x = @intCast(@as(usize, if (single) 1 else 2) * rows_t * tiles) }, .block = .{ .x = 128 }, .shared = shared, .cluster = if (single) null else .{ .x = 2 }, .pdl = kk.pdl }, s, &g);
     }
 };
