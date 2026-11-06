@@ -122,22 +122,6 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
     }
     grid_launch();
     for (int it = 0; it < per; ++it) {
-        // Input belongs to the completed PDL producer, not to the async packed-weight stage.
-        // Issue the exact current-group A fragments while that stage is still in flight.
-        uint32_t av[GS / 16][I][4];
-#pragma unroll
-        for (int kt = 0; kt < GS / 16; ++kt)
-#pragma unroll
-            for (int i = 0; i < I; ++i) {
-                const int r = wm * (BM / WM) + i * 16 + (lane >> 2);
-                const int c = it * GS + kt * 16 + 2 * (lane & 3);
-                const __nv_bfloat16* a0 = x_ready + static_cast<size_t>(m0 + r) * ldx + c;
-                const __nv_bfloat16* a1 = a0 + 8 * ldx;
-                av[kt][i][0] = compact_load_a(a0);
-                av[kt][i][1] = compact_load_a(a1);
-                av[kt][i][2] = compact_load_a(a0 + 8);
-                av[kt][i][3] = compact_load_a(a1 + 8);
-            }
         wait<0>();
 #if __CUDA_ARCH__ >= 1200
         if (tid == 0) {
@@ -171,6 +155,20 @@ __device__ __forceinline__ void mlp_single_compact_body(const __nv_bfloat16* __r
         for (int j = 0; j < T::NT; ++j)
 #pragma unroll
             for (int v = 0; v < GS / 32; ++v) words[j][v] = pw[((wn * T::NT + j) * 32 + lane) * (GS / 32) + v];
+        uint32_t av[GS / 16][I][4];
+#pragma unroll
+        for (int kt = 0; kt < GS / 16; ++kt)
+#pragma unroll
+            for (int i = 0; i < I; ++i) {
+                const int r = wm * (BM / WM) + i * 16 + (lane >> 2);
+                const int c = it * GS + kt * 16 + 2 * (lane & 3);
+                const __nv_bfloat16* a0 = x_ready + static_cast<size_t>(m0 + r) * ldx + c;
+                const __nv_bfloat16* a1 = a0 + 8 * ldx;
+                av[kt][i][0] = compact_load_a(a0);
+                av[kt][i][1] = compact_load_a(a1);
+                av[kt][i][2] = compact_load_a(a0 + 8);
+                av[kt][i][3] = compact_load_a(a1 + 8);
+            }
         float xv[I][2];
 #pragma unroll
         for (int i = 0; i < I; ++i) {
