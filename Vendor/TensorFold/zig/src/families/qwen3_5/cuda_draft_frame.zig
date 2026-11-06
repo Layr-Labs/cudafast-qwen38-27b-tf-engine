@@ -28,6 +28,9 @@ pub fn stagedLen(rank: usize) usize {
 pub fn segments(st: []u8) []Segment {
     return @alignCast(std.mem.bytesAsSlice(Segment, st[segments_at..words_at]));
 }
+/// The frame's readback's running mean wait (cuda_engine.zig pacedSync).
+var frame_wait: @import("cuda_engine.zig").PacedWait = .{};
+
 pub fn stage(c: draft.Config, items: []const dr.Hold, contexts: []const *draft.Ctx, st: []u8) !void {
     if (items.len == 0 or items.len > max_streams or contexts.len != items.len or (c.block != 8 and c.block != 16) or st.len < try stagedBytes(c.rank) or @intFromPtr(st.ptr) % 8 != 0) return error.BadDraftFrame;
     for (items, contexts, 0..) |it, ctx, index| {
@@ -154,6 +157,13 @@ fn body(d: anytype, n: usize, narrow_: bool) !?u64 {
     return spanned;
 }
 
+/// TF_GRAPH_UPLOAD=0: launch the captured draft graph without its device-side preparation.
+/// Measured on this base: upload on is 0.54% faster over 4 ABBA pairs (3/4), CI -0.95..+2.04.
+fn graphUploadOff() bool {
+    const v = @import("sys").c.getenv("TF_GRAPH_UPLOAD") orelse return false;
+    return @import("std").mem.eql(u8, @import("std").mem.span(v), "0");
+}
+
 fn run(d: anytype, n: usize, narrow_: bool) !?u64 {
     const e = d.e;
     if (draft.graphsOff()) return body(d, n, narrow_);
@@ -179,7 +189,10 @@ fn run(d: anytype, n: usize, narrow_: bool) !?u64 {
         exec = captured.instantiate() catch null;
     } else |_| {}
     try d.graphs.put(d.gpa, key, .{ .exec = exec, .spanned = spanned });
-    if (exec) |x| try x.launchOn(e.stream) else _ = try body(d, n, narrow_);
+    if (exec) |x| {
+        if (!graphUploadOff()) try x.upload(e.stream);
+        try x.launchOn(e.stream);
+    } else _ = try body(d, n, narrow_);
     return spanned;
 }
 
@@ -199,9 +212,13 @@ pub fn forward(d: anytype, items: []const dr.Hold, contexts: []const *draft.Ctx)
     try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(d.segments, st.ptr + segments_at, items.len * @sizeOf(Segment), e.stream.handle), "cuMemcpyHtoDAsync");
     const rows = items.len * (c.block - 1);
     const spanned = try run(d, items.len, narrow(contexts));
-    try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + words_at, d.words, rows * lp_words * 4, e.stream.handle), "cuMemcpyDtoHAsync");
-    try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + hp_at, d.hp, rows * c.rank * 2, e.stream.handle), "cuMemcpyDtoHAsync");
-    try e.stream.synchronize();
+    const mapped = if (@hasField(@TypeOf(d.*), "staged_device")) d.staged_device != 0 else false;
+    if (!mapped) {
+        try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + words_at, d.words, rows * lp_words * 4, e.stream.handle), "cuMemcpyDtoHAsync");
+        try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + hp_at, d.hp, rows * c.rank * 2, e.stream.handle), "cuMemcpyDtoHAsync");
+    }
+    // Publish only after completion, including the mapped path; no host/device atomics or polling.
+    try e.pacedSync(&frame_wait); // sleeps, then spins (cuda_engine.zig pacedSync)
     if (spanned != null) for (0..rows) |r| {
         const w = std.mem.bytesAsSlice(u32, st[words_at + r * lp_words * 4 ..][0 .. lp_words * 4]);
         for (w[2..][0..c.topk]) |*id| if (id.* >= spans[0][1]) {
