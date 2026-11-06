@@ -1,15 +1,3 @@
-// draw 14 of tree b20c989 (comment only: no executable line changes)
-// draw 13 of tree b20c989 (comment only: no executable line changes)
-// draw 12 of tree b20c989 (comment only: no executable line changes)
-// draw 11 of tree b20c989 (comment only: no executable line changes)
-// draw 10 of tree b20c989 (comment only: no executable line changes)
-// draw 9 of tree b20c989 (comment only: no executable line changes)
-// draw 8 of tree b20c989 (comment only: no executable line changes)
-// draw 7 of tree b20c989 (comment only: no executable line changes)
-// draw 6 of tree b20c989 (comment only: no executable line changes)
-// draw 5 of tree b20c989 (comment only: no executable line changes)
-// draw 4 of tree b20c989 (comment only: no executable line changes)
-// draw 3 of tree b20c989 (comment only: no executable line changes)
 // Modified by Layr Labs, Inc. in 2026; see THIRD_PARTY_NOTICES.md.
 //! Qwen3.5's hybrids on CUDA: qlinear projections, qwen35.cu glue, one captured forward over every stream's window.
 const std = @import("std");
@@ -146,6 +134,9 @@ pub const Engine = struct {
     /// each norm writes the rows it reads a sublayer later, past a projection's weights streaming through L2.
     l2_persist: usize = 0,
     overlap: Overlap = .{},
+    /// promptWait's blocking-sync event, created on the first prompt wait and kept for the engine's life
+    /// (null: none yet, or TF_PROMPT_WAIT=spin)
+    prompt_event: cuda.abi.Event = null,
     h_window: ?cuda.abi.AccessPolicyWindow = null,
     wide_words: ?DeviceBuffer = null,
     projection_streams: ?DeviceBuffer = null,
@@ -219,6 +210,9 @@ pub const Engine = struct {
     tables: DeviceBuffer,
     staged: cuda.HostBuffer,
     host_logits: cuda.HostBuffer,
+    host_tokens: ?cuda.HostBuffer = null,
+    token_device: u64 = 0,
+    mapped_results: bool = false,
     /// The kept rows' device draws, when forward was given them.
     tokens: [most_verify]u32 = undefined,
     /// The captured forwards by shape (`Shape.key`): the launches from the embedding to the head.
@@ -253,6 +247,9 @@ pub const Engine = struct {
         const g = try Geometry.read(gpa, io, dir);
         const d = ctx.d;
         const e = try @import("cuda_prompt_int8.zig").Allocation(Engine).create(gpa);
+        e.host_tokens = null;
+        e.token_device = 0;
+        e.mapped_results = false;
         e.h_window = null; // Allocation.create leaves fields undefined before the first captured forward.
         errdefer gpa.destroy(e);
         e.projection_streams = null;
@@ -265,6 +262,7 @@ pub const Engine = struct {
         errdefer if (e.head3) |*h| h.deinit();
         e.sieve = null;
         e.overlap = .{}; // Allocation.create leaves it undefined: no side stream or pending logits before a drafter attaches
+        e.prompt_event = null; // likewise: promptWait creates it on first use
         errdefer e.int8.deinit();
         e.gpa = gpa;
         e.dir = try gpa.dupe(u8, dir);
@@ -318,6 +316,9 @@ pub const Engine = struct {
         const major = try ctx.attribute(.compute_capability_major);
         const minor = try ctx.attribute(.compute_capability_minor);
         const gb10 = major == 12 and minor == 1;
+        e.mapped_results = gb10 and !envOff("TF_MAPPED_RESULTS") and
+            (ctx.attribute(.can_map_host_memory) catch 0) != 0;
+        if (e.mapped_results) e.host_tokens = try @import("cuda_mapped_results.zig").alloc(d, most_verify * 4, true, &e.token_device);
         e.affine = try cuda.qlinear.Affine4Kernels.resolve(d, e.mods[0], e.mods[1], e.mods[2], e.mods[3], sms, gb10);
         e.affine.half_prompt = !gb10; // the 27B's prompt tile (Tile<64, 128, 128, 2, 2, 2>), quicker on an RTX 5090
         // GB10: split-K decode/verify projections on the cluster tile (bits unchanged); TF_CLUSTER_DECODE=0 restores lane_gemv
@@ -326,6 +327,11 @@ pub const Engine = struct {
         e.l2_persist = 0;
         if (gb10 and !envOff("TF_L2_PERSIST") and d.api.cuCtxSetLimit(cuda.abi.limit_persisting_l2, l2_persist_bytes) == cuda.abi.success) e.l2_persist = l2_persist_bytes;
         e.affine.group_wide = gb10 and !envOff("TF_WIDE_GROUP");
+        // GB10: 33 to 128-row windows' projections grouped the verifyMany32 way on the plain row kernels (bits
+        // unchanged: each part's blocks are its own launch's); TF_WIDE_DEEP=0 restores one launch a projection
+        e.affine.group_wide_deep = gb10 and !envOff("TF_WIDE_DEEP");
+        // rows > 32 row kernels on the deep weight ring (qmm_group.cu group_wide_body; bits unchanged); TF_WIDE_KERNEL=0
+        e.affine.wide_deep_kernel = !envOff("TF_WIDE_KERNEL");
         // GB10: out/o (short K slices) on lane_gemv's column CTAs instead (bits unchanged); TF_SHORT_LANE=0 restores the cluster tile
         e.affine.short_lane = gb10 and !envOff("TF_SHORT_LANE");
         errdefer e.affine.deinit();
@@ -360,7 +366,14 @@ pub const Engine = struct {
         e.plan = try cuda.grouped.Router.resolve(e.mods[10]);
         e.moe = try cuda.moe.Fns.resolve(e.mods[13]);
         inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(e.fns, name) = try e.mods[4].function("tf_q35_" ++ name);
-        // Select the evaluated pair-fold / packed query head-rotary entry; each part has its own fallback.
+        // the U3/U4 escapes: TF_NORM_U0=1 binds the baseline norm (the residual's loads held across the past_rows
+        // return), TF_NORMROPE_U0=1 the baseline norm+rope tail (a per-thread rotate, no pair fold); unset keeps both
+        if (@import("sys").c.getenv("TF_NORM_U0") != null) e.fns.norm = try e.mods[4].function("tf_q35_norm_u0");
+        if (@import("sys").c.getenv("TF_NORMROPE_U0") != null) e.fns.norm_rope = try e.mods[4].function("tf_q35_norm_rope_u0");
+        // Four-stack integration: the prompt head rope defaults to the composed entry (child08's RoPE merge:
+        // the corrected pair-fold rotate AND the packed query stores in one kernel). Each component rolls back
+        // independently: TF_HROPE_PF=0 keeps the baseline sincosf-per-element rotate, TF_HROPE_PK=0 the
+        // per-element stores; both off restore the baseline kernel.
         {
             const pf = !envOff("TF_HROPE_PF");
             const pk = !envOff("TF_HROPE_PK");
@@ -485,6 +498,7 @@ pub const Engine = struct {
         while (hit.next()) |x| x.deinit();
         e.heads.deinit(e.gpa);
         e.host_logits.free();
+        if (e.host_tokens) |*b| b.free();
         e.staged.free();
         e.tables.free();
         if (e.wide_words) |*b| b.free();
@@ -492,6 +506,7 @@ pub const Engine = struct {
         if (e.verify_weights) |*b| b.free();
         if (e.fast) |*p| p.free();
         if (e.head3) |*h| h.deinit();
+        if (e.prompt_event != null) _ = e.d.api.cuEventDestroy_v2(e.prompt_event);
         if (e.sieve) |*sv| sv.deinit();
         e.arena.free();
         e.gpa.free(e.layers);
@@ -570,7 +585,8 @@ pub const Engine = struct {
         e.logits = try t.alloc(most_verify * g.vocab * 2);
         if (g.moe()) e.routed = try routed.Scratch.carve(t, g, R);
         e.amax = try t.alloc(most_verify * argmaxSlices(g.vocab) * 8);
-        e.head_amax = try t.alloc(cuda.qlinear.Affine4Kernels.max_rows * ((g.vocab + 63) / 64) * 8);
+        // the amax head's per-tile bests: 32 rows (the sieve's extended windows; TF_SIEVE32=0 still runs at most 16)
+        e.head_amax = try t.alloc(32 * ((g.vocab + 63) / 64) * 8);
         e.picks = try t.alloc(most_verify * cuda.sample.Draws.row_scratch);
         return total;
     }
@@ -615,6 +631,13 @@ pub const Engine = struct {
         if (e.embed_bits == 16) return modelopt.embed(e, ids, out, rows); // bf16 rows; padding rows' ids are zeroed
         const f = if (e.embed_bits == 8) e.fns.embed8 else e.fns.embed;
         try e.run(f, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ ids, e.embed_w, e.embed_s, e.embed_b, out, @as(c_int, @intCast(e.g.hidden)), params });
+    }
+
+    /// The device address the verify's token writers target: the mapped result view when mapped results are on
+    /// (kernels write the host-visible bytes; the completion sync is the visibility boundary), else the staged
+    /// tables' token rows (cuda_prompt_tail.zig writes the sieve's token there).
+    pub fn tokenOutput(e: *const Engine) u64 {
+        return if (e.token_device != 0) e.token_device else e.tables.ptr + tokens_at;
     }
 
     /// Whether a verify of `bucket` rows, all drawn by `draws`, takes the head's own argmax (Shape.amax): every row
@@ -708,6 +731,7 @@ pub const Engine = struct {
         const heads: usize = if (record) total else 1;
         // the prompt GEMM only for prompt chunks: a window's rows keep the bits of one-row steps
         const prompt = !record;
+        if (record) @import("cuda_dtprof.zig").mark(e.d, e.stream, .verify_entry);
         // the tables
         const st = e.staged.bytes;
         @memcpy(std.mem.bytesAsSlice(u32, st[ids_at..][0 .. total * 4]), ids);
@@ -772,6 +796,14 @@ pub const Engine = struct {
         shape.hidden = keep == .hidden;
         shape.paged = @import("cuda_attention.zig").hasPages(segs);
         shape.amax = keep == .draws and e.learning == null and !e.pockets.any() and e.headArgmax(shape.total, keep.draws);
+        // PEER-18 (265c97a6/c80d6ce): the ordinary sieve returns winning keys directly (the host decodes
+        // them), dropping the finish launch; every other path still returns tokens. The host_logits buffer
+        // (verify_rows x vocab x 2 B) dwarfs total x 8, so the capacity guard below cannot fire on real windows.
+        const sieve_keys: u64 = if (shape.amax and e.head3 == null) blk: {
+            if (e.sieve) |*sv| if (sv.mode == .on) break :blk sv.best;
+            break :blk 0;
+        } else 0;
+        if (sieve_keys != 0 and total > e.host_logits.bytes.len / @sizeOf(u64)) return error.InvalidQwenSegments;
         // a cache of at most GROUP_LEN positions holds fewer keys than that before any row it verifies
         shape.short = for (parts) |p| {
             if (p.cache.cap > @import("cuda_forward.zig").group_len) break false;
@@ -818,14 +850,17 @@ pub const Engine = struct {
                     e.cut_head = null;
                 }
             }
+            if (record) @import("cuda_dtprof.zig").mark(e.d, e.stream, .verify_launch);
             if (e.heads.get(shape.key())) |h| try h.launchOn(e.stream);
             try gop.value_ptr.launchOn(e.stream);
+            if (record) @import("cuda_dtprof.zig").mark(e.d, e.stream, .verify_end);
         }
+        const dround_start: u64 = @intCast(parts[0].cache.len);
         for (parts) |p| p.cache.advanced(p.rows, record);
         switch (keep) {
             .hidden => try e.stream.synchronize(), // mapped layer inputs are ready before the learner reads them
             .draws => |pk| {
-                const toks = e.tables.ptr + tokens_at;
+                const toks = e.tokenOutput();
                 var i: usize = if (shape.amax) pk.len else 0; // amax: the graph's head wrote every row's token
                 while (i < pk.len) { // runs of greedy rows argmaxed together, runs of sampled rows drawn together
                     const sampled = pk[i].rule != null;
@@ -836,9 +871,38 @@ pub const Engine = struct {
                     } else try e.argmax(i, n, toks);
                     i += n;
                 }
-                try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(e.host_logits.bytes.ptr, toks, total * 4, e.stream.handle), "cuMemcpyDtoHAsync");
-                try e.pacedSync(&verify_wait);
-                @memcpy(e.tokens[0..total], e.host_logits.slice(u32)[0..total]);
+                // F7 (child08 second-eyes): on the keys path nobody writes the token view (the finish launch is
+                // gone and amax skips its argmax), so the host decodes the picks and writes them back for this
+                // round's dround_accept — the non-keys paths keep the base order (afterVerify before the readback).
+                // Keys readback mechanism: PEER-18, donor submission 265c97a6-7eec-4f84-abdc-116680ab2cd7
+                // (ported from child03 4de49108; composed here with PEER-20's mapped result view).
+                if (record and parts.len == 1 and sieve_keys == 0) @import("cuda_dround.zig").afterVerify(e, parts[0].cache, dround_start, parts[0].rows, parts[0].parents, ids, toks);
+                // The ordinary sieve returns winning keys directly (PEER-18); all other paths return tokens. A mapped
+                // result view (PEER-20) replaces the token copy when bound; the keys path keeps its explicit readback.
+                const host = e.host_tokens orelse e.host_logits;
+                if (sieve_keys != 0) {
+                    try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(e.host_logits.bytes.ptr, sieve_keys, total * @sizeOf(u64), e.stream.handle), "cuMemcpyDtoHAsync");
+                    try e.pacedSync(&verify_wait);
+                    @import("cuda_dtprof.zig").mark(e.d, e.stream, .post_sync);
+                    for (e.host_logits.slice(u64)[0..total], e.tokens[0..total]) |key, *token|
+                        token.* = std.math.maxInt(u32) - @as(u32, @truncate(key));
+                    if (record and parts.len == 1) {
+                        // The write-back is only paid when the device round is on (TF_DROUND; afterVerify
+                        // early-returns in .off, so an unconditional copy would be pure overhead in the default
+                        // config). e.tokens is engine-lifetime memory and the pageable HtoD is staged by the
+                        // driver at call time, so the async copy's source is stable.
+                        if (@import("cuda_dround.zig").mode() != .off)
+                            try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(toks, std.mem.sliceAsBytes(e.tokens[0..total]).ptr, total * 4, e.stream.handle), "cuMemcpyHtoDAsync");
+                        @import("cuda_dround.zig").afterVerify(e, parts[0].cache, dround_start, parts[0].rows, parts[0].parents, ids, toks);
+                    }
+                } else {
+                    if (e.token_device == 0)
+                        try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(host.bytes.ptr, toks, total * 4, e.stream.handle), "cuMemcpyDtoHAsync");
+                    // This completion is also the visibility boundary for GPU stores into mapped host memory.
+                    try e.pacedSync(&verify_wait);
+                    @import("cuda_dtprof.zig").mark(e.d, e.stream, .post_sync);
+                    @memcpy(e.tokens[0..total], host.slice(u32)[0..total]);
+                }
                 if (shape.amax and e.head3 != null) try e.head3Settle(total);
                 if (shape.amax and e.head3 == null) if (e.sieve) |*sv| sv.after();
             },
@@ -876,20 +940,25 @@ pub const Engine = struct {
     /// context for the whole pass (GB10's CPU and GPU share one package); decode rounds keep their spin waits.
     /// TF_PROMPT_WAIT=spin restores the spin wait. Wait mode only: no launch or value changes.
     fn promptWait(e: *Engine, prompt: bool) !void {
-        if (!prompt or std.mem.eql(u8, std.mem.span(@import("sys").c.getenv("TF_PROMPT_WAIT") orelse ""), "spin"))
-            return e.stream.synchronize();
-        var ev: cuda.abi.Event = null;
-        // 0x1: CU_EVENT_BLOCKING_SYNC (its waiter sleeps whatever the context's schedule)
-        try e.d.check(e.d.api.cuEventCreate(&ev, 0x1 | cuda.abi.event_disable_timing), "cuEventCreate");
-        defer _ = e.d.api.cuEventDestroy_v2(ev);
-        try e.d.check(e.d.api.cuEventRecord(ev, e.stream.handle), "cuEventRecord");
-        try e.d.check(e.d.api.cuEventSynchronize(ev), "cuEventSynchronize");
+        if (!prompt or promptWaitSpin()) return e.stream.synchronize();
+        // one event for the engine's life instead of a create and a destroy on every prompt pass: a record after the
+        // previous wait returned re-arms it, so the wait still covers exactly the work queued before this call
+        if (e.prompt_event == null) {
+            // 0x1: CU_EVENT_BLOCKING_SYNC (its waiter sleeps whatever the context's schedule)
+            try e.d.check(e.d.api.cuEventCreate(&e.prompt_event, 0x1 | cuda.abi.event_disable_timing), "cuEventCreate");
+        }
+        try e.d.check(e.d.api.cuEventRecord(e.prompt_event, e.stream.handle), "cuEventRecord");
+        try e.d.check(e.d.api.cuEventSynchronize(e.prompt_event), "cuEventSynchronize");
     }
 
     /// A decode wait that sleeps, then spins: the host sleeps in 200 us slices (polling the stream between them) for
     /// nine tenths of this site's running mean wait, then takes the context's spin wait for the rest. The core idles
     /// through most of a verify round (GB10's CPU and GPU share one package), and no wake-up lands on the round's end.
     /// TF_PACED_WAIT=0: the plain spin wait. Host scheduling only: no launch or value changes.
+    /// Port of the host-only paced wait of peer submission f2c6531d-1b1b-4fc0-b09f-ec4c871c3b48
+    /// (commit 18764266c54d2af8d591123dd26a8443e9e4df35, official 2.80003946875173); the submission's graph-upload
+    /// piece is already in this base byte-for-byte (cuda_draft_frame.zig's capture-path upload), this paced wait is
+    /// the submission's remaining host-only decode delta.
     pub fn pacedSync(e: *Engine, site: *PacedWait) !void {
         if (!pacedOn()) return e.stream.synchronize();
         const t0 = monoNs();
@@ -909,7 +978,7 @@ pub const Engine = struct {
     pub const Shape = @import("cuda_shapes.zig").Shape;
 
     /// The same scan selected by body, exposed for host launch-contract fixtures.
-    pub fn deltaScan(e: *Engine, record: bool, slot_count: u8, segments: usize, layer: c_int) !void {
+    pub fn deltaScan(e: *Engine, record: bool, slot_count: u8, segments: usize, layer: c_int, next: ?Proj) !void {
         const scan = if (!record) e.fns.gdn_chain else switch (slot_count) {
             1 => e.fns.gdn_slots_1,
             2 => e.fns.gdn_slots_2,
@@ -926,7 +995,31 @@ pub const Engine = struct {
         const input = e.tables.ptr + @as(usize, if (record) Round.steps_at else rowpar_at);
         // qwen35_slots.cuh: up to four slots scan two value rows a warp, so a block covers eight
         const rows_a_warp: usize = if (record and (slot_count == 3 or slot_count == 35 or slot_count == 37 or slot_count == 38)) 4 else if (record and slot_count <= 4) 2 else 1;
-        try e.runAfter(scan, .{ 1, geometry.dk / (4 * rows_a_warp), e.g.v_heads * segments }, .{ 32, 4, 1 }, .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, input, layer, e.y, e.tables.ptr + params_at });
+        const grid = .{ 1, geometry.dk / (4 * rows_a_warp), e.g.v_heads * segments };
+        const base = .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, input, layer, e.y, e.tables.ptr + params_at };
+        // the slots kernels that declare the warm-up's four trailing parameters (qwen35_slots.cuh, qwen35_slots16.cuh):
+        // the lean scans (37, 38) do not, so a window on them keeps plain launches
+        if (!record or slot_count == 37 or slot_count == 38) return e.runAfter(scan, grid, .{ 32, 4, 1 }, base);
+        const pf = warmOf(next, warm_gdn);
+        return e.runAfter(scan, grid, .{ 32, 4, 1 }, base ++ .{ pf.w, pf.tile, pf.tiles, pf.take });
+    }
+
+    /// Shares (of 64) of each 64-column tile of the next lane projection warmed into L2 during the latency-bound kernel before it.
+    pub const warm_gdn: usize = 40;
+    pub const warm_attn: usize = 40;
+
+    pub const Warm = struct { w: u64 = 0, tile: c_int = 0, tiles: c_int = 0, take: c_int = 0 };
+
+    /// The L2 warm-up of `next`'s weight words (tile-major, k / 64 tiles of 2 KiB a 64-column tile): cache state only.
+    pub fn warmOf(next: ?Proj, share: usize) Warm {
+        if (envOff("TF_WARM")) return .{};
+        const p = next orelse return .{};
+        if (p != .a4) return .{};
+        const q = p.a4;
+        if (q.k % 64 != 0 or q.n % 64 != 0) return .{};
+        const tile = q.k / 64 * 2048;
+        const take = tile * share / 64 / 16 * 16;
+        return .{ .w = q.w, .tile = @intCast(tile), .tiles = @intCast(q.npad / 64), .take = @intCast(take) };
     }
 
     /// The launches of a forward of `shape`, from the embedding to the kept rows' logits (captured once a shape).
@@ -959,6 +1052,15 @@ pub fn promptSieveOn() bool {
     return !envOff("TF_PROMPT_SIEVE");
 }
 
+/// TF_PROMPT_WAIT=spin, read once: the environment does not change while the engine runs.
+var prompt_wait_spin: ?bool = null;
+fn promptWaitSpin() bool {
+    if (prompt_wait_spin) |v| return v;
+    const v = std.mem.eql(u8, std.mem.span(@import("sys").c.getenv("TF_PROMPT_WAIT") orelse ""), "spin");
+    prompt_wait_spin = v;
+    return v;
+}
+
 fn promptSieveCheck() bool {
     const v = @import("sys").c.getenv("TF_PROMPT_SIEVE") orelse return false;
     return std.mem.eql(u8, std.mem.span(v), "check");
@@ -969,7 +1071,7 @@ fn envOff(name: [*:0]const u8) bool {
     return std.mem.eql(u8, std.mem.span(v), "0");
 }
 
-/// A paced wait site's running mean of its waits (Engine.pacedSync).
+/// A paced wait site's running mean of its waits (Engine.pacedSync, peer f2c6531d's host-only port).
 pub const PacedWait = struct { mean_ns: u64 = 0 };
 /// The verify round's token readback; the drafter frame's readback has its own (cuda_draft_frame.zig).
 var verify_wait: PacedWait = .{};
