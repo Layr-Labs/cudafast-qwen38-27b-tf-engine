@@ -28,9 +28,8 @@ pub fn stagedLen(rank: usize) usize {
 pub fn segments(st: []u8) []Segment {
     return @alignCast(std.mem.bytesAsSlice(Segment, st[segments_at..words_at]));
 }
-/// The frame's readback's running mean wait (cuda_engine.zig pacedSync).
+/// The frame's readback's running mean wait (cuda_engine.zig pacedSync; peer f2c6531d's host-only port).
 var frame_wait: @import("cuda_engine.zig").PacedWait = .{};
-
 pub fn stage(c: draft.Config, items: []const dr.Hold, contexts: []const *draft.Ctx, st: []u8) !void {
     if (items.len == 0 or items.len > max_streams or contexts.len != items.len or (c.block != 8 and c.block != 16) or st.len < try stagedBytes(c.rank) or @intFromPtr(st.ptr) % 8 != 0) return error.BadDraftFrame;
     for (items, contexts, 0..) |it, ctx, index| {
@@ -196,7 +195,6 @@ fn run(d: anytype, n: usize, narrow_: bool) !?u64 {
     return spanned;
 }
 
-
 pub fn forward(d: anytype, items: []const dr.Hold, contexts: []const *draft.Ctx) !void {
     const c = d.c;
     const e = d.e;
@@ -208,13 +206,20 @@ pub fn forward(d: anytype, items: []const dr.Hold, contexts: []const *draft.Ctx)
         ctx.grown = 0;
     }
     errdefer cuda.completion.drain(e.d, e.stream, "a failed DFlash frame did not drain before its pinned staging was reused");
+    @import("cuda_dtprof.zig").mark(e.d, e.stream, .frame_begin);
     try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(d.ids, st.ptr, B * 4, e.stream.handle), "cuMemcpyHtoDAsync");
     try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(d.segments, st.ptr + segments_at, items.len * @sizeOf(Segment), e.stream.handle), "cuMemcpyHtoDAsync");
     const rows = items.len * (c.block - 1);
     const spanned = try run(d, items.len, narrow(contexts));
-    try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + words_at, d.words, rows * lp_words * 4, e.stream.handle), "cuMemcpyDtoHAsync");
-    try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + hp_at, d.hp, rows * c.rank * 2, e.stream.handle), "cuMemcpyDtoHAsync");
-    try e.pacedSync(&frame_wait); // sleeps, then spins (cuda_engine.zig pacedSync)
+    @import("cuda_dtprof.zig").mark(e.d, e.stream, .frame_end);
+    try @import("cuda_dtree.zig").launch(d, items, spanned != null);
+    const mapped = if (@hasField(@TypeOf(d.*), "staged_device")) d.staged_device != 0 else false;
+    if (!mapped) {
+        try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + words_at, d.words, rows * lp_words * 4, e.stream.handle), "cuMemcpyDtoHAsync");
+        try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + hp_at, d.hp, rows * c.rank * 2, e.stream.handle), "cuMemcpyDtoHAsync");
+    }
+    // Publish only after completion, including the mapped path; no host/device atomics or polling.
+    try e.pacedSync(&frame_wait); // sleeps, then spins (cuda_engine.zig pacedSync; peer f2c6531d's host-only port)
     if (spanned != null) for (0..rows) |r| {
         const w = std.mem.bytesAsSlice(u32, st[words_at + r * lp_words * 4 ..][0 .. lp_words * 4]);
         for (w[2..][0..c.topk]) |*id| if (id.* >= spans[0][1]) {
@@ -222,6 +227,60 @@ pub fn forward(d: anytype, items: []const dr.Hold, contexts: []const *draft.Ctx)
         };
     };
     try publish(d, items, contexts);
+    @import("cuda_dtree.zig").check(d, items, contexts[0]);
+}
+
+/// TF_DROUND: a one-stream frame's staged ids (the pending row set on the device later) and segment, uploaded before
+/// the device round's accept kernel writes ids[0] and the segment's bounds.
+pub fn stageDev(d: anytype, ctx: *draft.Ctx) !void {
+    const c = d.c;
+    const e = d.e;
+    const st = d.staged.bytes;
+    const ids = std.mem.bytesAsSlice(u32, st[0 .. c.block * 4]);
+    ids[0] = 0;
+    @memset(ids[1..c.block], c.mask);
+    segments(st)[0] = .{ .ring = ctx.ring.ptr, .begin = @intCast(ctx.begin), .position = @intCast(ctx.end) };
+    try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(d.ids, st.ptr, c.block * 4, e.stream.handle), "cuMemcpyHtoDAsync");
+    try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(d.segments, st.ptr + segments_at, @sizeOf(Segment), e.stream.handle), "cuMemcpyHtoDAsync");
+}
+
+/// TF_DROUND: the frame graph for one stream on the device-written ids and segment, its words and selector rows read
+/// back into the staging; the host reads them after the verify's synchronize. Returns the span head's logits, if any.
+pub fn runDev(d: anytype, ctx: *draft.Ctx) !?u64 {
+    const c = d.c;
+    const e = d.e;
+    @import("cuda_dtprof.zig").mark(e.d, e.stream, .frame_begin);
+    const rows = c.block - 1;
+    const spanned = try run(d, 1, narrow(&.{ctx}));
+    @import("cuda_dtprof.zig").mark(e.d, e.stream, .frame_end);
+    const st = d.staged.bytes;
+    try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + words_at, d.words, rows * lp_words * 4, e.stream.handle), "cuMemcpyDtoHAsync");
+    try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + hp_at, d.hp, rows * c.rank * 2, e.stream.handle), "cuMemcpyDtoHAsync");
+    return spanned;
+}
+
+/// TF_DROUND: forward()'s host half after a device-fed frame (the words already read back): ids remapped, published.
+pub fn finishDev(d: anytype, items: []const dr.Hold, contexts: []const *draft.Ctx, spanned: bool) !void {
+    const c = d.c;
+    const st = d.staged.bytes;
+    for (contexts) |ctx| {
+        ctx.held_n = 0;
+        ctx.grown = 0;
+    }
+    const rows = c.block - 1;
+    if (spanned) for (0..rows) |r| {
+        const w = std.mem.bytesAsSlice(u32, st[words_at + r * lp_words * 4 ..][0 .. lp_words * 4]);
+        for (w[2..][0..c.topk]) |*id| if (id.* >= spans[0][1]) {
+            id.* += @intCast(spans[1][0] - spans[0][1]);
+        };
+    };
+    try publish(d, items, contexts);
+    @import("cuda_dtree.zig").check(d, items, contexts[0]);
+}
+
+/// Whether the context reads the span head (cuda_dround.zig: a frame's head is fixed when it is launched).
+pub fn narrowOf(ctx: *draft.Ctx) bool {
+    return narrow(&.{ctx});
 }
 
 /// A stream's tokens outside the spans may outnumber this share of its tokens before the frame reads the whole head.
