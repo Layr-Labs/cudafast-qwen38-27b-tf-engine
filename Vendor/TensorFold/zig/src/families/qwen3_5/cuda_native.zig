@@ -364,7 +364,7 @@ const Lanes = struct {
         }
         const cache = try self.gpa.create(E.Cache);
         errdefer self.gpa.destroy(cache);
-        cache.* = try E.Cache.initFor(self.gpa, self.e, rows, taps);
+        cache.* = try E.Cache.initWithin(self.gpa, self.e, rows, self.capacity, taps);
         return cache;
     }
 
