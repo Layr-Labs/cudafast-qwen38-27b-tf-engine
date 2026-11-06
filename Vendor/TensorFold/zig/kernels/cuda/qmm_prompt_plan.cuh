@@ -27,9 +27,6 @@ __device__ __forceinline__ Item item(int at) {
 extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_plan(const __nv_bfloat16* __restrict__ x,
         const __grid_constant__ tf_qmm_prefill::ManyParts parts, int M, int K, int ldx, int first, int count) {
     using namespace tf_qmm_plan;
-    // CAP3-05 D3: fire the dependents at entry, as the crown prompt bodies do (H25 parity; the plan
-    // kernels replace those bodies' launches at the 496-row prompt). Scheduling only, no arithmetic.
-    qmm_frag::grid_launch();
     for (int w = blockIdx.x; w < count; w += gridDim.x) {
         const Item t = item(first + w);
         const ManyPart& P = parts.p[t.part];
@@ -50,9 +47,6 @@ extern "C" __global__ void __launch_bounds__(128) tf_qmm_prompt_plan_mlp(const _
         const __grid_constant__ tf_qmm_prefill::ManyParts parts, __nv_bfloat16* __restrict__ act, int M, int K, int ldx,
         int first, int count) {
     using namespace tf_qmm_plan;
-    // CAP3-05 D3: fire the dependents at entry, as the crown prompt bodies do (H25 parity; the plan
-    // kernels replace those bodies' launches at the 496-row prompt). Scheduling only, no arithmetic.
-    qmm_frag::grid_launch();
     for (int w = blockIdx.x; w < count; w += gridDim.x) {
         const Item t = item(first + w);
         switch (t.shape) {
